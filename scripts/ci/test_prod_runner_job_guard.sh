@@ -5,12 +5,15 @@
 # the first step of a job, whether the job may run as the identity that can read
 # the production kubeconfig. So what is proved here is refusal, not features.
 #
-# One context is allowed, and every deviation from it -- a different repository,
-# workflow, ref or event, a missing variable, an empty one, a value that merely
-# looks like the authorised one -- must exit non-zero. The suite also proves the
-# two properties a log-reading operator depends on: the values a workflow chose
-# never reach the guard's output, and no shell metacharacter in them is ever
-# executed.
+# Three contexts are allowed (issue #933) -- candidate preparation from the
+# default branch, cutover and rollback dispatched from main -- and every
+# deviation from them must exit non-zero: a different repository, workflow, ref
+# or event, a missing variable, an empty one, a value that merely looks like an
+# authorised one, and above all a *crossed* combination, where each field is
+# authorised for some context but not for the same one. The suite also proves
+# the two properties a log-reading operator depends on: the values a workflow
+# chose never reach the guard's output, and no shell metacharacter in them is
+# ever executed.
 set -uo pipefail
 
 # Preparation is checked, not assumed. An unresolved root, or a workspace
@@ -48,9 +51,12 @@ SUBSTITUTION="\$(touch $SUBSTITUTION_MARKER)"
 
 failures=0
 
+WORKFLOWS="nicrepository/nchat/.github/workflows"
+
+# The cutover context, used as the baseline every scenario deviates from.
 declare -A AUTHORISED=(
   [GITHUB_REPOSITORY]="nicrepository/nchat"
-  [GITHUB_WORKFLOW_REF]="nicrepository/nchat/.github/workflows/deploy-nchat-prod.yml@refs/heads/main"
+  [GITHUB_WORKFLOW_REF]="$WORKFLOWS/cutover-nchat-prod.yml@refs/heads/main"
   [GITHUB_REF]="refs/heads/main"
   [GITHUB_EVENT_NAME]="workflow_dispatch"
 )
@@ -178,9 +184,37 @@ expect_allow() { check "$1" "" "${@:2}"; }
 expect_deny() { check "$1" "$2" "${@:3}"; }
 
 
-# --- the one authorised context ---------------------------------------------
+# --- the three authorised contexts -------------------------------------------
 
-expect_allow "the production deploy dispatched from main is allowed"
+expect_allow "the cutover dispatched from main is allowed"
+expect_allow "the rollback dispatched from main is allowed" \
+  "GITHUB_WORKFLOW_REF=$WORKFLOWS/rollback-nchat-prod.yml@refs/heads/main"
+expect_allow "candidate preparation from the default branch is allowed" \
+  "GITHUB_WORKFLOW_REF=$WORKFLOWS/cd-prepare-production.yml@refs/heads/develop" \
+  GITHUB_REF=refs/heads/develop GITHUB_EVENT_NAME=workflow_run
+
+# --- crossed contexts --------------------------------------------------------
+#
+# Every field below is authorised for *some* context. None of these
+# combinations is authorised for the same one, which is the property a flat
+# union of allowed values would lose: preparation is the only workflow that may
+# run from develop, and it is the only one that may run without a dispatch.
+
+expect_deny "cutover from the default branch is refused" GITHUB_REF \
+  GITHUB_REF=refs/heads/develop
+expect_deny "cutover started by workflow_run is refused" GITHUB_EVENT_NAME \
+  GITHUB_EVENT_NAME=workflow_run
+expect_deny "rollback from the default branch is refused" GITHUB_REF \
+  "GITHUB_WORKFLOW_REF=$WORKFLOWS/rollback-nchat-prod.yml@refs/heads/main" \
+  GITHUB_REF=refs/heads/develop
+expect_deny "preparation dispatched by hand is refused" GITHUB_EVENT_NAME \
+  "GITHUB_WORKFLOW_REF=$WORKFLOWS/cd-prepare-production.yml@refs/heads/develop" \
+  GITHUB_REF=refs/heads/develop GITHUB_EVENT_NAME=workflow_dispatch
+expect_deny "preparation from main is refused" GITHUB_WORKFLOW_REF \
+  "GITHUB_WORKFLOW_REF=$WORKFLOWS/cd-prepare-production.yml@refs/heads/main" \
+  GITHUB_EVENT_NAME=workflow_run
+expect_deny "the retired deploy workflow is refused" GITHUB_WORKFLOW_REF \
+  "GITHUB_WORKFLOW_REF=$WORKFLOWS/deploy-nchat-prod.yml@refs/heads/main"
 
 # --- repository --------------------------------------------------------------
 
@@ -194,11 +228,11 @@ expect_deny "a fork of this repository is refused" GITHUB_REPOSITORY GITHUB_REPO
 expect_deny "an absent GITHUB_WORKFLOW_REF is refused" GITHUB_WORKFLOW_REF GITHUB_WORKFLOW_REF=@absent
 expect_deny "an empty GITHUB_WORKFLOW_REF is refused" GITHUB_WORKFLOW_REF GITHUB_WORKFLOW_REF=
 expect_deny "another workflow of this repository is refused" GITHUB_WORKFLOW_REF \
-  GITHUB_WORKFLOW_REF=nicrepository/nchat/.github/workflows/ci.yml@refs/heads/main
-expect_deny "the deploy workflow on develop is refused" GITHUB_WORKFLOW_REF \
-  GITHUB_WORKFLOW_REF=nicrepository/nchat/.github/workflows/deploy-nchat-prod.yml@refs/heads/develop
-expect_deny "the deploy workflow on a pull request ref is refused" GITHUB_WORKFLOW_REF \
-  GITHUB_WORKFLOW_REF=nicrepository/nchat/.github/workflows/deploy-nchat-prod.yml@refs/pull/123/merge
+  "GITHUB_WORKFLOW_REF=$WORKFLOWS/ci.yml@refs/heads/main"
+expect_deny "the cutover workflow on develop is refused" GITHUB_WORKFLOW_REF \
+  "GITHUB_WORKFLOW_REF=$WORKFLOWS/cutover-nchat-prod.yml@refs/heads/develop"
+expect_deny "the cutover workflow on a pull request ref is refused" GITHUB_WORKFLOW_REF \
+  "GITHUB_WORKFLOW_REF=$WORKFLOWS/cutover-nchat-prod.yml@refs/pull/123/merge"
 
 # --- ref ---------------------------------------------------------------------
 
@@ -216,6 +250,7 @@ expect_deny "pull_request is refused" GITHUB_EVENT_NAME GITHUB_EVENT_NAME=pull_r
 expect_deny "pull_request_target is refused" GITHUB_EVENT_NAME GITHUB_EVENT_NAME=pull_request_target
 expect_deny "push is refused" GITHUB_EVENT_NAME GITHUB_EVENT_NAME=push
 expect_deny "workflow_call is refused" GITHUB_EVENT_NAME GITHUB_EVENT_NAME=workflow_call
+expect_deny "schedule is refused" GITHUB_EVENT_NAME GITHUB_EVENT_NAME=schedule
 
 # --- values that only look authorised ----------------------------------------
 
@@ -229,7 +264,7 @@ expect_deny "a ref that merely contains the authorised one is refused" GITHUB_RE
   GITHUB_REF=refs/heads/feature/refs/heads/main
 expect_deny "a differently cased ref is refused" GITHUB_REF GITHUB_REF=refs/heads/MAIN
 expect_deny "a workflow path under the authorised one is refused" GITHUB_WORKFLOW_REF \
-  GITHUB_WORKFLOW_REF=nicrepository/nchat/.github/workflows/deploy-nchat-prod.yml.bak@refs/heads/main
+  "GITHUB_WORKFLOW_REF=$WORKFLOWS/cutover-nchat-prod.yml.bak@refs/heads/main"
 expect_deny "trailing whitespace is not trimmed away" GITHUB_REF GITHUB_REF="refs/heads/main "
 
 # --- hostile values ----------------------------------------------------------

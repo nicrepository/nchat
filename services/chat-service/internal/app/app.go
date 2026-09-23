@@ -8,9 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-
-	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
+	"github.com/nicrepository/nchat/libs/go/platform/linkfetch"
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
 	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/chat-service/internal/config"
@@ -182,401 +180,21 @@ func New(cfg config.Config) (*App, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	logger := platformlog.New(cfg.ServiceName, cfg.Env)
-	obsCfg := observability.LoadConfig(cfg.ServiceName)
-	shutdown, _ := observability.SetupTracing(context.Background(), obsCfg)
-	// One registry for the whole process, built here rather than inside the
-	// router because RF-21's counter is registered during service wiring, which
-	// happens first. The router serves this exact object.
-	obsMetrics := observability.NewMetrics(obsCfg)
-
-	// JWT token validator — nil when secret is not configured.
-	validator, err := httpapi.NewTokenValidator(cfg.AuthJWTHMACSecret, cfg.AuthJWTIssuer, cfg.AuthJWTAudience)
-	if err != nil {
-		logger.Warn("sidebar auth disabled", "reason", "invalid_jwt_config")
+	b := newBootstrap(cfg)
+	if err := b.openDatabase(); err != nil {
+		return nil, err
 	}
-
-	var sidebarSvc *service.SidebarService
-	var dmSvc *service.DMService
-	var messageSvc *service.MessageService
-	var mentionSvc *service.MentionService
-	var workspaceStore *storage.PGXWorkspaceStore
-	var userDisplayNameStore *storage.PGXUserDisplayNameStore
-	var sessionValidator storage.SessionValidator
-	var channelStore *storage.PGXChannelStore
-	var memberStore *storage.PGXMemberStore
-	var dmStore *storage.PGXDMStore
-	var mentionCache *storage.ValkeyMentionLabelCache
-	var reactionSvc *service.ReactionService
-	var favoriteSvc *service.FavoriteService
-	var pinSvc *service.PinService
-	var acknowledgementSvc *service.AcknowledgementService
-	var sidebarPinStore *storage.PGXSidebarPinStore
-	var conversationReadStateStore *storage.PGXConversationReadStateStore
-	var notificationPrefStore *storage.PGXNotificationPrefStore
-	var permissionSvc *service.PermissionService
-	var channelSvc *service.ChannelService
-	var channelCategorySvc *service.ChannelCategoryService
-	var memberSvc *service.MemberService
-	var callSvc *service.CallService
-	var linkScanSvc *service.LinkScanService
-	var linkReconcileSvc *service.LinkReconcileService
-
-	var closeDB func()
-	databaseReady := false
-	if cfg.DatabaseURL != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), dbBootstrapTimeout)
-		pool, dbErr := openDBWithRetry(ctx, cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds, logger)
-		cancel()
-		if dbErr != nil {
-			// Fail fast: a half-wired server must never start serving.
-			// Kubernetes restarts the container and the retry window resets.
-			logger.Error("database bootstrap failed; refusing degraded start", "reason", "open_db_failed")
-			_ = shutdown(context.Background())
-			return nil, dbErr
-		}
-		databaseReady = true
-		if closer, ok := pool.(interface{ Close() }); ok {
-			closeDB = closer.Close
-		}
-		if validator != nil {
-			sessionValidator = storage.NewPGXSessionValidator(pool)
-			workspaceStore = storage.NewPGXWorkspaceStore(pool)
-			userDisplayNameStore = storage.NewPGXUserDisplayNameStore(pool)
-			channelStore = storage.NewPGXChannelStore(pool)
-			memberStore = storage.NewPGXMemberStore(pool)
-			dmStore = storage.NewPGXDMStore(pool)
-			dmSvc = service.NewDMService(dmStore, memberStore)
-			messages := storage.NewPGXMessageStore(pool)
-			reactionSvc = service.NewReactionService(storage.NewPGXReactionStore(pool))
-			favoriteSvc = service.NewFavoriteService(storage.NewPGXFavoriteStore(pool))
-			pinSvc = service.NewPinService(storage.NewPGXPinStore(pool))
-			acknowledgementSvc = service.NewAcknowledgementService(storage.NewPGXAcknowledgementStore(pool))
-			sidebarPinStore = storage.NewPGXSidebarPinStore(pool)
-			conversationReadStateStore = storage.NewPGXConversationReadStateStore(pool)
-			callSvc = service.NewCallService(storage.NewPGXCallStore(pool), time.Duration(cfg.CallRingTimeoutSeconds)*time.Second, nil, nil)
-			permissionSvc = service.NewPermissionService(memberStore, channelStore)
-			channelSvc = service.NewChannelService(workspaceStore, channelStore, memberStore)
-			// channelStore is both the category store and the visible-channel read
-			// side, so RF-17 groups channels through the same query the sidebar uses.
-			channelCategorySvc = service.NewChannelCategoryService(workspaceStore, memberStore, channelStore, channelStore)
-			notificationPrefStore = storage.NewPGXNotificationPrefStore(pool)
-			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore).
-				WithPins(sidebarPinStore).
-				WithReadState(conversationReadStateStore).
-				WithNotificationPrefs(notificationPrefStore).
-				// Issue #136's rollout gate. Off unless a deployment asks, and
-				// asked for in one place so the write path and the capability
-				// the payload publishes cannot disagree.
-				WithConversationNotificationLevels(cfg.ConversationNotificationLevelsEnabled)
-			messageSvc = service.NewMessageService(channelStore, dmStore, messages).
-				WithMessageAttachmentLimits(cfg.MaxMessageAttachments, cfg.MaxMessageAttachmentBytes)
-			// RF-21. Wired here, where the message service exists, and fatal:
-			// starting with the flag on and no gate would accept links nobody
-			// checked. A deployment without a database never reaches this block
-			// and needs no gate — its message routes answer 503 already.
-			//
-			// The publisher is attached later (the hub does not exist yet), so
-			// the worker is built here and given it below.
-			linkSafety, wireErr := wireLinkSafety(cfg, messageSvc, messages, nil, obsMetrics, logger)
-			if wireErr != nil {
-				closeDB()
-				_ = shutdown(context.Background())
-				return nil, wireErr
-			}
-			linkScanSvc, linkReconcileSvc = linkSafety.Scan, linkSafety.Reconcile
-			mentionCache = wireMentionLabelCache(cfg.ValkeyURL, cfg.MentionLabelCacheTTLSeconds, messageSvc, logger)
-			// One MemberService instance for both consumers: mention autocomplete
-			// reads channel members through it, and issue #398 writes them. Two
-			// instances would only be two paths to the same stores.
-			memberSvc = service.NewMemberService(memberStore, channelStore, workspaceStore)
-			mentionSvc = service.NewMentionService(memberSvc, permissionSvc, dmStore)
-		}
-	}
-
-	sidebar := httpapi.NewSidebarHandler(sidebarSvc).
-		WithMessageAttachmentLimits(cfg.MaxMessageAttachments, cfg.MaxMessageAttachmentBytes)
-	messageHandler := httpapi.NewMessageHandler(workspaceStore, messageSvc, nil)
-	if mentionSvc != nil {
-		messageHandler = httpapi.NewMessageHandler(workspaceStore, messageSvc, mentionSvc)
-	}
-	if favoriteSvc != nil {
-		messageHandler = messageHandler.WithFavorites(favoriteSvc)
-	}
-
-	// Hub and presence are always created so their lifecycle is always managed
-	// by Shutdown. When DB is unavailable, NopAuthorizer denies all subscriptions
-	// and wsWorkspaces is nil so ServeWS returns 503 before any client connects.
-	presence := ws.NewPresenceTracker(defaultPresenceAwayTimeout)
-	var authorizer ws.SubscriptionAuthorizer = ws.NopAuthorizer{}
-	var wsWorkspaces ws.WorkspaceResolver
-	var wsDisplayNames ws.UserDisplayNameResolver
-	// Held concretely as well: the same adapter is the canonical workspace
-	// resolver for the RF-19 guard, so WebSocket sessions and HTTP sends bind to
-	// the same workspace by construction rather than by two similar lookups.
-	var canonicalWorkspaces *appWSWorkspaceResolver
-	if workspaceStore != nil {
-		authorizer = ws.NewServiceAuthorizer(channelStore, dmStore)
-		canonicalWorkspaces = &appWSWorkspaceResolver{store: workspaceStore}
-		wsWorkspaces = canonicalWorkspaces
-		wsDisplayNames = userDisplayNameStore
-	}
-	// Two identities, because they answer two different questions.
-	//
-	// instanceID is the logical one: configured through WS_INSTANCE_ID, meaningful
-	// to operators, and used by the bus to suppress its own echo. Nothing
-	// guarantees it is unique — a Deployment that sets a fixed value hands the
-	// same string to every pod, and WS_INSTANCE_ID is not provisioned in any
-	// manifest here at all, which is why it also needs a fallback.
-	//
-	// presenceInstanceID is the physical one: this execution of this process. The
-	// presence directory names the field it owns by it, and everything about
-	// single-writer ordering rests on no other process owning that field, so its
-	// uniqueness cannot be left to configuration. It is generated here, never
-	// read from the environment, never persisted, and changes on every restart —
-	// two pods sharing WS_INSTANCE_ID still write two different fields.
-	instanceID := cfg.WSInstanceID
-	if instanceID == "" {
-		instanceID = uuid.New().String()
-	}
-	presenceInstanceID := uuid.NewString()
-
-	var bus ws.BroadcastBus = ws.NopBus{}
-	if cfg.ValkeyWSBroadcastEnabled {
-		if valkeyBus, busErr := ws.NewValkeyBus(cfg.ValkeyURL, instanceID, logger); busErr != nil {
-			logger.Warn("distributed ws broadcast disabled", "reason", "invalid_valkey_config")
-		} else {
-			bus = valkeyBus
-		}
-	}
-	options := []ws.HubOption{ws.WithPresence(presence), ws.WithPresenceInstanceID(presenceInstanceID)}
-	// Shared presence state (RF-58). It only earns its keep when events already
-	// cross instances: with no bus this process is the whole cluster and its own
-	// connections are the complete answer, so a second source would be a cache
-	// of what it already knows. With a bus, it is what lets a client joining a
-	// conversation see the people connected to other replicas without waiting
-	// for one of them to move.
-	var presenceDirectory *ws.ValkeyPresenceDirectory
-	if cfg.ValkeyWSBroadcastEnabled {
-		if directory, dirErr := ws.NewValkeyPresenceDirectory(cfg.ValkeyURL, presenceInstanceID); dirErr != nil {
-			logger.Warn("shared presence directory disabled", "reason", "invalid_valkey_config")
-		} else {
-			presenceDirectory = directory
-			options = append(options, ws.WithPresenceDirectory(directory))
-		}
-	}
-	var reactionLimiter *ws.ValkeyReactionLimiter
-	if reactionSvc != nil {
-		if limiter, limiterErr := ws.NewValkeyReactionLimiter(
-			cfg.ValkeyURL, cfg.ReactionRateLimitMaxActions, cfg.ReactionRateLimitWindowSeconds,
-		); limiterErr != nil {
-			logger.Warn("message reactions disabled", "reason", "invalid_valkey_config")
-		} else {
-			reactionLimiter = limiter
-			options = append(options, ws.WithReactionHandler(&reactionHandlerAdapter{service: reactionSvc}), ws.WithReactionLimiter(limiter))
-			if callSvc != nil {
-				options = append(options, ws.WithCallHandler(&callHandlerAdapter{service: callSvc}),
-					ws.WithCallLimiter(limiter, cfg.CallStartRateLimitMaxActions, cfg.CallStartRateLimitWindowSeconds))
-			}
-		}
-	}
-	// Typing indicator: independent of the reaction feature (reactionSvc may be
-	// nil while typing still works), so it gets its own Valkey-backed limiter
-	// and TTL backstop, each dialed from the same VALKEY_URL — the established
-	// pattern in this package, where every ws subsystem (bus, presence
-	// directory, reaction limiter) owns its own client rather than sharing one.
-	// Absent VALKEY_URL, typing.start is refused (ErrTypingFeatureDisabled,
-	// fail-closed per SECURITY.md's WS rate-limit requirement) and the TTL
-	// backstop is simply absent — delivery itself does not depend on Valkey.
-	var typingLimiter *ws.ValkeyReactionLimiter
-	if limiter, limiterErr := ws.NewValkeyReactionLimiter(
-		cfg.ValkeyURL, cfg.TypingRateLimitMaxActions, cfg.TypingRateLimitWindowSeconds,
-	); limiterErr != nil {
-		logger.Warn("typing indicator rate limiting disabled", "reason", "invalid_valkey_config")
-	} else {
-		typingLimiter = limiter
-		options = append(options, ws.WithTypingLimiter(limiter, cfg.TypingRateLimitMaxActions, cfg.TypingRateLimitWindowSeconds))
-	}
-	var typingStore *ws.ValkeyTypingStore
-	if store, storeErr := ws.NewValkeyTypingStore(cfg.ValkeyURL); storeErr != nil {
-		logger.Warn("typing ttl backstop disabled", "reason", "invalid_valkey_config")
-	} else {
-		typingStore = store
-		options = append(options, ws.WithTypingStore(store))
-	}
-	// RF-19 (issue #419): the configurable per-workspace send limit. It reuses
-	// the same Lua/Valkey limiter as reactions and edits — no second rate
-	// limiting mechanism — so it exists only when that limiter does. When it is
-	// nil the send routes answer 503 rather than degrading to a per-process
-	// limiter, which would restore the cross-instance bypass RF-19 closes.
-	//
-	// The guard is given three distinct things on purpose: who decides the
-	// workspace (canonicalWorkspaces), where the policy for a given workspace ID
-	// is read (workspaceStore), and what counts (reactionLimiter). It has no
-	// notion of a default workspace of its own.
-	//
-	// The nil checks are on the concrete pointers, not inside the constructor: a
-	// nil *ws.ValkeyReactionLimiter assigned to an interface parameter is a
-	// non-nil interface holding a nil pointer, so a check there would pass and
-	// the guard would panic on its first send.
-	var antiSpam *httpapi.AntiSpamGuard
-	if canonicalWorkspaces != nil && workspaceStore != nil && reactionLimiter != nil {
-		antiSpam = httpapi.NewAntiSpamGuard(canonicalWorkspaces, workspaceStore, reactionLimiter)
-	}
-	if workspaceStore != nil {
-		messageHandler = messageHandler.WithEditing(workspaceStore, permissionSvc, reactionLimiter).WithAntiSpam(antiSpam)
-	}
-	var directMessages *httpapi.DMHandler
-	if dmSvc != nil {
-		directMessages = httpapi.NewDMHandler(workspaceStore, dmSvc, reactionLimiter)
-	}
-	// The limiter is required, not optional: without it the create route would run
-	// unthrottled, so an unconfigured Valkey leaves the route unregistered (404)
-	// rather than exposed. Readiness already fails in that configuration.
-	var channels *httpapi.ChannelHandler
-	if channelSvc != nil && reactionLimiter != nil {
-		channels = httpapi.NewChannelHandler(workspaceStore, channelSvc, reactionLimiter)
-	}
-	// Same reasoning for the category routes (RF-17): the writes must be
-	// throttled, so an unconfigured Valkey leaves them unregistered rather than
-	// exposed. The read route shares the handler and so is gated with them.
-	var channelCategories *httpapi.ChannelCategoryHandler
-	if channelCategorySvc != nil && reactionLimiter != nil {
-		channelCategories = httpapi.NewChannelCategoryHandler(workspaceStore, channelCategorySvc, reactionLimiter)
-	}
-	options = withRecipientPolicyOption(options, notificationPrefStore)
-	hub := ws.NewHub(authorizer, logger, bus, instanceID, options...)
-	wsHandler := ws.ServeWSWithConfig(hub, logger, wsWorkspaces, httpapi.GetContextUserID, wsHandlerConfig(cfg, sessionValidator, wsDisplayNames))
-
-	var callWorkerCancel context.CancelFunc
-	var callWorkerWG *sync.WaitGroup
-	if callSvc != nil {
-		// hubBroadcaster, not hub directly: CallEventPublisher also needs
-		// PublishConversationEvent (issue #835 realtime follow-up), whose
-		// string targetType hubBroadcaster is what adapts to the hub's own
-		// typed ws.TargetType — the same adapter every other broadcaster
-		// below already goes through.
-		callSvc.SetPublisher(&hubBroadcaster{hub: hub})
-		workerCtx, cancel := context.WithCancel(context.Background())
-		callWorkerCancel = cancel
-		callWorkerWG = &sync.WaitGroup{}
-		callWorkerWG.Add(1)
-		go func() {
-			defer callWorkerWG.Done()
-			runCallExpiryWorker(workerCtx, callSvc, logger)
-		}()
-	}
-	// Wire the hub as the broadcast publisher for message creation events.
-	// SetPublisher is called after both messageSvc and hub are ready.
-	if messageSvc != nil {
-		messageSvc.SetPublisher(&hubBroadcaster{hub: hub})
-	}
-
-	// RF-21's worker starts here, for the same reason: a message it promotes has
-	// to be broadcast, and the hub is what broadcasts. It shares the call
-	// worker's lifecycle machinery rather than inventing a second one.
-	var linkScanWorkerCancel context.CancelFunc
-	var linkScanWorkerWG *sync.WaitGroup
-	if linkScanSvc != nil {
-		linkScanSvc.SetPublisher(&hubBroadcaster{hub: hub})
-		// The refusal channel is sender-scoped and therefore a different object:
-		// a blocked message goes to its author alone, never to the conversation
-		// it was never shown in.
-		linkScanSvc.SetBlockedPublisher(&hubBroadcaster{hub: hub})
-		workerCtx, cancel := context.WithCancel(context.Background())
-		linkScanWorkerCancel = cancel
-		linkScanWorkerWG = &sync.WaitGroup{}
-		linkScanWorkerWG.Add(1)
-		go func() {
-			defer linkScanWorkerWG.Done()
-			service.RunLinkScanWorker(workerCtx, linkScanSvc, service.LinkScanPollInterval, logger)
-		}()
-		// The recovery pass (issue #135) shares that lifecycle rather than
-		// inventing a third one, but runs on its own, much slower ticker: it
-		// corrects messages that were already delivered, so nobody is waiting on a
-		// pass. It is search-then-read at the provider and can never submit.
-		if linkReconcileSvc != nil {
-			linkReconcileSvc.SetPublisher(&hubBroadcaster{hub: hub})
-			linkScanWorkerWG.Add(1)
-			go func() {
-				defer linkScanWorkerWG.Done()
-				service.RunLinkReconcileWorker(
-					workerCtx, linkReconcileSvc, service.LinkReconcileInterval, logger)
-			}()
-		}
-	}
-	// The reader-driven half of the same recovery. Wired after the hub, because a
-	// verdict it obtains has to be announced to everyone holding the message.
-	//
-	// The limiter is the shared Valkey one every other user-action budget already
-	// uses (issue #135, CQ-005). Without it the route stays 503: this is the only
-	// user-triggered path that reaches a paid third party, and an unlimited one —
-	// or one limited per replica — is not an acceptable degradation.
-	if linkReconcileSvc != nil && reactionLimiter != nil {
-		messageHandler = messageHandler.WithLinkReconcile(linkReconcileSvc, reactionLimiter)
-	}
-
-	// Pins broadcast over the same hub; wired after the hub exists (RF-05).
-	if pinSvc != nil {
-		messageHandler = messageHandler.WithPins(pinSvc, &hubBroadcaster{hub: hub})
-	}
-	messageHandler = wireAcknowledgements(messageHandler, acknowledgementSvc, hub)
-
-	// The channel-details panel (issue #435) reports member presence from the
-	// same tracker the hub feeds, so the HTTP layer never has to invent one.
-	if channels != nil {
-		channels = channels.WithPresence(presenceReporter{tracker: presence})
-	}
-	// The group-details panel (issue #441) annotates participants with the same
-	// tracker. Unlike the channel panel it does not filter by presence, so this
-	// only decides what each row says about itself.
-	// Add members (issue #398) broadcasts over the same hub, wired after it
-	// exists. Both routes share one adapter so the channel and the group event
-	// travel the identical path.
-	if memberSvc != nil && channels != nil {
-		channels = channels.WithMembers(memberSvc, &hubBroadcaster{hub: hub})
-	}
-	// Rename (issue #527) broadcasts over the same hub. Wired separately from
-	// WithMembers because the rename route does not need the member service.
-	if channels != nil {
-		channels = channels.WithChannelUpdates(&hubBroadcaster{hub: hub})
-	}
-	if directMessages != nil {
-		directMessages = directMessages.WithMembersBroadcast(&hubBroadcaster{hub: hub})
-		// The details panel reports participant presence from the same tracker
-		// the hub feeds, exactly like the channel panel.
-		directMessages = directMessages.WithPresence(presenceReporter{tracker: presence})
-	}
-
-	// Database is the pool's own bootstrap outcome, independent of JWT or
-	// service wiring; the remaining fields reflect each component's wiring.
-	readiness := httpapi.ReadinessState{
-		Database:         databaseReady,
-		TokenValidator:   validator != nil,
-		SessionValidator: sessionValidator != nil,
-		Sidebar:          sidebarSvc != nil,
-		Messages:         messageSvc != nil,
-		WebSocket:        wsWorkspaces != nil && validator != nil && sessionValidator != nil,
-	}
-
-	return &App{
-		Config:            cfg,
-		Logger:            logger,
-		Handler:           httpapi.NewRouter(cfg, logger, readiness, validator, sessionValidator, sidebar, messageHandler, wsHandler, directMessages, channels, channelCategories, antiSpam, obsMetrics),
-		TracingShutdown:   shutdown,
-		hub:               hub,
-		presence:          presence,
-		presenceDirectory: presenceDirectory,
-		mentionCache:      mentionCache,
-		reactionLimiter:   reactionLimiter,
-		typingLimiter:     typingLimiter,
-		typingStore:       typingStore,
-		callWorkerCancel:  callWorkerCancel,
-		callWorkerWG:      callWorkerWG,
-		linkScanCancel:    linkScanWorkerCancel,
-		linkScanWG:        linkScanWorkerWG,
-		closeDB:           closeDB,
-	}, nil
+	b.buildPresence()
+	b.buildBus()
+	b.buildLimiters()
+	b.buildMessageHandler()
+	b.buildConversationHandlers()
+	b.buildHub()
+	b.startCallWorker()
+	b.startLinkWorkers()
+	b.attachMessageBroadcasters()
+	b.attachConversationBroadcasters()
+	return b.app(), nil
 }
 
 // wireLinkSafety attaches the RF-21 Safe Browsing gate to message creation,
@@ -601,29 +219,31 @@ func New(cfg config.Config) (*App, error) {
 // client goes to the worker instead, which is the only thing allowed to submit
 // and poll.
 //
-// linkSafetyStore is only the two halves of RF-21 the bootstrap touches — the
-// verdicts the send path reads and the queue the worker drains — rather than the
-// whole MessageStore. Narrow because it is also what a test has to provide.
+// linkSafetyStore is what the bootstrap wires for links: the verdicts the send
+// path reads, the queues the workers drain, and — since issue #807 — the
+// per-link read model and the preview store. Narrow because it is also what a
+// test has to provide.
 type linkSafetyStore interface {
 	service.URLSafetyChecker
 	service.LinkScanQueue
 	service.LinkReconcileQueue
+	service.LinkEntityStore
+	service.LinkTargetIndex
+	service.LinkPreviewQueue
 }
 
-// linkSafetyWiring is the pair of workers RF-21 runs.
+// linkSafetyWiring is the set of workers the link pipeline runs.
 //
-// Two, not one, and they are deliberately separate objects with separate provider
-// interfaces. The scan worker may submit; the reconcile worker may not, and its
-// dependency (service.LinkVerdictReconciler) has no method that could. Returning
-// them together keeps the bootstrap to one call while leaving that separation
-// visible in the types.
+// Scan and Reconcile are deliberately separate objects with separate provider
+// interfaces: the scan worker may submit, the reconcile worker may not. Since
+// issue #807 Scan is always present — with the flag off it only sweeps, so
+// nothing is ever stranded — and Preview drains the preview queue, fetching only
+// when its own flag is on. Announcer is the convergence they share.
 type linkSafetyWiring struct {
-	// Scan drains the queue of URLs awaiting a first verdict.
-	Scan *service.LinkScanService
-	// Reconcile re-reads scans that finished without one. Nil when the feature is
-	// off, which is a working deployment: an inconclusive link stays inconclusive
-	// and the server still never fetches it.
+	Scan      *service.LinkScanService
 	Reconcile *service.LinkReconcileService
+	Preview   *service.LinkPreviewService
+	Announcer *service.LinkTargetAnnouncer
 }
 
 func wireLinkSafety(
@@ -631,65 +251,132 @@ func wireLinkSafety(
 	store linkSafetyStore, publisher service.MessageEventPublisher,
 	metrics *observability.Metrics, logger *slog.Logger,
 ) (linkSafetyWiring, error) {
-	if !cfg.LinkSafetyEnabled {
-		return linkSafetyWiring{}, nil
-	}
 	if messageSvc == nil || store == nil {
 		return linkSafetyWiring{}, errLinkSafetyUnwired
 	}
 	_ = publisher // attached after the hub exists; see SetPublisher below.
+	// Link entities exist whether or not a provider does (issue #807): the
+	// backend is the authority for what in a body is a link, and a deployment
+	// with safety off still records targets — as unknown/disabled — so the client
+	// draws interstitials rather than deciding for itself.
+	messageSvc.SetLinkSafety(store)
+	messageSvc.SetLinkEntities(store)
+	messageSvc.SetLinkPreviewEnabled(cfg.LinkPreviewEnabled)
+	pipeline := urlsafety.NewPipelineMetrics(metrics, cfg.ServiceName)
+	messageSvc.SetAdmissionMetrics(pipeline)
+
+	announcer := service.NewLinkTargetAnnouncer(store, nil, nil, logger)
+	announcer.SetPreviewEnabled(cfg.LinkPreviewEnabled)
+
+	safety, err := wireReputationProvider(cfg, metrics)
+	if err != nil {
+		return linkSafetyWiring{}, err
+	}
+	worker, reconcile := wireScanWorkers(cfg, messageSvc, store, safety, pipeline, announcer, logger)
+	preview := wirePreviewWorker(cfg, store, pipeline, announcer, logger)
+	return linkSafetyWiring{Scan: worker, Reconcile: reconcile, Preview: preview, Announcer: announcer}, nil
+}
+
+// wireReputationProvider builds the provider behind the abstraction, or nil
+// with the flag off. Config.Validate already refuses missing credentials; this
+// is the second lock on the same door.
+//
+// Since issue #928 the provider is a composition: Google Web Risk answers first
+// and Cloudflare URL Scanner answers when it cannot. Both clients are built
+// before either is used, so a deployment with a bad credential fails at
+// start-up rather than at the first link somebody sends — the same rule the
+// single-provider wiring had, applied to both halves.
+func wireReputationProvider(cfg config.Config, metrics *observability.Metrics) (*urlsafety.Service, error) {
+	if !cfg.LinkSafetyEnabled {
+		return nil, nil
+	}
+	// Every constructor error below is flattened into one fixed value. Their own
+	// messages name no credential, but a message that varies with which
+	// credential was missing is itself a fact about the secrets, so nothing
+	// about them can reach a log through this return.
+	primary, err := urlsafety.NewWebRiskProvider(cfg.LinkSafetyGoogleWebRiskKey)
+	if err != nil {
+		return nil, errLinkSafetyUnwired
+	}
 	scanner, err := urlsafety.NewCloudflareScanner(
 		cfg.LinkSafetyCloudflareAccount, cfg.LinkSafetyCloudflareToken,
 	)
 	if err != nil {
-		// The constructor's message names no value, but it is not repeated
-		// either: this returns a fixed error so nothing about the credentials
-		// can reach a log through it.
-		return linkSafetyWiring{}, errLinkSafetyUnwired
+		return nil, errLinkSafetyUnwired
 	}
-	// The shared counter, registered on this service's own registry so
-	// chat-service reports verdict outcomes exactly as file-service does. Its
-	// labels are the closed set the shared package defines; no URL, host, user or
-	// message id is ever one.
-	safety := urlsafety.NewService(scanner, urlsafety.NewMetrics(metrics))
-	messageSvc.SetLinkSafety(store)
-	// What a workspace, and this deployment, may spend on new provider work.
-	// Applied at admission, before any message is created and before any job is
-	// queued, so a refusal costs the provider nothing.
-	messageSvc.SetLinkScanCapacity(storage.LinkScanCapacity{
-		WorkspaceNewURLBudget: cfg.LinkSafetyWorkspaceBudget,
-		BudgetWindow:          time.Duration(cfg.LinkSafetyBudgetWindowSeconds) * time.Second,
-		MaxPendingJobs:        cfg.LinkSafetyMaxPendingJobs,
-	})
-	// The pipeline gauges and counters. Without them a Cloudflare outage is
-	// indistinguishable from a quiet system: messages simply stop appearing.
-	// One reporter, shared by the request path and the worker, so the admission
-	// counter and the pipeline counters land on the same registry — registering
-	// twice would produce nothing at all.
-	pipeline := urlsafety.NewPipelineMetrics(metrics, cfg.ServiceName)
-	messageSvc.SetAdmissionMetrics(pipeline)
+	// The shared counters, registered on this service's own registry so
+	// chat-service reports verdict outcomes exactly as file-service does. Their
+	// labels are the closed sets the shared package defines; no URL, host, user,
+	// message id or credential is ever one. The circuit breakers live inside this
+	// service: one in front of the composition, one in front of the primary.
+	return urlsafety.NewFallbackService(primary, scanner, urlsafety.NewMetrics(metrics)), nil
+}
 
-	worker := service.NewLinkScanService(store, safety, publisher, logger)
+// wireScanWorkers builds the scan worker — always, so the deadline sweep runs —
+// and the reconcile worker when a provider exists.
+func wireScanWorkers(
+	cfg config.Config, messageSvc *service.MessageService, store linkSafetyStore,
+	safety *urlsafety.Service, pipeline *urlsafety.PipelineMetrics,
+	announcer *service.LinkTargetAnnouncer, logger *slog.Logger,
+) (*service.LinkScanService, *service.LinkReconcileService) {
+	var provider service.LinkScanProvider
+	if safety != nil {
+		provider = safety
+		// What a workspace, and this deployment, may spend on new provider work.
+		// Applied at admission, before any job is queued, so a refusal costs the
+		// provider nothing. With the flag off nothing is spent, so nothing is
+		// capped.
+		messageSvc.SetLinkScanCapacity(linkScanCapacity(cfg))
+	}
+	worker := service.NewLinkScanService(store, provider, nil, logger)
 	worker.SetMetrics(pipeline)
+	worker.SetAnnouncer(announcer)
+	worker.SetHostResolver(linkfetch.LookupAddrs)
+	worker.SetSafetyEnabled(cfg.LinkSafetyEnabled)
 	worker.SetCapacity(service.LinkScanWorkerCapacity{
 		ProviderSubmitLimit:  cfg.LinkSafetyProviderSubmitLimit,
 		ProviderSubmitWindow: time.Duration(cfg.LinkSafetyProviderSubmitWindowSeconds) * time.Second,
 		UncertainTimeout:     time.Duration(cfg.LinkSafetySubmitUncertainTimeoutSeconds) * time.Second,
 	})
-
+	if safety == nil {
+		return worker, nil
+	}
 	// The recovery half (issue #135). It shares the provider client, and therefore
-	// the same strict verdict rules and the same in-process verdict cache, but it
-	// is handed to a narrower interface: LinkVerdictReconciler has exactly one
-	// method and no way to submit. That is the structural guarantee that no
-	// inconclusive scan can ever turn into a second billed Cloudflare scan.
-	//
-	// It shares the pipeline metrics reporter for the same reason the worker does:
-	// one registry, one set of series, and no risk of a duplicate registration
-	// silently disabling both.
+	// the same strict verdict rules, breaker and cache, but it is handed to a
+	// narrower interface: LinkVerdictReconciler has exactly one method and no way
+	// to submit.
 	reconcile := service.NewLinkReconcileService(store, safety, logger)
 	reconcile.SetMetrics(pipeline)
+	reconcile.SetAnnouncer(announcer)
+	return worker, reconcile
+}
 
-	return linkSafetyWiring{Scan: worker, Reconcile: reconcile}, nil
+// wirePreviewWorker builds the preview worker. With the flag off it has no
+// fetcher and only drains, so switching the flag off leaves no row waiting.
+func wirePreviewWorker(
+	cfg config.Config, store linkSafetyStore, pipeline *urlsafety.PipelineMetrics,
+	announcer *service.LinkTargetAnnouncer, logger *slog.Logger,
+) *service.LinkPreviewService {
+	var fetcher service.LinkPreviewFetcher
+	if cfg.LinkPreviewEnabled {
+		fetcher = linkfetch.NewFetcher(service.LinkPreviewFetchTimeout)
+	}
+	preview := service.NewLinkPreviewService(store, fetcher, logger)
+	preview.SetMetrics(pipeline)
+	preview.SetAnnouncer(announcer)
+	preview.SetEnabled(cfg.LinkPreviewEnabled)
+	if cfg.LinkSafetyEnabled {
+		preview.SetScanCapacity(linkScanCapacity(cfg))
+	}
+	return preview
+}
+
+func linkScanCapacity(cfg config.Config) storage.LinkScanCapacity {
+	return storage.LinkScanCapacity{
+		WorkspaceNewURLBudget: cfg.LinkSafetyWorkspaceBudget,
+		BudgetWindow:          time.Duration(cfg.LinkSafetyBudgetWindowSeconds) * time.Second,
+		MaxPendingJobs:        cfg.LinkSafetyMaxPendingJobs,
+	}
 }
 
 // errLinkSafetyUnwired stops the bootstrap when RF-21 is switched on and the
@@ -860,7 +547,8 @@ func domainMessageToWSUpdatedPayload(msg domain.Message) ws.MessageUpdatedPayloa
 	}
 	return ws.MessageUpdatedPayload{
 		MessageID: msg.ID, ChannelID: msg.ChannelID, DMID: msg.DMConversationID,
-		Body: body, BodyFormat: string(msg.BodyFormat), LinkSafetyState: string(msg.LinkSafety), EditedAt: msg.EditedAt,
+		Body: body, BodyFormat: string(msg.BodyFormat), LinkSafetyState: string(msg.LinkSafety),
+		Links: domainLinksToWSPayload(msg.Links), EditedAt: msg.EditedAt,
 		EditCount: msg.EditCount, IsEdited: msg.EditCount > 0,
 		Status: string(msg.Status), IsRemoved: removed, DeletedAt: deletedAt, UpdatedAt: msg.UpdatedAt,
 	}
@@ -898,6 +586,39 @@ func (b *hubBroadcaster) PublishMessageLinkSafetyChanged(
 
 // PublishConversationUpdated adapts the hub for the issue #527 rename signal,
 // converting the string targetType so the HTTP layer keeps no ws import.
+// PublishMessageLinkUpdated satisfies service.LinkUpdatePublisher (issue #807).
+func (b *hubBroadcaster) PublishMessageLinkUpdated(
+	ctx context.Context, workspaceID, targetType, targetID, messageID string, link domain.MessageLink,
+) {
+	b.hub.PublishMessageLinkUpdated(ctx, workspaceID, ws.TargetType(targetType), targetID, messageID, domainLinkToWSPayload(link))
+}
+
+func domainLinksToWSPayload(links []domain.MessageLink) []ws.LinkPayload {
+	if len(links) == 0 {
+		return nil
+	}
+	out := make([]ws.LinkPayload, len(links))
+	for i, link := range links {
+		out[i] = domainLinkToWSPayload(link)
+	}
+	return out
+}
+
+func domainLinkToWSPayload(link domain.MessageLink) ws.LinkPayload {
+	payload := ws.LinkPayload{
+		Ordinal: link.Ordinal, TargetKey: link.TargetKey, Text: link.Text, URL: link.URL, Hostname: link.Hostname,
+		Safety: string(link.Safety), Click: string(link.Click), Href: link.Href, UpdatedAt: link.UpdatedAt,
+	}
+	if link.Preview != nil {
+		payload.Preview = &ws.LinkPreviewPayload{
+			State: string(link.Preview.State), Hostname: link.Preview.Hostname,
+			SiteName: link.Preview.SiteName, Title: link.Preview.Title, Description: link.Preview.Description,
+			ImageID: link.Preview.ImageID, ImageWidth: link.Preview.ImageWidth, ImageHeight: link.Preview.ImageHeight,
+		}
+	}
+	return payload
+}
+
 func (b *hubBroadcaster) PublishConversationUpdated(ctx context.Context, workspaceID, targetType, targetID string) {
 	b.hub.PublishConversationUpdated(ctx, workspaceID, ws.TargetType(targetType), targetID)
 }
@@ -933,6 +654,16 @@ func wireAcknowledgements(
 		return handler
 	}
 	return handler.WithAcknowledgements(acknowledgements, &hubBroadcaster{hub: hub})
+}
+
+// wireLinkPreviewImages serves derived link-preview thumbnails (issue #807)
+// from the store that re-authorises each read; without a store there is no
+// route.
+func wireLinkPreviewImages(handler *httpapi.MessageHandler, store *storage.PGXMessageStore) *httpapi.MessageHandler {
+	if store == nil {
+		return handler
+	}
+	return handler.WithLinkPreviewImages(store)
 }
 
 func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
@@ -974,6 +705,7 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 		// reload must render identically.
 		PersistentNotifications: msg.PersistentNotifications,
 		LinkSafetyState:         string(msg.LinkSafety),
+		Links:                   domainLinksToWSPayload(msg.Links),
 		IsRemoved:               removed,
 		CreatedAt:               msg.CreatedAt,
 		UpdatedAt:               msg.UpdatedAt,

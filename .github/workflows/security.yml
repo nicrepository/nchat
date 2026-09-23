@@ -1,14 +1,10 @@
 name: Security
 
+# Owner of the four security gates. Called by ci.yml on every pull request and
+# push so its results reach `CI / Required`, and run on its own weekly schedule
+# so a CVE published against unchanged code is still found.
 on:
-  pull_request:
-    branches:
-      - main
-      - develop
-  push:
-    branches:
-      - main
-      - develop
+  workflow_call:
   workflow_dispatch:
   schedule:
     - cron: "17 6 * * 1"
@@ -16,8 +12,11 @@ on:
 permissions:
   contents: read
 
+# `github.workflow` resolves to the CALLER's name inside a called workflow, so an
+# inherited group would collide with ci.yml's own and this run would cancel the
+# very run that started it. The group is a literal for that reason.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: nchat-security-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
@@ -25,7 +24,7 @@ env:
 
 jobs:
   secrets:
-    name: Secret scan
+    name: Secrets
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -43,7 +42,7 @@ jobs:
           GITLEAKS_ENABLE_SUMMARY: true
 
   govulncheck:
-    name: govulncheck
+    name: Govulncheck
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -63,11 +62,14 @@ jobs:
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
 
+      - name: Test the govulncheck gate
+        run: python3 scripts/security/test_govulncheck_gate.py
+
       - name: Scan Go modules
         run: bash scripts/security/govulncheck.sh
 
   trivy-fs:
-    name: Trivy filesystem
+    name: Trivy FS
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -84,7 +86,7 @@ jobs:
           format: table
 
   trivy-config:
-    name: Trivy config
+    name: Trivy Config
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

@@ -137,6 +137,9 @@ type MessageHandler struct {
 	// route answers 503 rather than running unlimited: a limiter that cannot be
 	// consulted is not permission to spend the provider's quota.
 	reconcileLimiter actionRateLimiter
+	// previewImages serves derived link-preview thumbnails (issue #807). Nil is a
+	// working deployment: the route answers 404.
+	previewImages LinkPreviewImageReader
 	// antiSpam is the RF-19 guard, held only so a policy update can invalidate
 	// its cache. Nil is safe: Invalidate is a no-op and the guard's TTL still
 	// picks the new value up.
@@ -202,6 +205,12 @@ func NewMessageHandler(workspaces workspaceResolver, messages messageProvider, m
 	return &MessageHandler{workspaces: workspaces, messages: messages, mentions: mentions}
 }
 
+// WithLinkPreviewImages attaches the derived-image reader (issue #807).
+func (h *MessageHandler) WithLinkPreviewImages(reader LinkPreviewImageReader) *MessageHandler {
+	h.previewImages = reader
+	return h
+}
+
 // Ready reports whether the handler is wired to the DB-backed message service
 // and workspace resolver. Used by the readiness probe; when either is nil the
 // message endpoints return 503.
@@ -214,10 +223,15 @@ func (h *MessageHandler) Ready() bool {
 // messageJSON is the outbound representation of a single message.
 // body_text is suppressed for deleted messages; is_removed is set instead.
 type messageJSON struct {
-	ID                string `json:"id"`
-	SenderID          string `json:"sender_id"`
-	SenderDisplayName string `json:"sender_display_name,omitempty"`
-	SenderEmail       string `json:"sender_email,omitempty"`
+	ID string `json:"id"`
+	// CreatedConversationEventID identifies the membership event created in the
+	// same transaction as this message. It is returned only by that create
+	// operation, allowing the author to reconcile the event without relying on
+	// its own WebSocket echo.
+	CreatedConversationEventID string `json:"created_conversation_event_id,omitempty"`
+	SenderID                   string `json:"sender_id"`
+	SenderDisplayName          string `json:"sender_display_name,omitempty"`
+	SenderEmail                string `json:"sender_email,omitempty"`
 	// SenderAvatarURL is the sender's auth.users.avatar_url, straight from the
 	// same JOIN as SenderDisplayName/SenderEmail (issue #495). Omitted when the
 	// sender has none set. Same-origin/scheme safety is a render-time client
@@ -262,18 +276,23 @@ type messageJSON struct {
 	// notice from, and it authorises nothing — file-service re-derives its own
 	// verdict from its own store on every preview request. Omitted for a message
 	// with no link-safety opinion, which is almost all of them.
-	LinkSafetyState string         `json:"link_safety_state,omitempty"`
-	DeletedAt       *time.Time     `json:"deleted_at,omitempty"`
-	CreatedAt       time.Time      `json:"created_at"`
-	UpdatedAt       time.Time      `json:"updated_at"`
-	EditedAt        *time.Time     `json:"edited_at,omitempty"`
-	EditCount       int            `json:"edit_count"`
-	IsEdited        bool           `json:"is_edited"`
-	Reactions       []reactionJSON `json:"reactions"`
-	IsFavorited     bool           `json:"is_favorited,omitempty"`
-	IsForwarded     bool           `json:"is_forwarded"`
-	Quoted          *quoteJSON     `json:"quoted,omitempty"`
-	Reference       *referenceJSON `json:"reference,omitempty"`
+	LinkSafetyState string `json:"link_safety_state,omitempty"`
+	// Links are the per-occurrence link entities (issue #807): what in the body
+	// is a link, its canonical destination, its safety state, what the reader
+	// may do with it, and its preview. The client renders these and decides
+	// nothing about a URL itself. Omitted for a message without links.
+	Links       []linkJSON     `json:"links,omitempty"`
+	DeletedAt   *time.Time     `json:"deleted_at,omitempty"`
+	CreatedAt   time.Time      `json:"created_at"`
+	UpdatedAt   time.Time      `json:"updated_at"`
+	EditedAt    *time.Time     `json:"edited_at,omitempty"`
+	EditCount   int            `json:"edit_count"`
+	IsEdited    bool           `json:"is_edited"`
+	Reactions   []reactionJSON `json:"reactions"`
+	IsFavorited bool           `json:"is_favorited,omitempty"`
+	IsForwarded bool           `json:"is_forwarded"`
+	Quoted      *quoteJSON     `json:"quoted,omitempty"`
+	Reference   *referenceJSON `json:"reference,omitempty"`
 	// Attachments is omitted entirely for a message that carries none, so every
 	// existing text-only response is byte-for-byte what it was.
 	Attachments []messageAttachmentJSON `json:"attachments,omitempty"`
@@ -417,6 +436,9 @@ type messageSecuritySnapshotJSON struct {
 	LinkSafetyState string                             `json:"link_safety_state,omitempty"`
 	UpdatedAt       string                             `json:"updated_at,omitempty"`
 	Quoted          *quotedMessageSecuritySnapshotJSON `json:"quoted,omitempty"`
+	// Links is the authoritative per-link state (issue #807), so a reconnect
+	// converges every anchor and card, not only the aggregate marker.
+	Links []linkJSON `json:"links,omitempty"`
 }
 
 type messageSecuritySnapshotsData struct {
@@ -424,9 +446,10 @@ type messageSecuritySnapshotsData struct {
 }
 
 type mentionJSON struct {
-	Type  string `json:"type"`
-	ID    string `json:"id"`
-	Label string `json:"label"`
+	Type        string `json:"type"`
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	WillBeAdded bool   `json:"will_be_added,omitempty"`
 }
 
 type searchMentionsResponseData struct {
@@ -642,26 +665,27 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		editedAt = &m.EditedAt
 	}
 	j := messageJSON{
-		ID:                      m.ID,
-		SenderID:                m.SenderID,
-		SenderDisplayName:       m.SenderDisplayName,
-		SenderEmail:             m.SenderEmail,
-		SenderAvatarURL:         m.SenderAvatarURL,
-		Kind:                    string(m.Kind),
-		BodyFormat:              string(m.BodyFormat),
-		Status:                  string(m.Status),
-		Priority:                string(m.Priority.OrStandard()),
-		AcknowledgementRequired: m.AcknowledgementRequired,
-		PersistentNotifications: m.PersistentNotifications,
-		LinkSafetyState:         string(m.LinkSafety),
-		CreatedAt:               m.CreatedAt,
-		UpdatedAt:               m.UpdatedAt,
-		EditedAt:                editedAt,
-		EditCount:               m.EditCount,
-		IsEdited:                m.EditCount > 0,
-		Reactions:               make([]reactionJSON, len(m.Reactions)),
-		IsFavorited:             m.IsFavorited,
-		IsForwarded:             m.ForwardedFromMessageID != "",
+		ID:                         m.ID,
+		CreatedConversationEventID: m.CreatedConversationEventID,
+		SenderID:                   m.SenderID,
+		SenderDisplayName:          m.SenderDisplayName,
+		SenderEmail:                m.SenderEmail,
+		SenderAvatarURL:            m.SenderAvatarURL,
+		Kind:                       string(m.Kind),
+		BodyFormat:                 string(m.BodyFormat),
+		Status:                     string(m.Status),
+		Priority:                   string(m.Priority.OrStandard()),
+		AcknowledgementRequired:    m.AcknowledgementRequired,
+		PersistentNotifications:    m.PersistentNotifications,
+		LinkSafetyState:            string(m.LinkSafety),
+		CreatedAt:                  m.CreatedAt,
+		UpdatedAt:                  m.UpdatedAt,
+		EditedAt:                   editedAt,
+		EditCount:                  m.EditCount,
+		IsEdited:                   m.EditCount > 0,
+		Reactions:                  make([]reactionJSON, len(m.Reactions)),
+		IsFavorited:                m.IsFavorited,
+		IsForwarded:                m.ForwardedFromMessageID != "",
 	}
 	for i, reaction := range m.Reactions {
 		j.Reactions[i] = reactionJSON{
@@ -678,6 +702,7 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		}
 	} else {
 		j.BodyText = m.BodyText
+		j.Links = mapLinksJSON(m.Links)
 		j.Quoted = mapQuoteJSON(m.Quoted)
 		j.Reference = mapReferenceJSON(m)
 		// Withheld for a removed message, like the body: the placeholder is the
@@ -1735,6 +1760,12 @@ func (h *MessageHandler) getMessageSecuritySnapshots(w http.ResponseWriter, r *h
 		mapServiceError(w, err)
 		return
 	}
+	httputil.WriteJSON(w, http.StatusOK, mapSecuritySnapshotsJSON(snapshots))
+}
+
+// mapSecuritySnapshotsJSON projects the authorised snapshots. Fields of an
+// unavailable message stay absent: nothing about it is described.
+func mapSecuritySnapshotsJSON(snapshots []service.MessageSecuritySnapshot) messageSecuritySnapshotsData {
 	response := messageSecuritySnapshotsData{Snapshots: make([]messageSecuritySnapshotJSON, 0, len(snapshots))}
 	for _, snapshot := range snapshots {
 		item := messageSecuritySnapshotJSON{
@@ -1744,6 +1775,7 @@ func (h *MessageHandler) getMessageSecuritySnapshots(w http.ResponseWriter, r *h
 		}
 		if snapshot.Available {
 			item.UpdatedAt = snapshot.UpdatedAt.UTC().Format(time.RFC3339Nano)
+			item.Links = mapLinksJSON(snapshot.Links)
 		}
 		if snapshot.Quoted != nil {
 			item.Quoted = &quotedMessageSecuritySnapshotJSON{
@@ -1754,7 +1786,7 @@ func (h *MessageHandler) getMessageSecuritySnapshots(w http.ResponseWriter, r *h
 		}
 		response.Snapshots = append(response.Snapshots, item)
 	}
-	httputil.WriteJSON(w, http.StatusOK, response)
+	return response
 }
 
 // GetMessageLinkSafetyStatus answers what became of the caller's own withheld
@@ -1916,9 +1948,10 @@ func mapMentions(candidates []domain.MentionCandidate) []mentionJSON {
 	out := make([]mentionJSON, 0, len(candidates))
 	for _, candidate := range candidates {
 		out = append(out, mentionJSON{
-			Type:  string(candidate.Type),
-			ID:    candidate.ID,
-			Label: candidate.Label,
+			Type:        string(candidate.Type),
+			ID:          candidate.ID,
+			Label:       candidate.Label,
+			WillBeAdded: candidate.WillBeAdded,
 		})
 	}
 	return out
@@ -1928,6 +1961,8 @@ func mapMentions(candidates []domain.MentionCandidate) []mentionJSON {
 // Keeps error messages generic to avoid leaking internal details.
 func mapServiceError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, domain.ErrMentionNotEligible):
+		httputil.WriteError(w, http.StatusUnprocessableEntity, "mention_not_eligible", "mention is not eligible for this conversation")
 	case errors.Is(err, domain.ErrInvalidInput):
 		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid request")
 	case errors.Is(err, domain.ErrInvalidCursor):

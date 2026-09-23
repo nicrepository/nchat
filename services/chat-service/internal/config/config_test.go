@@ -226,6 +226,7 @@ func TestValidateAcceptsParseableLinkSafetyFlag(t *testing.T) {
 			t.Setenv("CHAT_LINK_SAFETY_ENABLED", raw)
 			// Credentials so this stays a test about *parsing*: enabling
 			// without them is its own error, asserted separately below.
+			t.Setenv("CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY", "key-xyz")
 			t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", "acct-123")
 			t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", "token-abc")
 
@@ -242,6 +243,7 @@ func TestValidateAcceptsParseableLinkSafetyFlag(t *testing.T) {
 
 func TestLoadReadsLinkSafetyCredentials(t *testing.T) {
 	t.Setenv("CHAT_LINK_SAFETY_ENABLED", "true")
+	t.Setenv("CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY", "key-xyz")
 	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", "acct-123")
 	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", "token-abc")
 
@@ -249,6 +251,9 @@ func TestLoadReadsLinkSafetyCredentials(t *testing.T) {
 
 	if !cfg.LinkSafetyEnabled {
 		t.Fatal("CHAT_LINK_SAFETY_ENABLED was not read")
+	}
+	if cfg.LinkSafetyGoogleWebRiskKey != "key-xyz" {
+		t.Fatalf("web risk key: %q", cfg.LinkSafetyGoogleWebRiskKey)
 	}
 	if cfg.LinkSafetyCloudflareAccount != "acct-123" || cfg.LinkSafetyCloudflareToken != "token-abc" {
 		t.Fatalf("credentials: %q / %q", cfg.LinkSafetyCloudflareAccount, cfg.LinkSafetyCloudflareToken)
@@ -261,25 +266,34 @@ func TestLoadReadsLinkSafetyCredentials(t *testing.T) {
 // absent, and every message went through.
 func TestValidateRejectsEnabledLinkSafetyWithoutCredentials(t *testing.T) {
 	for name, testCase := range map[string]struct {
-		account string
-		token   string
-		want    string
+		webRiskKey string
+		account    string
+		token      string
+		want       string
 	}{
+		// The primary comes first, because a deployment with no primary is the
+		// configuration issue #928 replaced rather than a degraded version of
+		// the one it introduced.
+		"no web risk key": {
+			webRiskKey: "", account: "acct-123", token: "token-abc",
+			want: "CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY is required when CHAT_LINK_SAFETY_ENABLED is true",
+		},
 		"no account": {
-			account: "", token: "token-abc",
+			webRiskKey: "key-xyz", account: "", token: "token-abc",
 			want: "CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID is required when CHAT_LINK_SAFETY_ENABLED is true",
 		},
 		"no token": {
-			account: "acct-123", token: "",
+			webRiskKey: "key-xyz", account: "acct-123", token: "",
 			want: "CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN is required when CHAT_LINK_SAFETY_ENABLED is true",
 		},
-		"neither": {
-			account: "", token: "",
-			want: "CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID is required when CHAT_LINK_SAFETY_ENABLED is true",
+		"nothing at all": {
+			webRiskKey: "", account: "", token: "",
+			want: "CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY is required when CHAT_LINK_SAFETY_ENABLED is true",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("CHAT_LINK_SAFETY_ENABLED", "true")
+			t.Setenv("CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY", testCase.webRiskKey)
 			t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", testCase.account)
 			t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", testCase.token)
 
@@ -290,17 +304,21 @@ func TestValidateRejectsEnabledLinkSafetyWithoutCredentials(t *testing.T) {
 			if err.Error() != testCase.want {
 				t.Fatalf("message is not the deterministic one: %v", err)
 			}
-			if strings.Contains(err.Error(), testCase.token) && testCase.token != "" {
-				t.Fatal("the error repeated the token")
+			for _, secret := range []string{testCase.token, testCase.webRiskKey} {
+				if secret != "" && strings.Contains(err.Error(), secret) {
+					t.Fatal("the error repeated a credential")
+				}
 			}
 		})
 	}
 }
 
 // Disabled is the one state in which absent credentials are correct, and it has
-// to stay valid: it is how an environment without a Cloudflare account runs.
+// to stay valid: it is how an environment with neither a Web Risk key nor a
+// Cloudflare account runs.
 func TestValidateAcceptsDisabledLinkSafetyWithoutCredentials(t *testing.T) {
 	t.Setenv("CHAT_LINK_SAFETY_ENABLED", "false")
+	t.Setenv("CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY", "")
 	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", "")
 	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", "")
 
@@ -325,6 +343,7 @@ func TestNoConfigurationCanEnableAnUncertainResubmit(t *testing.T) {
 	// The retired variable, set to the value that used to enable the behaviour.
 	t.Setenv("CHAT_LINK_SAFETY_MAX_UNCERTAIN_RESUBMITS", "5")
 	t.Setenv("CHAT_LINK_SAFETY_ENABLED", "true")
+	t.Setenv("CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY", "key-1")
 	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", "acct-1")
 	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", "token-1")
 
@@ -359,6 +378,7 @@ func TestNoConfigurationCanEnableAnUncertainResubmit(t *testing.T) {
 // everything immediately", which would be the same as having no signal.
 func TestUncertainStalenessThresholdMustBePositive(t *testing.T) {
 	t.Setenv("CHAT_LINK_SAFETY_ENABLED", "true")
+	t.Setenv("CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY", "key-1")
 	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", "acct-1")
 	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", "token-1")
 	t.Setenv("CHAT_LINK_SAFETY_SUBMIT_UNCERTAIN_TIMEOUT_SECONDS", "0")

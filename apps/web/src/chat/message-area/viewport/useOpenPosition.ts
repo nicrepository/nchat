@@ -16,8 +16,7 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
-import { UNREAD_DIVIDER_KEY } from "../../timelineVirtualization";
-import { scrollToBottom } from "./scrollCommands";
+import type { NavigationReason, NavigationTarget } from "./navigation";
 import {
   decideOpenPositionResolution,
   type OpenPositionInput,
@@ -32,6 +31,8 @@ export interface OpenPositionState {
   firstUnreadMessageId: string | null;
   /** Whether the opening position has been decided — mutations wait for it. */
   resolved: boolean;
+  /** Which destination won the #880 priority, once decided. */
+  target: NavigationTarget | null;
   /** Where the one instant positioning scroll lands, once decided. */
   scrollTarget: ScrollTarget;
 }
@@ -72,6 +73,7 @@ export function useOpenPositionResolution({
   const [resolved, setResolved] = useState(false);
   const [firstUnreadMessageId, setFirstUnreadMessageId] = useState<string | null>(null);
   const [scrollTarget, setScrollTarget] = useState<ScrollTarget>(undefined);
+  const [target, setTarget] = useState<NavigationTarget | null>(null);
   const [searchAttempts, setSearchAttempts] = useState(0);
   const [searchedForLength, setSearchedForLength] = useState(-1);
 
@@ -99,6 +101,7 @@ export function useOpenPositionResolution({
     // useState's setter (see useViewportCore), so it bails out the same way.
     setResolved(true);
     setFirstUnreadMessageId(decision.firstUnreadMessageId);
+    setTarget(decision.target);
     setScrollTarget(decision.scrollTarget);
     core.setPhase(decision.phase);
   }
@@ -110,31 +113,38 @@ export function useOpenPositionResolution({
     if (searchAttempts > 0) onLoadMoreRef.current();
   }, [searchAttempts]);
 
-  return { firstUnreadMessageId, resolved, scrollTarget };
+  return { firstUnreadMessageId, resolved, target, scrollTarget };
 }
 
 /**
  * Performs the actual instant positioning once resolution picked a target — a
  * plain DOM operation, no setState of its own.
+ *
+ * #880: neither the tail nor the unread boundary is positioned here. Both are
+ * logical destinations — where they end up depends on measurements that land
+ * after this effect — so both are handed to the navigator, which owns the
+ * scrollport and keeps correcting until the arrival is confirmed. A restored
+ * anchor stays a single instant scroll.
  */
 export function useInstantPositioning(
   core: ViewportCore,
   scrollTarget: ScrollTarget,
-  firstUnreadMessageId: string | null,
+  target: NavigationTarget | null,
+  navigateToTail: (reason: NavigationReason) => void,
+  navigateToFirstUnread: (reason: NavigationReason) => void,
 ) {
   useLayoutEffect(() => {
-    if (!scrollTarget) return;
-    if (scrollTarget.messageId === null) {
-      scrollToBottom(core.bottomRef, "auto");
+    if (!scrollTarget || target === null) return;
+    if (target === "TAIL") {
+      navigateToTail("open");
       return;
     }
-    // Land on the separator, not the message: the message sits right below it,
-    // so scrolling to the message alone would push the separator (and its
-    // "Novas mensagens" label) off-screen above the viewport.
-    const targetKey =
-      scrollTarget.messageId === firstUnreadMessageId ? UNREAD_DIVIDER_KEY : scrollTarget.messageId;
-    // Read through the refs, not the render values: the dependency list has to
-    // stay [scrollTarget, firstUnreadMessageId]. Positioning happens once, when
+    if (target === "FIRST_UNREAD") {
+      navigateToFirstUnread("open");
+      return;
+    }
+    // A saved reading position. Read through the refs, not the render values:
+    // the dependency list has to stay as it is. Positioning happens once, when
     // resolution picks a target — re-running it because the row model changed
     // would re-scroll on every prepended page, which is precisely the "not
     // moving the message being read" invariant #492 exists to protect.
@@ -143,14 +153,16 @@ export function useInstantPositioning(
       // #675: the row this resolves to is very often outside the initial
       // window, so the virtualizer places it rather than a DOM node that does
       // not exist yet.
-      const index = core.rowIndexRef.current.get(targetKey);
+      const index =
+        scrollTarget.messageId === null
+          ? undefined
+          : core.rowIndexRef.current.get(scrollTarget.messageId);
       if (index !== undefined) activeVirtualizer.scrollToIndex(index, { align: "start" });
       return;
     }
-    const element =
-      targetKey === UNREAD_DIVIDER_KEY
-        ? core.unreadDividerRef.current
-        : core.messageRefs.current.get(targetKey);
-    element?.scrollIntoView({ behavior: "auto", block: "start" });
-  }, [core, scrollTarget, firstUnreadMessageId]);
+    if (scrollTarget.messageId === null) return;
+    core.messageRefs.current
+      .get(scrollTarget.messageId)
+      ?.scrollIntoView({ behavior: "auto", block: "start" });
+  }, [core, scrollTarget, target, navigateToTail, navigateToFirstUnread]);
 }

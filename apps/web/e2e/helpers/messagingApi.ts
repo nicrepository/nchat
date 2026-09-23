@@ -91,6 +91,30 @@ export interface RawMessageAttachment {
   duration_ms?: number;
 }
 
+/** One link entity as the server states it (issue #807). */
+export interface RawLink {
+  ordinal: number;
+  /** The target's stable identity; every occurrence and every update carries one. */
+  target_key: string;
+  text?: string;
+  url?: string;
+  hostname?: string;
+  safety: "pending" | "safe" | "malicious" | "unknown";
+  click: "none" | "direct" | "interstitial";
+  href?: string;
+  updated_at: string;
+  preview?: {
+    state: "none" | "queued" | "fetching" | "ready" | "unsupported" | "failed";
+    hostname: string;
+    site_name?: string;
+    title?: string;
+    description?: string;
+    image_id?: string;
+    image_width?: number;
+    image_height?: number;
+  };
+}
+
 interface RawMessage {
   id: string;
   sender_id: string;
@@ -101,6 +125,9 @@ interface RawMessage {
   body_format: "v1" | "v2" | "v3";
   status: "active" | "deleted";
   is_removed: boolean;
+  /** RF-21 aggregate marker and the issue #807 per-link entities. */
+  link_safety_state?: string;
+  links?: RawLink[];
   created_at: string;
   updated_at: string;
   edited_at?: string | null;
@@ -159,6 +186,11 @@ interface MessagingScenarioOptions {
   editWindowExpiredIds?: string[];
   /** People returned by GET /dm-candidates, used by "nova conversa" specs. */
   dmCandidates?: DMCandidateFixture[];
+  /**
+   * Issue #807: the link entities the mocked server attaches to a message the
+   * reader posts. Absent means the body has no links the server described.
+   */
+  postLinks?: (bodyText: string) => RawLink[] | undefined;
 }
 
 interface PatchRequest {
@@ -175,6 +207,7 @@ export interface MessagingScenario {
   targetId: string;
   targetName: string;
   messagesByTarget: Map<string, RawMessage[]>;
+  postLinks?: (bodyText: string) => RawLink[] | undefined;
   requests: {
     channelPosts: Array<{
       body_text?: string;
@@ -254,6 +287,15 @@ export interface MessagingScenario {
   // IDs were sent.
   addMembersRequests: Array<{ channelId: string; userIds: string[] }>;
   addMembersStatus: number;
+  // The administrable roster per channel id (issue #469). Absent means the
+  // server refuses the route, which is what a caller without the capability
+  // gets.
+  channelRosters: Map<string, ChannelRosterFixture>;
+  // Removals the app performed, and the status the mock should answer with
+  // (issue #469). Recording each one is what lets a spec assert that a double
+  // click sent exactly one request.
+  removeMemberRequests: Array<{ kind: TargetKind; targetId: string; userId: string }>;
+  removeMemberStatus: number;
   // Channel attachments per channel id, newest first, as the server returns them.
   channelAttachments: Map<string, AttachmentFixture[]>;
   // Group-details payload per conversation id (issue #441).
@@ -271,14 +313,21 @@ export interface GroupParticipantFixture {
 }
 
 /**
- * A group's details. Deliberately without visibility, slug or description: a
- * chat.dm_conversations row has none of them, and the panel must never show a
+ * A group's details. Deliberately without visibility or slug: a
+ * chat.dm_conversations row has neither, and the panel must never show a
  * channel's vocabulary for a group.
+ *
+ * description and creator_display_name are optional here for the same reason
+ * the server omits them (issue #894): absence is the contract for "there is
+ * none", so a spec that says nothing about them exercises the empty and
+ * neutral states rather than a value the backend would have had to invent.
  */
 export interface GroupDetailsFixture {
   id: string;
   type: "group";
   name: string;
+  description?: string;
+  creator_display_name?: string;
   created_at: string;
   /** Every active participant; may exceed participants.length. */
   participant_count: number;
@@ -289,6 +338,13 @@ export interface GroupDetailsFixture {
    * reads as false and the action stays hidden.
    */
   can_manage_members: boolean;
+  /**
+   * Whether the server would let this caller remove another participant
+   * (issue #469). A different answer from the one above for a group — adding
+   * is open to every participant, removing is the creator's alone — so a
+   * spec has to set it deliberately.
+   */
+  can_remove_members?: boolean;
 }
 
 /**
@@ -327,6 +383,16 @@ export interface ChannelDetailsFixture {
   slug: string;
   display_name: string;
   type: "public" | "private";
+  /**
+   * Optional exactly as the server's own field is (issue #894): absent means
+   * the conversation has no description and the panel says so.
+   */
+  description?: string;
+  /**
+   * Absent when the server could resolve no trustworthy creator identity. It is
+   * a name and never an id — the real payload carries no creator id at all.
+   */
+  creator_display_name?: string;
   created_at: string;
   /** Every active member of the channel, online or not. */
   member_count: number;
@@ -340,6 +406,28 @@ export interface ChannelDetailsFixture {
    * reads as false and the action stays hidden.
    */
   can_manage_members: boolean;
+  /** Whether this caller may remove a member (issue #469). */
+  can_remove_members?: boolean;
+}
+
+/**
+ * One row of a channel's administrable membership (issue #469).
+ *
+ * No presence field: this list is membership, and who is connected is the
+ * realtime store's answer. That is the difference from ChannelMemberFixture
+ * above, which is the presence preview.
+ */
+export interface ChannelRosterMemberFixture {
+  user_id: string;
+  display_name: string;
+  role: "member" | "moderator";
+}
+
+/** GET /api/chat/channels/{id}/members (issue #469). */
+export interface ChannelRosterFixture {
+  total: number;
+  next_cursor?: string;
+  members: ChannelRosterMemberFixture[];
 }
 
 export interface AttachmentFixture {
@@ -390,6 +478,8 @@ export function makeMessage(overrides: Partial<RawMessage> = {}): RawMessage {
     // carries them and neither does a fixture built without them.
     event_type: overrides.event_type,
     event_payload: overrides.event_payload,
+    link_safety_state: overrides.link_safety_state,
+    links: overrides.links,
   };
 }
 
@@ -483,6 +573,7 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
     kind: options.kind,
     targetId: options.targetId,
     targetName: options.targetName,
+    postLinks: options.postLinks,
     messagesByTarget,
     requests: {
       channelPosts: [],
@@ -515,6 +606,9 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
     channelAttachments: new Map(),
     addMembersRequests: [],
     addMembersStatus: 200,
+    channelRosters: new Map(),
+    removeMemberRequests: [],
+    removeMemberStatus: 204,
     directProfiles: new Map(),
     conversationAttachments: new Map(),
   };
@@ -535,6 +629,7 @@ export function groupDetailsFixture(
   participants: GroupParticipantFixture[],
   participantCount = participants.length,
   canManageMembers = false,
+  canRemoveMembers = false,
 ): GroupDetailsFixture {
   return {
     id: conversation.id,
@@ -544,7 +639,22 @@ export function groupDetailsFixture(
     participant_count: participantCount,
     participants,
     can_manage_members: canManageMembers,
+    can_remove_members: canRemoveMembers,
   };
+}
+
+/**
+ * Default administrable roster for a channel (issue #469).
+ *
+ * memberCount defaults to the page's length and is overridable for the same
+ * reason every other total here is: the page is capped and the membership is
+ * not.
+ */
+export function channelRosterFixture(
+  members: ChannelRosterMemberFixture[],
+  memberCount = members.length,
+): ChannelRosterFixture {
+  return { total: memberCount, members };
 }
 
 /**
@@ -578,6 +688,7 @@ export function channelDetailsFixture(
   onlineMembers: ChannelMemberFixture[],
   memberCount = onlineMembers.length,
   canManageMembers = false,
+  canRemoveMembers = false,
 ): ChannelDetailsFixture {
   return {
     id: channel.id,
@@ -589,7 +700,52 @@ export function channelDetailsFixture(
     online_member_count: onlineMembers.length,
     online_members: onlineMembers,
     can_manage_members: canManageMembers,
+    can_remove_members: canRemoveMembers,
   };
+}
+
+/**
+ * Applies a committed channel removal to the fixture (issue #469): the roster
+ * row, the roster's total, the membership set and the details count all move
+ * together, because on the server they are one population.
+ */
+function removeChannelMemberFromFixture(
+  scenario: MessagingScenario,
+  channelId: string,
+  userId: string,
+): void {
+  const roster = scenario.channelRosters.get(channelId);
+  if (roster) {
+    const before = roster.members.length;
+    roster.members = roster.members.filter((member) => member.user_id !== userId);
+    if (roster.members.length !== before) roster.total -= 1;
+  }
+  scenario.channelMemberships.get(channelId)?.delete(userId);
+  const details = scenario.channelDetails.get(channelId);
+  if (details) {
+    const before = details.online_members.length;
+    details.online_members = details.online_members.filter((member) => member.user_id !== userId);
+    if (details.online_members.length !== before) details.online_member_count -= 1;
+    details.member_count = Math.max(0, details.member_count - 1);
+  }
+}
+
+/** The group counterpart of the helper above. */
+function removeGroupParticipantFromFixture(
+  scenario: MessagingScenario,
+  conversationId: string,
+  userId: string,
+): void {
+  scenario.groupMemberships.get(conversationId)?.delete(userId);
+  const details = scenario.groupDetails.get(conversationId);
+  if (!details) return;
+  const before = details.participants.length;
+  details.participants = details.participants.filter(
+    (participant) => participant.user_id !== userId,
+  );
+  if (details.participants.length !== before) {
+    details.participant_count = Math.max(0, details.participant_count - 1);
+  }
 }
 
 export function messagesFor(
@@ -649,6 +805,8 @@ export async function emitMessageCreated(
       deleted_at: options.message.deleted_at,
       quoted: options.message.quoted,
       is_forwarded: options.message.is_forwarded,
+      link_safety_state: options.message.link_safety_state,
+      links: options.message.links,
     },
   };
   await page.waitForFunction(
@@ -667,6 +825,56 @@ export async function emitMessageCreated(
       }
     ).__e2eEmitMessageCreated(messageCreatedEvent);
   }, event);
+}
+
+/**
+ * Emits message.link_updated for one target of one message (issue #807), as the
+ * safety or preview worker would after a verdict or a card lands.
+ */
+export async function emitLinkUpdated(
+  page: Page,
+  options: {
+    kind: TargetKind;
+    targetId: string;
+    messageId: string;
+    link: RawLink;
+    eventId?: string;
+  },
+) {
+  await page.waitForFunction(
+    ({ kind, targetId }) =>
+      (
+        window as unknown as {
+          __e2eHasSubscription?: (kind: string, targetId: string) => boolean;
+        }
+      ).__e2eHasSubscription?.(kind, targetId) === true,
+    { kind: options.kind, targetId: options.targetId },
+  );
+  await page.evaluate(
+    ({ kind, targetId, messageId, link, eventId }) => {
+      (
+        window as unknown as {
+          __e2eEmitWebSocketEvent: (event: Record<string, unknown>) => void;
+        }
+      ).__e2eEmitWebSocketEvent({
+        schema_version: 1,
+        type: "message.link_updated",
+        workspace_id: "e2e-workspace",
+        target_type: kind,
+        target_id: targetId,
+        message_id: messageId,
+        event_id: eventId,
+        link_update: { message_id: messageId, link },
+      });
+    },
+    {
+      kind: options.kind,
+      targetId: options.targetId,
+      messageId: options.messageId,
+      link: options.link,
+      eventId: options.eventId ?? `${options.messageId}-link-${options.link.url ?? "blocked"}`,
+    },
+  );
 }
 
 /** One presence entry as the server states it (RF-58). */
@@ -919,6 +1127,62 @@ export async function emitConversationAvailable(
   );
 }
 
+/**
+ * Emits the frame a rename broadcasts (issue #893, CQ-893-02).
+ *
+ * It carries no payload at all — not even the new name — exactly like the real
+ * one: it means "your view of this target is stale", and the client converges
+ * by refetching the canonical list, which the server re-authorises. So a spec
+ * moves the *mock server's* state first and then fires this; nothing here
+ * hands the application a name, touches the DOM or calls into React.
+ */
+export async function emitConversationUpdated(
+  page: Page,
+  target: { kind: TargetKind; targetId: string },
+) {
+  await page.waitForFunction(
+    () =>
+      typeof (window as unknown as { __e2eEmitWebSocketEvent?: unknown })
+        .__e2eEmitWebSocketEvent === "function",
+  );
+  await page.evaluate(
+    ({ kind, targetId }) => {
+      (
+        window as unknown as {
+          __e2eEmitWebSocketEvent: (event: Record<string, unknown>) => void;
+        }
+      ).__e2eEmitWebSocketEvent({
+        schema_version: 1,
+        type: "conversation.updated",
+        workspace_id: "e2e-workspace",
+        target_type: kind,
+        target_id: targetId,
+        event_id: `updated-${kind}-${targetId}-${Date.now()}`,
+      });
+    },
+    { kind: target.kind, targetId: target.targetId },
+  );
+}
+
+/**
+ * Moves the mock server's own record of a channel's name.
+ *
+ * Both projections the client can read — the sidebar list and GET /details —
+ * come from one row on the real server, so they move together here too. It
+ * changes server state and nothing else: no request is answered differently
+ * until the client makes one.
+ */
+export function setServerChannelName(
+  scenario: MessagingScenario,
+  channelId: string,
+  displayName: string,
+) {
+  const channel = scenario.sidebarChannels.find((candidate) => candidate.id === channelId);
+  if (channel) channel.display_name = displayName;
+  const details = scenario.channelDetails.get(channelId);
+  if (details) details.display_name = displayName;
+}
+
 /** Kills the tab's connection so the client takes its own reconnect path. */
 export async function dropWebSocket(page: Page) {
   await page.waitForFunction(
@@ -1114,6 +1378,96 @@ async function installChannelDetailsMocks(
         },
       }),
     });
+  });
+
+  // GET /api/chat/channels/{id}/members (issue #469) — the administrable
+  // membership, which is a different population from the details panel's
+  // presence preview. No roster in the fixture means the server refused the
+  // route, which is exactly what a caller without the capability gets.
+  //
+  // Registered before the POST handler below because Playwright runs the most
+  // recently added matching route first; both fall back for a method they do
+  // not serve, so order only decides who looks first.
+  await page.route("**/api/chat/channels/*/members", async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
+    const channelId = pathSegmentAfter(route.request().url(), "channels");
+    if (!channelId || !assertConversationAccess(channelId)) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    const roster = scenario.channelRosters.get(channelId);
+    if (!roster) {
+      await route.fulfill({
+        status: 403,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "forbidden", message: "forbidden" } }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: roster }),
+    });
+  });
+
+  // DELETE /api/chat/channels/{id}/members/{userId} (issue #469).
+  //
+  // On success it mutates the scenario's own fixtures — the roster, its total
+  // and the details count — so the panel's refetch observes the removal the
+  // way it would against the real service. A mock that answered 204 without
+  // changing anything would let a broken reconciliation pass.
+  await page.route("**/api/chat/channels/*/members/*", async (route) => {
+    if (route.request().method() !== "DELETE") {
+      await route.fallback();
+      return;
+    }
+    const channelId = pathSegmentAfter(route.request().url(), "channels");
+    const userId = pathSegmentAfter(route.request().url(), "members");
+    if (!channelId || !userId || !assertConversationAccess(channelId)) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    scenario.removeMemberRequests.push({ kind: "channel", targetId: channelId, userId });
+    if (scenario.removeMemberStatus !== 204) {
+      await route.fulfill({
+        status: scenario.removeMemberStatus,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "denied", message: "denied" } }),
+      });
+      return;
+    }
+    removeChannelMemberFromFixture(scenario, channelId, userId);
+    await route.fulfill({ status: 204, body: "" });
+  });
+
+  // DELETE /api/chat/dm/{id}/participants/{userId} (issue #469), the group
+  // counterpart. Same fixture mutation, against the participant list.
+  await page.route("**/api/chat/dm/*/participants/*", async (route) => {
+    if (route.request().method() !== "DELETE") {
+      await route.fallback();
+      return;
+    }
+    const conversationId = pathSegmentAfter(route.request().url(), "dm");
+    const userId = pathSegmentAfter(route.request().url(), "participants");
+    if (!conversationId || !userId || !assertConversationAccess(conversationId)) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    scenario.removeMemberRequests.push({ kind: "dm", targetId: conversationId, userId });
+    if (scenario.removeMemberStatus !== 204) {
+      await route.fulfill({
+        status: scenario.removeMemberStatus,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "denied", message: "denied" } }),
+      });
+      return;
+    }
+    removeGroupParticipantFromFixture(scenario, conversationId, userId);
+    await route.fulfill({ status: 204, body: "" });
   });
 
   // POST /api/chat/channels/{id}/members (issue #398).
@@ -1890,6 +2244,11 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
     scenario.requests.groupRenames.push({ conversationId: id, title });
     const previous = group.name;
     group.name = title;
+    // One row, one name: the details projection the panel reads is the same
+    // record the sidebar list is built from, so a rename moves both or the
+    // mock would let a panel look stale in a way the real service cannot.
+    const groupDetails = scenario.groupDetails.get(id);
+    if (groupDetails) groupDetails.name = title;
     // The real rename writes a system message in the same transaction; the mock
     // appends the same structured event so the timeline can render it.
     appendConversationEvent(
@@ -1948,6 +2307,9 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
     scenario.requests.channelRenames.push({ channelId: id, displayName });
     const previousName = channel.display_name;
     channel.display_name = displayName;
+    // See the group rename above: the details projection is the same row.
+    const channelDetails = scenario.channelDetails.get(id);
+    if (channelDetails) channelDetails.display_name = displayName;
     appendConversationEvent(
       scenario,
       { kind: "channel", targetId: id },
@@ -2500,6 +2862,7 @@ async function handleTargetMessagesRoute(
       body_format: body.body_format ?? (routeKind === "channel" ? "v3" : "v2"),
       created_at: "2026-07-15T12:03:00.000Z",
       updated_at: "2026-07-15T12:03:00.000Z",
+      links: scenario.postLinks?.(body.body_text ?? ""),
       quoted: parent ? quoteFrom(parent) : undefined,
       reference: source
         ? {
@@ -2710,6 +3073,16 @@ export async function fillComposer(page: Page, text: string) {
   await input.click();
   await page.keyboard.insertText(text);
   await expect(input).toContainText(text);
+}
+
+/**
+ * Issue #875: a message the server acknowledged is not a draft. Asserts the
+ * composer holds nothing of it — neither the text nor the quote of the
+ * message it answered.
+ */
+export async function expectComposerConsumedTheSend(page: Page) {
+  await expect(page.getByTestId("chat-composer-input")).toHaveText("");
+  await expect(page.getByTestId("chat-composer-quote")).toHaveCount(0);
 }
 
 export async function replaceEditorText(page: Page, editor: Locator, text: string) {

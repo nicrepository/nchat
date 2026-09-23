@@ -11,12 +11,17 @@ import { IconWarning } from "./icons";
  *
  * The refusals share one line because only one of them can usefully be read at
  * a time, and the order is the order they matter in.
+ *
+ * A refused open-DM is deliberately not among them (issue #895). That flow is
+ * owned by the shell, above this conversation, because the surfaces that can
+ * start it are not all inside one — and a single state reported here *and* by
+ * the details panel beside this strip produced two alerts for one failure. The
+ * shell reports it once.
  */
 export default function ConversationNotices({
   sendError,
   realtimeError,
   actionError,
-  openDMError,
   pinError,
   acknowledgeError,
   typingLabel,
@@ -24,13 +29,12 @@ export default function ConversationNotices({
   sendError: string | null;
   realtimeError: string | null;
   actionError: string | null;
-  openDMError: string | null;
   pinError: string | null;
   /** Issue #824: a confirmation that could not be recorded. */
   acknowledgeError?: string | null;
   typingLabel: string | null;
 }) {
-  const refusal = actionError ?? openDMError ?? pinError ?? acknowledgeError ?? null;
+  const refusal = actionError ?? pinError ?? acknowledgeError ?? null;
   return (
     <>
       {sendError && (

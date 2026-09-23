@@ -71,6 +71,23 @@ type Notification struct {
 	// nothing here does, and the empty string is a recipient who expressed no
 	// level at all.
 	NotificationLevel string
+	// Presentation is the one exception to "references only" above, and it is a
+	// narrow one (issue #870).
+	//
+	// It is not the message. It is a bounded, already-authorized projection of
+	// what a native notification banner may say about it — the author's display
+	// name, the conversation it happened in, and at most the first few hundred
+	// characters of the body — resolved by the same claim statement against the
+	// recipient's access at the claim snapshot, and empty whenever they may see nothing. An
+	// adapter therefore still holds nothing a reader of the message had not
+	// already been granted, which is the property this struct's restraint was
+	// protecting.
+	//
+	// Raw, deliberately: it is sanitised and truncated by webpush_preview.go on
+	// its way into a payload, so no adapter can present more of it than the
+	// rules there allow. It is never logged, never a metric label and never part
+	// of an error — see logOutcome here and logAttempt in webpush_delivery.go.
+	Presentation storage.MessagePresentation
 }
 
 // IdempotencyKey is what an adapter must present to a provider that supports
@@ -104,6 +121,7 @@ func notificationFrom(event storage.NotificationEvent) Notification {
 		OccurredAt:        event.OccurredAt,
 		Muted:             event.Muted,
 		NotificationLevel: event.NotificationLevel,
+		Presentation:      event.Presentation,
 	}
 }
 

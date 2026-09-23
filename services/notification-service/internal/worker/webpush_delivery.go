@@ -93,6 +93,10 @@ type WebPushDeliverer struct {
 	// the expiry gate and the push service's own TTL header, so the two cannot
 	// disagree.
 	ttl time.Duration
+	// preview selects the payload contract (issue #870). See
+	// config.WebPushConfig.PushPreviewEnabled for why a deployment chooses it
+	// rather than this layer deciding for itself.
+	preview bool
 }
 
 // WebPushDeps is what the deliverer cannot build for itself.
@@ -115,6 +119,7 @@ func NewWebPushDeliverer(cfg config.WebPushConfig, deps WebPushDeps) *WebPushDel
 		metrics: deps.Metrics,
 		logger:  logger,
 		ttl:     time.Duration(cfg.Normalized().TTLSeconds) * time.Second,
+		preview: cfg.PushPreviewEnabled,
 	}
 }
 
@@ -199,7 +204,7 @@ func (d *WebPushDeliverer) Deliver(ctx context.Context, notification Notificatio
 		return errPushNoTarget
 	}
 
-	payload, err := buildPushPayload(notification)
+	payload, err := buildPushPayload(notification, d.preview)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrPermanentDelivery, err)
 	}

@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import type { Locator } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 
 import {
   CURRENT_USER_ID,
@@ -30,6 +30,77 @@ import {
 async function expectPinPreview(pinsBar: Locator, bodyText: string) {
   await expect(pinsBar.getByText(`${OTHER_USER_NAME}:`, { exact: true })).toBeVisible();
   await expect(pinsBar.getByText(`${OTHER_USER_NAME}: ${bodyText}`, { exact: true })).toBeVisible();
+}
+
+/**
+ * Um passo do ciclo de saída do badge, na ordem em que a página o viu.
+ *
+ * A ordem do array é o registro do tempo: nada aqui guarda milissegundos, que
+ * são característica da máquina e não contrato.
+ */
+type ReactionExitEvent =
+  | { type: "exiting-applied"; pointerEvents: string }
+  | { type: "animation-start"; animationName: string }
+  | { type: "animation-end"; animationName: string };
+
+declare global {
+  interface Window {
+    __e2eReactionExit?: ReactionExitEvent[];
+  }
+}
+
+/**
+ * Passa a registrar, de dentro da página, o ciclo de saída do badge de reação.
+ *
+ * De dentro porque o estado de saída é transitório: um matcher do Playwright
+ * consegue reconsultar enquanto um estado ainda não chegou, mas não alcança um
+ * que já passou, então amostrá-lo de fora falha sob carga. Um MutationObserver
+ * e os listeners abaixo são síncronos com o que observam e não perdem frame.
+ *
+ * O registro é bruto de propósito: entra todo evento de animação cujo alvo é o
+ * próprio slot, na ordem, com o `animationName`. É isso que deixa o teste
+ * exigir a animação certa em vez de aceitar qualquer uma — e enxergar uma
+ * inesperada, se aparecer. Eventos de filho ficam de fora: o emoji dentro do
+ * badge tem a própria animação, e ela sobe até aqui.
+ *
+ * Uma segunda instalação não duplicaria nada: cada uma escreve no array que
+ * criou, e a leitura devolve o da última.
+ */
+async function installExitRecorder(bubble: Locator) {
+  await bubble.evaluate((node: Element) => {
+    const events: ReactionExitEvent[] = [];
+    window.__e2eReactionExit = events;
+
+    const slot = node.querySelector(".chat-msg-area__reaction-slot");
+    if (!slot) throw new Error("nenhum badge de reação para observar");
+
+    slot.addEventListener("animationstart", (event) => {
+      if (event.target !== slot) return;
+      events.push({ type: "animation-start", animationName: event.animationName });
+    });
+    slot.addEventListener("animationend", (event) => {
+      if (event.target !== slot) return;
+      events.push({ type: "animation-end", animationName: event.animationName });
+    });
+
+    new MutationObserver((records) => {
+      for (const record of records) {
+        if (record.attributeName !== "data-exiting") continue;
+        if (slot.getAttribute("data-exiting") !== "true") continue;
+        // pointer-events lido no instante da mutação, e não amostrado depois:
+        // a classe de saída é aplicada no mesmo commit que o atributo.
+        events.push({
+          type: "exiting-applied",
+          pointerEvents: getComputedStyle(slot).pointerEvents,
+        });
+      }
+    }).observe(slot, { attributes: true, attributeFilter: ["data-exiting"] });
+  });
+}
+
+/** Devolve o histórico como está; quem julga o que ele contém é o teste. */
+async function readExitRecord(page: Page): Promise<ReactionExitEvent[]> {
+  return (await page.evaluate(() => window.__e2eReactionExit)) ?? [];
 }
 
 /**
@@ -410,12 +481,38 @@ test.describe("interações de mensagem — reação, favorito e pin", () => {
 
     const bubble = messageBubble(page, original.id);
     const slot = bubble.locator(".chat-msg-area__reaction-slot");
+    await expect(slot).toHaveCount(1);
+
+    await installExitRecorder(bubble);
     await bubble.getByRole("button", { name: "Remover reação 🎉" }).click();
 
-    // A última reação não some entre dois frames: ela sai, e só então é removida.
-    await expect(slot).toHaveAttribute("data-exiting", "true");
-    await expect(slot).toHaveCSS("pointer-events", "none");
+    // Estado final e estável: é por ele que o teste espera, nunca pelo estado
+    // de saída, que é transitório.
     await expect(slot).toHaveCount(0);
+    await expect(bubble.getByRole("button", { name: /reação 🎉/ })).toHaveCount(0);
+
+    // A última reação não some entre dois frames: ela recebe o estado de
+    // saída, a animação de saída roda inteira, e só então o badge é removido.
+    //
+    // A animação é nomeada porque é ela o contrato: os testes de componente
+    // disparam animationend à mão (ReactionBadge.test.tsx), então nenhum deles
+    // notaria a regra sumindo do CSS — e o badge, sem animationend, ficaria
+    // preso na tela para sempre. Só um navegador responde isso.
+    const exitAnimation = "chat-reaction-exit";
+    const events = await readExitRecord(page);
+    const exitingAt = events.findIndex((event) => event.type === "exiting-applied");
+    const startAt = events.findIndex(
+      (event) => event.type === "animation-start" && event.animationName === exitAnimation,
+    );
+    const endAt = events.findIndex(
+      (event) => event.type === "animation-end" && event.animationName === exitAnimation,
+    );
+
+    expect(exitingAt).toBeGreaterThanOrEqual(0);
+    expect(startAt).toBeGreaterThan(exitingAt);
+    expect(endAt).toBeGreaterThan(startAt);
+    // Inerte enquanto sai: o badge não recebe ponteiro enquanto some.
+    expect(events[exitingAt]).toEqual({ type: "exiting-applied", pointerEvents: "none" });
   });
 
   test("fecha o picker com Escape e devolve o foco ao acionador", async ({ page }, testInfo) => {

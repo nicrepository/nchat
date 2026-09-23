@@ -175,3 +175,133 @@ func TestDMService_GetGroupDetails_SurfacesAParticipantQueryFailure(t *testing.T
 		t.Fatal("expected the participant query failure to surface")
 	}
 }
+
+// ── About metadata (issue #894) ──────────────────────────────────────────────
+
+// A group carries the same two About facts as a channel, read from its own
+// aggregate after the access gate, and with the same treatment of absence.
+func TestDMService_GetGroupDetails_CarriesAboutMetadata(t *testing.T) {
+	dms := &fakeDMStore{
+		visibleConversation: groupConversation(),
+		participants:        storage.DMParticipantPage{Participants: participantsOf(3), TotalCount: 6},
+		about: storage.ConversationAbout{
+			Description:        "O grupo que cuida da malha.",
+			CreatorDisplayName: "Álvaro Neto",
+		},
+	}
+
+	got, err := service.NewDMService(dms, newFakeMemberStore()).
+		GetGroupDetails(context.Background(), groupDetailsInput(domain.MaxDMDetailsParticipants))
+	if err != nil {
+		t.Fatalf("GetGroupDetails: %v", err)
+	}
+	if got.About.Description != "O grupo que cuida da malha." {
+		t.Fatalf("Description = %q", got.About.Description)
+	}
+	if got.About.CreatorDisplayName != "Álvaro Neto" {
+		t.Fatalf("CreatorDisplayName = %q", got.About.CreatorDisplayName)
+	}
+	// The count keeps coming from the participant query, not from the About
+	// read and not from the preview's length.
+	if got.ParticipantCount != 6 || len(got.Participants) != 3 {
+		t.Fatalf("count = %d, preview = %d", got.ParticipantCount, len(got.Participants))
+	}
+	if len(dms.aboutCalls) != 1 {
+		t.Fatalf("about reads = %d, want exactly one (no N+1)", len(dms.aboutCalls))
+	}
+	if dms.aboutCalls[0].workspaceID != "ws-1" || dms.aboutCalls[0].targetID != "conv-1" {
+		t.Fatalf("about call = %+v", dms.aboutCalls[0])
+	}
+}
+
+// An unresolvable creator is absent, and the conversation's created_by — which
+// the service is holding — never stands in for the name.
+func TestDMService_GetGroupDetails_UnresolvedCreatorStaysEmpty(t *testing.T) {
+	dms := &fakeDMStore{
+		visibleConversation: groupConversation(),
+		participants:        storage.DMParticipantPage{Participants: participantsOf(1), TotalCount: 1},
+	}
+
+	got, err := service.NewDMService(dms, newFakeMemberStore()).
+		GetGroupDetails(context.Background(), groupDetailsInput(domain.MaxDMDetailsParticipants))
+	if err != nil {
+		t.Fatalf("GetGroupDetails: %v", err)
+	}
+	if got.About.Description != "" || got.About.CreatorDisplayName != "" {
+		t.Fatalf("About = %+v, want both empty", got.About)
+	}
+	if got.Conversation.CreatedBy == "" {
+		t.Fatal("fixture should carry a created_by for this case to mean anything")
+	}
+}
+
+// A 1:1 conversation is refused before the About read, so the endpoint cannot
+// be used to learn whether a direct conversation has a description.
+func TestDMService_GetGroupDetails_DirectConversationNeverReadsAbout(t *testing.T) {
+	conversation := groupConversation()
+	conversation.Type = domain.DMConversationTypeDirect
+	dms := &fakeDMStore{visibleConversation: conversation}
+
+	if _, err := service.NewDMService(dms, newFakeMemberStore()).
+		GetGroupDetails(context.Background(), groupDetailsInput(0)); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if len(dms.aboutCalls) != 0 {
+		t.Fatalf("about reads = %d, want none for a 1:1 conversation", len(dms.aboutCalls))
+	}
+}
+
+// A caller the gate refuses never reaches the About read either.
+func TestDMService_GetGroupDetails_DeniedCallerNeverReadsAbout(t *testing.T) {
+	dms := &fakeDMStore{getVisibleErr: domain.ErrNotFound}
+
+	if _, err := service.NewDMService(dms, newFakeMemberStore()).
+		GetGroupDetails(context.Background(), groupDetailsInput(0)); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if len(dms.aboutCalls) != 0 {
+		t.Fatalf("about reads = %d, want none for a denied caller", len(dms.aboutCalls))
+	}
+}
+
+// The removal capability is creatorship, and nothing else (issue #469).
+//
+// A group has no role column — chat.dm_members.role is closed by CHECK to
+// 'member' — so the creator is the only authority narrower than "any
+// participant". can_manage_members is true for every participant here, which
+// is exactly why the removal control cannot be derived from it: the store
+// would refuse every one of those callers.
+func TestDMService_GetGroupDetails_ReportsRemovalCapabilityAsCreatorshipAlone(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		createdBy string
+		caller    string
+		want      bool
+	}{
+		{name: "the creator", createdBy: "user-1", caller: "user-1", want: true},
+		{name: "another participant", createdBy: "user-9", caller: "user-1", want: false},
+		{name: "no recorded creator", createdBy: "", caller: "user-1", want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			conversation := groupConversation()
+			conversation.CreatedBy = test.createdBy
+			dms := &fakeDMStore{
+				visibleConversation: conversation,
+				participants:        storage.DMParticipantPage{Participants: participantsOf(2), TotalCount: 2},
+			}
+			input := groupDetailsInput(domain.MaxDMDetailsParticipants)
+			input.CallerID = test.caller
+
+			got, err := service.NewDMService(dms, newFakeMemberStore()).GetGroupDetails(context.Background(), input)
+			if err != nil {
+				t.Fatalf("GetGroupDetails: %v", err)
+			}
+			if got.CanRemoveMembers != test.want {
+				t.Fatalf("CanRemoveMembers = %v, want %v", got.CanRemoveMembers, test.want)
+			}
+			if !got.CanManageMembers {
+				t.Fatal("adding stays open to every participant; only removal is creator-only")
+			}
+		})
+	}
+}

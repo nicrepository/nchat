@@ -17,6 +17,7 @@ import {
   type Message,
 } from "../chatTypes";
 import { safeAvatarUrl } from "../chatApi";
+import { parseMessageLinks } from "../messageLinks";
 import type { WSMessagePayload, WSQuotePayload } from "../useChatWebSocket";
 
 /** A message the server has already withdrawn carries no content to render. */
@@ -40,7 +41,6 @@ function quotedFromPayload(quoted: WSQuotePayload): NonNullable<Message["quoted"
 
 export function messageFromCreatedPayload(payload: WSMessagePayload): Message {
   const removed = payloadIsRemoved(payload);
-  const quoted = payload.quoted;
   return {
     id: payload.id,
     senderId: payload.sender_id,
@@ -76,9 +76,21 @@ export function messageFromCreatedPayload(payload: WSMessagePayload): Message {
     priority: normalizeMessagePriority(payload.priority),
     acknowledgementRequired: payload.acknowledgement_required === true,
     persistentNotifications: payload.persistent_notifications === true,
-    quoted: !removed && quoted ? quotedFromPayload(quoted) : undefined,
-    // Same parser as the HTTP path, so an event and a refetch describe the
-    // same attachment. Withheld for a removed message, like the body.
-    attachments: removed ? undefined : parseMessageAttachments(payload.attachments),
+    ...(removed ? {} : contentFromPayload(payload)),
+  };
+}
+
+/**
+ * What a removed message no longer carries: the quote it answered, its
+ * attachments and its links (issue #807). Same parsers as the HTTP path, so an
+ * event and a refetch describe the same message.
+ */
+function contentFromPayload(
+  payload: WSMessagePayload,
+): Pick<Message, "quoted" | "attachments" | "links"> {
+  return {
+    quoted: payload.quoted ? quotedFromPayload(payload.quoted) : undefined,
+    attachments: parseMessageAttachments(payload.attachments),
+    links: parseMessageLinks(payload.links),
   };
 }

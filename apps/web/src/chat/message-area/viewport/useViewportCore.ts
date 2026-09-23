@@ -24,6 +24,7 @@ import { useCallback, useLayoutEffect, useRef, useState, type RefObject } from "
 import type { Virtualizer } from "@tanstack/react-virtual";
 
 import type { ViewportPhase } from "../../chatViewportState";
+import type { DrivenTarget, NavigationReason } from "./navigation";
 import type { ViewportAnchorPoint } from "./scrollCommands";
 
 /** An in-flight prepend restoration (#675), or null when there is none. */
@@ -33,6 +34,37 @@ export interface PrependRestore {
   passes: number;
   /** Whether the anchor row has been measured at least once. */
   measured: boolean;
+}
+
+/**
+ * A programmatic navigation in flight (#880), or null when the scrollport
+ * belongs to the reader.
+ *
+ * While this is set it is the ONLY thing allowed to write scrollTop: the
+ * tail-lock stands down, the prepend restoration stands down, and the
+ * virtualizer's resize compensation stands down. It ends when its destination
+ * is confirmed, and not when a scroll command happened to return.
+ */
+export interface Navigation {
+  target: DrivenTarget;
+  reason: NavigationReason;
+  /**
+   * Increments on every request. A callback that arrives late compares the
+   * navigation it captured against the current one, which is how a delayed
+   * observer from a conversation the reader has already left moves nothing.
+   */
+  generation: number;
+  /** The conversation this navigation belongs to (`${kind}:${targetId}`). */
+  conversationKey: string;
+  passes: number;
+  /** Where the scrollport was when the previous pass looked. */
+  lastScrollTopPx: number | null;
+  /** How tall the content was then — whether the layout has stopped moving. */
+  lastScrollHeightPx: number | null;
+  /** The position this navigation last wrote, so it can recognise its own. */
+  writtenScrollTopPx: number | null;
+  /** Whether that write was animated, and may still be in flight. */
+  animating: boolean;
 }
 
 /** What a scroll event said, once its geometry was found trustworthy. */
@@ -97,6 +129,17 @@ export interface ViewportCore {
    * cannot be mistaken for the reader moving.
    */
   prependRestoreRef: RefObject<PrependRestore | null>;
+  /**
+   * #880: the programmatic navigation that owns the scrollport, or null.
+   * Outranks the restoration above — an explicit "take me there" is a stronger
+   * intent than putting an old reading position back.
+   */
+  navigationRef: RefObject<Navigation | null>;
+  /**
+   * Whether the bottom sentinel is on screen, as the IntersectionObserver last
+   * reported it. Half of the tail's arrival condition (see tailConfirmed).
+   */
+  tailSentinelVisibleRef: RefObject<boolean>;
   /** Where the reader is, as of the last trustworthy reading. */
   currentAnchorRef: RefObject<ViewportAnchorPoint | null>;
   /** Whether the last scroll could not resolve an anchor (see the handler). */
@@ -133,6 +176,22 @@ export interface ViewportCore {
   markRestoreMeasured: () => void;
   /** Ends `restore`, unless something else already replaced it. */
   endPrependRestore: (restore: PrependRestore) => boolean;
+  /**
+   * #880: takes ownership of the scrollport for a logical destination, and
+   * gives up whatever held it before — a restoration is a weaker intent than
+   * the reader asking to be taken somewhere.
+   */
+  beginNavigation: (target: DrivenTarget, reason: NavigationReason, key: string) => Navigation;
+  /** Begins a pass and returns how many this navigation has now taken. */
+  countNavigationPass: () => number;
+  /** Remembers the geometry this pass saw, so the next one can tell it moved. */
+  noteNavigationPosition: (scrollTopPx: number, scrollHeightPx: number) => void;
+  /** Remembers where this navigation just sent the scrollport, and how. */
+  noteNavigationWrite: (scrollTopPx: number, animated: boolean) => void;
+  /** Ends `navigation`, unless a newer one already replaced it. */
+  endNavigation: (navigation: Navigation) => boolean;
+  /** The bottom sentinel's own report, for the tail's arrival condition. */
+  noteTailSentinel: (visible: boolean) => void;
   /**
    * Puts a message on screen, and says whether it could (#675).
    *
@@ -181,6 +240,9 @@ export function useViewportCore(): ViewportCoreState {
   const lastScrollHeightRef = useRef(0);
   const prevScrollHeightRef = useRef(0);
   const prependRestoreRef = useRef<PrependRestore | null>(null);
+  const navigationRef = useRef<Navigation | null>(null);
+  const navigationGenerationRef = useRef(0);
+  const tailSentinelVisibleRef = useRef(false);
   const currentAnchorRef = useRef<ViewportAnchorPoint | null>(null);
   const anchorStaleRef = useRef(false);
 
@@ -258,6 +320,62 @@ export function useViewportCore(): ViewportCoreState {
     return true;
   }, []);
 
+  const beginNavigation = useCallback(
+    (target: DrivenTarget, reason: NavigationReason, key: string) => {
+      // The handoff #880 item 16 asks for, stated where ownership changes
+      // hands: a restoration in flight is abandoned rather than left armed to
+      // pull the reader back to a position they have just said they are done
+      // with.
+      prependRestoreRef.current = null;
+      navigationGenerationRef.current += 1;
+      const navigation: Navigation = {
+        target,
+        reason,
+        generation: navigationGenerationRef.current,
+        conversationKey: key,
+        passes: 0,
+        lastScrollTopPx: null,
+        lastScrollHeightPx: null,
+        writtenScrollTopPx: null,
+        animating: false,
+      };
+      navigationRef.current = navigation;
+      return navigation;
+    },
+    [],
+  );
+
+  const countNavigationPass = useCallback(() => {
+    const navigation = navigationRef.current;
+    if (!navigation) return 0;
+    navigation.passes += 1;
+    return navigation.passes;
+  }, []);
+
+  const noteNavigationPosition = useCallback((scrollTopPx: number, scrollHeightPx: number) => {
+    const navigation = navigationRef.current;
+    if (!navigation) return;
+    navigation.lastScrollTopPx = scrollTopPx;
+    navigation.lastScrollHeightPx = scrollHeightPx;
+  }, []);
+
+  const noteNavigationWrite = useCallback((scrollTopPx: number, animated: boolean) => {
+    const navigation = navigationRef.current;
+    if (!navigation) return;
+    navigation.writtenScrollTopPx = scrollTopPx;
+    navigation.animating = animated;
+  }, []);
+
+  const endNavigation = useCallback((navigation: Navigation) => {
+    if (navigationRef.current !== navigation) return false;
+    navigationRef.current = null;
+    return true;
+  }, []);
+
+  const noteTailSentinel = useCallback((visible: boolean) => {
+    tailSentinelVisibleRef.current = visible;
+  }, []);
+
   const scrollToMessage = useCallback((messageId: string) => {
     const el = messageRefs.current.get(messageId);
     if (el) {
@@ -294,6 +412,8 @@ export function useViewportCore(): ViewportCoreState {
     lastScrollHeightRef,
     prevScrollHeightRef,
     prependRestoreRef,
+    navigationRef,
+    tailSentinelVisibleRef,
     currentAnchorRef,
     anchorStaleRef,
     attachList,
@@ -309,6 +429,12 @@ export function useViewportCore(): ViewportCoreState {
     countRestorePass,
     markRestoreMeasured,
     endPrependRestore,
+    beginNavigation,
+    countNavigationPass,
+    noteNavigationPosition,
+    noteNavigationWrite,
+    endNavigation,
+    noteTailSentinel,
     scrollToMessage,
     hasRow,
   }));

@@ -1,0 +1,22 @@
+# Advisories the Go vulnerability gate accepts, and only for as long as the
+# reason below holds. Mirrors .trivyignore.yaml: an exception states why it is
+# safe, and expires so it is revisited rather than inherited.
+#
+# Scope is one advisory id per entry. There is no wildcard and no "ignore
+# everything from this module": an id that is not listed here fails the gate,
+# and so does a listed id past its expired_at.
+vulnerabilities:
+  - id: GO-2026-6452
+    module: github.com/xuri/excelize/v2
+    statement: >-
+      Panic via negative shared-string index, reachable from the file-service
+      XLSX preview path (renderXLSX -> excelize Rows.Columns). The advisory has
+      no fixed version — its affected range is introduced:0 with no fix event —
+      so no upgrade resolves it. Reachable impact is contained in
+      PreviewService.render, which recovers a renderer panic and states it as
+      preview.ErrRender: the attachment's own preview job fails permanently and
+      the file-service process stays up, instead of one malformed upload taking
+      the pod down for every tenant. The upstream vulnerability itself remains.
+      Remove this entry once excelize ships a fixed version and it is deployed.
+    tracking: https://github.com/nicrepository/nchat/issues/925
+    expired_at: 2026-12-17

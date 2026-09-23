@@ -6,6 +6,9 @@ metadata:
 data:
   LIVEKIT_ENABLED: "true"
   APP_ENV: nchat-dev
+  # #870: Web Push v2 preview rollout validated in nchat-dev.
+  # Explicit environment decision; the application default remains false.
+  NOTIFICATION_PUSH_PREVIEW_ENABLED: "true"
   AUTH_PUBLIC_WEB_BASE_URL: REPLACE_ME_PUBLIC_URL
   AUTH_TRUSTED_PROXY_CIDRS: 10.42.0.0/16
   VALKEY_WS_BROADCAST_ENABLED: "true"
@@ -58,6 +61,14 @@ data:
   # refuse to start rather than accept links nobody checked.
   CHAT_LINK_SAFETY_ENABLED: "false"
   FILE_LINK_SAFETY_ENABLED: "false"
+  # Issue #807 rich previews: chat-service fetching a cleared URL's Open Graph
+  # metadata and image itself. Off in every overlay until the rollout phase
+  # that turns it on, and stated explicitly so the environment cannot drift to
+  # the application default. Turning it on is an egress decision as much as a
+  # feature one — the fetcher needs TCP/80 and TCP/443 to the public internet
+  # from chat-service, which the link-safety egress policy grants only on 443.
+  # Off, links cleared as safe stay clickable; only the card is absent.
+  CHAT_LINK_PREVIEW_ENABLED: "false"
   # RF-21 capacity. Stated explicitly per environment rather than left to the
   # application default, because the right numbers depend on the Cloudflare plan
   # this cluster is billed under and no code may assume one.

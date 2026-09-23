@@ -1,0 +1,136 @@
+/*
+ * LinkInterstitialDialog styles (issue #807).
+ *
+ * The same modal language as the other conversation dialogs, under its own
+ * prefix. Nothing here reads as "safe": the accent is the neutral primary, the
+ * heading carries a warning glyph, and the destination host is the largest
+ * text in the box because it is the one thing the reader must judge.
+ */
+
+.link-interstitial__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 420;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(16, 42, 51, 0.58);
+  backdrop-filter: blur(3px);
+}
+
+.link-interstitial {
+  width: min(460px, 100%);
+  padding: 22px 24px 20px;
+  border: 1px solid var(--color-border, #dbe7eb);
+  border-radius: var(--radius-xl, 12px);
+  background: var(--color-surface, #fff);
+  box-shadow: var(--shadow-lg, 0 18px 48px rgba(16, 42, 51, 0.12));
+  color: var(--color-ink, #102a33);
+}
+
+.link-interstitial__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  font-size: 17px;
+  line-height: 1.3;
+}
+
+.link-interstitial__title .material-symbols-outlined {
+  font-size: 22px;
+  color: var(--color-muted, #5c7380);
+}
+
+.link-interstitial__host {
+  margin: 0 0 8px;
+  font-size: 20px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.link-interstitial__description {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--color-muted, #5c7380);
+}
+
+.link-interstitial__url {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border-radius: var(--radius-md, 6px);
+  background: var(--color-surface-2, #f8fbfc);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-ink-2, #264653);
+  overflow-wrap: anywhere;
+}
+
+.link-interstitial__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.link-interstitial__cancel,
+.link-interstitial__open,
+.link-interstitial__recheck {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 16px;
+  font: inherit;
+  font-weight: 600;
+  border-radius: var(--radius-lg, 8px);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.link-interstitial__recheck {
+  margin-right: auto;
+  border: 0;
+  background: none;
+  color: var(--color-primary, #0e7490);
+  text-decoration: underline;
+}
+
+.link-interstitial__recheck:disabled {
+  color: var(--color-muted, #5c7380);
+  text-decoration: none;
+  cursor: default;
+}
+
+.link-interstitial__cancel {
+  border: 1px solid var(--color-border, #dbe7eb);
+  background: var(--color-surface, #fff);
+  color: var(--color-ink, #102a33);
+}
+
+.link-interstitial__open {
+  border: 1px solid var(--color-border-strong, #b8cdd5);
+  background: var(--color-surface-2, #f8fbfc);
+  color: var(--color-ink, #102a33);
+}
+
+.link-interstitial__cancel:focus-visible,
+.link-interstitial__open:focus-visible,
+.link-interstitial__recheck:focus-visible {
+  outline: 2px solid var(--color-primary, #0e7490);
+  outline-offset: 2px;
+}
+
+@media (max-width: 480px) {
+  .link-interstitial__actions {
+    flex-direction: column-reverse;
+    align-items: stretch;
+  }
+
+  .link-interstitial__recheck {
+    margin-right: 0;
+    justify-content: center;
+  }
+}

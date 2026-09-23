@@ -104,20 +104,34 @@ DIGEST_ARTIFACT = {
 MUTABLE_TAGS = ("latest", "main", "master", "prod", "stable")
 
 BUILDER_REFERENCE = "./.github/workflows/build-nchat-images.yml"
-DEPLOY_REFERENCE = "./.github/workflows/deploy-nchat-dev.yml"
-CALLER_BUILD_WITH = {
-    "sha": "${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}",
-    "require_main": "${{ github.event_name == 'workflow_dispatch' }}",
+# The caller -- images.yml -- became a reusable unit with issue #933. It used
+# to be triggered by a push to develop, which meant it built in parallel with
+# the CI of the same commit and could deploy one CI then failed. Eligibility
+# now belongs to the CD workflows, which call this after `CI / Required` has
+# passed, so the caller must carry no trigger of its own at all.
+#
+# Everything it may contain is written out: two jobs, one `workflow_call`
+# trigger, two inputs. A deploy job reappearing here, or a `push:` trigger,
+# would restore exactly the race #933 removed, and is refused by name.
+CALLER_TRIGGERS = {"workflow_call"}
+CALLER_JOBS = {"build", "release-manifest"}
+CALLER_FORBIDDEN_JOBS = ("deploy",)
+CALLER_CALL_INPUTS = {
+    "sha": {"required": True, "type": "string"},
+    "require_main": {"required": False, "type": "boolean", "default": False},
 }
-CALLER_DEPLOY_WITH = {"sha": "${{ github.sha }}"}
+CALLER_SHA_OUTPUT = "${{ jobs.build.outputs.sha }}"
+# Passed straight through. A caller that rewrote either value would be a second
+# place deciding what production builds.
+CALLER_BUILD_WITH = {
+    "sha": "${{ inputs.sha }}",
+    "require_main": "${{ inputs.require_main }}",
+}
 MANIFEST_JOB = "release-manifest"
-# Both consumers of a build hang off the build alone: neither may wait for the
-# other, or a manifest that cannot be written would stop a development deploy.
+# The manifest hangs off the build alone.
 CONSUMER_NEEDS = {"build"}
 MANIFEST_SHA = "${{ needs.build.outputs.sha }}"
 MANIFEST_GENERATOR = "scripts/deploy/nchat-prod/release-manifest.sh"
-CALLER_DEPLOY_IF = "github.event_name == 'push' && github.ref == 'refs/heads/develop'"
-CALLER_PUSH_BRANCHES = ["develop"]
 
 
 def load(path):
@@ -397,21 +411,21 @@ def check_inventory_file(path):
 
 
 def check_caller(caller):
-    """develop keeps its build and its deploy; a dispatch asks for the proof."""
+    """The release build is a reusable unit: build once, seal once, no trigger."""
     jobs = caller.get("jobs") or {}
     build = jobs.get("build") or {}
-    deploy = jobs.get("deploy") or {}
     problems = []
     if build.get("uses") != BUILDER_REFERENCE:
         problems.append(f"the caller build job must use {BUILDER_REFERENCE}")
     problems += compare("caller build with", build.get("with", {}), CALLER_BUILD_WITH)
-    if deploy.get("uses") != DEPLOY_REFERENCE:
-        problems.append(f"the caller deploy job must use {DEPLOY_REFERENCE}")
-    if deploy.get("needs") not in ("build", ["build"]):
-        problems.append("the caller deploy job must depend on build")
-    if str(deploy.get("if", "")) != CALLER_DEPLOY_IF:
-        problems.append(f"the caller deploy job must be guarded by {CALLER_DEPLOY_IF!r}")
-    problems += compare("caller deploy with", deploy.get("with", {}), CALLER_DEPLOY_WITH)
+    if set(jobs) != CALLER_JOBS:
+        problems.append(f"the caller must contain exactly the jobs {sorted(CALLER_JOBS)}")
+    for forbidden in CALLER_FORBIDDEN_JOBS:
+        if forbidden in jobs:
+            problems.append(
+                f"the caller must not contain a {forbidden!r} job: delivery is the CD"
+                " workflows' decision, taken after CI / Required"
+            )
     return problems + check_release_dag(jobs) + check_caller_triggers(caller)
 
 
@@ -422,14 +436,13 @@ def needs_of(job):
 
 
 def check_release_dag(jobs):
-    """Manifest and deploy are siblings of the build, never of each other."""
+    """The manifest is sealed from the build, and from nothing else."""
     manifest = jobs.get(MANIFEST_JOB) or {}
     problems = []
     if not manifest:
         return [f"the caller must seal the release in a {MANIFEST_JOB} job"]
-    for name in (MANIFEST_JOB, "deploy"):
-        if needs_of(jobs.get(name) or {}) != CONSUMER_NEEDS:
-            problems.append(f"{name} must depend on exactly {sorted(CONSUMER_NEEDS)}")
+    if needs_of(manifest) != CONSUMER_NEEDS:
+        problems.append(f"{MANIFEST_JOB} must depend on exactly {sorted(CONSUMER_NEEDS)}")
     return problems + check_manifest_identity(manifest.get("steps", []))
 
 
@@ -445,19 +458,40 @@ def check_manifest_identity(steps):
 
 
 def check_caller_triggers(caller):
+    """No trigger of its own: a build starts only when a CD workflow calls it."""
     triggers = caller.get(True) or caller.get("on") or {}
+    if set(triggers) != CALLER_TRIGGERS:
+        return [
+            f"the caller must be triggered by exactly {sorted(CALLER_TRIGGERS)}; a trigger"
+            " of its own would build in parallel with the CI of the same commit"
+        ]
+    return check_call_inputs(triggers) + check_call_output(triggers)
+
+
+def check_call_inputs(triggers):
+    """The two values a caller may choose, and their gate-bearing shapes."""
+    declared = (triggers.get("workflow_call") or {}).get("inputs") or {}
     problems = []
-    if (triggers.get("push") or {}).get("branches") != CALLER_PUSH_BRANCHES:
-        problems.append(f"the caller must build pushes to exactly {CALLER_PUSH_BRANCHES}")
-    return problems + check_dispatch_input(triggers)
+    if set(declared) != set(CALLER_CALL_INPUTS):
+        problems.append(
+            f"the release build must take exactly the inputs {sorted(CALLER_CALL_INPUTS)}"
+        )
+    for name, contract in CALLER_CALL_INPUTS.items():
+        spec = declared.get(name) or {}
+        problems += [
+            f"input {name}.{key} is {spec.get(key)!r}, expected {want!r}"
+            for key, want in contract.items()
+            if spec.get(key) != want
+        ]
+    return problems
 
 
-def check_dispatch_input(triggers):
-    """A production build is asked for by SHA, never by whatever ref dispatched it."""
-    dispatch = triggers.get("workflow_dispatch") or {}
-    sha = (dispatch.get("inputs") or {}).get("sha") or {}
-    if sha.get("required") is not True or sha.get("type") != "string":
-        return ["the dispatch trigger must take a required string sha"]
+def check_call_output(triggers):
+    """The commit the images were built from, reported from the job that proved it."""
+    outputs = (triggers.get("workflow_call") or {}).get("outputs") or {}
+    value = (outputs.get("sha") or {}).get("value")
+    if value != CALLER_SHA_OUTPUT:
+        return [f"the release build must output sha={CALLER_SHA_OUTPUT!r}, got {value!r}"]
     return []
 
 

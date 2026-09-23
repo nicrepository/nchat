@@ -806,6 +806,43 @@ current_slot_workloads() {
     -l "$NCHAT_PROD_SLOT_LABEL=$slot" -o "jsonpath=$template" 2>/dev/null
 }
 
+# --- time and duration, shared by the evidence and lifecycle contracts ------
+
+# One RFC3339 UTC instant as seconds since the epoch, or failure.
+#
+# The format is pinned rather than handed to `date` as-is: `date -d` accepts
+# "yesterday", "now" and a bare integer, and every one of those would make a
+# record that carries no real instant look like one that does.
+instant_to_epoch() {
+  local stamp="$1"
+  [[ "$stamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
+  date -u -d "$stamp" +%s 2>/dev/null
+}
+
+# A duration setting, refused unless it is a plain non-negative decimal.
+#
+# It reaches an arithmetic context, and bash resolves a bare word there as a
+# variable name: a value of `oops` ended the run with "oops: unbound variable",
+# and "1+1" would have been evaluated as an expression. A misconfigured limit is
+# an ordinary operator mistake and has to be reported as one.
+#
+# 10# forces base ten, so 000900 is nine hundred seconds rather than an octal
+# reading of the same digits.
+#
+# The digit cap is the second half of the same problem. "Decimal" was not enough:
+# bash arithmetic is signed 64-bit and wraps silently, so 9999999999999999999
+# became -8446744073709551617 and 18446744073709551616 became 0 -- a limit of
+# zero, which quietly refuses everything, and a negative one, which quietly
+# accepts everything for the wrong reason. Eighteen digits keeps every accepted
+# value comfortably inside the range, and is checked as text precisely because
+# measuring it with arithmetic would be the bug itself.
+bounded_seconds() {
+  local name="$1" value="$2"
+  [[ "$value" =~ ^[0-9]{1,18}$ ]] ||
+    { echo "invalid $name: expected a non-negative decimal integer of at most 18 digits, got '$value'" >&2; return 1; }
+  printf '%s' "$((10#$value))"
+}
+
 # --- cluster-wide capacity evidence -------------------------------------
 #
 # The three collectors above read Nodes and Pods across every namespace. The
@@ -873,39 +910,17 @@ capacity_evidence_files_present() {
   done
 }
 
-# The freshness limit, refused unless it is a plain non-negative decimal.
-#
-# It reaches an arithmetic context, and bash resolves a bare word there as a
-# variable name: NCHAT_PROD_CAPACITY_EVIDENCE_MAX_AGE_SECONDS=oops ended the run
-# with "oops: unbound variable", and "1+1" would have been evaluated as an
-# expression. A misconfigured limit is an ordinary operator mistake and has to
-# be reported as one.
-#
-# 10# forces base ten, so 000900 is nine hundred seconds rather than an octal
-# reading of the same digits.
-#
-# The digit cap is the second half of the same problem. "Decimal" was not enough:
-# bash arithmetic is signed 64-bit and wraps silently, so 9999999999999999999
-# became -8446744073709551617 and 18446744073709551616 became 0 -- a limit of
-# zero, which quietly refuses every snapshot, and a negative one, which quietly
-# accepts none of them for the right reason. Eighteen digits keeps every accepted
-# value below 10^18, comfortably inside the range, and is checked as text
-# precisely because measuring it with arithmetic would be the bug itself. Nobody
-# needs a freshness window longer than the age of the universe.
+# The freshness limit, validated by the shared duration rule.
 capacity_evidence_max_age() {
-  local value="$NCHAT_PROD_CAPACITY_EVIDENCE_MAX_AGE_SECONDS"
-  [[ "$value" =~ ^[0-9]{1,18}$ ]] ||
-    { echo "invalid NCHAT_PROD_CAPACITY_EVIDENCE_MAX_AGE_SECONDS: expected a non-negative decimal integer of at most 18 digits, got '$value'" >&2; return 1; }
-  printf '%s' "$((10#$value))"
+  bounded_seconds NCHAT_PROD_CAPACITY_EVIDENCE_MAX_AGE_SECONDS \
+    "$NCHAT_PROD_CAPACITY_EVIDENCE_MAX_AGE_SECONDS"
 }
 
 capacity_evidence_is_fresh() {
   local stamp="$1" collected now age limit
   limit="$(capacity_evidence_max_age)" || return 1
-  [[ "$stamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
+  collected="$(instant_to_epoch "$stamp")" ||
     { echo "capacity evidence has no usable collected_at timestamp: '$stamp'" >&2; return 1; }
-  collected="$(date -u -d "$stamp" +%s 2>/dev/null)" ||
-    { echo "capacity evidence collected_at is not a real instant: '$stamp'" >&2; return 1; }
   now="$(date -u +%s)"
   age=$((now - collected))
   # A stamp in the future is refused too, with a minute of clock skew allowed:

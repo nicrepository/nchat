@@ -1218,7 +1218,7 @@ func TestMessageHandler_SearchMentions_RejectsInvalidOrUnauthenticatedRequests(t
 
 func TestMessageHandler_SearchMentions_ReturnsAuthorizedCandidates(t *testing.T) {
 	mentions := &fakeMentionProvider{out: service.SearchMentionsOutput{
-		Users:    []domain.MentionCandidate{{Type: domain.MentionTypeUser, ID: msgTestUserID, Label: "Alice"}},
+		Users:    []domain.MentionCandidate{{Type: domain.MentionTypeUser, ID: msgTestUserID, Label: "Alice", WillBeAdded: true}},
 		Channels: []domain.MentionCandidate{{Type: domain.MentionTypeChannel, ID: testChannelID, Label: "geral"}},
 	}}
 	h := httpapi.NewMessageHandler(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{}, mentions)
@@ -1237,6 +1237,10 @@ func TestMessageHandler_SearchMentions_ReturnsAuthorizedCandidates(t *testing.T)
 	body := decodeBody(t, rec)["data"].(map[string]any)
 	if len(body["users"].([]any)) != 1 || len(body["channels"].([]any)) != 1 {
 		t.Fatalf("unexpected candidates: %v", body)
+	}
+	user := body["users"].([]any)[0].(map[string]any)
+	if user["will_be_added"] != true {
+		t.Fatalf("outside member marker = %v, want true", user["will_be_added"])
 	}
 }
 
@@ -1834,6 +1838,7 @@ func TestMessageHandler_CreateDMMessage_Success(t *testing.T) {
 	dmMsg := testMessage()
 	dmMsg.ChannelID = ""
 	dmMsg.DMConversationID = testConversationID
+	dmMsg.CreatedConversationEventID = "event-member-added"
 	msgs := &fakeMessageProvider{createDMMsg: dmMsg}
 	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
 	rec := httptest.NewRecorder()
@@ -1843,6 +1848,17 @@ func TestMessageHandler_CreateDMMessage_Success(t *testing.T) {
 	h.CreateDMMessage(rec, r)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d — body: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Data struct {
+			CreatedConversationEventID string `json:"created_conversation_event_id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.Data.CreatedConversationEventID != dmMsg.CreatedConversationEventID {
+		t.Fatalf("expected created event id %q, got %q", dmMsg.CreatedConversationEventID, body.Data.CreatedConversationEventID)
 	}
 }
 

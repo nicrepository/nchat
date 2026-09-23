@@ -7,10 +7,32 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
-// CanManageChannelMembers is the named seam for issue #398. The assertion that
-// matters is not that it returns true for owners, but that it returns false for
-// a plain member and a guest: a channel member who could add others would make
-// a private channel's audience grow without a manager ever deciding to.
+func TestCanAddChannelMembers(t *testing.T) {
+	tests := map[string]struct {
+		member *domain.WorkspaceMember
+		want   bool
+	}{
+		"active owner":     {&domain.WorkspaceMember{Role: domain.WorkspaceRoleOwner, Status: domain.MemberStatusActive}, true},
+		"active admin":     {&domain.WorkspaceMember{Role: domain.WorkspaceRoleAdmin, Status: domain.MemberStatusActive}, true},
+		"active moderator": {&domain.WorkspaceMember{Role: domain.WorkspaceRoleModerator, Status: domain.MemberStatusActive}, true},
+		"active member":    {&domain.WorkspaceMember{Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusActive}, true},
+		"active guest":     {&domain.WorkspaceMember{Role: domain.WorkspaceRoleGuest, Status: domain.MemberStatusActive}, false},
+		"suspended member": {&domain.WorkspaceMember{Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusSuspended}, false},
+		"left owner":       {&domain.WorkspaceMember{Role: domain.WorkspaceRoleOwner, Status: domain.MemberStatusLeft}, false},
+		"unknown role":     {&domain.WorkspaceMember{Role: domain.WorkspaceRole("wizard"), Status: domain.MemberStatusActive}, false},
+		"no membership":    {nil, false},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := domain.CanAddChannelMembers(test.member); got != test.want {
+				t.Fatalf("CanAddChannelMembers = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+// Issue #705 deliberately leaves this administrative/removal capability
+// unchanged while addition moves to CanAddChannelMembers.
 func TestCanManageChannelMembers(t *testing.T) {
 	tests := map[string]struct {
 		member *domain.WorkspaceMember
@@ -51,12 +73,9 @@ func TestCanManageChannelMembers(t *testing.T) {
 	}
 }
 
-// The predicate must stay identical to CanManageWorkspace rather than becoming a
-// second, independently-edited copy of the same rule. If a future change widens
-// one, this fails and forces the divergence to be deliberate.
-func TestCanManageChannelMembersMatchesWorkspaceManagement(t *testing.T) {
+func TestCanManageChannelMembersMatchesWorkspaceModeration(t *testing.T) {
 	roles := []domain.WorkspaceRole{
-		domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin,
+		domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin, domain.WorkspaceRoleModerator,
 		domain.WorkspaceRoleMember, domain.WorkspaceRoleGuest,
 	}
 	statuses := []domain.MemberStatus{
@@ -65,7 +84,7 @@ func TestCanManageChannelMembersMatchesWorkspaceManagement(t *testing.T) {
 	for _, role := range roles {
 		for _, status := range statuses {
 			member := &domain.WorkspaceMember{Role: role, Status: status}
-			if domain.CanManageChannelMembers(member) != domain.CanManageWorkspace(member) {
+			if domain.CanManageChannelMembers(member) != domain.CanModerateWorkspace(member) {
 				t.Fatalf("divergence for role=%s status=%s", role, status)
 			}
 		}

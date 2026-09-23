@@ -12,9 +12,11 @@ import { describe, expect, it } from "vitest";
 
 import { MAX_BOUNDARY_SEARCH_PAGES } from "../../chatViewportState";
 import type { Message } from "../../chatTypes";
+import { NAVIGATION_PRIORITY } from "./navigation";
 import {
   decideOpenPositionResolution,
   resolveOpenPosition,
+  targetFor,
   type OpenPositionInput,
   type ResolutionInput,
 } from "./openPosition";
@@ -146,6 +148,49 @@ describe("resolveOpenPosition", () => {
  * position — the guard that stops a bounded search from asking twice for the
  * same page included, which is what issue #834's review asked to see proved.
  */
+/**
+ * #880 item 14: the priority is a list, and this is the only place that
+ * applies it. Rather than restate the order, each case removes the strongest
+ * intent available and asserts the next one down wins — so the day the list
+ * changes, this is what says so.
+ */
+describe("the navigation priority, end to end", () => {
+  const everything = input({
+    focusMessageId: "m2",
+    initialAnchor: anchorAt("m1"),
+    unreadCountAtOpen: 2,
+  });
+
+  /** The winning destination, for an input that always settles on one. */
+  function targetOf(candidate: OpenPositionInput) {
+    const position = resolveOpenPosition(candidate);
+    if (position.kind === "need-more-history") throw new Error("expected a settled position");
+    return targetFor(position);
+  }
+
+  it("walks down the list as each stronger intent is taken away", () => {
+    const withoutDeepLink = { ...everything, focusMessageId: undefined };
+    const withoutAnchor = { ...withoutDeepLink, initialAnchor: null };
+    const withoutUnread = { ...withoutAnchor, unreadCountAtOpen: 0 };
+
+    expect([
+      targetOf(everything),
+      targetOf(withoutDeepLink),
+      targetOf(withoutAnchor),
+      targetOf(withoutUnread),
+    ]).toEqual([...NAVIGATION_PRIORITY]);
+  });
+
+  it("names the winning destination on the settled resolution", () => {
+    const decision = decideOpenPositionResolution({
+      ...everything,
+      resolved: false,
+      searchedForLength: -1,
+    });
+    expect(decision).toMatchObject({ kind: "settle", target: "MESSAGE_TARGET" });
+  });
+});
+
 describe("decideOpenPositionResolution", () => {
   function resolutionInput(overrides: Partial<ResolutionInput> = {}): ResolutionInput {
     return { ...input(), resolved: false, searchedForLength: -1, ...overrides };
@@ -163,12 +208,13 @@ describe("decideOpenPositionResolution", () => {
     });
   });
 
-  it("settles at the bottom, in AT_BOTTOM, with no unread", () => {
+  it("settles on the tail with no unread, leaving AT_BOTTOM to the confirmed arrival", () => {
     expect(decideOpenPositionResolution(resolutionInput())).toEqual({
       kind: "settle",
       firstUnreadMessageId: null,
+      target: "TAIL",
       scrollTarget: { messageId: null },
-      phase: "AT_BOTTOM",
+      phase: "RESTORING_POSITION",
     });
   });
 
@@ -176,6 +222,7 @@ describe("decideOpenPositionResolution", () => {
     expect(decideOpenPositionResolution(resolutionInput({ unreadCountAtOpen: 2 }))).toEqual({
       kind: "settle",
       firstUnreadMessageId: "m2",
+      target: "FIRST_UNREAD",
       scrollTarget: { messageId: "m2" },
       phase: "AT_FIRST_UNREAD",
     });
@@ -187,6 +234,7 @@ describe("decideOpenPositionResolution", () => {
     ).toEqual({
       kind: "settle",
       firstUnreadMessageId: null,
+      target: "RESTORED_ANCHOR",
       scrollTarget: { messageId: "m2" },
       phase: "READING_HISTORY",
     });
@@ -196,6 +244,7 @@ describe("decideOpenPositionResolution", () => {
     expect(decideOpenPositionResolution(resolutionInput({ focusMessageId: "m2" }))).toEqual({
       kind: "settle",
       firstUnreadMessageId: null,
+      target: "MESSAGE_TARGET",
       scrollTarget: undefined,
       phase: "READING_HISTORY",
     });
@@ -220,6 +269,7 @@ describe("decideOpenPositionResolution", () => {
     expect(after).toEqual({
       kind: "settle",
       firstUnreadMessageId: null,
+      target: "RESTORED_ANCHOR",
       scrollTarget: { messageId: "m0" },
       phase: "READING_HISTORY",
     });
@@ -251,8 +301,9 @@ describe("decideOpenPositionResolution", () => {
     expect(decision).toEqual({
       kind: "settle",
       firstUnreadMessageId: null,
+      target: "TAIL",
       scrollTarget: { messageId: null },
-      phase: "AT_BOTTOM",
+      phase: "RESTORING_POSITION",
     });
   });
 });

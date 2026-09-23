@@ -8,7 +8,7 @@
 
 import AudioPlayer from "./AudioPlayer";
 import { formatTime } from "./audioTimeFormat";
-import type { VoiceRecorderControls } from "./useVoiceRecorder";
+import type { VoiceRecorderControls, VoiceRecorderPhase } from "./useVoiceRecorder";
 
 function Icon({ name }: { name: string }) {
   return (
@@ -18,8 +18,26 @@ function Icon({ name }: { name: string }) {
   );
 }
 
-export default function VoiceRecorderPanel({ recorder }: { recorder: VoiceRecorderControls }) {
-  const { phase, elapsedMs, previewUrl, error, uploadProgress } = recorder;
+/**
+ * The phase the panel draws. A recording under review whose send is still
+ * open in a previous instance of the composer (issue #929) — the composer
+ * was remounted mid-send — is shown exactly as the instance that sent it
+ * shows it: going out, not sendable again.
+ */
+function displayedPhase(phase: VoiceRecorderPhase, sendPending: boolean | undefined) {
+  return phase === "reviewing" && sendPending ? "uploading" : phase;
+}
+
+export default function VoiceRecorderPanel({
+  recorder,
+  sendPending,
+}: {
+  recorder: VoiceRecorderControls;
+  /** A send of the recording under review is still open elsewhere — see displayedPhase. */
+  sendPending?: boolean;
+}) {
+  const { elapsedMs, previewUrl, error, uploadProgress } = recorder;
+  const phase = displayedPhase(recorder.phase, sendPending);
 
   if (phase === "idle") return null;
 

@@ -1,26 +1,26 @@
 name: Governance
 
+# Owner of repository governance. Called by ci.yml, which runs on pull_request
+# and push: the `github` context a called workflow sees is the caller's, so the
+# pull request payload the Git conventions check reads is unchanged. The trust
+# model is unchanged too -- `contents: read`, never pull_request_target.
 on:
-  pull_request:
-    branches:
-      - main
-      - develop
-  push:
-    branches:
-      - develop
-      - main
+  workflow_call:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# `github.workflow` resolves to the CALLER's name inside a called workflow, so an
+# inherited group would collide with ci.yml's own and this run would cancel the
+# very run that started it. The group is a literal for that reason.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: nchat-governance-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
   governance:
-    name: Repository governance
+    name: Repository
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

@@ -52,6 +52,15 @@ type messageUpdatedPublisher interface {
 	PublishMessageUpdated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message)
 }
 
+type conversationEventPublisher interface {
+	PublishConversationEvent(ctx context.Context, workspaceID, targetType, targetID, messageID string)
+}
+
+type membershipEventPublisher interface {
+	PublishMembersAdded(ctx context.Context, workspaceID, targetType, targetID, actorUserID string, addedCount, memberCount int)
+	PublishConversationAvailable(ctx context.Context, workspaceID, targetType, targetID string, userIDs []string)
+}
+
 // acknowledgementUpdatedPublisher announces that one message's acknowledgement
 // changed (issue #824). Optional, like messageUpdatedPublisher: a publisher
 // that does not implement it simply announces nothing, and clients reconcile on
@@ -117,6 +126,10 @@ type MessageSecuritySnapshot struct {
 	LinkSafetyState domain.MessageLinkSafety
 	UpdatedAt       time.Time
 	Quoted          *QuotedMessageSecuritySnapshot
+	// Links is the per-link state (issue #807). Bodies still never leave this
+	// endpoint: a condemned link arrives with no text and no URL, and the client
+	// re-reads the message to obtain its redacted body.
+	Links []domain.MessageLink
 }
 
 type QuotedMessageSecuritySnapshot struct {
@@ -176,7 +189,46 @@ func (s *MessageService) MessageSecuritySnapshots(
 		}
 		result = append(result, snapshot)
 	}
-	return result, nil
+	return result, s.attachSnapshotLinks(ctx, workspaceID, result)
+}
+
+// attachSnapshotLinks hydrates the per-link state of the available, published
+// snapshots (issue #807), through the same funnel the message reads use.
+func (s *MessageService) attachSnapshotLinks(ctx context.Context, workspaceID string, snapshots []MessageSecuritySnapshot) error {
+	ids := publishedSnapshotIDs(snapshots)
+	if s.linkEntities == nil || len(ids) == 0 {
+		return nil
+	}
+	bodies, err := s.linkEntities.LoadMessageBodies(ctx, ids)
+	if err != nil {
+		return fmt.Errorf("load bodies for security snapshots: %w", err)
+	}
+	messages := make([]domain.Message, 0, len(ids))
+	for _, id := range ids {
+		messages = append(messages, domain.Message{ID: id, Kind: domain.MessageKindUser, BodyText: bodies[id]})
+	}
+	if err := s.hydrateMessageLinks(ctx, workspaceID, messages); err != nil {
+		return err
+	}
+	links := make(map[string][]domain.MessageLink, len(messages))
+	for _, message := range messages {
+		links[message.ID] = message.Links
+	}
+	for i := range snapshots {
+		snapshots[i].Links = links[snapshots[i].MessageID]
+	}
+	return nil
+}
+
+// publishedSnapshotIDs lists the snapshots whose body a reader may see.
+func publishedSnapshotIDs(snapshots []MessageSecuritySnapshot) []string {
+	var ids []string
+	for _, snapshot := range snapshots {
+		if snapshot.Available && snapshot.Status == domain.MessageStatusActive {
+			ids = append(ids, snapshot.MessageID)
+		}
+	}
+	return ids
 }
 
 // MessageLinkSafetyStates reports the authoritative state of the caller's own
@@ -285,10 +337,6 @@ type ForwardChannelMessageInput struct {
 type ForwardChannelMessageOutput struct {
 	Message  domain.Message
 	Replayed bool
-	// Pending is true when the forwarded snapshot carries a link with no verdict
-	// yet (RF-21). The message exists and the caller may report it, but nobody
-	// else has been shown it.
-	Pending bool
 }
 
 // ListChannelMessagesInput identifies the channel and caller for a message list.
@@ -392,6 +440,11 @@ type MessageService struct {
 	// linkSafety is the RF-21 gate. Nil means the deployment did not enable the
 	// check and every path behaves exactly as it did before it existed.
 	linkSafety URLSafetyChecker
+	// linkEntities is the per-link read model (issue #807): targets, previews
+	// and the bodies the projection withheld. Nil means links are not hydrated.
+	linkEntities LinkEntityStore
+	// linkPreviewEnabled gates whether stored previews are served at all.
+	linkPreviewEnabled bool
 	// linkScanCapacity is what a workspace, and the deployment, may spend on new
 	// provider work. Zero values disable the corresponding ceiling.
 	linkScanCapacity storage.LinkScanCapacity
@@ -506,19 +559,23 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 	if err != nil || replayed {
 		return existing, err
 	}
-	// RF-21 is asynchronous, so this yields one of three outcomes: publish now,
-	// withhold, or refuse. Only the refusal returns here.
-	links, err := s.classifyBodyLinks(ctx, workspaceID, body)
-	if err != nil {
-		return domain.Message{}, err
-	}
-
 	mentions, err := s.resolveOutgoingMentions(ctx, workspaceID, channelID, "", false, senderID, body, bodyFormat)
 	if err != nil {
 		return domain.Message{}, err
 	}
-	body = mentions.Body
+	// persistedBody is the one representation from here on: mentions have been
+	// resolved and rewritten, and this exact text is what is classified,
+	// fingerprinted and stored, so the link occurrences the store associates
+	// are the ones every later read re-derives from the body it finds. A label
+	// the client typed inside a mention never becomes a target.
+	persistedBody := mentions.Body
 	mentionedUserIDs, mentionedChannelIDs := mentions.UserIDs, mentions.ChannelIDs
+	// RF-21 is asynchronous, so this yields one of three outcomes: publish now,
+	// withhold, or refuse. Only the refusal returns here.
+	links, err := s.classifyBodyLinks(ctx, workspaceID, persistedBody)
+	if err != nil {
+		return domain.Message{}, err
+	}
 
 	refs, err := s.validateCreateReferences(ctx, createReferenceInput{
 		WorkspaceID: workspaceID, ChannelID: channelID, SenderID: senderID,
@@ -536,7 +593,7 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		ChannelID:               channelID,
 		SenderID:                senderID,
 		Kind:                    domain.MessageKindUser,
-		BodyText:                body,
+		BodyText:                persistedBody,
 		BodyFormat:              bodyFormat,
 		ParentMessageID:         parentID,
 		ForwardedFromMessageID:  forwardedID,
@@ -548,7 +605,7 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		Priority:                request.Priority,
 		AcknowledgementRequired: request.AcknowledgementRequired,
 		PersistentNotifications: request.PersistentNotifications,
-	}, links, body, replayInput, "create channel message")
+	}, links, persistedBody, replayInput, "create channel message")
 	if err != nil {
 		return domain.Message{}, err
 	}
@@ -935,23 +992,20 @@ func (s *MessageService) validateCreateReferences(
 // authorization and source state may both have changed while the row was being
 // persisted, and the response must never serialize the older answer.
 //
-// Then the RF-21 decision, in one place rather than at the end of each create:
-// a withheld message is announced to nobody. Nothing is broadcast, nothing is
-// notified and no unread count moves, because the row is pending_link_scan and
-// every read path already excludes it. The worker publishes it if the scan
-// clears, and blocks it if it does not.
+// Since issue #807 every created message is announced: its links carry their
+// own states, and a link nobody has cleared yet is simply not clickable. The
+// URLs that already hold a fresh clearance are queued for a preview here, so a
+// card for a well-known link appears without waiting for a worker pass.
 func (s *MessageService) announceCreatedMessage(
 	ctx context.Context, workspaceID, senderID, targetType, targetID string,
 	msg domain.Message, links linkDecision,
 ) domain.Message {
+	s.queueLinkPreviews(ctx, workspaceID, links.SafeURLs)
 	created := []domain.Message{msg}
-	if err := s.resolveMessageReferences(ctx, workspaceID, senderID, created); err != nil {
+	if err := s.enrichMessages(ctx, workspaceID, senderID, created); err != nil {
 		msg.Reference = &domain.MessageReference{Available: false}
 	} else {
 		msg = created[0]
-	}
-	if links.pending() {
-		return msg
 	}
 	s.publishMessageCreated(ctx, workspaceID, targetType, targetID, msg)
 	// A published reply resolves its author's own pending request on the parent
@@ -1106,7 +1160,7 @@ func (s *MessageService) persistMessage(
 	body string, replayInput storage.CreateReplayInput, operation string,
 ) (domain.Message, error) {
 	input.Status = links.messageStatus()
-	input.LinkSafetyState = links.initialState()
+	input.LinkSafetyState = links.aggregateState()
 	input.LinkScanURLs = links.URLs
 	input.LinkSafetyFingerprint = links.fingerprint(body)
 	input.IdempotencyKey = replayInput.IdempotencyKey
@@ -1256,78 +1310,109 @@ func passThrough(err error, operation string, unchanged ...error) error {
 // ForwardChannelMessage creates a server-side snapshot of an authorized source
 // message in another authorized channel. Source provenance never leaves the API.
 func (s *MessageService) ForwardChannelMessage(ctx context.Context, input ForwardChannelMessageInput) (ForwardChannelMessageOutput, error) {
-	workspaceID := strings.TrimSpace(input.WorkspaceID)
-	destinationChannelID := strings.TrimSpace(input.DestinationChannelID)
-	actorID := strings.TrimSpace(input.ActorID)
-	sourceMessageID := strings.TrimSpace(input.SourceMessageID)
-	if workspaceID == "" || destinationChannelID == "" || actorID == "" || sourceMessageID == "" {
-		return ForwardChannelMessageOutput{}, fmt.Errorf("%w: forwarding identifiers are required", domain.ErrInvalidInput)
+	forward, err := parseForwardInput(input)
+	if err != nil {
+		return ForwardChannelMessageOutput{}, err
 	}
-
-	// Idempotency first, and before anything leaves this process.
-	//
-	// A retried forward is a request for the message that already exists, not a
-	// request to create one, so it must not depend on a third party agreeing
-	// twice: a verdict that flipped to malicious after the original send, or a
-	// provider that is simply down, would otherwise turn a legitimate retry of
-	// an already-persisted message into a refusal. Nothing new is published
-	// here, so nothing new needs checking.
-	//
-	// Two concurrent *first* attempts can both miss this and both check. That is
-	// allowed: the unique index below is still the only thing that decides which
-	// one inserts, one message is created, and the other is told it replayed. A
-	// duplicate provider lookup in a rare race is not worth a distributed lock.
-	idempotencyKey := strings.TrimSpace(input.IdempotencyKey)
-	if idempotencyKey != "" {
-		replay, err := s.messages.LookupForwardReplay(ctx, storage.ForwardReplayInput{
-			WorkspaceID: workspaceID, DestinationChannelID: destinationChannelID,
-			ActorID: actorID, SourceMessageID: sourceMessageID,
-			IdempotencyKey: idempotencyKey,
-		})
-		switch {
-		case err == nil:
-			return ForwardChannelMessageOutput{Message: replay, Replayed: true}, nil
-		case errors.Is(err, domain.ErrNotFound):
-			// No earlier forward under this key: carry on and create one.
-		default:
-			return ForwardChannelMessageOutput{}, passThrough(err, "lookup forward replay",
-				domain.ErrConflict, context.Canceled, context.DeadlineExceeded)
-		}
+	replay, replayed, err := s.lookupForwardReplay(ctx, forward)
+	if err != nil {
+		return ForwardChannelMessageOutput{}, err
 	}
+	if replayed {
+		return ForwardChannelMessageOutput{Message: replay, Replayed: true}, nil
+	}
+	return s.forwardSnapshot(ctx, forward)
+}
 
-	// RF-21. A forward creates a *new* message, so it is a way to publish content
-	// that was written before the check existed — or while it was switched off —
-	// into a channel where it never passed one. It goes through the same gate.
-	//
-	// The order is what makes it correct rather than decorative. The snapshot is
-	// read first, outside any transaction and holding no row lock, so the
-	// provider call below never happens with a database connection pinned; the
-	// snapshot is then what is checked *and* what the statement writes, so a
-	// concurrent edit of the source cannot swap the content between the two. The
-	// source-side authorization the snapshot query applies is the same one the
-	// forwarding statement applies, and the destination-side authorization is
-	// untouched — it still lives in the atomic statement below.
+// forwardRequest is a validated, trimmed ForwardChannelMessageInput.
+type forwardRequest struct {
+	workspaceID, destinationChannelID, actorID, sourceMessageID, idempotencyKey string
+}
+
+func parseForwardInput(input ForwardChannelMessageInput) (forwardRequest, error) {
+	forward := forwardRequest{
+		workspaceID:          strings.TrimSpace(input.WorkspaceID),
+		destinationChannelID: strings.TrimSpace(input.DestinationChannelID),
+		actorID:              strings.TrimSpace(input.ActorID),
+		sourceMessageID:      strings.TrimSpace(input.SourceMessageID),
+		idempotencyKey:       strings.TrimSpace(input.IdempotencyKey),
+	}
+	if forward.workspaceID == "" || forward.destinationChannelID == "" || forward.actorID == "" || forward.sourceMessageID == "" {
+		return forwardRequest{}, fmt.Errorf("%w: forwarding identifiers are required", domain.ErrInvalidInput)
+	}
+	return forward, nil
+}
+
+// lookupForwardReplay answers a retried forward from the message that already
+// exists, before anything leaves this process.
+//
+// A retried forward is a request for the message that already exists, not a
+// request to create one, so it must not depend on a third party agreeing
+// twice: a verdict that flipped to malicious after the original send, or a
+// provider that is simply down, would otherwise turn a legitimate retry of an
+// already-persisted message into a refusal. Nothing new is published here, so
+// nothing new needs checking.
+//
+// Two concurrent *first* attempts can both miss this and both check. That is
+// allowed: the unique index is still the only thing that decides which one
+// inserts, one message is created, and the other is told it replayed. A
+// duplicate provider lookup in a rare race is not worth a distributed lock.
+func (s *MessageService) lookupForwardReplay(ctx context.Context, forward forwardRequest) (domain.Message, bool, error) {
+	if forward.idempotencyKey == "" {
+		return domain.Message{}, false, nil
+	}
+	replay, err := s.messages.LookupForwardReplay(ctx, storage.ForwardReplayInput{
+		WorkspaceID: forward.workspaceID, DestinationChannelID: forward.destinationChannelID,
+		ActorID: forward.actorID, SourceMessageID: forward.sourceMessageID,
+		IdempotencyKey: forward.idempotencyKey,
+	})
+	switch {
+	case err == nil:
+		return replay, true, nil
+	case errors.Is(err, domain.ErrNotFound):
+		// No earlier forward under this key: carry on and create one.
+		return domain.Message{}, false, nil
+	default:
+		return domain.Message{}, false, passThrough(err, "lookup forward replay",
+			domain.ErrConflict, context.Canceled, context.DeadlineExceeded)
+	}
+}
+
+// forwardSnapshot creates the forwarded message from a snapshot of the source.
+//
+// RF-21. A forward creates a *new* message, so it is a way to publish content
+// that was written before the check existed — or while it was switched off —
+// into a channel where it never passed one. It goes through the same gate.
+//
+// The order is what makes it correct rather than decorative. The snapshot is
+// read first, outside any transaction and holding no row lock, so the
+// provider call never happens with a database connection pinned; the snapshot
+// is then what is checked *and* what the statement writes, so a concurrent
+// edit of the source cannot swap the content between the two. The source-side
+// authorization the snapshot query applies is the same one the forwarding
+// statement applies, and the destination-side authorization is untouched — it
+// still lives in the atomic statement.
+func (s *MessageService) forwardSnapshot(ctx context.Context, forward forwardRequest) (ForwardChannelMessageOutput, error) {
 	snapshot, err := s.messages.SnapshotForwardableMessage(ctx, storage.ForwardSnapshotInput{
-		WorkspaceID: workspaceID, DestinationChannelID: destinationChannelID,
-		ActorID: actorID, SourceMessageID: sourceMessageID,
+		WorkspaceID: forward.workspaceID, DestinationChannelID: forward.destinationChannelID,
+		ActorID: forward.actorID, SourceMessageID: forward.sourceMessageID,
 	})
 	if err != nil {
 		return ForwardChannelMessageOutput{}, passThrough(err, "snapshot forwardable message",
 			domain.ErrNotFound, context.Canceled, context.DeadlineExceeded)
 	}
-	links, err := s.classifyBodyLinks(ctx, workspaceID, snapshot.BodyText)
+	links, err := s.classifyBodyLinks(ctx, forward.workspaceID, snapshot.BodyText)
 	if err != nil {
 		return ForwardChannelMessageOutput{}, err
 	}
-
 	result, err := s.messages.ForwardChannelMessage(ctx, storage.ForwardChannelMessageInput{
-		WorkspaceID: workspaceID, DestinationChannelID: destinationChannelID,
-		ActorID: actorID, SourceMessageID: sourceMessageID,
-		IdempotencyKey:        idempotencyKey,
+		WorkspaceID: forward.workspaceID, DestinationChannelID: forward.destinationChannelID,
+		ActorID: forward.actorID, SourceMessageID: forward.sourceMessageID,
+		IdempotencyKey:        forward.idempotencyKey,
 		BodyText:              snapshot.BodyText,
 		BodyFormat:            snapshot.BodyFormat,
 		Status:                links.messageStatus(),
-		LinkSafetyState:       links.initialState(),
+		LinkSafetyState:       links.aggregateState(),
 		LinkScanURLs:          links.URLs,
 		LinkSafetyFingerprint: links.fingerprint(snapshot.BodyText),
 	})
@@ -1336,12 +1421,11 @@ func (s *MessageService) ForwardChannelMessage(ctx context.Context, input Forwar
 			domain.ErrInvalidInput, domain.ErrNotFound, domain.ErrConflict,
 			context.Canceled, context.DeadlineExceeded)
 	}
-	if !result.Replayed && !links.pending() {
-		s.publishMessageCreated(ctx, workspaceID, "channel", destinationChannelID, result.Message)
+	if !result.Replayed {
+		result.Message = s.announceCreatedMessage(ctx, forward.workspaceID, forward.actorID, "channel",
+			forward.destinationChannelID, result.Message, links)
 	}
-	return ForwardChannelMessageOutput{
-		Message: result.Message, Replayed: result.Replayed, Pending: links.pending(),
-	}, nil
+	return ForwardChannelMessageOutput{Message: result.Message, Replayed: result.Replayed}, nil
 }
 
 // CreateDMMessage posts a message to a DM conversation.
@@ -1384,11 +1468,6 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		return existing, err
 	}
 
-	links, err := s.classifyBodyLinks(ctx, workspaceID, body)
-	if err != nil {
-		return domain.Message{}, err
-	}
-
 	mentions, err := s.resolveDMMentions(ctx, dmMentionInput{
 		WorkspaceID: workspaceID, ConversationID: conversationID, SenderID: senderID,
 		Body: body, BodyFormat: bodyFormat,
@@ -1397,7 +1476,14 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 	if err != nil {
 		return domain.Message{}, err
 	}
-	body = mentions.Body
+	// persistedBody: the same rule as the channel path — classified,
+	// fingerprinted and stored from one representation, after the mentions
+	// were rewritten (issue #807).
+	persistedBody := mentions.Body
+	links, err := s.classifyBodyLinks(ctx, workspaceID, persistedBody)
+	if err != nil {
+		return domain.Message{}, err
+	}
 
 	refs, err := s.validateCreateReferences(ctx, createReferenceInput{
 		WorkspaceID: workspaceID, DMConversationID: conversationID, SenderID: senderID,
@@ -1415,7 +1501,7 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		DMConversationID:        conversationID,
 		SenderID:                senderID,
 		Kind:                    domain.MessageKindUser,
-		BodyText:                body,
+		BodyText:                persistedBody,
 		BodyFormat:              bodyFormat,
 		ParentMessageID:         parentID,
 		ForwardedFromMessageID:  forwardedID,
@@ -1428,7 +1514,7 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		Priority:                request.Priority,
 		AcknowledgementRequired: request.AcknowledgementRequired,
 		PersistentNotifications: request.PersistentNotifications,
-	}, links, body, replayInput, "create dm message")
+	}, links, persistedBody, replayInput, "create dm message")
 	if err != nil {
 		return domain.Message{}, err
 	}
@@ -1519,8 +1605,24 @@ func (s *MessageService) publishMessageCreated(ctx context.Context, workspaceID,
 	if publisher == nil {
 		return
 	}
+	eventPublisher, canPublishConversationEvent := publisher.(conversationEventPublisher)
+	membershipPublisher, canPublishMembershipEvent := publisher.(membershipEventPublisher)
 	s.enqueuePublish(ctx, func(publishCtx context.Context) {
 		publisher.PublishMessageCreated(publishCtx, workspaceID, targetType, targetID, msg)
+		if canPublishMembershipEvent && len(msg.AutoAddedMemberIDs) > 0 {
+			membershipPublisher.PublishMembersAdded(
+				publishCtx, workspaceID, targetType, targetID, msg.SenderID,
+				len(msg.AutoAddedMemberIDs), msg.MemberCount,
+			)
+			membershipPublisher.PublishConversationAvailable(
+				publishCtx, workspaceID, targetType, targetID, msg.AutoAddedMemberIDs,
+			)
+		}
+		if canPublishConversationEvent && msg.CreatedConversationEventID != "" {
+			eventPublisher.PublishConversationEvent(
+				publishCtx, workspaceID, targetType, targetID, msg.CreatedConversationEventID,
+			)
+		}
 	})
 }
 
@@ -1590,22 +1692,11 @@ func (s *MessageService) enqueuePublish(ctx context.Context, publish func(contex
 // EditMessage validates the body with the creation path's rules, then delegates
 // the atomic authorization, snapshot, window check, and update to storage.
 func (s *MessageService) EditMessage(ctx context.Context, input EditMessageInput) (domain.Message, error) {
-	workspaceID := strings.TrimSpace(input.WorkspaceID)
-	messageID := strings.TrimSpace(input.MessageID)
-	editorID := strings.TrimSpace(input.EditorID)
-	body := strings.TrimSpace(input.Body)
-	if workspaceID == "" || messageID == "" || editorID == "" {
-		return domain.Message{}, fmt.Errorf("%w: workspace_id, message_id, and editor_id are required", domain.ErrInvalidInput)
-	}
-	if err := validateMessageBody(body); err != nil {
-		return domain.Message{}, err
-	}
-	bodyFormat, err := normalizeBodyFormat(input.BodyFormat)
+	edit, err := parseEditInput(input)
 	if err != nil {
 		return domain.Message{}, err
 	}
-
-	current, err := s.messages.GetMessageByIDInWorkspace(ctx, workspaceID, messageID, editorID)
+	current, err := s.messages.GetMessageByIDInWorkspace(ctx, edit.workspaceID, edit.messageID, edit.editorID)
 	if err != nil {
 		return domain.Message{}, err
 	}
@@ -1624,82 +1715,106 @@ func (s *MessageService) EditMessage(ctx context.Context, input EditMessageInput
 	// FOR UPDATE, against the database's own clock — so an edit that squeaks past
 	// this and expires in between is still refused. This is an optimisation in
 	// front of the authority, never a replacement for it.
-	if err := domain.ValidateMessageEdit(current, editorID, nil, time.Now()); err != nil {
+	if err := domain.ValidateMessageEdit(current, edit.editorID, nil, time.Now()); err != nil {
+		return domain.Message{}, err
+	}
+	persistedBody, err := s.rewriteEditedBody(ctx, current, edit)
+	if err != nil {
 		return domain.Message{}, err
 	}
 	// RF-21 applies to editing too, and not as an afterthought: a check that ran
 	// only on creation would be bypassed by sending a clean message and editing
-	// the link in. This is the same funnel — one body, one rule.
-	//
-	// Editing is the one path that cannot go pending. A withheld *edit* would
-	// mean either showing everyone the unscanned new body or silently keeping
-	// the old one while telling the author it was saved, and both are worse than
-	// asking the author to retry: the currently published version stays exactly
-	// as it is, and the scan the classification just queued makes the retry
-	// succeed shortly. A pending revision table is the upgrade if authors ever
-	// find the retry intrusive.
-	editLinks, err := s.classifyBodyLinks(ctx, workspaceID, body)
+	// the link in. This is the same funnel — one body, one rule — and the body
+	// is the one that will be stored, after the mentions were rewritten. An
+	// edit publishes immediately, exactly like a create (issue #807): a URL
+	// nothing has decided yet is recorded pending and its link waits, not the
+	// edit.
+	editLinks, err := s.classifyBodyLinks(ctx, edit.workspaceID, persistedBody)
 	if err != nil {
 		return domain.Message{}, err
 	}
-	// An edit publishes immediately or not at all, so the two halves of "pending"
-	// part company here — the one place they do.
-	//
-	// A URL nothing has decided means waiting: there is no answer and this path
-	// will not produce one. A URL whose scan is terminal-without-verdict is
-	// decided, and the edit lands carrying the same `inconclusive` marker a created
-	// message ends up with, with the same consequences — the reader may click, this
-	// server may not fetch. Refusing that case would make a message permanently
-	// uneditable whenever one of its links happened to be one Cloudflare declined
-	// to scan.
-	editState, editable := editLinks.editState()
-	if !editable {
-		return domain.Message{}, domain.ErrURLCheckPending
+	return s.commitEdit(ctx, edit, persistedBody, editLinks)
+}
+
+// editRequest is a validated, trimmed EditMessageInput.
+type editRequest struct {
+	workspaceID, messageID, editorID, body string
+	bodyFormat                             domain.MessageBodyFormat
+}
+
+func parseEditInput(input EditMessageInput) (editRequest, error) {
+	edit := editRequest{
+		workspaceID: strings.TrimSpace(input.WorkspaceID),
+		messageID:   strings.TrimSpace(input.MessageID),
+		editorID:    strings.TrimSpace(input.EditorID),
+		body:        strings.TrimSpace(input.Body),
 	}
+	if edit.workspaceID == "" || edit.messageID == "" || edit.editorID == "" {
+		return editRequest{}, fmt.Errorf("%w: workspace_id, message_id, and editor_id are required", domain.ErrInvalidInput)
+	}
+	if err := validateMessageBody(edit.body); err != nil {
+		return editRequest{}, err
+	}
+	bodyFormat, err := normalizeBodyFormat(input.BodyFormat)
+	if err != nil {
+		return editRequest{}, err
+	}
+	edit.bodyFormat = bodyFormat
+	return edit, nil
+}
+
+// rewriteEditedBody resolves mentions in the new body against the conversation
+// the message lives in.
+//
+// A 1:1 DM is always body_format v2 (createDMMessage's own default), and
+// resolveAndRewriteMentions is a no-op below v3, so the extra round trip only
+// ever runs for the v3 bodies it can actually affect: channel edits (where
+// DMConversationID is empty and this is skipped) and group DM edits. Gating on
+// bodyFormat here, not just DMConversationID, is what keeps a plain-text 1:1
+// edit exactly as cheap as it was before #776.
+func (s *MessageService) rewriteEditedBody(ctx context.Context, current domain.Message, edit editRequest) (string, error) {
 	isGroupDM := false
-	// A 1:1 DM is always body_format v2 (createDMMessage's own default), and
-	// resolveAndRewriteMentions is a no-op below v3, so the extra round trip
-	// only ever runs for the v3 bodies it can actually affect: channel edits
-	// (where DMConversationID is empty and this is skipped) and group DM
-	// edits. Gating on bodyFormat here, not just DMConversationID, is what
-	// keeps a plain-text 1:1 edit exactly as cheap as it was before #776.
-	if current.DMConversationID != "" && bodyFormat == domain.MessageBodyFormatV3 {
+	if current.DMConversationID != "" && edit.bodyFormat == domain.MessageBodyFormatV3 {
 		// Re-derived now, not carried from creation: a group can only ever
 		// become another group or be archived, never change into a 1:1, but
 		// re-reading it here (rather than trusting a stale assumption) keeps
 		// this the same authority resolveOutgoingMentions uses on send.
-		conversation, err := s.dms.GetVisibleConversationByID(ctx, workspaceID, current.DMConversationID, editorID)
+		conversation, err := s.dms.GetVisibleConversationByID(ctx, edit.workspaceID, current.DMConversationID, edit.editorID)
 		if err != nil {
-			return domain.Message{}, err
+			return "", err
 		}
 		isGroupDM = conversation.Type == domain.DMConversationTypeGroup
 	}
-	body, err = s.resolveAndRewriteMentions(ctx, workspaceID, current.ChannelID, current.DMConversationID, isGroupDM, editorID, body, bodyFormat)
-	if err != nil {
-		return domain.Message{}, err
-	}
+	return s.resolveAndRewriteMentions(ctx, edit.workspaceID, current.ChannelID, current.DMConversationID,
+		isGroupDM, edit.editorID, edit.body, edit.bodyFormat)
+}
 
-	// The fingerprint is computed over the *rewritten* body, which is the text the
-	// URLs were extracted from after mention resolution — the same binding
-	// creation uses, so a verdict obtained for one content can never decide
-	// another.
+// commitEdit persists the rewritten body with its link projection, then
+// hydrates and announces the result.
+//
+// persistedBody is the one representation: the text the URLs were classified
+// from, the text the fingerprint is computed over, and the text stored — the
+// same binding creation uses, so a verdict obtained for one content can never
+// decide another. The aggregate marker is the same projection a created
+// message gets.
+func (s *MessageService) commitEdit(ctx context.Context, edit editRequest, persistedBody string, editLinks linkDecision) (domain.Message, error) {
 	updated, err := s.messages.EditMessage(ctx, storage.EditMessageInput{
-		WorkspaceID: workspaceID, MessageID: messageID, EditorID: editorID,
-		Body: body, BodyFormat: bodyFormat,
-		LinkSafetyState:       editState,
-		LinkSafetyFingerprint: editLinks.fingerprint(body),
+		WorkspaceID: edit.workspaceID, MessageID: edit.messageID, EditorID: edit.editorID,
+		Body: persistedBody, BodyFormat: edit.bodyFormat,
+		LinkSafetyState:       editLinks.aggregateState(),
+		LinkSafetyFingerprint: editLinks.fingerprint(persistedBody),
 		LinkScanURLs:          editLinks.URLs,
 	})
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("edit message: %w", err)
 	}
+	s.queueLinkPreviews(ctx, edit.workspaceID, editLinks.SafeURLs)
 	updatedMessages := []domain.Message{updated}
-	if err := s.resolveMessageReferences(ctx, workspaceID, editorID, updatedMessages); err != nil {
+	if err := s.enrichMessages(ctx, edit.workspaceID, edit.editorID, updatedMessages); err != nil {
 		return domain.Message{}, err
 	}
-	updated = updatedMessages[0]
-	s.publishMessageUpdated(ctx, updated)
-	return updated, nil
+	s.publishMessageUpdated(ctx, updatedMessages[0])
+	return updatedMessages[0], nil
 }
 
 // DeleteMessage soft-deletes an authored user message and publishes the
@@ -1803,39 +1918,50 @@ func (s *MessageService) ListChannelMessages(ctx context.Context, input ListChan
 		return ListChannelMessagesOutput{}, fmt.Errorf("%w: workspace_id, channel_id, and caller_id are required", domain.ErrInvalidInput)
 	}
 
-	storageInput := storage.ListChannelMessagesInput{
-		WorkspaceID: workspaceID,
-		ChannelID:   channelID,
-		UserID:      callerID,
-		Limit:       input.Limit,
-	}
-	if input.BeforeCursor != "" {
-		c, err := storage.DecodeCursor(input.BeforeCursor)
-		if err != nil {
-			return ListChannelMessagesOutput{}, domain.ErrInvalidCursor
-		}
-		storageInput.BeforeCursor = &c
+	before, err := decodeBeforeCursor(input.BeforeCursor)
+	if err != nil {
+		return ListChannelMessagesOutput{}, err
 	}
 	if _, err := s.channels.GetVisibleChannelByID(ctx, workspaceID, channelID, callerID); err != nil {
 		return ListChannelMessagesOutput{}, err
 	}
-
-	result, err := s.messages.ListChannelMessages(ctx, storageInput)
+	result, err := s.messages.ListChannelMessages(ctx, storage.ListChannelMessagesInput{
+		WorkspaceID: workspaceID, ChannelID: channelID, UserID: callerID,
+		Limit: input.Limit, BeforeCursor: before,
+	})
 	if err != nil {
 		return ListChannelMessagesOutput{}, fmt.Errorf("list channel messages: %w", err)
 	}
-	if err := s.refreshMentionLabels(ctx, workspaceID, result.Messages); err != nil {
+	if err := s.hydrateListing(ctx, workspaceID, callerID, result.Messages); err != nil {
 		return ListChannelMessagesOutput{}, err
 	}
-	if err := s.resolveMessageReferences(ctx, workspaceID, callerID, result.Messages); err != nil {
-		return ListChannelMessagesOutput{}, err
-	}
-
 	var nextCursor string
 	if result.NextCursor != nil {
 		nextCursor = storage.EncodeCursor(*result.NextCursor)
 	}
 	return ListChannelMessagesOutput{Messages: result.Messages, NextCursor: nextCursor}, nil
+}
+
+// decodeBeforeCursor turns the optional pagination cursor into the storage
+// form; a non-empty cursor that cannot be decoded is ErrInvalidCursor.
+func decodeBeforeCursor(cursor string) (*storage.MessageCursor, error) {
+	if cursor == "" {
+		return nil, nil
+	}
+	c, err := storage.DecodeCursor(cursor)
+	if err != nil {
+		return nil, domain.ErrInvalidCursor
+	}
+	return &c, nil
+}
+
+// hydrateListing completes a page the way every reader gets it: current
+// mention labels, then references and per-link entities (issue #807).
+func (s *MessageService) hydrateListing(ctx context.Context, workspaceID, callerID string, messages []domain.Message) error {
+	if err := s.refreshMentionLabels(ctx, workspaceID, messages); err != nil {
+		return err
+	}
+	return s.enrichMessages(ctx, workspaceID, callerID, messages)
 }
 
 // ListDMMessages returns messages for a DM conversation visible to the caller.
@@ -1872,7 +1998,7 @@ func (s *MessageService) ListDMMessages(ctx context.Context, input ListDMMessage
 	if err != nil {
 		return ListDMMessagesOutput{}, fmt.Errorf("list dm messages: %w", err)
 	}
-	if err := s.resolveMessageReferences(ctx, workspaceID, callerID, result.Messages); err != nil {
+	if err := s.enrichMessages(ctx, workspaceID, callerID, result.Messages); err != nil {
 		return ListDMMessagesOutput{}, err
 	}
 
@@ -1915,6 +2041,16 @@ func (s *MessageService) validateReferencedMessage(ctx context.Context, workspac
 		return "", nil, domain.ErrInvalidMessageReference
 	}
 	return refID, &ref, nil
+}
+
+// enrichMessages fills everything a served message carries beyond its row: the
+// RF-09 reference and, since issue #807, its link entities. One funnel for every
+// read path, so a message cannot reach a client half-hydrated.
+func (s *MessageService) enrichMessages(ctx context.Context, workspaceID, userID string, messages []domain.Message) error {
+	if err := s.resolveMessageReferences(ctx, workspaceID, userID, messages); err != nil {
+		return err
+	}
+	return s.hydrateMessageLinks(ctx, workspaceID, messages)
 }
 
 func (s *MessageService) resolveMessageReferences(ctx context.Context, workspaceID, userID string, messages []domain.Message) error {
@@ -2089,12 +2225,12 @@ func normalizeAttachmentIDs(rawIDs []string, maxAttachments int) ([]string, erro
 func validateMentionRefs(userIDs, channelIDs []string, labels map[string]string) error {
 	for _, id := range userIDs {
 		if _, ok := labels["user:"+id]; !ok {
-			return fmt.Errorf("%w: invalid mention", domain.ErrInvalidInput)
+			return domain.ErrMentionNotEligible
 		}
 	}
 	for _, id := range channelIDs {
 		if _, ok := labels["channel:"+id]; !ok {
-			return fmt.Errorf("%w: invalid mention", domain.ErrInvalidInput)
+			return domain.ErrMentionNotEligible
 		}
 	}
 	return nil
@@ -2138,7 +2274,7 @@ func (s *MessageService) GetChannelMessage(ctx context.Context, input GetChannel
 	if err := s.refreshMentionLabels(ctx, workspaceID, messages); err != nil {
 		return domain.Message{}, err
 	}
-	if err := s.resolveMessageReferences(ctx, workspaceID, callerID, messages); err != nil {
+	if err := s.enrichMessages(ctx, workspaceID, callerID, messages); err != nil {
 		return domain.Message{}, err
 	}
 	return messages[0], nil
@@ -2246,7 +2382,7 @@ func (s *MessageService) GetDMMessage(ctx context.Context, input GetDMMessageInp
 		return domain.Message{}, domain.ErrNotFound
 	}
 	messages := []domain.Message{msg}
-	if err := s.resolveMessageReferences(ctx, workspaceID, callerID, messages); err != nil {
+	if err := s.enrichMessages(ctx, workspaceID, callerID, messages); err != nil {
 		return domain.Message{}, err
 	}
 	msg = messages[0]

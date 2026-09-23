@@ -1167,7 +1167,7 @@ func authorizedContextArgs() []any {
 // — cannot be mocked and are proved against real PostgreSQL in
 // channel_store_postgres_test.go.
 
-func TestPGXChannelStore_CreateChannelForActiveMember_PublicCommitsWithoutMembership(t *testing.T) {
+func TestPGXChannelStore_CreateChannelForActiveMember_PublicSeedsWorkspaceMembers(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
@@ -1181,11 +1181,14 @@ func TestPGXChannelStore_CreateChannelForActiveMember_PublicCommitsWithoutMember
 		WillReturnRows(pgxmock.NewRows(channelCols()).
 			AddRow("ch-1", "ws-1", "", "infra", "Infra", "public", "active", false, 0, "user-1", now, now))
 	expectConversationCreatedEvent(mock, "ch-1", "")
+	mock.ExpectExec(`(?s)INSERT INTO chat.channel_members.*FROM chat.workspace_members wm.*wm.status = 'active'.*wm.role IN \('owner', 'admin', 'moderator', 'member'\)`).
+		WithArgs("ch-1", "ws-1", "member").
+		WillReturnResult(pgxmock.NewResult("INSERT", 4))
 	mock.ExpectCommit()
 
 	ch, err := storage.NewPGXChannelStore(mock).CreateChannelForActiveMember(context.Background(), storage.CreateChannelInput{
 		WorkspaceID: "ws-1", Slug: "infra", DisplayName: "Infra",
-		Type: domain.ChannelTypePublic, CreatedBy: "user-1",
+		Type: domain.ChannelTypePublic, CreatedBy: "user-1", EnsurePublicWorkspaceMembers: true,
 	})
 	if err != nil {
 		t.Fatalf("CreateChannelForActiveMember: %v", err)
@@ -1338,6 +1341,37 @@ func TestPGXChannelStore_CreateChannelForActiveMember_MemberInsertFailureRollsBa
 		EnsureCreatorMemberRole: domain.ChannelRoleMember,
 	}); err == nil {
 		t.Fatal("expected the member insert failure to surface")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXChannelStore_CreateChannelForActiveMember_PublicPopulationFailureRollsBack(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	mock.ExpectBegin()
+	mock.ExpectQuery(`WITH authorized_context`).
+		WithArgs("ws-1", pgxmock.AnyArg(), "infra", "Infra", "public", false, 0, "user-1").
+		WillReturnRows(pgxmock.NewRows(channelCols()).
+			AddRow("ch-1", "ws-1", "", "infra", "Infra", "public", "active", false, 0, "user-1", now, now))
+	expectConversationCreatedEvent(mock, "ch-1", "")
+	mock.ExpectExec(`(?s)INSERT INTO chat.channel_members.*FROM chat.workspace_members`).
+		WithArgs("ch-1", "ws-1", "member").
+		WillReturnError(errors.New("boom"))
+	mock.ExpectRollback()
+
+	_, err = storage.NewPGXChannelStore(mock).CreateChannelForActiveMember(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1", Slug: "infra", DisplayName: "Infra",
+		Type: domain.ChannelTypePublic, CreatedBy: "user-1", EnsurePublicWorkspaceMembers: true,
+	})
+	if err == nil {
+		t.Fatal("expected public membership population failure")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)

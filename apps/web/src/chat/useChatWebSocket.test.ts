@@ -277,6 +277,30 @@ describe("useChatWebSocket", () => {
     expect(FakeWebSocket.instances[0].readyState).toBe(FakeWebSocket.OPEN);
   });
 
+  it("ignores a subscribe error for another conversation", () => {
+    const onSubscriptionError = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onSubscriptionError,
+      }),
+    );
+
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "error",
+        operation: "subscribe",
+        code: "room_subscription_unavailable",
+        target_type: "channel",
+        target_id: "ch-other",
+      }),
+    );
+
+    expect(onSubscriptionError).not.toHaveBeenCalled();
+  });
+
   it("recovers a temporary subscribe failure on the current open socket", () => {
     vi.useFakeTimers();
     const onReactionError = vi.fn();
@@ -1350,6 +1374,51 @@ describe("useChatWebSocket", () => {
     });
 
     expect(onLinkSafetyChanged).not.toHaveBeenCalled();
+  });
+
+  it("routes a per-link update and drops one that names another message (issue #807)", () => {
+    const onLinkUpdated = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onMessageLinkUpdated: onLinkUpdated,
+      }),
+    );
+    const link = {
+      ordinal: 0,
+      target_key: "target-example-a",
+      url: "https://example.test/a",
+      hostname: "example.test",
+      safety: "safe",
+      click: "direct",
+      href: "https://example.test/a",
+      updated_at: "2026-08-18T12:00:00Z",
+    };
+    const event = {
+      type: "message.link_updated",
+      target_type: "channel",
+      target_id: "ch-1",
+      message_id: "msg-1",
+      link_update: { message_id: "msg-1", link },
+    };
+
+    act(() => {
+      FakeWebSocket.instances[0].simulateOpen();
+      FakeWebSocket.instances[0].simulateMessage(event);
+      FakeWebSocket.instances[0].simulateMessage({
+        ...event,
+        link_update: { message_id: "msg-2", link },
+      });
+      FakeWebSocket.instances[0].simulateMessage({
+        ...event,
+        link_update: { message_id: "msg-1" },
+      });
+    });
+
+    expect(onLinkUpdated).toHaveBeenCalledTimes(1);
+    expect(onLinkUpdated).toHaveBeenCalledWith(event);
   });
 
   it("routes every supported message.updated body format only for the active target", () => {

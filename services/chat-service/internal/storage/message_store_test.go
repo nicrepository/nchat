@@ -10,7 +10,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	pgxmock "github.com/pashagolub/pgxmock/v2"
 
-	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
@@ -710,10 +709,10 @@ func TestPGXMessageStore_CreateMessage_AllMentionFanoutDecisionStopsPastTheBound
 	checkExpectations(t, mock)
 }
 
-func TestPGXMessageStore_CreateMessage_GroupMentionUsesMembershipAndIdempotentOutbox(t *testing.T) {
+func TestPGXMessageStore_CreateMessage_GroupMentionAutoAddsBeforeIdempotentOutbox(t *testing.T) {
 	mock := newMock(t)
 	now := time.Now()
-	mock.ExpectQuery(`(?s)invalid_mentions.*chat\.dm_conversations source_dm.*source_dm\.type = 'group'.*chat\.notification_outbox.*ON CONFLICT`).
+	mock.ExpectQuery(`(?s)authorized_user_mentions AS MATERIALIZED.*chat\.dm_conversations dc.*dc\.type = 'group'.*inserted AS.*auto_added_dm_members AS.*chat\.notification_outbox.*ON CONFLICT`).
 		WithArgs(
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
@@ -1139,10 +1138,9 @@ func TestPGXMessageStore_EditMessage_SnapshotsAndUpdatesInOneTransaction(t *test
 	// The link-safety half of the edit, in the same transaction (issue #135):
 	// the states of the new body's URLs are re-checked under the row lock and its
 	// version-bound associations are written.
-	mock.ExpectQuery(`(?s)SELECT canonical_url, status.*FROM chat\.link_scans`).
-		WithArgs([]string{"https://edited.example/b"}, urlsafety.VerdictTTL.Seconds()).
-		WillReturnRows(pgxmock.NewRows([]string{"canonical_url", "status"}).
-			AddRow("https://edited.example/b", "safe"))
+	mock.ExpectQuery(`(?s)SELECT status = 'malicious'.*FROM chat\.link_scans.*FOR UPDATE`).
+		WithArgs([]string{"https://edited.example/b"}).
+		WillReturnRows(pgxmock.NewRows([]string{"malicious"}).AddRow(false))
 	mock.ExpectExec(`DELETE FROM chat\.message_link_scans`).
 		WithArgs("msg-1").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))

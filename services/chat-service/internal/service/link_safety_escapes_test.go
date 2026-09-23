@@ -27,13 +27,12 @@ func TestAnEscapedURLIsStillChecked(t *testing.T) {
 	})
 	svc, publisher := messageServiceWith(store)
 
-	_, err := createChannelMessage(svc, `veja https://my\-site.example/login`)
-
-	if !errors.Is(err, domain.ErrMaliciousURL) {
-		t.Fatalf("an escaped malicious link was not recognised: %v", err)
+	if _, err := createChannelMessage(svc, `veja https://my\-site.example/login`); err != nil {
+		t.Fatalf("CreateChannelMessage: %v", err)
 	}
-	if store.createCalls != 0 || publisher.count() != 0 {
-		t.Fatal("an escaped malicious link produced a message")
+	waitForPublishCalls(t, publisher, 1)
+	if store.lastCreateInput.LinkSafetyState != domain.MessageLinkSafetyMalicious {
+		t.Fatalf("an escaped malicious link was not recognised: state=%q", store.lastCreateInput.LinkSafetyState)
 	}
 }
 
@@ -77,8 +76,8 @@ func TestTheConditionalDotEscapeIsUnescapedLikeTheClientDoes(t *testing.T) {
 		t.Fatalf("scanned %v, want the escaped dot resolved the way the reader sees it",
 			store.ensuredURLs)
 	}
-	if store.lastCreateInput.Status != domain.MessageStatusPendingLinkScan {
-		t.Fatalf("status = %q, want the unscanned link withheld", store.lastCreateInput.Status)
+	if store.lastCreateInput.LinkSafetyState != domain.MessageLinkSafetyNone {
+		t.Fatalf("state = %q, want no opinion yet for the unscanned link", store.lastCreateInput.LinkSafetyState)
 	}
 }
 

@@ -33,6 +33,8 @@ export interface AuthoritativeReads {
   readReactionSnapshot(messageId: string): void;
   /** Re-reads a message an update announced, inserting it when it was never delivered. */
   readMessageSnapshot(messageId: string, insertIfMissing: boolean): void;
+  /** Re-reads a post-commit conversation event once if its first read races. */
+  readConversationEventSnapshot(messageId: string): void;
 }
 
 interface Options {
@@ -54,23 +56,35 @@ export function useAuthoritativeReads({
   notifyRemoved,
 }: Options): AuthoritativeReads {
   const read = useCallback(
-    (key: string, messageId: string, onMessage: (message: Message) => void) => {
-      const controller = fallbacks.start(key);
-      const loadKey = scope.key;
-      void gateway.fetchMessage(messageId, controller.signal).then(
-        (message) => {
-          fallbacks.finish(key, controller);
-          if (controller.signal.aborted) return;
-          if (!scope.isCurrent(loadKey)) return;
-          onMessage(message);
-        },
-        (error: unknown) => {
-          fallbacks.finish(key, controller);
-          if (isAbortError(error)) return;
-          if (!scope.isCurrent(loadKey)) return;
-          dispatch({ type: "ws_fetch_error", error: realtimeFallbackErrorMessage });
-        },
-      );
+    (
+      key: string,
+      messageId: string,
+      onMessage: (message: Message) => void,
+      retriesRemaining = 0,
+    ) => {
+      const readOnce = (remaining: number) => {
+        const controller = fallbacks.start(key);
+        const loadKey = scope.key;
+        void gateway.fetchMessage(messageId, controller.signal).then(
+          (message) => {
+            fallbacks.finish(key, controller);
+            if (controller.signal.aborted) return;
+            if (!scope.isCurrent(loadKey)) return;
+            onMessage(message);
+          },
+          (error: unknown) => {
+            fallbacks.finish(key, controller);
+            if (isAbortError(error)) return;
+            if (!scope.isCurrent(loadKey)) return;
+            if (remaining > 0) {
+              readOnce(remaining - 1);
+              return;
+            }
+            dispatch({ type: "ws_fetch_error", error: realtimeFallbackErrorMessage });
+          },
+        );
+      };
+      readOnce(retriesRemaining);
     },
     [dispatch, fallbacks, gateway, scope],
   );
@@ -112,5 +126,29 @@ export function useAuthoritativeReads({
     [dispatch, notifyRemoved, read, scope],
   );
 
-  return { readCreatedMessage, readReactionSnapshot, readMessageSnapshot };
+  const readConversationEventSnapshot = useCallback(
+    (messageId: string) => {
+      read(
+        updatedReadKey(messageId),
+        messageId,
+        (message) => {
+          if (message.isRemoved || message.status === "deleted") {
+            scope.rememberDeleted(message.id, message.deletedAt ?? message.updatedAt);
+          }
+          const snapshot = scope.sanitize(message);
+          dispatch({ type: "message_snapshot", message: snapshot, insertIfMissing: true });
+          if (snapshot.isRemoved) notifyRemoved();
+        },
+        1,
+      );
+    },
+    [dispatch, notifyRemoved, read, scope],
+  );
+
+  return {
+    readCreatedMessage,
+    readReactionSnapshot,
+    readMessageSnapshot,
+    readConversationEventSnapshot,
+  };
 }

@@ -64,6 +64,24 @@ describe("MentionList", () => {
     expect(screen.getByRole("option", { name: /geral/ })).toHaveTextContent("#geral");
   });
 
+  it("separates outsiders and announces that they will be added on send", () => {
+    render(
+      <MentionList
+        items={[
+          items[0],
+          { mentionType: "user", id: "user-2", label: "Juliane", willBeAdded: true },
+        ]}
+        command={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Nesta conversa")).toBeInTheDocument();
+    expect(screen.getByText("Fora da conversa")).toBeInTheDocument();
+    expect(
+      screen.getByRole("option", { name: /Juliane.*Será adicionada ao enviar/ }),
+    ).toBeVisible();
+  });
+
   it("does not crash on unmount when scrollIntoView returns a non-function value (issue #773)", () => {
     // Element.prototype.scrollIntoView is global to the whole suite, so it
     // must be restored even if an assertion below throws — never rely on a

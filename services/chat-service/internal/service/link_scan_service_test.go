@@ -70,13 +70,124 @@ type fakeQueue struct {
 	providerReserved int
 	reserveErr       error
 	prunes           int
+
+	// Issue #807 convergence state.
+	expired         []string
+	terminalizeErr  error
+	terminalErr     error
+	drainedDisabled []string
+	policyTerminals map[string]string
+
+	// Issue #928: the provider-stated evidence ceiling written with each
+	// verdict, and the background second-opinion lane.
+	evidenceExpiry   map[string]time.Time
+	secondaryOpened  []string
+	secondaryJobs    []storage.LinkSecondaryJob
+	secondaryClaims  int
+	secondaryRefs    map[string]string
+	secondarySettled []string
+	secondaryGuilty  map[string]time.Time
+	secondaryRefErr  error
+	secondaryVerdErr error
+	// Which attempt currently owns each lane, so the fake can refuse a stale
+	// worker the way the store does.
+	secondaryGeneration     map[string]int
+	nextSecondaryGeneration int
+}
+
+// --- the background second opinion (issue #928) ------------------------------
+//
+// The lane is a second claim over the same rows, so the fake models it the same
+// way the store does: a list of outstanding verifications, handed out once per
+// pass, and three settlements that each clear it.
+
+func (q *fakeQueue) ClaimDueSecondaryVerifications(
+	_ context.Context, batchSize int,
+) ([]storage.LinkSecondaryJob, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.secondaryClaims++
+	if len(q.secondaryJobs) == 0 || batchSize <= 0 {
+		return nil, nil
+	}
+	if batchSize > len(q.secondaryJobs) {
+		batchSize = len(q.secondaryJobs)
+	}
+	claimed := q.secondaryJobs[:batchSize]
+	q.secondaryJobs = q.secondaryJobs[batchSize:]
+	// The claim issues the attempt identity, exactly as the store's does.
+	for i := range claimed {
+		q.nextSecondaryGeneration++
+		claimed[i].Generation = q.nextSecondaryGeneration
+		q.secondaryGeneration[claimed[i].CanonicalURL] = q.nextSecondaryGeneration
+	}
+	return claimed, nil
+}
+
+// The fake enforces the same rule the store does: a write whose generation is
+// not the one the lane currently holds changes nothing. Without that, a worker
+// test could pass while the real compare-and-set was absent.
+func (q *fakeQueue) ownsSecondaryLane(canonicalURL string, generation int) bool {
+	current, claimed := q.secondaryGeneration[canonicalURL]
+	return claimed && current == generation
+}
+
+func (q *fakeQueue) RecordSecondaryRef(
+	_ context.Context, canonicalURL string, generation int, ref string,
+) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.secondaryRefErr != nil {
+		return q.secondaryRefErr
+	}
+	if !q.ownsSecondaryLane(canonicalURL, generation) {
+		return storage.ErrLinkScanConflict
+	}
+	q.secondaryRefs[canonicalURL] = ref
+	return nil
+}
+
+func (q *fakeQueue) SettleSecondaryVerification(
+	_ context.Context, canonicalURL string, generation int,
+) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if !q.ownsSecondaryLane(canonicalURL, generation) {
+		return storage.ErrLinkScanConflict
+	}
+	delete(q.secondaryGeneration, canonicalURL)
+	q.secondarySettled = append(q.secondarySettled, canonicalURL)
+	return nil
+}
+
+func (q *fakeQueue) RecordSecondaryMalicious(
+	_ context.Context, canonicalURL string, generation int,
+	_ string, evidenceExpiresAt time.Time,
+) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.secondaryVerdErr != nil {
+		return q.secondaryVerdErr
+	}
+	if !q.ownsSecondaryLane(canonicalURL, generation) {
+		return storage.ErrLinkScanConflict
+	}
+	// The store's statement flips the row in one shot; the fake records the same
+	// two facts the assertions care about.
+	q.verdicts[canonicalURL] = urlsafety.VerdictMalicious
+	q.secondaryGuilty[canonicalURL] = evidenceExpiresAt
+	return nil
 }
 
 func newFakeQueue(jobs ...storage.LinkScanJob) *fakeQueue {
 	return &fakeQueue{
-		jobs:      jobs,
-		submitted: map[string]string{},
-		verdicts:  map[string]urlsafety.Verdict{},
+		jobs:                jobs,
+		submitted:           map[string]string{},
+		verdicts:            map[string]urlsafety.Verdict{},
+		evidenceExpiry:      map[string]time.Time{},
+		secondaryRefs:       map[string]string{},
+		secondaryGuilty:     map[string]time.Time{},
+		secondaryGeneration: map[string]int{},
 	}
 }
 
@@ -166,7 +277,7 @@ func (q *fakeQueue) PruneLinkScanBudget(_ context.Context, _ time.Duration) erro
 	return q.pruneErr
 }
 
-func (q *fakeQueue) RecordLinkVerdict(_ context.Context, canonicalURL, scanUUID string, verdict urlsafety.Verdict) error {
+func (q *fakeQueue) RecordLinkVerdict(_ context.Context, write storage.LinkVerdictWrite) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.verdictConflict {
@@ -177,8 +288,12 @@ func (q *fakeQueue) RecordLinkVerdict(_ context.Context, canonicalURL, scanUUID 
 	if q.verdictErr != nil {
 		return q.verdictErr
 	}
-	q.verdicts[canonicalURL] = verdict
-	q.boundScan = scanUUID
+	q.verdicts[write.CanonicalURL] = write.Verdict
+	q.boundScan = write.ScanUUID
+	q.evidenceExpiry[write.CanonicalURL] = write.EvidenceExpiresAt
+	if write.VerifySecondary {
+		q.secondaryOpened = append(q.secondaryOpened, write.CanonicalURL)
+	}
 	return nil
 }
 
@@ -260,6 +375,38 @@ func (q *fakeQueue) PublishOutboxBacklog(_ context.Context) (int, time.Duration,
 	return len(q.events), 0, nil
 }
 
+// Issue #807 convergence methods. The fake has no deadlines, so nothing expires
+// unless a test stages it.
+func (q *fakeQueue) TerminalizeExpiredLinkScans(_ context.Context) ([]string, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	expired := q.expired
+	q.expired = nil
+	return expired, q.terminalizeErr
+}
+
+func (q *fakeQueue) TerminalizePendingLinkScansDisabled(_ context.Context) ([]string, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var drained []string
+	for _, job := range q.jobs {
+		drained = append(drained, job.CanonicalURL)
+	}
+	q.jobs = nil
+	q.drainedDisabled = append(q.drainedDisabled, drained...)
+	return drained, nil
+}
+
+func (q *fakeQueue) RecordLinkTargetTerminal(_ context.Context, canonicalURL, reason string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.policyTerminals == nil {
+		q.policyTerminals = map[string]string{}
+	}
+	q.policyTerminals[canonicalURL] = reason
+	return q.terminalErr
+}
+
 func (q *fakeQueue) LinkScanBacklog(_ context.Context) (map[string]int, time.Duration, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -325,6 +472,33 @@ func (p *fakeProvider) Poll(_ context.Context, _, _ string) (urlsafety.Verdict, 
 	defer p.mu.Unlock()
 	p.polls++
 	return p.verdict, p.pollErr
+}
+
+// Check adapts the two-step fake to the provider-agnostic contract the worker
+// now speaks (issue #807): no ref submits, a ref polls. The tests below keep
+// their Submit/Poll vocabulary because that is the provider shape they pin.
+func (p *fakeProvider) Check(ctx context.Context, canonicalURL, providerRef string) (urlsafety.ReputationResult, error) {
+	if providerRef == "" {
+		scanID, err := p.Submit(ctx, canonicalURL)
+		if err != nil {
+			return urlsafety.ReputationResult{}, err
+		}
+		return urlsafety.ReputationResult{ProviderRef: scanID}, urlsafety.ErrCheckInProgress
+	}
+	verdict, err := p.Poll(ctx, canonicalURL, providerRef)
+	switch {
+	case errors.Is(err, urlsafety.ErrScanPending):
+		return urlsafety.ReputationResult{ProviderRef: providerRef}, urlsafety.ErrCheckInProgress
+	case errors.Is(err, urlsafety.ErrScanInconclusive):
+		return urlsafety.ReputationResult{ProviderRef: providerRef, Verdict: urlsafety.ReputationUnknown}, nil
+	case err != nil:
+		return urlsafety.ReputationResult{}, err
+	case !verdict.IsFinal():
+		// Exactly what the real adapter does: a zero, unknown or future Verdict
+		// is a failed exchange, never a terminal answer.
+		return urlsafety.ReputationResult{}, urlsafety.ErrUnavailable
+	}
+	return urlsafety.ReputationResult{ProviderRef: providerRef, Verdict: urlsafety.ReputationVerdict(verdict)}, nil
 }
 
 func (p *fakeProvider) counts() (int, int) {

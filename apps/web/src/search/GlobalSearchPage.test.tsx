@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router";
+import { MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { mockSearchMessages, mockSearchUsers, mockSearchChannels } = vi.hoisted(() => ({
@@ -71,6 +71,24 @@ describe("GlobalSearchPage", () => {
     const tabs = screen.getAllByRole("tab");
     expect(tabs.map((t) => t.textContent)).toEqual(["Mensagens", "Usuários", "Canais"]);
     expect(screen.getByRole("tab", { name: "Mensagens" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("closes the Ctrl/Cmd+K search surface with Escape", () => {
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral", "/chat/search"]} initialIndex={1}>
+        <Routes>
+          <Route path="/chat/search" element={<GlobalSearchPage />} />
+          <Route path="/chat/channel/geral" element={<p>Conversa anterior</p>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    fireEvent.keyDown(
+      screen.getByRole("searchbox", { name: "Buscar mensagens, pessoas e canais" }),
+      { key: "Escape" },
+    );
+
+    expect(screen.getByText("Conversa anterior")).toBeInTheDocument();
   });
 
   it("debounces typing and calls only the active tab's endpoint", async () => {

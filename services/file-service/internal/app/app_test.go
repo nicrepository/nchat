@@ -815,3 +815,14 @@ func TestLinkSafetyFailsWhenTheDatabaseIsUnreachable(t *testing.T) {
 		t.Fatalf("the error leaked the DSN: %v", err)
 	}
 }
+
+// The pgx-backed admission and fence need the concrete pool; a start-up with
+// any other pool is refused rather than left without an upload gate.
+func TestPGXDependenciesRefuseANonPGXPool(t *testing.T) {
+	if _, err := newUploadAdmission(&stubPool{}, storage.UploadAdmissionLimits{}, slog.Default()); !errors.Is(err, errDependenciesUnavailable) {
+		t.Fatalf("admission err = %v", err)
+	}
+	if _, err := newAttachmentFence(&stubPool{}, slog.Default()); !errors.Is(err, errDependenciesUnavailable) {
+		t.Fatalf("fence err = %v", err)
+	}
+}

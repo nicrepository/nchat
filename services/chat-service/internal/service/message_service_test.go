@@ -123,6 +123,7 @@ type fakeMessageStore struct {
 	lastHistoryInput       storage.ListMessageEditHistoryInput
 	lastDeleteInput        storage.DeleteMessageInput
 	lastForwardInput       storage.ForwardChannelMessageInput
+	lastEditInput          storage.EditMessageInput
 	lastSnapshotInput      storage.ForwardSnapshotInput
 	lastReplayInput        storage.ForwardReplayInput
 	createCalls            int
@@ -244,7 +245,7 @@ func (f *fakeMessageStore) ReserveProviderSubmit(_ context.Context, _ int, _ tim
 
 func (f *fakeMessageStore) PruneLinkScanBudget(_ context.Context, _ time.Duration) error { return nil }
 
-func (f *fakeMessageStore) RecordLinkVerdict(_ context.Context, _, _ string, _ urlsafety.Verdict) error {
+func (f *fakeMessageStore) RecordLinkVerdict(_ context.Context, _ storage.LinkVerdictWrite) error {
 	return nil
 }
 
@@ -303,6 +304,7 @@ func (f *fakeMessageStore) ForwardChannelMessage(_ context.Context, input storag
 }
 
 func (f *fakeMessageStore) EditMessage(_ context.Context, input storage.EditMessageInput) (domain.Message, error) {
+	f.lastEditInput = input
 	if f.editErr != nil {
 		return domain.Message{}, f.editErr
 	}

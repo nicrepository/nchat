@@ -993,23 +993,28 @@ func TestNewRefusesInvalidLinkSafetyFlag(t *testing.T) {
 // enabled-but-unbuildable checker means, so the three states are asserted on the
 // wiring function itself rather than only through Config.Validate.
 
-// Disabled is the only state in which a nil checker is correct: downstream,
-// nil means "the feature is off", and here that is exactly what was asked for.
-func TestWireLinkSafetySkipsWhenDisabled(t *testing.T) {
+// Disabled (issue #807): no provider and no reconcile worker, but the link
+// entities are still wired and the scan worker still exists — as the sweep that
+// terminalises every pending target as unknown/disabled. A flag that stopped
+// the sweep would strand rows, which is the failure issue #566 documented.
+func TestWireLinkSafetyDisabledStillConverges(t *testing.T) {
 	svc := &service.MessageService{}
 
 	wiring, err := wireLinkSafety(config.Config{LinkSafetyEnabled: false}, svc, stubLinkStore{}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("a disabled check must need no credentials: %v", err)
 	}
-	if wiring.Scan != nil {
-		t.Fatal("no scan worker may be built when the flag is off")
+	if wiring.Scan == nil {
+		t.Fatal("the sweep must run with the flag off")
 	}
 	if wiring.Reconcile != nil {
 		t.Fatal("no reconcile worker may be built when the flag is off")
 	}
-	if svc.HasLinkSafety() {
-		t.Fatal("no gate may be installed when the flag is off")
+	if wiring.Preview == nil || wiring.Announcer == nil {
+		t.Fatal("the preview drain and the announcer must exist regardless of the flags")
+	}
+	if !svc.HasLinkSafety() {
+		t.Fatal("link entities must be wired with the flag off: the backend stays the authority")
 	}
 }
 
@@ -1017,6 +1022,7 @@ func TestWireLinkSafetyInstallsGateWhenEnabled(t *testing.T) {
 	svc := &service.MessageService{}
 	cfg := config.Config{
 		LinkSafetyEnabled:           true,
+		LinkSafetyGoogleWebRiskKey:  "key-xyz",
 		LinkSafetyCloudflareAccount: "acct-123",
 		LinkSafetyCloudflareToken:   "token-abc",
 	}
@@ -1046,8 +1052,24 @@ func TestWireLinkSafetyInstallsGateWhenEnabled(t *testing.T) {
 func TestWireLinkSafetyFailsWhenTheCheckerCannotBeBuilt(t *testing.T) {
 	for name, cfg := range map[string]config.Config{
 		"no credentials": {LinkSafetyEnabled: true},
-		"no token":       {LinkSafetyEnabled: true, LinkSafetyCloudflareAccount: "acct-123"},
-		"no account":     {LinkSafetyEnabled: true, LinkSafetyCloudflareToken: "token-abc"},
+		// The primary is a way the checker cannot be built too, and since issue
+		// #928 it is the first one: falling through to Cloudflare alone would be
+		// the configuration this issue replaced, reached by omission.
+		"no web risk key": {
+			LinkSafetyEnabled:           true,
+			LinkSafetyCloudflareAccount: "acct-123",
+			LinkSafetyCloudflareToken:   "token-abc",
+		},
+		"no token": {
+			LinkSafetyEnabled:           true,
+			LinkSafetyGoogleWebRiskKey:  "key-xyz",
+			LinkSafetyCloudflareAccount: "acct-123",
+		},
+		"no account": {
+			LinkSafetyEnabled:          true,
+			LinkSafetyGoogleWebRiskKey: "key-xyz",
+			LinkSafetyCloudflareToken:  "token-abc",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			svc := &service.MessageService{}
@@ -1057,11 +1079,10 @@ func TestWireLinkSafetyFailsWhenTheCheckerCannotBeBuilt(t *testing.T) {
 			if err == nil {
 				t.Fatal("the bootstrap continued with the flag on and no gate")
 			}
-			if svc.HasLinkSafety() {
-				t.Fatal("a failed wiring must not leave a half-installed gate")
-			}
-			if strings.Contains(err.Error(), "acct-123") || strings.Contains(err.Error(), "token-abc") {
-				t.Fatalf("the error carries a configuration value: %v", err)
+			for _, secret := range []string{"acct-123", "token-abc", "key-xyz"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("the error carries a configuration value: %v", err)
+				}
 			}
 		})
 	}
@@ -1073,6 +1094,7 @@ func TestWireLinkSafetyFailsWhenTheCheckerCannotBeBuilt(t *testing.T) {
 func TestWireLinkSafetyFailsWithoutAMessageService(t *testing.T) {
 	cfg := config.Config{
 		LinkSafetyEnabled:           true,
+		LinkSafetyGoogleWebRiskKey:  "key-xyz",
 		LinkSafetyCloudflareAccount: "acct-123",
 		LinkSafetyCloudflareToken:   "token-abc",
 	}
@@ -1115,7 +1137,7 @@ func (stubLinkStore) ReserveProviderSubmit(context.Context, int, time.Duration) 
 }
 
 func (stubLinkStore) PruneLinkScanBudget(context.Context, time.Duration) error { return nil }
-func (stubLinkStore) RecordLinkVerdict(context.Context, string, string, urlsafety.Verdict) error {
+func (stubLinkStore) RecordLinkVerdict(context.Context, storage.LinkVerdictWrite) error {
 	return nil
 }
 func (stubLinkStore) ResolveDecidedMessages(context.Context) (storage.ResolveSummary, error) {
@@ -1179,6 +1201,76 @@ func (stubLinkStore) RefreshMessageLinkSafety(
 ) ([]storage.MessageLinkSafetyChange, error) {
 	return nil, nil
 }
+
+// Issue #807: the per-link read model, the target index and the preview queue.
+// All of them answer "nothing", which is all wiring needs.
+
+func (stubLinkStore) LoadLinkTargets(context.Context, []string) (map[string]storage.LinkTargetState, error) {
+	return map[string]storage.LinkTargetState{}, nil
+}
+
+func (stubLinkStore) LoadLinkPreviews(context.Context, string, []string) (map[string]storage.LinkPreviewRow, error) {
+	return map[string]storage.LinkPreviewRow{}, nil
+}
+
+func (stubLinkStore) LoadMessageBodies(context.Context, []string) (map[string]string, error) {
+	return map[string]string{}, nil
+}
+
+func (stubLinkStore) QueueLinkPreviews(context.Context, string, []string) error { return nil }
+
+func (stubLinkStore) MessagesReferencingLink(context.Context, string, string, string, int) ([]storage.LinkReference, error) {
+	return nil, nil
+}
+
+func (stubLinkStore) LinkWorkspacesReferencing(context.Context, string) ([]string, error) {
+	return nil, nil
+}
+
+func (stubLinkStore) RevokeLinkPreviews(context.Context, string) ([]storage.LinkPreviewRow, error) {
+	return nil, nil
+}
+
+func (stubLinkStore) BeginLinkFanout(context.Context, string, string, string) (storage.LinkFanout, error) {
+	return storage.LinkFanout{}, nil
+}
+
+func (stubLinkStore) ClaimDueLinkFanouts(context.Context, int) ([]storage.LinkFanout, error) {
+	return nil, nil
+}
+
+func (stubLinkStore) AdvanceLinkFanout(context.Context, storage.LinkFanout, string) error { return nil }
+func (stubLinkStore) FinishLinkFanout(context.Context, storage.LinkFanout) error          { return nil }
+
+func (stubLinkStore) TerminalizeExpiredLinkScans(context.Context) ([]string, error) { return nil, nil }
+
+func (stubLinkStore) TerminalizePendingLinkScansDisabled(context.Context) ([]string, error) {
+	return nil, nil
+}
+
+func (stubLinkStore) RecordLinkTargetTerminal(context.Context, string, string) error { return nil }
+
+func (stubLinkStore) ClaimDueLinkPreviews(context.Context, int) ([]storage.LinkPreviewJob, error) {
+	return nil, nil
+}
+
+func (stubLinkStore) CompleteLinkPreview(context.Context, storage.LinkPreviewJob, storage.LinkPreviewResult) (storage.LinkPreviewRow, error) {
+	return storage.LinkPreviewRow{}, nil
+}
+
+func (stubLinkStore) FailLinkPreview(context.Context, storage.LinkPreviewJob, string, bool) (storage.LinkPreviewRow, error) {
+	return storage.LinkPreviewRow{}, nil
+}
+
+func (stubLinkStore) TerminalizeExpiredLinkPreviews(context.Context) ([]storage.LinkPreviewRow, error) {
+	return nil, nil
+}
+
+func (stubLinkStore) DrainLinkPreviewsDisabled(context.Context) ([]storage.LinkPreviewRow, error) {
+	return nil, nil
+}
+
+func (stubLinkStore) LinkPreviewBacklog(context.Context) (int, error) { return 0, nil }
 
 // Issue #821. message.created carries the message's priority, because that
 // payload is what a delivery decision is made from — RecipientPolicy.PolicyFor
@@ -1257,6 +1349,32 @@ func TestDomainMessageToWSPayloadKeepsTheAcknowledgementRequestOnARemovedMessage
 	}
 	if !got.AcknowledgementRequired {
 		t.Fatal("a removed message must still say what it had asked for")
+	}
+}
+
+func TestHubBroadcasterPublishesPerLinkUpdate(t *testing.T) {
+	bus := &captureBroadcastBus{published: make(chan ws.Event, 1)}
+	hub := ws.NewHub(ws.NopAuthorizer{}, slog.Default(), bus, "test-link-update-broadcaster")
+	t.Cleanup(hub.Shutdown)
+	updatedAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+	(&hubBroadcaster{hub: hub}).PublishMessageLinkUpdated(
+		t.Context(), "workspace-1", "channel", "channel-1", "message-1", domain.MessageLink{
+			Ordinal: 1, TargetKey: domain.LinkTargetKey("https://site.example/"),
+			Text: "site.example", URL: "https://site.example/", Hostname: "site.example",
+			Safety: domain.LinkSafetySafe, Click: domain.LinkClickDirect, Href: "https://site.example/", UpdatedAt: updatedAt,
+			Preview: &domain.LinkPreview{State: domain.LinkPreviewReady, Hostname: "site.example", Title: "Site", ImageID: "img-1", ImageWidth: 480, ImageHeight: 320},
+		})
+
+	events := publishedEvents(t, bus, 1)
+	link := events[0].LinkUpdate
+	if events[0].Type != ws.EventTypeMessageLinkUpdated || link == nil || link.MessageID != "message-1" ||
+		link.Link.Ordinal != 1 || link.Link.TargetKey != domain.LinkTargetKey("https://site.example/") || link.Link.Safety != "safe" || link.Link.Click != "direct" || link.Link.Href != "https://site.example/" ||
+		link.Link.Preview == nil || link.Link.Preview.State != "ready" || link.Link.Preview.ImageID != "img-1" || link.Link.Preview.ImageWidth != 480 {
+		t.Fatalf("unexpected per-link update: %+v", events[0])
+	}
+	if got := domainLinksToWSPayload(nil); got != nil {
+		t.Fatalf("no links must map to a nil slice, got %+v", got)
 	}
 }
 

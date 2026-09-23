@@ -129,6 +129,17 @@ chave push, nenhum payload de entrega. Apenas referencias. O que a entrega
 precisa renderizar e lido depois, pelas mesmas projecoes autorizadas de sempre.
 Logs da outbox nunca carregam conteudo de mensagem.
 
+Isso continua valendo depois da #870, que deu banner com remetente e preview ao
+Web Push. Ela **nao** adicionou coluna nenhuma aqui e nao tem migration: o
+preview e resolvido por `presentationProjection` dentro do mesmo `ClaimDue` que
+ja acontecia, contra o acesso do destinatario **no snapshot do statement ClaimDue**, e vive
+somente na memoria do worker ate virar bytes de payload. Um snapshot gravado no
+envio foi recusado por tres motivos, o ultimo decisivo: duplicaria texto numa
+tabela com retencao propria, contradiria este invariante, e congelaria o preview
+— uma mensagem apagada entre o envio e o push ainda enviaria o texto antigo. Ver
+[notification-web-push.md](notification-web-push.md), "De onde vem o titulo e o
+preview".
+
 ## Retencao (documentada, nao implementada)
 
 Apenas linhas terminais (`sent`, `suppressed`, `failed`) acumulam. A politica

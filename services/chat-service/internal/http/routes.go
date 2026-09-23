@@ -67,6 +67,11 @@ const (
 	// a channel's members under /channels, a group's under the DM prefix — because
 	// a group is a chat.dm_conversations row and not a channel. Neither carries a
 	// workspace segment, for the same reason none of the others does.
+	// Served for POST (add) and, since issue #469, GET — the administrable
+	// roster of the same collection. The GET is not a second contract for
+	// /details' online preview: that one is presence-filtered and answers every
+	// reader, this one is membership and answers only a caller who may change
+	// it.
 	RouteChannelMembers = "/api/chat/channels/{channelID}/members"
 	// Issue #685 admin removal, distinct from the self-leave DELETE above: this
 	// one names the target in the path and requires management authority, while
@@ -128,6 +133,10 @@ const (
 	// credentials to look up arbitrary URLs.
 	RouteMessageLinkSafetyReconcile = "/api/chat/messages/{messageID}/link-safety/reconcile"
 	RouteMessageEditHistory         = "/api/chat/messages/{messageID}/history"
+	// RouteLinkPreviewImage serves a derived link-preview thumbnail (issue
+	// #807). The id names a preview row, workspace-scoped and re-authorised
+	// per request; nothing in the path is a remote URL.
+	RouteLinkPreviewImage = "/api/chat/link-previews/{previewID}/image"
 	// Issue #824 recipient acknowledgement. Message-scoped and target-free, for
 	// the same reason RouteMessageFavorite is: the message is the aggregate, and
 	// the conversation it lives in is something the server resolves from it

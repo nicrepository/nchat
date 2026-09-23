@@ -133,6 +133,12 @@ export function createMentionExtension() {
           parseHTML: (element) => element.getAttribute("data-mention-type"),
           renderHTML: (attributes) => ({ "data-mention-type": attributes.mentionType }),
         },
+        willBeAdded: {
+          default: false,
+          parseHTML: (element) => element.getAttribute("data-will-be-added") === "true",
+          renderHTML: (attributes) =>
+            attributes.willBeAdded ? { "data-will-be-added": "true" } : {},
+        },
       };
     },
   }).configure({
@@ -146,6 +152,12 @@ export function createMentionExtension() {
         "data-id": node.attrs.id,
         "data-label": node.attrs.label,
         "data-mention-type": node.attrs.mentionType,
+        ...(node.attrs.willBeAdded
+          ? {
+              "data-will-be-added": "true",
+              title: "Será adicionada a esta conversa ao enviar.",
+            }
+          : {}),
       },
       `@${node.attrs.label ?? node.attrs.id}`,
     ],

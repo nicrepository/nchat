@@ -29,14 +29,66 @@ services refuse to start without the credentials. So this Secret must be sealed
 CrashLoopBackOff. That is the intended failure: enabled with
 no checker would accept every link unchecked.
 
-The template is versioned; the ciphertext is not, because sealing needs the real
-Cloudflare account id and a token scoped to Account > URL Scanner > Edit. Steps 1-3 above, with:
+The template is versioned; the ciphertext is not, because sealing needs real
+credentials for both providers.
+
+### Adding the Google Web Risk key to an already-sealed Secret (issue #928)
+
+`nchat-dev` already holds a valid `nchat-link-safety` SealedSecret with the four
+Cloudflare keys. Issue #928 added a fifth,
+`CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY`, and **this repository cannot generate
+its ciphertext**: sealing requires the plaintext key, which lives outside Git.
+The committed SealedSecret is therefore unchanged and is missing that one key,
+so chat-service will refuse to start with `CHAT_LINK_SAFETY_ENABLED=true` until
+an operator performs the steps below. That refusal is the intended failure —
+starting with only the fallback configured is the pre-#928 arrangement, in which
+ordinary links stay permanently unverified.
+
+`kubeseal` merges a single key into an existing SealedSecret without needing the
+other four, so nothing already sealed has to be re-entered:
+
+```
+# WEBRISK_KEY is read into the environment out of band -- never as a shell
+# argument, which would reach the history file and the process list.
+read -rs WEBRISK_KEY
+
+printf '%s' "$WEBRISK_KEY" | kubeseal \
+  --raw \
+  --namespace nchat-dev \
+  --name nchat-link-safety \
+  --scope strict \
+  --controller-namespace kube-system \
+  --controller-name sealed-secrets
+
+unset WEBRISK_KEY
+```
+
+Paste the single-line ciphertext `--raw` prints into
+`infra/k8s/secrets/sealed/nchat-dev/nchat-link-safety.yaml` under
+`spec.encryptedData` as:
+
+```
+    CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY: <ciphertext>
+```
+
+Keep the existing four entries exactly as they are. `--scope strict` is
+required: the other entries were sealed with it, and a mixed-scope SealedSecret
+fails to decrypt.
+
+At Google, restrict the key to the Web Risk API only and to this deployment's
+egress addresses before sealing it. An unrestricted key is spendable by anybody
+who obtains it.
+
+### Sealing the Secret from scratch (a new environment)
+
+Steps 1-3 above, with:
 
 ```
 cp infra/k8s/secrets/templates/nchat-link-safety.template.yaml \
    infra/k8s/secrets/unsealed/nchat-link-safety.yaml
-# fill in the four values (the account id and token are the same in both
-# CHAT_* and FILE_* keys), then:
+# fill in the five values: the Google Web Risk key for chat-service, and the
+# Cloudflare account id and token, which are the same in both the CHAT_* and
+# FILE_* keys. Then:
 scripts/secrets/sealed-secrets-seal.sh \
   infra/k8s/secrets/unsealed/nchat-link-safety.yaml \
   infra/k8s/secrets/sealed/nchat-dev/nchat-link-safety.yaml \
@@ -45,6 +97,10 @@ scripts/secrets/sealed-secrets-seal.sh \
 
 Add the generated file to `infra/k8s/secrets/sealed/nchat-dev/kustomization.yaml`
 and delete the unsealed copy.
+
+Note that only chat-service reads the Web Risk key. file-service names the two
+`FILE_*` Cloudflare keys individually rather than mounting this Secret with
+`envFrom`, so rotating the Google key never requires restarting it.
 
 ## Web Push: nchat-webpush (#862)
 

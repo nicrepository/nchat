@@ -342,6 +342,39 @@ test.describe("layout responsivo", () => {
   });
 
   /**
+   * ISSUE #891, a metade móvel. O caminho do `X` e o retorno de foco já são
+   * cobertos pela jornada acima; o que falta é a mesma superfície fechada por
+   * `Escape` — o gesto vale igual nas duas composições — e a prova de que o
+   * rascunho continua intacto do outro lado do fechamento, num celular onde o
+   * painel cobre a conversa inteira em vez de ficar ao lado dela.
+   */
+  test("celular: Escape fecha os detalhes, devolve o foco e preserva o rascunho", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize(PHONE);
+    await openChannel(page, testInfo);
+
+    await fillComposer(page, "rascunho do celular");
+    await expect(composer(page)).toContainText("rascunho do celular");
+
+    await detailsToggle(page).click();
+    const details = page.getByTestId("chat-conversation-details");
+    await expect(details).toBeVisible();
+    await expect(detailsToggle(page)).toHaveAttribute("aria-expanded", "true");
+    // A superfície cabe na viewport: nada essencial fica abaixo ou ao lado dela.
+    await expectWithinViewport(page, details);
+    await expectNoHorizontalScroll(page);
+
+    await page.keyboard.press("Escape");
+
+    await expect(details).toBeHidden();
+    await expect(detailsToggle(page)).toHaveAttribute("aria-expanded", "false");
+    await expect(detailsToggle(page)).toBeFocused();
+    await expect(composer(page)).toContainText("rascunho do celular");
+    await expectNoHorizontalScroll(page);
+  });
+
+  /**
    * ISSUE #822 — the priority selector is a popover on desktop and a sheet on a
    * phone, and this is the half a jsdom test cannot answer: that the sheet is
    * actually on screen, reachable and does not widen the page.

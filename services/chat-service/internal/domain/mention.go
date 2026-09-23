@@ -10,9 +10,10 @@ const (
 
 // MentionCandidate is an authorized autocomplete result.
 type MentionCandidate struct {
-	Type  MentionType
-	ID    string
-	Label string
+	Type        MentionType
+	ID          string
+	Label       string
+	WillBeAdded bool
 }
 
 // MaxGroupAllMentionRecipients bounds how many eligible recipients a single

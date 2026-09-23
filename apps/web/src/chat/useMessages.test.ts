@@ -436,9 +436,18 @@ afterEach(() => {
 });
 
 describe("useMessages — DM body format", () => {
-  it("posts group messages as v3", async () => {
+  it("posts group messages as v3 and reconciles the membership event", async () => {
     mockFetchDMMessages.mockResolvedValue(emptyPage);
-    mockPostDMMessage.mockResolvedValue(makeMessage({ id: "group-message", bodyFormat: "v3" }));
+    mockPostDMMessage.mockResolvedValue(
+      makeMessage({
+        id: "group-message",
+        bodyFormat: "v3",
+        createdConversationEventId: "event-member-added",
+      }),
+    );
+    mockFetchDMMessage.mockResolvedValue(
+      makeMessage({ id: "event-member-added", kind: "system", bodyText: "" }),
+    );
     const { result } = renderHook(() =>
       useMessages({
         kind: "dm",
@@ -456,6 +465,43 @@ describe("useMessages — DM body format", () => {
       "@[Ana](mention:user:user-1)",
       expect.objectContaining({ bodyFormat: "v3" }),
     );
+    await waitFor(() =>
+      expect(mockFetchDMMessage).toHaveBeenCalledWith(
+        "group-1",
+        "event-member-added",
+        expect.any(AbortSignal),
+      ),
+    );
+    expect(result.current.state.messages.map((message) => message.id).sort()).toEqual([
+      "event-member-added",
+      "group-message",
+    ]);
+  });
+
+  it("retries the auto-add event announced by the send response without flashing a realtime error", async () => {
+    const event = makeMessage({
+      id: "event-member-added",
+      kind: "system",
+      eventType: "conversation_member_added",
+      eventPayload: { targetUsers: [{ userId: "user-new", displayName: "Pessoa nova" }] },
+    });
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockPostChannelMessage.mockResolvedValue(
+      makeMessage({ id: "message-with-auto-add", createdConversationEventId: event.id }),
+    );
+    mockFetchChannelMessage.mockRejectedValueOnce(new Error("temporary read failure"));
+    mockFetchChannelMessage.mockResolvedValueOnce(event);
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-auto-add", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(() => result.current.sendMessage("@[Pessoa nova](mention:user:user-new)"));
+
+    await waitFor(() => expect(mockFetchChannelMessage).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.state.messages).toContainEqual(event));
+    expect(result.current.state.realtimeError).toBeNull();
   });
 
   it("keeps direct messages on v2 by default", async () => {
@@ -886,7 +932,11 @@ describe("useMessages — WS message.created integration", () => {
     expect(result.current.state.actionError).toMatch(/temporariamente indisponíveis/i);
   });
 
-  it("maps subscribe errors to realtime state without showing a reaction failure", async () => {
+  // Issue #475: a room_access_denied subscribe rejection means membership was
+  // lost while this conversation was open, not a transient realtime hiccup —
+  // it converges on the same access-denied state a 404 on the REST load
+  // produces, instead of surfacing as a "tentar novamente"-shaped banner.
+  it("maps a room_access_denied subscribe error to the access-denied state", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
     const { result } = renderHook(() =>
       useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
@@ -901,7 +951,9 @@ describe("useMessages — WS message.created integration", () => {
       }),
     );
 
-    expect(result.current.state.realtimeError).toMatch(/tempo real/i);
+    expect(result.current.state.status).toBe("denied");
+    expect(result.current.state.messages).toEqual([]);
+    expect(result.current.state.realtimeError).toBeNull();
     expect(result.current.state.actionError).toBeNull();
   });
 
@@ -1655,6 +1707,31 @@ describe("useMessages — WS message.created integration", () => {
     expect(result.current.state.messages[0]).toEqual(evt);
   });
 
+  it("retries the auto-add system event once without showing a realtime failure", async () => {
+    const evt = makeMessage({
+      id: "evt-auto-added-member",
+      kind: "system",
+      eventType: "conversation_member_added",
+      eventPayload: { targetUsers: [{ userId: "user-new", displayName: "Pessoa nova" }] },
+    });
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchChannelMessage.mockRejectedValueOnce(new Error("temporary read failure"));
+    mockFetchChannelMessage.mockResolvedValueOnce(evt);
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-auto-add", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      fireWsConversationEvent("channel", "ch-auto-add", "evt-auto-added-member");
+    });
+
+    await waitFor(() => expect(mockFetchChannelMessage).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.state.messages).toEqual([evt]));
+    expect(result.current.state.realtimeError).toBeNull();
+  });
+
   it("ignores a conversation.event for a different conversation", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
 
@@ -1670,6 +1747,60 @@ describe("useMessages — WS message.created integration", () => {
 
     expect(mockFetchChannelMessage).not.toHaveBeenCalled();
     expect(result.current.state.messages).toHaveLength(0);
+  });
+
+  // Issue #469: a removal publishes conversation.event and nothing else —
+  // there is no members.removed — so anything else that describes this
+  // conversation has to hear about it here or converge only on the next
+  // reload.
+  it("forwards a conversation event for the open target to the caller", async () => {
+    const onConversationEvent = vi.fn();
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({ id: "evt-removed", kind: "system", eventType: "conversation_member_removed" }),
+    );
+
+    const { result } = renderHook(() =>
+      useMessages({
+        kind: "channel",
+        targetId: "ch-evt",
+        currentUserId: "user-me",
+        onConversationEvent,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      fireWsConversationEvent("channel", "ch-evt", "evt-removed");
+    });
+
+    await waitFor(() => expect(onConversationEvent).toHaveBeenCalledTimes(1));
+    expect(onConversationEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ target_id: "ch-evt", message_id: "evt-removed" }),
+    );
+  });
+
+  it("does not forward a conversation event for another conversation", async () => {
+    const onConversationEvent = vi.fn();
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+
+    const { result } = renderHook(() =>
+      useMessages({
+        kind: "channel",
+        targetId: "ch-mine",
+        currentUserId: "user-me",
+        onConversationEvent,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      fireWsConversationEvent("channel", "ch-other", "evt-elsewhere");
+    });
+
+    expect(onConversationEvent).not.toHaveBeenCalled();
   });
 
   it("does not duplicate a system event redelivered while already in the timeline", async () => {
@@ -2597,6 +2728,131 @@ describe("useMessages — reply state", () => {
       ),
     );
     await waitFor(() => expect(result.current.state.replyTo).toBeNull());
+  });
+});
+
+// ── Issue #929: a send's acknowledgement consumes only what it carried ───────
+
+describe("useMessages — the acknowledgement of a send (issue #929)", () => {
+  it("consumes the reply the send carried, but keeps one picked while it was in flight", async () => {
+    const first = makeMessage({ id: "msg-first" });
+    const second = makeMessage({ id: "msg-second" });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [first, second], nextCursor: "" });
+    let resolveSend!: (message: ReturnType<typeof makeMessage>) => void;
+    mockPostChannelMessage.mockReturnValueOnce(
+      new Promise<ReturnType<typeof makeMessage>>((resolve) => (resolveSend = resolve)),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.selectReply(first));
+    let send!: Promise<unknown>;
+    act(() => {
+      send = result.current.sendMessage("resposta");
+    });
+    await waitFor(() => expect(mockPostChannelMessage).toHaveBeenCalledOnce());
+    expect(mockPostChannelMessage.mock.calls[0]?.[2]).toMatchObject({
+      parentMessageId: "msg-first",
+    });
+
+    // Before the acknowledgement, the reader answers the other message.
+    act(() => result.current.selectReply(second));
+    await act(async () => {
+      resolveSend(makeMessage({ id: "msg-sent", bodyText: "resposta" }));
+      await send;
+    });
+
+    expect(result.current.state.replyTo).toEqual(second);
+  });
+
+  it("consumes the reply when it is still the one the send carried", async () => {
+    const first = makeMessage({ id: "msg-first" });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [first], nextCursor: "" });
+    mockPostChannelMessage.mockResolvedValue(makeMessage({ id: "msg-sent" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    act(() => result.current.selectReply(first));
+
+    await act(() => result.current.sendMessage("resposta"));
+
+    expect(result.current.state.replyTo).toBeNull();
+  });
+
+  it("reports a send the server accepted as sent even after a target change, without touching the new target", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    let resolveSend!: (message: ReturnType<typeof makeMessage>) => void;
+    mockPostChannelMessage.mockReturnValueOnce(
+      new Promise<ReturnType<typeof makeMessage>>((resolve) => (resolveSend = resolve)),
+    );
+    const { result, rerender } = renderHook(
+      ({ targetId }: { targetId: string }) =>
+        useMessages({ kind: "channel", targetId, currentUserId: "user-me" }),
+      { initialProps: { targetId: "ch-1" } },
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let send!: Promise<{ status: string }>;
+    act(() => {
+      send = result.current.sendMessage("de A");
+    });
+    await waitFor(() => expect(mockPostChannelMessage).toHaveBeenCalledOnce());
+
+    rerender({ targetId: "ch-2" });
+    await waitFor(() =>
+      expect(mockFetchChannelMessages).toHaveBeenCalledWith(
+        "ch-2",
+        undefined,
+        expect.any(AbortSignal),
+      ),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let outcome!: { status: string };
+    await act(async () => {
+      resolveSend(makeMessage({ id: "msg-sent", bodyText: "de A" }));
+      outcome = await send;
+    });
+
+    // Authoritative for A's draft, which the caller reconciles by the key it
+    // captured at submit; B's timeline shows none of it.
+    expect(outcome).toEqual({ status: "sent" });
+    expect(result.current.state.messages).toEqual([]);
+    expect(result.current.state.sendError).toBeNull();
+  });
+
+  it("reports stale when the request fails after a target change", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    let rejectSend!: (error: Error) => void;
+    const pending = new Promise<never>((_, reject) => (rejectSend = reject));
+    pending.catch(() => undefined);
+    mockPostChannelMessage.mockReturnValueOnce(pending);
+    const { result, rerender } = renderHook(
+      ({ targetId }: { targetId: string }) =>
+        useMessages({ kind: "channel", targetId, currentUserId: "user-me" }),
+      { initialProps: { targetId: "ch-1" } },
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let send!: Promise<{ status: string }>;
+    act(() => {
+      send = result.current.sendMessage("de A");
+    });
+    await waitFor(() => expect(mockPostChannelMessage).toHaveBeenCalledOnce());
+    rerender({ targetId: "ch-2" });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let outcome!: { status: string };
+    await act(async () => {
+      rejectSend(new Error("rede"));
+      outcome = await send;
+    });
+
+    expect(outcome).toEqual({ status: "stale" });
+    expect(result.current.state.sendError).toBeNull();
   });
 });
 

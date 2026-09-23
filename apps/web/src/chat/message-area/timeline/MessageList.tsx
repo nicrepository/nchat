@@ -10,6 +10,7 @@
  */
 
 import { useMemo } from "react";
+import type { DirectMessageAccess } from "../../directMessage";
 
 import AttachmentViewerHost from "../../AttachmentViewerHost";
 import type { CallParticipantProfile } from "../../chatApi";
@@ -46,7 +47,8 @@ export interface MessageListProps {
   systemScope: SystemMessageScope;
   presenceTarget?: string;
   pinnedIds?: Set<string>;
-  openingAuthorDMIds?: Set<string>;
+  /** The shared open-DM operation and this conversation's claim on it. */
+  directMessage?: DirectMessageAccess;
   /** Issue #824: the server's acknowledgement summary per message, if any. */
   acknowledgements?: Record<string, MessageAcknowledgement>;
   /** Issue #824: the message whose confirmation is in flight, if any. */
@@ -102,9 +104,8 @@ export default function MessageList(props: MessageListProps) {
     virtualizer,
     highlightedMessageId,
     jumpToMessage,
-    pendingCount,
-    scrollButtonVisible,
-    scrollToBottomNow,
+    scrollButton,
+    onScrollButtonClick,
     focusList,
   } = useConversationViewport({
     messages,
@@ -134,7 +135,7 @@ export default function MessageList(props: MessageListProps) {
     onEmojiToneChange: props.onEmojiToneChange,
     editDisabledIds: props.editDisabledIds,
     pinnedIds: props.pinnedIds,
-    openingAuthorDMIds: props.openingAuthorDMIds,
+    directMessage: props.directMessage,
     acknowledgements: props.acknowledgements,
     acknowledgingId: props.acknowledgingId,
     resolveRecipientIdentities: props.resolveRecipientIdentities,
@@ -206,11 +207,7 @@ export default function MessageList(props: MessageListProps) {
           <div ref={bottomRef} data-testid="chat-bottom-sentinel" />
         </div>
       </div>
-      <ScrollToBottomButton
-        visible={scrollButtonVisible}
-        pendingCount={pendingCount}
-        onClick={scrollToBottomNow}
-      />
+      <ScrollToBottomButton state={scrollButton} onClick={onScrollButtonClick} />
     </div>
   );
 

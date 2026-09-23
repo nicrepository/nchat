@@ -353,6 +353,11 @@ type stubRenderer struct {
 	// duringRender runs while the renderer is "working", so a test can change
 	// the world underneath a job exactly as a scan verdict would.
 	duringRender func()
+	// panicValue, when set, makes Render panic instead of returning — the
+	// shape a third-party parser takes on a file it cannot survive, which is
+	// what GO-2026-6452 does to excelize. Read after the call is counted, so a
+	// test can still assert how much of the render budget the attempt spent.
+	panicValue any
 
 	calls     int
 	lastMIME  string
@@ -376,6 +381,9 @@ func (r *stubRenderer) Render(
 	defer r.mu.Unlock()
 	r.calls++
 	r.lastMIME, r.lastBytes = detectedMIME, read
+	if r.panicValue != nil {
+		panic(r.panicValue)
+	}
 	if readErr != nil {
 		return nil, "", readErr
 	}
@@ -724,6 +732,82 @@ func TestProcessDueRecordsARenderFailureAndLeavesTheAttachmentIntact(t *testing.
 	}
 	if deleted := f.objects.deletedKeys(); len(deleted) != 0 {
 		t.Fatalf("nothing should have been deleted, got %v", deleted)
+	}
+}
+
+// A renderer that panics must not be able to take the service with it
+// (GO-2026-6452).
+//
+// The panic is raised from inside Render, which is where a document library
+// raises it, and the assertions are the three things that distinguish
+// containment from merely surviving: the process is still here, the row
+// reached a terminal state instead of being left claimable forever, and it
+// reached the *permanent* one — an unclassified failure would be read as
+// transient and hand the same hostile file straight back to the next pass.
+func TestProcessDueContainsARendererPanicAsAPermanentRenderFailure(t *testing.T) {
+	f := newPreviewFixture(t)
+	f.renderer.panicValue = "renderer exploded on a malformed sheet"
+	job := f.storeAttachment(t, []byte("the original attachment bytes"), "application/pdf")
+	f.store.enqueue(job)
+
+	// Reaching the next line at all is half the assertion: an unrecovered
+	// panic here would unwind through the test binary, not fail this test.
+	if _, err := f.service.ProcessDue(context.Background()); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+
+	_, terminal := f.store.recorded()
+	if len(terminal) != 1 || terminal[0] != domain.PreviewStatusFailed {
+		t.Fatalf("terminal = %v, want one failed", terminal)
+	}
+	if calls := f.renderer.callCount(); calls != 1 {
+		t.Fatalf("render called %d times, want exactly one attempt spent", calls)
+	}
+	// Containment is not deletion: the attachment is as downloadable as it was.
+	if _, ok := f.objects.objects[job.StorageObjectKey]; !ok || f.objects.count() != 1 {
+		t.Fatal("a panicking renderer must not disturb the attachment's own object")
+	}
+	if deleted := f.objects.deletedKeys(); len(deleted) != 0 {
+		t.Fatalf("nothing should have been deleted, got %v", deleted)
+	}
+}
+
+// Availability is the point: the worker has to keep working afterwards.
+//
+// The second job also proves the panic did not strand anything the renderer
+// holds — Render panics while holding its own mutex, and a boundary that let
+// that escape would deadlock this second call rather than fail it.
+func TestProcessDueKeepsServingAfterARendererPanic(t *testing.T) {
+	f := newPreviewFixture(t)
+	f.renderer.panicValue = "renderer exploded on a malformed sheet"
+	poisoned := f.storeAttachment(t, []byte("the malformed attachment"), "application/pdf")
+	f.store.enqueue(poisoned)
+
+	if _, err := f.service.ProcessDue(context.Background()); err != nil {
+		t.Fatalf("process poisoned: %v", err)
+	}
+
+	// A perfectly ordinary attachment, right behind it.
+	f.renderer.panicValue = nil
+	healthy := f.storeAttachment(t, []byte("a well formed attachment"), "application/pdf")
+	f.store.enqueue(healthy)
+
+	processed, err := f.service.ProcessDue(context.Background())
+	if err != nil {
+		t.Fatalf("process healthy: %v", err)
+	}
+	if processed != 1 {
+		t.Fatalf("processed = %d, want the healthy attachment rendered", processed)
+	}
+
+	// One preview published, and the only terminal row is the poisoned one:
+	// the panic cost its own job and nothing else.
+	ready, terminal := f.store.recorded()
+	if len(ready) != 1 || ready[0].AttachmentID != healthy.AttachmentID {
+		t.Fatalf("ready = %v, want the healthy attachment's preview", ready)
+	}
+	if len(terminal) != 1 || terminal[0] != domain.PreviewStatusFailed {
+		t.Fatalf("terminal = %v, want only the poisoned attachment failed", terminal)
 	}
 }
 

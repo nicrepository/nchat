@@ -3,8 +3,8 @@ set -euo pipefail
 
 # `go install` re-verifies every transitive dependency of golangci-lint
 # against sum.golang.org on each run — a large dependency tree (see
-# .github/workflows/backend.yml). A single transient network error from the
-# checksum database (observed: "stream error ... INTERNAL_ERROR" over HTTP/2)
+# the Static / Go job of .github/workflows/ci.yml). A single transient network
+# error from the checksum database (observed: "stream error ... INTERNAL_ERROR" over HTTP/2)
 # fails the whole install. Retried with backoff rather than disabling
 # GOSUMDB/GONOSUMCHECK, which would drop supply-chain verification instead of
 # just tolerating a flaky fetch.

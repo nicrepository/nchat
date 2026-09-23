@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -12,7 +13,10 @@ import (
 
 // Twenty candidates gives the bounded popup more than two visible pages while
 // keeping an empty-prefix request far from a workspace-directory download.
-const mentionSearchLimit = 20
+const (
+	mentionSearchLimit    = 20
+	mentionOutsideReserve = 5
+)
 
 type SearchMentionsInput struct {
 	WorkspaceID string
@@ -62,6 +66,10 @@ func (s *MentionService) SearchMentions(ctx context.Context, input SearchMention
 		if err != nil {
 			return SearchMentionsOutput{}, fmt.Errorf("search dm conversation members: %w", err)
 		}
+		users, err = s.appendGroupCandidates(ctx, users, workspaceID, targetID, callerID, query)
+		if err != nil {
+			return SearchMentionsOutput{}, err
+		}
 		return SearchMentionsOutput{Users: users, Channels: []domain.MentionCandidate{}}, nil
 	}
 	if targetType != "channel" {
@@ -77,6 +85,10 @@ func (s *MentionService) SearchMentions(ctx context.Context, input SearchMention
 	users, err := s.members.SearchChannelMembers(ctx, workspaceID, targetID, query, mentionSearchLimit)
 	if err != nil {
 		return SearchMentionsOutput{}, fmt.Errorf("search channel members: %w", err)
+	}
+	users, err = s.appendChannelCandidates(ctx, users, workspaceID, targetID, callerID, query)
+	if err != nil {
+		return SearchMentionsOutput{}, err
 	}
 	visible, err := s.permissions.ListVisibleChannels(ctx, workspaceID, callerID)
 	if err != nil {
@@ -102,4 +114,53 @@ func (s *MentionService) SearchMentions(ctx context.Context, input SearchMention
 		channels = channels[:mentionSearchLimit]
 	}
 	return SearchMentionsOutput{Users: users, Channels: channels}, nil
+}
+
+func (s *MentionService) appendChannelCandidates(
+	ctx context.Context, current []domain.MentionCandidate, workspaceID, channelID, callerID, query string,
+) ([]domain.MentionCandidate, error) {
+	candidates, err := s.members.searchChannelMemberCandidates(ctx, SearchChannelMemberCandidatesInput{
+		WorkspaceID: workspaceID, ChannelID: channelID, CallerID: callerID,
+		Query: query, Limit: mentionOutsideReserve,
+	}, 0)
+	if errors.Is(err, domain.ErrForbidden) {
+		return current, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("search mention add candidates: %w", err)
+	}
+	return appendAutoAddCandidates(current, candidates, mentionSearchLimit), nil
+}
+
+func (s *MentionService) appendGroupCandidates(
+	ctx context.Context, current []domain.MentionCandidate, workspaceID, conversationID, callerID, query string,
+) ([]domain.MentionCandidate, error) {
+	candidates, err := s.dms.SearchGroupParticipantCandidates(
+		ctx, workspaceID, conversationID, callerID, query, mentionOutsideReserve,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("search mention add candidates: %w", err)
+	}
+	return appendAutoAddCandidates(current, candidates, mentionSearchLimit), nil
+}
+
+func appendAutoAddCandidates(
+	current []domain.MentionCandidate, candidates []domain.DMCandidate, limit int,
+) []domain.MentionCandidate {
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	if keep := limit - len(candidates); len(current) > keep {
+		current = current[:keep]
+	}
+	for _, candidate := range candidates {
+		if len(current) >= limit {
+			break
+		}
+		current = append(current, domain.MentionCandidate{
+			Type: domain.MentionTypeUser, ID: candidate.UserID,
+			Label: candidate.DisplayName, WillBeAdded: true,
+		})
+	}
+	return current
 }

@@ -215,8 +215,13 @@ describe("service worker: push", () => {
 
   it.each([
     ["absent", undefined],
-    ["a newer version", 2],
+    // Issue #870 made 2 a version this build understands, so the "newer
+    // version" case moved up. It has to stay expressible: failing closed on a
+    // version nobody has written yet is what lets version 3 add a field without
+    // this build guessing at what it means.
+    ["a newer version", 3],
     ["a string", "1"],
+    ["a float", 1.5],
   ])("shows nothing when the version is %s", async (_label, version) => {
     const harness = await loadServiceWorker();
 
@@ -476,5 +481,244 @@ describe("service worker: notificationclick", () => {
 
     expect(close).toHaveBeenCalledTimes(1);
     expect(harness.openWindow).not.toHaveBeenCalled();
+  });
+});
+
+describe("service worker: payload version 2", () => {
+  /**
+   * Issue #870. Version 2 is version 1 plus a title and a body preview, both
+   * produced and approved by the server.
+   *
+   * Two properties are under test and they pull in opposite directions. An
+   * approved preview must actually reach the screen, or the feature does not
+   * exist. Anything that is not an approved preview must not — and the fallback
+   * it lands on has to be indistinguishable from the one a version 1 payload
+   * gets, because the reasons a preview is missing (deleted, withheld, access
+   * revoked, previews turned off) are exactly what a banner must not disclose.
+   */
+  const v2Payload = {
+    ...validPayload,
+    v: 2,
+    title: "Ana Ribeiro · #incidentes",
+    body_preview: "o deploy de ontem derrubou o gateway",
+  };
+
+  it("shows the server's title and preview", async () => {
+    const harness = await loadServiceWorker();
+
+    await dispatchPush(harness, jsonData(v2Payload));
+
+    expect(harness.showNotification).toHaveBeenCalledWith(
+      "Ana Ribeiro · #incidentes",
+      expect.objectContaining({ body: "o deploy de ontem derrubou o gateway" }),
+    );
+  });
+
+  it("keeps the dedupe tag, the local assets, the timestamp and the click target", async () => {
+    const harness = await loadServiceWorker();
+
+    await dispatchPush(harness, jsonData(v2Payload));
+
+    expect(harness.showNotification.mock.calls[0][1]).toEqual({
+      tag: `nchat-notification-${validPayload.id}`,
+      icon: "/assets/nic-labs-icon.png",
+      badge: "/assets/favicon.png",
+      data: { url: "/chat" },
+      timestamp: Date.parse(validPayload.occurred_at),
+      body: "o deploy de ontem derrubou o gateway",
+    });
+  });
+
+  it("still shows a version 1 payload exactly as before", async () => {
+    const harness = await loadServiceWorker();
+
+    await dispatchPush(harness, jsonData(validPayload));
+
+    expect(harness.showNotification).toHaveBeenCalledWith("Você foi mencionado no NChat", {
+      tag: `nchat-notification-${validPayload.id}`,
+      icon: "/assets/nic-labs-icon.png",
+      badge: "/assets/favicon.png",
+      data: { url: "/chat" },
+      timestamp: Date.parse(validPayload.occurred_at),
+    });
+  });
+
+  it("ignores v2 fields carried by a version 1 payload", async () => {
+    const harness = await loadServiceWorker();
+
+    await dispatchPush(
+      harness,
+      jsonData({ ...validPayload, title: "forjado", body_preview: "segredo" }),
+    );
+
+    expect(harness.showNotification).toHaveBeenCalledWith(
+      "Você foi mencionado no NChat",
+      expect.not.objectContaining({ body: expect.anything() }),
+    );
+  });
+
+  it("falls back to the generic title when the server approved none", async () => {
+    const harness = await loadServiceWorker();
+    const withoutTitle = { ...v2Payload, title: undefined };
+
+    await dispatchPush(harness, jsonData(withoutTitle));
+
+    expect(harness.showNotification).toHaveBeenCalledWith(
+      "Você foi mencionado no NChat",
+      expect.anything(),
+    );
+    expect(harness.showNotification.mock.calls[0][1]).not.toHaveProperty("body");
+  });
+
+  it("shows no body when the server approved no preview", async () => {
+    const harness = await loadServiceWorker();
+    const withoutPreview = { ...v2Payload, body_preview: undefined };
+
+    await dispatchPush(harness, jsonData(withoutPreview));
+
+    expect(harness.showNotification.mock.calls[0][0]).toBe(v2Payload.title);
+    expect(harness.showNotification.mock.calls[0][1]).not.toHaveProperty("body");
+  });
+
+  it("refuses an unknown version even with valid presentation fields", async () => {
+    const harness = await loadServiceWorker();
+    await dispatchPush(harness, jsonData({ ...v2Payload, v: 3 }));
+    expect(harness.showNotification).not.toHaveBeenCalled();
+  });
+
+  // A field that is not a non-empty string of a plausible length is not a field
+  // this worker repairs. It is dropped whole, and the generic copy takes over:
+  // trimming or slicing it here would be the Service Worker deciding
+  // presentation, which is what #870 moved to the server.
+  it.each([
+    ["not a string", 42],
+    ["null", null],
+    ["an object", { toString: () => "gotcha" }],
+    ["an array", ["gotcha"]],
+    ["empty", ""],
+    ["whitespace", " \t\n "],
+    // Zero-width space: not empty, not whitespace, and invisible on a banner.
+    // The server cannot produce one — sanitizeLine drops the whole Cf category
+    // — so this is the case that only arrives from a payload we did not write.
+    ["a zero-width space", "​"],
+    ["a mix of invisible characters", "​ ﻿‎"],
+    ["longer than the contract allows", "x".repeat(201)],
+  ])("ignores a title that is %s", async (_label, title) => {
+    const harness = await loadServiceWorker();
+
+    await dispatchPush(harness, jsonData({ ...v2Payload, title }));
+
+    expect(harness.showNotification).toHaveBeenCalledWith(
+      "Você foi mencionado no NChat",
+      expect.anything(),
+    );
+    expect(harness.showNotification.mock.calls[0][1]).not.toHaveProperty("body");
+  });
+
+  it.each([
+    ["not a string", 42],
+    ["null", null],
+    ["an object", { toString: () => "gotcha" }],
+    ["empty", ""],
+    ["an array", ["gotcha"]],
+    ["whitespace", " \t\n "],
+    ["a zero-width space", "​"],
+    ["longer than the contract allows", "x".repeat(401)],
+  ])("ignores a body preview that is %s", async (_label, body_preview) => {
+    const harness = await loadServiceWorker();
+
+    await dispatchPush(harness, jsonData({ ...v2Payload, body_preview }));
+
+    expect(harness.showNotification.mock.calls[0][1]).not.toHaveProperty("body");
+  });
+
+  // The invisible-character check says "only invisible characters", not
+  // "contains one". A ZWJ emoji sequence carries U+200D and a family emoji is
+  // built entirely out of pictographs joined by it; a combining accent is Mn,
+  // not Cf. All of them are text somebody meant to send, and all of them are
+  // kept exactly as they arrived — nothing here rewrites a string.
+  it.each([
+    ["an emoji", "Ana 🎉"],
+    ["a ZWJ emoji sequence", "👨‍👩‍👦 chegou"],
+    ["combining marks", "Ana Ribeiro · #operações"],
+    ["non-Latin script", "田中さん"],
+    ["a zero-width joiner inside real text", "Ana​Ribeiro"],
+  ])("keeps a title that is %s", async (_label, title) => {
+    const harness = await loadServiceWorker();
+
+    await dispatchPush(harness, jsonData({ ...v2Payload, title }));
+
+    expect(harness.showNotification.mock.calls[0][0]).toBe(title);
+    expect(harness.showNotification.mock.calls[0][1].body).toBe(v2Payload.body_preview);
+  });
+
+  // The title is passed to showNotification as a string argument and the body
+  // as a string option. There is no element, no innerHTML and no parser here,
+  // so markup is the characters it is made of — asserted rather than assumed,
+  // because the day someone builds a DOM in this file is the day it matters.
+  it("passes markup through as literal text and never interprets it", async () => {
+    const harness = await loadServiceWorker();
+
+    await dispatchPush(
+      harness,
+      jsonData({
+        ...v2Payload,
+        title: "<img src=x onerror=alert(1)>",
+        body_preview: "<script>alert(1)</script>",
+      }),
+    );
+
+    expect(harness.showNotification).toHaveBeenCalledWith(
+      "<img src=x onerror=alert(1)>",
+      expect.objectContaining({ body: "<script>alert(1)</script>" }),
+    );
+  });
+
+  // The preview never becomes a destination. A click goes where every other
+  // click goes, and nothing in the payload can redirect it.
+  it("does not let the preview change where a click lands", async () => {
+    const harness = await loadServiceWorker();
+
+    await dispatchPush(
+      harness,
+      jsonData({ ...v2Payload, url: "https://evil.example/x", data: { url: "//evil.example" } }),
+    );
+
+    expect(harness.showNotification.mock.calls[0][1].data).toEqual({ url: "/chat" });
+  });
+
+  // The suppression rule #862 settled is about which surface presents the
+  // event, not about what the payload carries, so a preview does not change it.
+  it("is still suppressed by a visible and focused window", async () => {
+    const harness = await loadServiceWorker({
+      matchAll: vi
+        .fn()
+        .mockResolvedValue([windowClient("/chat", { visibilityState: "visible", focused: true })]),
+    });
+
+    await dispatchPush(harness, jsonData(v2Payload));
+
+    expect(harness.showNotification).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["visible without focus", { visibilityState: "visible" as const, focused: false }],
+    ["hidden", { visibilityState: "hidden" as const, focused: false }],
+  ])("is still shown for a window that is %s", async (_label, state) => {
+    const harness = await loadServiceWorker({
+      matchAll: vi.fn().mockResolvedValue([windowClient("/chat", state)]),
+    });
+
+    await dispatchPush(harness, jsonData(v2Payload));
+
+    expect(harness.showNotification).toHaveBeenCalledTimes(1);
+  });
+
+  it("is still shown when there is no window at all", async () => {
+    const harness = await loadServiceWorker({ matchAll: vi.fn().mockResolvedValue([]) });
+
+    await dispatchPush(harness, jsonData(v2Payload));
+
+    expect(harness.showNotification).toHaveBeenCalledTimes(1);
   });
 });

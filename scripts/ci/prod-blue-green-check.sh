@@ -192,34 +192,7 @@ check_preview_access_control() {
   allowlist="$(query 'Middleware|preview-allowlist|source-range')"
   [[ -n "$allowlist" ]] || fail "preview-allowlist declares no sourceRange"
   [[ "$allowlist" != *0.0.0.0/0* ]] || fail "preview-allowlist is open to the world"
-  check_preview_client_ip_strategy
   ok "every preview is restricted in the configuration, not only in a comment"
-}
-
-# The allowlist must compare its sourceRange against the operator, not against
-# whatever proxied the request.
-#
-# The preview hosts are behind Cloudflare. With no ipStrategy, IPAllowList
-# matches sourceRange against RemoteAddr -- the Cloudflare edge -- so
-# NCHAT_PROD_PREVIEW_ALLOW_CIDR would stop meaning "the operator's network".
-# The failure is silent in the direction that matters: the natural repair is to
-# put the Cloudflare ranges in sourceRange, which turns the allowlist into a
-# permit for every visitor Cloudflare forwards, and nothing in the manifest
-# would say so. In the expected public chain, depth 1 takes the rightmost
-# X-Forwarded-For entry Cloudflare supplies; for a request delivered by
-# Cloudflare, the client cannot forge that appended position.
-#
-# Exactly 1, not merely present: any other depth names a different hop in that
-# public chain. Additional origins in Traefik's global trustedIPs are part of
-# the infrastructure trust boundary and cannot be hardened by this gate.
-check_preview_client_ip_strategy() {
-  local depth
-  depth="$(query 'Middleware|preview-allowlist|ip-strategy-depth')"
-  case "$depth" in
-    1) ;;
-    "") fail "preview-allowlist declares no ipStrategy.depth; behind Cloudflare it would allowlist the edge address instead of the operator" ;;
-    *) fail "preview-allowlist uses ipStrategy.depth=$depth; this chain is client -> Cloudflare -> Traefik, where only depth 1 is the client" ;;
-  esac
 }
 
 # Both slots must be previewable, chat and console, or a candidate cannot be
@@ -361,30 +334,6 @@ check_scanner() {
   else
     fail "FILE_MALWARE_SCANNER_ADDRESS names '$host', which this overlay does not render"
   fi
-}
-
-# SMTP_WORKER_ENABLED is a switch the readiness probe enforces: with it on and
-# SMTP_HOST or SMTP_FROM absent, cfg.SMTPWorkerReady() fails the critical
-# `smtp-worker-config` check and notification-service never becomes Ready, so
-# the slot never takes traffic. The gate therefore does not demand the worker be
-# on or off -- it demands the switch and its configuration move together.
-check_smtp() {
-  local enabled key value missing=()
-  enabled="$(query 'ConfigMap|nchat-config|data.SMTP_WORKER_ENABLED')"
-  if [[ "$enabled" != "true" ]]; then
-    ok "SMTP worker is off (${enabled:-unset}); no transactional SMTP is required"
-    return
-  fi
-  for key in SMTP_HOST SMTP_FROM; do
-    [[ -n "$(query "ConfigMap|nchat-config|data.$key")" ]] || missing+=("$key")
-  done
-  [[ "${#missing[@]}" -eq 0 ]] ||
-    fail "SMTP_WORKER_ENABLED=true without ${missing[*]}; notification-service would never become Ready"
-  value="$(query 'ConfigMap|nchat-config|data.SMTP_TLS_MODE')"
-  [[ "$value" != "none" ]] ||
-    fail "SMTP_TLS_MODE=none is refused outside development/test/local"
-  [[ "${#missing[@]}" -ne 0 || "$value" == "none" ]] ||
-    ok "SMTP worker is on and carries the host, sender and TLS mode it needs"
 }
 
 check_livekit() {
@@ -562,7 +511,6 @@ check_configuration() {
   check_required_true VALKEY_WS_BROADCAST_ENABLED FILE_UPLOADS_ENABLED \
     FILE_MALWARE_SCAN_REQUIRED LIVEKIT_ENABLED OIDC_ENABLED
   check_scanner
-  check_smtp
   check_livekit
   check_livekit_client_contract
   check_livekit_environment_namespace

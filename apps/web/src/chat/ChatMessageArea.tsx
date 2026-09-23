@@ -42,6 +42,7 @@ import { usePendingReference } from "./usePendingReference";
 import { useConversationTarget } from "./useConversationTarget";
 import { useEmojiUsage } from "./emoji/useEmojiUsage";
 import { useMessages, type SendResult } from "./useMessages";
+import { useLatestRef } from "./messages/useLatestRef";
 import { useTypingIndicator } from "./useTypingIndicator";
 import type { WSTypingUpdatedEvent } from "./useChatWebSocket";
 import { usePins } from "./usePins";
@@ -49,18 +50,20 @@ import { selectLatestPin } from "./selectLatestPin";
 import { useConversationDetailsPanel } from "./useConversationDetailsPanel";
 import { useResourceCallBar } from "./useResourceCallBar";
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
+import { conversationRenameAction } from "./conversationRename";
 import ChatComposer from "./ChatComposer";
 import { noopConversationDrafts } from "./useConversationDrafts";
 import { senderLabel } from "./messageDisplay";
 import ConversationHeader from "./message-area/ConversationHeader";
 import ConversationCallBars from "./message-area/ConversationCallBars";
 import ConversationNotices from "./message-area/ConversationNotices";
+import { AccessDeniedState } from "./message-area/ConversationStates";
 import PinnedBar from "./message-area/PinnedBar";
 import ConversationDialogs from "./message-area/dialogs/ConversationDialogs";
 import ConversationTimeline from "./message-area/timeline/ConversationTimeline";
 import { quickReactionEmojis } from "./message-area/conversationText";
 import { directCallBar } from "./message-area/directCallBar";
-import { useAuthorDM } from "./message-area/hooks/useAuthorDM";
+import { inertDirectMessage, useDirectMessageAccess } from "./directMessage";
 import { useMessageDialogs } from "./message-area/hooks/useMessageDialogs";
 import { useTypingIndicatorLabel } from "./message-area/hooks/useTypingIndicatorLabel";
 import { useViewportAnchors } from "./message-area/hooks/useViewportAnchors";
@@ -109,13 +112,30 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   } = useEmojiUsage(ctx.currentUserId);
 
   const dialogs = useMessageDialogs({ kind, targetId, navigate });
-  const authorDM = useAuthorDM({
-    currentUserId: ctx.currentUserId,
-    kind,
-    targetId,
-    refreshConversations: ctx.refreshConversations,
-    navigate,
-  });
+  /*
+    The shell's coordinator, never one of this component's own (issue #895): the
+    in-flight registry inside it is what makes a second request for a recipient
+    already being resolved impossible, and the details panel beside this
+    timeline can address the same person. Two registries meant two POSTs. Falls
+    back to an inert one for the same reason drafts does — a ChatOutletContext
+    fixture that predates the field, never production.
+
+    The lifetime on top of it is this conversation's, stated as the domain
+    discriminant the rest of this component already keys everything by. So a
+    switch from one conversation to another releases what this surface was
+    waiting for, and a reply that arrives afterwards navigates nowhere — while
+    leaving untouched anything the details panel is still waiting for.
+  */
+  const directMessage = useDirectMessageAccess(
+    ctx.directMessage ?? inertDirectMessage,
+    `${kind}:${targetId}`,
+  );
+  const openAuthorDM = useCallback(
+    (message: Message) => {
+      if (message.senderId) directMessage.coordinator.open(message.senderId, directMessage.origin);
+    },
+    [directMessage],
+  );
   const anchors = useViewportAnchors({
     kind,
     targetId,
@@ -152,6 +172,21 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     toggleRef: detailsToggleRef,
   });
   const reloadOpenDetails = details.reload;
+  // The rename the panel may offer for the conversation on screen (issue #893).
+  // The capability is the server's, read from the canonical sidebar payload,
+  // and the mutation is the very one the sidebar's own dialog calls — so both
+  // surfaces converge through one refetch and neither holds a name.
+  const renameConversation = useMemo(
+    () =>
+      conversationRenameAction({
+        kind: details.detailsKind,
+        targetId,
+        channels: ctx.channels,
+        renameChannel: ctx.renameChannel,
+        renameGroup: ctx.renameGroup,
+      }),
+    [details.detailsKind, targetId, ctx.channels, ctx.renameChannel, ctx.renameGroup],
+  );
 
   // Typing indicator: useTypingIndicator needs sendTyping, which useMessages
   // only produces once called, but useMessages needs an onTypingUpdated
@@ -200,6 +235,15 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     // Passed directly: useMessages holds this callback in a ref, so a new
     // identity each render does not restart the socket or its subscriptions.
     onMembersAdded: reloadOpenDetails,
+    // A member was *removed*, renamed, or any other conversation event landed
+    // (issue #469). The server publishes conversation.event and nothing else
+    // for a removal — there is no members.removed — and the frame names only
+    // the message, so the panel does what it does for every other
+    // invalidation: it refetches, and the server decides what this reader now
+    // sees. An addition publishes both signals and therefore refetches twice;
+    // that is two idempotent reads of a panel that is already open, and
+    // deduplicating them would mean holding state about events instead.
+    onConversationEvent: reloadOpenDetails,
     // An attachment's malware verdict landed (RF-22). The same treatment as
     // members.added and for the same reason: the event says which row changed,
     // not what the list should now look like, so the panel refetches and the
@@ -234,30 +278,42 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
 
   // Issue #769: historyReducer.applyLoaded unconditionally resets replyTo on
   // every initial load, i.e. on every conversation switch (#492 review) —
-  // correct for a composer that used to lose its own draft the same way,
-  // wrong now that the reply is supposed to survive one. Restoring it here,
-  // once the messages a reply target could be found in have actually
-  // loaded, keeps that reset (nothing else here needs to know this ever
-  // happened) while still bringing the reply back for the reader.
+  // correct for the reducer's own operational state, but the reply is draft
+  // state and the draft store is its owner (issue #929). Once the page a
+  // reply target could be found in has loaded, the live reply — the Message
+  // the preview draws and sendMessage takes the parent id from — is derived
+  // back from the store's id.
   //
-  // A reply whose message is not in the loaded page — deleted, or simply
-  // outside it — is dropped rather than guessed at: RF says "não apagar
-  // texto", not "restore at any cost", and a dangling replyTo the server
-  // would reject on send is worse than none.
+  // Keyed on the *loaded state*, never on the conversation key. On the
+  // render where the route has already moved to A, `state` is still B's:
+  // the reducer only leaves "ready" from an effect. An effect reacting to
+  // the key change looked for A's reply in B's messages and dropped it —
+  // the reported bug of #929. `lastMutation === "initial"` is what says
+  // "this is the page that just loaded", so an append (a send, a realtime
+  // message) can never re-run this against a reply a send just consumed.
+  //
+  // A reply whose message is not in the loaded page — outside it, or
+  // removed — is dropped rather than guessed at, and only the reply: RF
+  // says "não apagar texto", not "restore at any cost", and a dangling
+  // replyTo the server would reject on send is worse than none.
+  const conversationKeyRef = useLatestRef(anchors.conversationKey);
   useEffect(() => {
-    if (state.status !== "ready" || state.replyTo || !anchors.conversationKey) return;
-    const draftReplyId = drafts.getDraft(anchors.conversationKey)?.replyToMessageId;
+    if (state.status !== "ready" || state.lastMutation !== "initial" || state.replyTo) return;
+    const draftKey = conversationKeyRef.current;
+    const draftReplyId = draftKey ? drafts.getDraft(draftKey)?.replyToMessageId : undefined;
     if (!draftReplyId) return;
     const message = state.messages.find((m) => m.id === draftReplyId);
-    if (message) {
-      selectReplyBase(message);
-    } else {
-      drafts.setReply(anchors.conversationKey, null);
-    }
-    // Runs once per conversation becoming ready, not on every message-list
-    // change (e.g. a realtime append must not re-trigger this).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.status, anchors.conversationKey]);
+    if (message && !message.isRemoved) selectReplyBase(message);
+    else drafts.setReply(draftKey, null);
+  }, [
+    conversationKeyRef,
+    drafts,
+    selectReplyBase,
+    state.lastMutation,
+    state.messages,
+    state.replyTo,
+    state.status,
+  ]);
 
   const typing = useTypingIndicator({
     kind,
@@ -314,36 +370,30 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       attachmentIds?: string[],
       priority?: MessagePriorityIntent,
     ): Promise<SendResult> => {
+      const sentFrom = anchors.conversationKey;
       const result = await sendMessage(
         body,
         pendingReference.messageId || undefined,
         attachmentIds,
         priority,
       );
-      if (result.status === "sent") {
+      // What the draft keeps or loses is the composer's, decided against the
+      // snapshot it captured at submit (issue #929). What is left here is
+      // this screen's: the typing session and the pending reference in the
+      // location state — both of the conversation the send left from, so
+      // neither is touched once the reader has moved to another one.
+      if (result.status === "sent" && conversationKeyRef.current === sentFrom) {
         // Sending is itself the clearest possible "stopped typing" signal — do
         // not wait for the composer-cleared activity event or the inactivity
         // timeout to catch up.
         typingStop();
-        // Mirrors applySent's own replyTo: null (issue #769) — the reply
-        // this message answered is consumed, in the draft as much as in
-        // the live reducer state. Only when there actually was one: an
-        // unconditional setReply(null) would bump the draft's revision on
-        // every single send, even a plain one with no reply — and the
-        // send-vs-edit-race guard in ChatComposer (issue #769, "ACK
-        // ATRASADO") would then read that as "the reader changed something
-        // since submitting" and leave the just-sent text sitting in the
-        // editor instead of clearing it.
-        if (anchors.conversationKey && drafts.getDraft(anchors.conversationKey)?.replyToMessageId) {
-          drafts.setReply(anchors.conversationKey, null);
-        }
         navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
       }
       return result;
     },
     [
       anchors.conversationKey,
-      drafts,
+      conversationKeyRef,
       location.pathname,
       location.search,
       navigate,
@@ -429,9 +479,9 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   const handleMentionClick = useCallback(
     (mentionType: MentionType, id: string) => {
       if (mentionType !== "user" || !id || id === ctx.currentUserId) return;
-      authorDM.openMentionDM(id);
+      directMessage.coordinator.open(id, directMessage.origin);
     },
-    [ctx.currentUserId, authorDM],
+    [ctx.currentUserId, directMessage],
   );
 
   // One object rather than a dozen props: the timeline hands every one of these
@@ -442,7 +492,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     onReferenceMessage: dialogs.openReference,
     onForwardMessage: dialogs.openForward,
     onReferenceJump: jumpToReference,
-    onOpenAuthorDM: authorDMAction(ctx.currentUserId, kind, activeDM, authorDM.openAuthorDM),
+    onOpenAuthorDM: authorDMAction(ctx.currentUserId, kind, activeDM, openAuthorDM),
     onMentionClick: handleMentionClick,
     onToggleFavorite: toggleFavorite,
     onReconcileLinkSafety: reconcileLinkSafety,
@@ -455,6 +505,20 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   };
 
   const directCallBarProps = directCallBar(kind, ctx.directCallSession, activeDM?.counterpart);
+
+  // Issue #475: a conversation this reader is not a member of renders nothing
+  // of the conversation column — no header (name/avatar/participants), no
+  // timeline (messages/attachments/pins/system events), no composer, no
+  // details panel/dialogs. Returning early here, before any of that JSX, is
+  // what makes "nothing renders" a property of the code rather than of every
+  // descendant remembering to check state.status on its own.
+  if (state.status === "denied") {
+    return (
+      <div className="chat-msg-area chat-msg-area--denied" data-testid="chat-message-area">
+        <AccessDeniedState onBack={() => navigate("/chat")} />
+      </div>
+    );
+  }
 
   return (
     <div
@@ -502,7 +566,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           onRetry={retry}
           editDisabledIds={editDisabledIds}
           pinnedIds={pinnedIds}
-          openingAuthorDMIds={authorDM.openingAuthorDMIds}
+          directMessage={directMessage}
           acknowledgements={acknowledgements}
           acknowledgingId={acknowledgingId}
           recentReactionEmojis={recentReactionEmojis}
@@ -520,7 +584,6 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           sendError={state.sendError}
           realtimeError={state.realtimeError}
           actionError={state.actionError}
-          openDMError={authorDM.openDMError}
           pinError={pinError}
           acknowledgeError={acknowledgeError}
           typingLabel={typingIndicatorLabel}
@@ -586,6 +649,11 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           state={details.detailsState}
           currentUserId={ctx.currentUserId}
           latestPin={latestPin}
+          onRename={renameConversation}
+          // The very flow a mention and a message author already use, and the
+          // very same instance, so the roster cannot acquire a second way — or a
+          // second in-flight map — for the same endpoint.
+          openDM={directMessage}
           onClose={details.close}
         />
       )}

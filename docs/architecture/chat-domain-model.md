@@ -79,22 +79,27 @@ case-insensitively; the same name in two workspaces is allowed. Index
 
 ### workspace_members
 
-| Column       | Type        | Notes                              |
-| ------------ | ----------- | ---------------------------------- |
-| workspace_id | uuid        | PK part, FK → workspaces (CASCADE) |
-| user_id      | uuid        | PK part, auth.users ref (no FK)    |
-| role         | text        | owner / admin / member / guest     |
-| status       | text        | active / suspended / left          |
-| joined_at    | timestamptz |                                    |
+| Column       | Type        | Notes                                                                |
+| ------------ | ----------- | -------------------------------------------------------------------- |
+| workspace_id | uuid        | PK part, FK → workspaces (CASCADE)                                   |
+| user_id      | uuid        | PK part, auth.users ref (no FK)                                      |
+| role         | text        | owner / admin / moderator / member / guest (RF-74, migration 000022) |
+| status       | text        | active / suspended / left                                            |
+| joined_at    | timestamptz |                                                                      |
 
 ### channel_members
 
-| Column     | Type        | Notes                            |
-| ---------- | ----------- | -------------------------------- |
-| channel_id | uuid        | PK part, FK → channels (CASCADE) |
-| user_id    | uuid        | PK part, auth.users ref (no FK)  |
-| role       | text        | member / moderator               |
-| joined_at  | timestamptz |                                  |
+| Column     | Type        | Notes                                                               |
+| ---------- | ----------- | ------------------------------------------------------------------- |
+| channel_id | uuid        | PK part, FK → channels (CASCADE)                                    |
+| user_id    | uuid        | PK part, auth.users ref (no FK)                                     |
+| role       | text        | member / moderator (per channel; never read as workspace authority) |
+| joined_at  | timestamptz |                                                                     |
+
+There is deliberately **no `status` column** here: the row exists or it does
+not. A row in this table is _explicit_ channel membership, which is not the same
+population as "who may read the channel" — see
+[chat-membership-contracts.md](./chat-membership-contracts.md).
 
 ### dm_conversations
 
@@ -124,8 +129,10 @@ responses do not include it, and future HTTP responses must not expose it.
 | joined_at       | timestamptz |                                        |
 | left_at         | timestamptz | Nullable; set only when status is left |
 
-Active workspace members are automatically synced into their workspace's
-mandatory `#geral` channel. The pgx member store performs workspace
+Under CURRENT RF-74, active workspace owners, admins, moderators and members
+are eligible for automatic sync into their workspace's mandatory `#geral`
+channel; guests are excluded by `generalMembershipRoles`. The future policy
+and RF-18/RF-74 consolidation belong to #882. The pgx member store performs workspace
 join/reactivation and `#geral` `channel_members` insertion in one transaction
 where the general channel is loaded by the same `workspace_id`. Duplicate rows
 are ignored with `ON CONFLICT DO NOTHING`; unexpected database errors propagate.
@@ -192,22 +199,40 @@ key material and scanner detail never leave file-service.
 
 ## Permission rules
 
-| Scenario                                              | Access |
-| ----------------------------------------------------- | ------ |
-| user_id not in workspace_members (or status ≠ active) | DENY   |
-| workspace member + public channel                     | ALLOW  |
-| workspace member + is_general=true channel            | ALLOW  |
-| workspace member + private channel, no channel_member | DENY   |
-| workspace member + private channel + channel_member   | ALLOW  |
+| Scenario                                                    | Access |
+| ----------------------------------------------------------- | ------ |
+| user_id not in workspace_members (or status ≠ active)       | DENY   |
+| owner/admin/moderator/member + public channel               | ALLOW  |
+| owner/admin/moderator/member + is_general=true channel      | ALLOW  |
+| **guest** + public or is_general channel, no channel_member | DENY   |
+| any role + private channel, no channel_member               | DENY   |
+| any role + any channel + channel_member                     | ALLOW  |
+
+RF-74 (migration 000022) made the predicate role-aware: a guest's workspace
+membership grants no channel on its own, so it reaches exactly the channels it
+holds a `channel_members` row for. The role test is an **allowlist**
+(`owner, admin, moderator, member`), never `role <> 'guest'`, so an unrecognised
+role fails closed. `domain.CanReachPublicChannels` and
+`chat.channel_visible_to_user` state the same list and must stay identical.
+
+The corollary matters and is easy to miss: for a **public** channel, "may read"
+and "has a `channel_members` row" are different populations, and the roster,
+`member_count`, mention autocomplete and candidate search all read the second
+one. See [chat-membership-contracts.md](./chat-membership-contracts.md).
 
 Read/write checks use `PermissionService` with workspace-bound channel lookup;
 global channel IDs are never sufficient for authorization. Visible channel lists
 are filtered in SQL by active workspace, active workspace membership, channel
 status/type, and private channel membership. Disabled workspaces deny channel
 list, read, write, category creation, channel creation, and channel membership.
-`#geral` authorization does not depend solely on the synced `channel_members`
-row: any active workspace member may read/write the active public general
-channel, even if a repair sync has not yet inserted the consistency row.
+Under the current RF-74 policy, active workspace owners, admins, moderators and
+members have implicit access to active public channels, including `#geral`,
+even before a repair sync inserts their `channel_members` row. Active guests
+require explicit `channel_members`; workspace membership alone does not grant
+them access to public channels or `#geral`. Private channels require explicit
+channel membership for every role. The current domain/SQL visibility predicate
+remains authoritative; this describes existing behavior, not the future `#geral`
+decision owned by #882.
 
 The database enforces the general-channel invariant with a partial unique index,
 an active/public `CHECK`, and deferred constraint triggers. This permits creating
@@ -232,21 +257,29 @@ Implemented service/storage operations:
   category, position, and public/private type;
 - archive non-general channels by setting `status='archived'`.
 
-Channel **creation** takes active workspace membership and nothing else: every
-active member — `owner`, `admin`, `member` or `guest` — may create a channel, and
-the role is deliberately not consulted (BUG #393). Suspended, left, missing and
-disabled-workspace callers are denied. The authorization is not a check followed
-by a write: the pgx store inserts the channel with `INSERT ... SELECT` from a
-row-locked authorized context (`chat.workspaces` + `chat.workspace_members`), so
-a membership revoked concurrently leaves no row to insert from and no channel
-behind.
+Channel **creation** takes no management role (BUG #393): a plain `member` and an
+`owner` take the same path, and no management predicate is consulted. RF-74
+(migration 000022) narrowed it in exactly one place — the decision is
+`domain.CanCreateChannel`, which delegates to `domain.CanReachPublicChannels`, so
+active `owner`, `admin`, `moderator` and `member` may create a channel and a
+`guest` may not. A guest's reach is the channels it was explicitly added to;
+letting it mint channels would hand back the workspace-wide scope RF-74 removes,
+and would let it create a public channel every real member sees.
 
-Because a `GET /api/chat/sidebar` 200 already means an active membership, its
-`can_create_channel` field is now always `true` and is **deprecated**: it is kept
-only so clients that predate BUG #393 keep working during rollout, is never
-derived from the caller's role, and is ignored by the current UI, which offers
-"Nova conversa" as the single entry point. `POST /api/chat/channels` re-derives
-the decision from the session on every call.
+Suspended, left, missing and disabled-workspace callers are denied. The
+authorization is not a check followed by a write: the pgx store inserts the
+channel with `INSERT ... SELECT` from a row-locked authorized context
+(`chat.workspaces` + `chat.workspace_members`) that re-derives the same role
+allowlist itself, so neither a membership revoked concurrently nor a demotion to
+`guest` committed mid-flight leaves a row to insert from.
+
+`GET /api/chat/sidebar`'s `can_create_channel` field is **deprecated**: it is
+kept only so clients that predate BUG #393 keep working during rollout, and is
+ignored by the current UI, which offers "Nova conversa" as the single entry
+point. It is not always `true` — `SidebarService` derives it from
+`domain.CanCreateChannel`, so a guest reads `false`. It remains a rendering hint
+either way: `POST /api/chat/channels` re-derives the decision from the session
+on every call, and the store re-derives it again inside the insert.
 
 `display_name` is required, trimmed, and capped at 100 Unicode code points by
 `domain.NormalizeChannelDisplayName` — the one helper every write path uses
@@ -260,13 +293,27 @@ Channel **update** and **archive** remain management operations for this MVP:
 active workspace `owner` and `admin` only. Full RBAC (RF-74) remains out of
 scope.
 
-Public/private visibility rules are enforced by SQL in the pgx channel store:
-the query joins `chat.workspaces`, active `chat.workspace_members`, and
-`chat.channel_members` for private channels. Public and `#geral` channels are
-visible to active workspace members; private channels are visible only to active
-workspace members who also have a `channel_members` row for that channel. Stale
-private membership alone grants nothing when the workspace is disabled or the
-workspace membership is inactive.
+Public/private visibility is enforced by SQL, in exactly one place:
+`chat.channel_visible_to_user`, which every listing, direct read, message read
+and WebSocket authorizer calls rather than restating. Precisely:
+
+- an explicit `chat.channel_members` row admits **any** role to **any** channel,
+  and for a `guest` it is the only thing that does;
+- the roles `domain.CanReachPublicChannels` admits — `owner`, `admin`,
+  `moderator`, `member` — additionally reach `public` channels, `#geral`
+  included, **implicitly**, with no `channel_members` row;
+- a `private` channel is never reached implicitly, by any role: a workspace
+  admin does not read a private channel it does not belong to.
+
+Stale private membership alone grants nothing when the workspace is disabled or
+the workspace membership is inactive.
+
+The implicit half is why **visibility/access is not roster membership**. For a
+public channel the two describe different populations, and the details count,
+mention autocomplete and candidate search all read the second one. That
+divergence is diagnosed, characterized against a real database and assigned in
+[chat-membership-contracts.md](./chat-membership-contracts.md) (issue #881;
+issue #883 owns the fix).
 
 Create/update inputs do not accept `is_general`, `status`, or `created_by` from
 clients/callers. The service sets `created_by` from the caller on create,

@@ -42,7 +42,13 @@ else
   echo "Install the repository-approved actionlint version before running this check."
 fi
 
-for workflow in governance.yml security.yml images.yml build-nchat-images.yml deploy-nchat-dev.yml deploy-nchat-prod.yml; do
+# ci.yml joined this list with issue #931: it is the workflow that runs the pull
+# request's own code, and `Quality / SonarQube` inside it holds SONAR_TOKEN, so a
+# mutable tag there is the most valuable one for an attacker to move. Local
+# reusable workflows (`uses: ./…`) are skipped below: they have no external SHA.
+for workflow in ci.yml governance.yml security.yml images.yml build-nchat-images.yml \
+  ci-eligibility.yml cd-develop.yml cd-prepare-production.yml \
+  deploy-nchat-dev.yml cutover-nchat-prod.yml rollback-nchat-prod.yml; do
   while IFS= read -r line; do
     [[ "$line" =~ uses:[[:space:]]*([^[:space:]#]+) ]] || continue
     reference="${BASH_REMATCH[1]}"
@@ -54,19 +60,35 @@ for workflow in governance.yml security.yml images.yml build-nchat-images.yml de
   done <"$ROOT/.github/workflows/$workflow"
 done
 
+# The cutover and rollback workflows check out `main` by name, which is a
+# branch and not an action reference, so the pattern is anchored to `@`
+# followed by the mutable name -- `ref: main` does not match it and
+# `uses: something@main` does.
 if grep -En '@(latest|main|master)([^A-Za-z0-9_.-]|$)' \
+  "$ROOT/.github/workflows/ci.yml" \
   "$ROOT/.github/workflows/security.yml" "$ROOT/.github/workflows/images.yml" \
   "$ROOT/.github/workflows/build-nchat-images.yml" \
+  "$ROOT/.github/workflows/ci-eligibility.yml" \
+  "$ROOT/.github/workflows/cd-develop.yml" \
+  "$ROOT/.github/workflows/cd-prepare-production.yml" \
   "$ROOT/.github/workflows/deploy-nchat-dev.yml" \
-  "$ROOT/.github/workflows/deploy-nchat-prod.yml"; then
+  "$ROOT/.github/workflows/cutover-nchat-prod.yml" \
+  "$ROOT/.github/workflows/rollback-nchat-prod.yml"; then
   echo "Mutable tool/action reference found in nchat deployment workflows." >&2
   exit 1
 fi
 
-if grep -q 'pull_request_target:' "$ROOT/.github/workflows/security.yml" \
+# ci.yml runs the pull request's own code, so it is the workflow where
+# pull_request_target would be most dangerous and is most tempting.
+if grep -q 'pull_request_target:' "$ROOT/.github/workflows/ci.yml" \
+  "$ROOT/.github/workflows/security.yml" \
   "$ROOT/.github/workflows/images.yml" "$ROOT/.github/workflows/build-nchat-images.yml" \
+  "$ROOT/.github/workflows/ci-eligibility.yml" \
+  "$ROOT/.github/workflows/cd-develop.yml" \
+  "$ROOT/.github/workflows/cd-prepare-production.yml" \
   "$ROOT/.github/workflows/deploy-nchat-dev.yml" \
-  "$ROOT/.github/workflows/deploy-nchat-prod.yml"; then
+  "$ROOT/.github/workflows/cutover-nchat-prod.yml" \
+  "$ROOT/.github/workflows/rollback-nchat-prod.yml"; then
   echo "pull_request_target is prohibited in nchat deployment workflows." >&2
   exit 1
 fi

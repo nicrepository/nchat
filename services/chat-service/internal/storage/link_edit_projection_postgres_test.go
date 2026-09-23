@@ -115,23 +115,32 @@ func TestEditMessageRechecksLockedLinkRowsPostgreSQL(t *testing.T) {
 	if err := reconcileTx.Commit(f.ctx); err != nil {
 		t.Fatalf("commit reconciliation: %v", err)
 	}
+	// Issue #807: the edit is not refused. It waited for the condemnation's
+	// row lock, re-read the row it locked, and committed with the marker the
+	// condemnation implies — never with the stale one the caller passed.
 	select {
 	case err := <-editDone:
-		if !errors.Is(err, domain.ErrMaliciousURL) {
-			t.Fatalf("EditMessage error = %v, want malicious URL refusal", err)
+		if err != nil {
+			t.Fatalf("EditMessage error = %v, want the edit to commit after the condemnation", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("EditMessage deadlocked after reconciliation committed")
 	}
+	if state, _ := f.storedState(t, editMessage); state != "malicious" {
+		t.Fatalf("state = %q, want the condemnation that landed before the commit", state)
+	}
 
+	// The new body is stored — with its condemned marker, so every projection
+	// withholds it — and the association names the new URL, so the next
+	// reconciliation of it finds this message.
 	var body, state string
 	if err := f.pool.QueryRow(f.ctx, `
 		SELECT body_text, link_safety_state FROM chat.messages WHERE id = $1::uuid`, editMessage,
 	).Scan(&body, &state); err != nil {
 		t.Fatalf("read final message: %v", err)
 	}
-	if body != "veja "+urlOld || state != "safe" {
-		t.Fatalf("unsafe edit committed: body=%q state=%q", body, state)
+	if body != "veja "+urlNew || state != "malicious" {
+		t.Fatalf("edit committed without its condemnation: body=%q state=%q", body, state)
 	}
 }
 
@@ -725,21 +734,25 @@ func TestEditMessageIsAtomicWithLinkSafetyPostgreSQL(t *testing.T) {
 		}
 	})
 
-	// 5. A -> B malicious. An edit is not a way to publish a condemned link, and
-	// the refusal is the store's, not the caller's: the caller here is passing
-	// "safe" on purpose.
-	t.Run("editing to a malicious link is refused by the store", func(t *testing.T) {
+	// 5. A -> B malicious (issue #807). An edit is not a way to publish a
+	// condemned link, but it is not refused either: the store re-reads the
+	// locked row and commits the condemned marker whatever the caller passed —
+	// the caller here is passing "safe" on purpose — so every projection withholds
+	// the body and the per-link read blocks that one span.
+	t.Run("editing to a malicious link commits condemned", func(t *testing.T) {
 		f.reset(t)
 		f.verdict(t, urlOld, "safe")
 		f.verdict(t, urlNew, "malicious")
 		f.seedMessage(t, editMessage, "veja "+urlOld, "safe", "fp-old", urlOld)
 
-		_, err := f.edit(t, "veja "+urlNew, domain.MessageLinkSafetySafe, []string{urlNew})
-		if err == nil {
-			t.Fatal("EditMessage published a body containing a condemned url")
+		if _, err := f.edit(t, "veja "+urlNew, domain.MessageLinkSafetySafe, []string{urlNew}); err != nil {
+			t.Fatalf("EditMessage: %v", err)
 		}
-		if got := f.associations(t, editMessage); len(got) != 1 || got[0] != urlOld {
-			t.Fatalf("associations = %q, want the original untouched", got)
+		if state, _ := f.storedState(t, editMessage); state != "malicious" {
+			t.Fatalf("state = %q, want the store's condemnation over the caller's marker", state)
+		}
+		if got := f.associations(t, editMessage); len(got) != 1 || got[0] != urlNew {
+			t.Fatalf("associations = %q, want the new body's url", got)
 		}
 	})
 
@@ -763,7 +776,8 @@ func TestEditMessageIsAtomicWithLinkSafetyPostgreSQL(t *testing.T) {
 
 	// 7. The race the atomicity is for: reconciliation condemns the *new* URL
 	// between the caller's classification and the commit. The store re-reads the
-	// verdicts inside the transaction, so the stale classification loses.
+	// verdicts inside the transaction, so the stale classification loses: the
+	// edit commits, and it commits condemned.
 	t.Run("a verdict that lands before the commit wins", func(t *testing.T) {
 		f.reset(t)
 		f.verdict(t, urlOld, "safe")
@@ -776,11 +790,11 @@ func TestEditMessageIsAtomicWithLinkSafetyPostgreSQL(t *testing.T) {
 		f.verdict(t, urlNew, "malicious")
 
 		if _, err := f.edit(t, "veja "+urlNew,
-			domain.MessageLinkSafetyInconclusive, []string{urlNew}); err == nil {
-			t.Fatal("a classification made before the condemnation was allowed to commit")
+			domain.MessageLinkSafetyInconclusive, []string{urlNew}); err != nil {
+			t.Fatalf("EditMessage: %v", err)
 		}
-		if got := f.associations(t, editMessage); len(got) != 1 || got[0] != urlOld {
-			t.Fatalf("associations = %q, want the original untouched", got)
+		if state, _ := f.storedState(t, editMessage); state != "malicious" {
+			t.Fatalf("state = %q, want the condemnation that landed first", state)
 		}
 	})
 

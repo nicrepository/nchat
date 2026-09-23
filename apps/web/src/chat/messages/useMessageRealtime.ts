@@ -1,6 +1,7 @@
 import { useCallback } from "react";
 
 import { normalizeLinkSafety } from "../chatTypes";
+import { linkUpdateNeedsSnapshot, parseMessageLink } from "../messageLinks";
 import {
   useChatWebSocket,
   type WSAttachmentStatusEvent,
@@ -11,6 +12,7 @@ import {
   type WSMessageBlockedEvent,
   type WSMessageCreatedEvent,
   type WSMessageLinkSafetyChangedEvent,
+  type WSMessageLinkUpdatedEvent,
   type WSMessageUpdatedEvent,
   type WSPinUpdatedEvent,
   type WSTypingUpdatedEvent,
@@ -36,6 +38,17 @@ type MessageUpdate = NonNullable<WSMessageUpdatedEvent["message_update"]>;
 export interface RealtimeListeners {
   onPinUpdated?: (event: WSPinUpdatedEvent) => void;
   onMembersAdded?: (event: WSMembersAddedEvent) => void;
+  /**
+   * Issue #469: called on a conversation.event for the active target, after
+   * the timeline has reconciled it.
+   *
+   * A membership removal writes a system message and publishes exactly this
+   * signal — there is no members.removed, and adding one would be a second
+   * protocol for a fact this one already carries. The frame names only the
+   * message, so a listener cannot tell which kind of event it was; the honest
+   * response is the same refetch every other invalidation here performs.
+   */
+  onConversationEvent?: (event: WSConversationEventMessage) => void;
   onAttachmentStatus?: (event: WSAttachmentStatusEvent) => void;
   onTypingUpdated?: (event: WSTypingUpdatedEvent) => void;
 }
@@ -103,7 +116,7 @@ export function useMessageRealtime({
   listeners,
 }: Options): MessageRealtime {
   const { targetId, kind } = scope;
-  const { readCreatedMessage, readMessageSnapshot } = reads;
+  const { readCreatedMessage, readMessageSnapshot, readConversationEventSnapshot } = reads;
 
   /**
    * A new message.
@@ -179,6 +192,33 @@ export function useMessageRealtime({
   );
 
   /**
+   * Issue #807: one link of a message changed state. Every occurrence is
+   * matched by the target's stable key, which survives redaction. A condemned
+   * target arrives without its URL — nothing in the event could tell this
+   * client which span to withhold — and a target released from condemnation
+   * needs the text the server withheld; both are re-read from the
+   * authoritative endpoint, which answers with the body and the links. Every
+   * other update patches the occurrences in place; a malformed entity is
+   * dropped, and the next read converges it.
+   */
+  const handleLinkUpdated = useCallback(
+    (event: WSMessageLinkUpdatedEvent) => {
+      const link = parseMessageLink(event.link_update.link);
+      if (!link) return;
+      // A condemnation, or the release of an occurrence this client holds
+      // blocked, needs the body only the server can produce: the redacted
+      // text, or the text it withheld. Either way the message is re-read.
+      const rendered = scope.messages().find((message) => message.id === event.message_id);
+      if (linkUpdateNeedsSnapshot(rendered?.links, link)) {
+        readMessageSnapshot(event.message_id, false);
+        return;
+      }
+      dispatch({ type: "link_updated", messageId: event.message_id, link });
+    },
+    [dispatch, readMessageSnapshot, scope],
+  );
+
+  /**
    * An update that carries what it announces.
    *
    * The tombstone is recorded before anything else, so a read already in flight
@@ -222,13 +262,16 @@ export function useMessageRealtime({
 
   const handleSubscriptionError = useCallback(
     (event: WSClientErrorEvent) => {
-      dispatch({
-        type: "ws_fetch_error",
-        error:
-          event.code === "room_access_denied"
-            ? "Não foi possível acessar as atualizações em tempo real desta conversa."
-            : realtimeFallbackErrorMessage,
-      });
+      // Issue #475: a conversation open when membership is revoked learns
+      // about it here, via the same non-enumerating rejection the server
+      // already uses for subscribe (room_access_denied) — converge on the
+      // same access-denied state a fresh 404 produces, rather than reporting
+      // it as a realtime hiccup the reader could "tentar novamente".
+      if (event.code === "room_access_denied") {
+        dispatch({ type: "denied" });
+        return;
+      }
+      dispatch({ type: "ws_fetch_error", error: realtimeFallbackErrorMessage });
     },
     [dispatch],
   );
@@ -298,20 +341,21 @@ export function useMessageRealtime({
    * timeline does not have it yet. Dedup by id in the reducer is what makes
    * this safe against redelivery or a reconnect replaying the same event.
    *
-   * Handled internally rather than forwarded to a caller-supplied listener —
-   * unlike pin/members/typing/attachment above, nothing outside the open
-   * timeline needs to react to this one.
+   * Reconciled internally *and* forwarded (issue #469): the timeline inserts
+   * the system message, and a caller that renders anything else about this
+   * conversation — the details panel's roster and counters — refetches. Both
+   * happen for the same frame because both are stale for the same reason.
    */
   const reconcileConversationEvent = useCallback(
     (event: WSConversationEventMessage) => {
       if (!event.message_id) return;
-      readMessageSnapshot(event.message_id, true);
+      readConversationEventSnapshot(event.message_id);
     },
-    [readMessageSnapshot],
+    [readConversationEventSnapshot],
   );
   const handleConversationEvent = useForwardedTargetEvent(
     target,
-    undefined,
+    listeners.onConversationEvent,
     reconcileConversationEvent,
   );
 
@@ -321,6 +365,7 @@ export function useMessageRealtime({
     onMessageCreated: handleMessageCreated,
     onMessageBlocked: handleMessageBlocked,
     onMessageLinkSafetyChanged: handleLinkSafetyChanged,
+    onMessageLinkUpdated: handleLinkUpdated,
     onMessageUpdated: handleMessageUpdated,
     onReactionUpdated: reactions.handleReactionUpdated,
     onTypingUpdated: handleTypingUpdated,

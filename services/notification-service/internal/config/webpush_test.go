@@ -456,3 +456,14 @@ func TestNotificationWorkerReadinessFollowsTheWebPushChannel(t *testing.T) {
 		})
 	}
 }
+
+func TestWebPushPreviewRolloutFlag(t *testing.T) {
+	for _, value := range []string{"", "false", "true"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("NOTIFICATION_PUSH_PREVIEW_ENABLED", value)
+			if got := config.Load().WebPush.PushPreviewEnabled; got != (value == "true") {
+				t.Fatalf("preview enabled = %v for %q", got, value)
+			}
+		})
+	}
+}

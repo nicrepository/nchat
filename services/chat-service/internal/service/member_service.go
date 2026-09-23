@@ -137,12 +137,9 @@ type AddChannelMembersInput struct {
 
 // AddChannelMembers adds active workspace members to an existing channel.
 //
-// Authorization is domain.CanManageChannelMembers — active workspace owner or
-// admin — the same authority that already removes a member from a channel and
-// that docs/runbooks/task-chat-channel-join-leave.md calls the "manager-add
-// flow". It is deliberately checked before the channel is even looked up, so a
-// caller with no management rights cannot use the response to learn whether a
-// channel UUID exists.
+// Authorization is domain.CanAddChannelMembers. A plain member must also pass
+// normal channel visibility; owner, admin and moderator retain the existing
+// administrative add path without being granted channel membership or reads.
 //
 // The channel is then loaded workspace-scoped and active-only, which is what
 // refuses an archived channel, a channel from another tenant and one that never
@@ -154,17 +151,11 @@ type AddChannelMembersInput struct {
 // parsing, the de-duplication, the batch cap — exists to refuse a malformed or
 // oversized request cheaply, never to decide who is eligible.
 func (s *MemberService) AddChannelMembers(ctx context.Context, input AddChannelMembersInput) (storage.AddMembersResult, error) {
-	// Active membership first, then the capability — deliberately not
-	// requireWorkspaceManager, which would apply CanManageWorkspace here and
-	// leave CanManageChannelMembers as decoration. The seam only means anything
-	// if it is the single predicate this endpoint actually consults: widening it
-	// for RF-74 must widen this route, and a second owner/admin gate above it
-	// would silently prevent that.
 	member, err := requireActiveWorkspaceMember(ctx, s.workspaces, s.members, input.WorkspaceID, input.CallerID)
 	if err != nil {
 		return storage.AddMembersResult{}, err
 	}
-	if !domain.CanManageChannelMembers(&member) {
+	if !domain.CanAddChannelMembers(&member) {
 		return storage.AddMembersResult{}, domain.ErrForbidden
 	}
 
@@ -173,15 +164,9 @@ func (s *MemberService) AddChannelMembers(ctx context.Context, input AddChannelM
 		return storage.AddMembersResult{}, err
 	}
 
-	channel, err := s.channels.GetChannelByIDInWorkspace(ctx, input.WorkspaceID, input.ChannelID)
+	channel, err := s.getAddableChannel(ctx, input.WorkspaceID, input.ChannelID, member)
 	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return storage.AddMembersResult{}, domain.ErrNotFound
-		}
-		return storage.AddMembersResult{}, fmt.Errorf("get channel: %w", err)
-	}
-	if channel.IsGeneral {
-		return storage.AddMembersResult{}, fmt.Errorf("%w: every active member already belongs to geral", domain.ErrInvalidInput)
+		return storage.AddMembersResult{}, err
 	}
 
 	// The actor is handed to the store so the transaction re-derives their
@@ -212,11 +197,7 @@ type SearchChannelMemberCandidatesInput struct {
 // SearchChannelMemberCandidates returns workspace members eligible to be added
 // to a channel, with current members already excluded by the store.
 //
-// The authorization is the same gate the write uses — domain.CanManageChannelMembers
-// — and it is checked before the channel is looked up, so a caller with no
-// management rights cannot use the response to learn whether a channel ID
-// exists. That is deliberate: this endpoint reveals which people are *not* in a
-// channel, which is a fact about a private channel's composition.
+// Authorization and channel resolution are identical to AddChannelMembers.
 //
 // The exclusion of current members happens in SQL, not here. The panel's member
 // preview is presence-filtered and capped, so it was never a complete
@@ -229,11 +210,72 @@ func (s *MemberService) SearchChannelMemberCandidates(
 	if err != nil {
 		return nil, err
 	}
+	if !domain.CanAddChannelMembers(&member) {
+		return nil, domain.ErrForbidden
+	}
+	query, limit, err := normalizeCandidateSearch(input.Query, input.Limit)
+	if err != nil {
+		return nil, err
+	}
+
+	channel, err := s.getAddableChannel(ctx, input.WorkspaceID, input.ChannelID, member)
+	if err != nil {
+		return nil, err
+	}
+
+	candidates, err := s.members.SearchChannelMemberCandidates(
+		ctx, input.WorkspaceID, channel.ID, member.UserID, query, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("search channel member candidates: %w", err)
+	}
+	return candidates, nil
+}
+
+// getAddableChannel is the shared #705 policy for add and candidate search.
+// Administrative roles keep their existing private-channel management scope;
+// a plain member resolves through normal visibility and therefore cannot use a
+// guessed private-channel UUID as an oracle.
+func (s *MemberService) getAddableChannel(
+	ctx context.Context, workspaceID, channelID string, member domain.WorkspaceMember,
+) (domain.Channel, error) {
+	var channel domain.Channel
+	var err error
+	if domain.CanManageChannelMembers(&member) {
+		channel, err = s.channels.GetChannelByIDInWorkspace(ctx, workspaceID, channelID)
+	} else {
+		channel, err = s.channels.GetVisibleChannelByID(ctx, workspaceID, channelID, member.UserID)
+	}
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return domain.Channel{}, domain.ErrNotFound
+		}
+		return domain.Channel{}, fmt.Errorf("get channel: %w", err)
+	}
+	if channel.IsGeneral {
+		return domain.Channel{}, fmt.Errorf("%w: every active member already belongs to geral", domain.ErrInvalidInput)
+	}
+	return channel, nil
+}
+
+// searchChannelMemberCandidates is the mention popup's auto-add preview, which
+// may request its initial page with an empty prefix. It deliberately stays on
+// CanManageChannelMembers rather than #705's add policy: the candidates it
+// returns are marked will-be-added, and message auto-add (MessageStore) still
+// admits only owner, admin and moderator. It also leaves #geral to the store
+// (no candidates) instead of refusing it, so mention search there keeps working.
+func (s *MemberService) searchChannelMemberCandidates(
+	ctx context.Context, input SearchChannelMemberCandidatesInput, minQueryRunes int,
+) ([]domain.DMCandidate, error) {
+	member, err := requireActiveWorkspaceMember(ctx, s.workspaces, s.members, input.WorkspaceID, input.CallerID)
+	if err != nil {
+		return nil, err
+	}
 	if !domain.CanManageChannelMembers(&member) {
 		return nil, domain.ErrForbidden
 	}
 
-	query, limit, err := normalizeCandidateSearch(input.Query, input.Limit)
+	query, limit, err := normalizeCandidateSearchWithMinimum(input.Query, input.Limit, minQueryRunes)
 	if err != nil {
 		return nil, err
 	}
@@ -258,9 +300,13 @@ func (s *MemberService) SearchChannelMemberCandidates(
 // normalizeCandidateSearch applies the same query bounds and limit clamping the
 // DM candidate search already uses, so the three searches cannot drift.
 func normalizeCandidateSearch(rawQuery string, rawLimit int) (string, int, error) {
+	return normalizeCandidateSearchWithMinimum(rawQuery, rawLimit, minDMCandidateQuery)
+}
+
+func normalizeCandidateSearchWithMinimum(rawQuery string, rawLimit, minQueryRunes int) (string, int, error) {
 	query := strings.TrimSpace(rawQuery)
 	queryRunes := utf8.RuneCountInString(query)
-	if queryRunes < minDMCandidateQuery || queryRunes > maxDMCandidateQuery {
+	if queryRunes < minQueryRunes || queryRunes > maxDMCandidateQuery {
 		return "", 0, fmt.Errorf("%w: invalid candidate search", domain.ErrInvalidInput)
 	}
 	if rawLimit < 0 {
@@ -333,19 +379,60 @@ func (s *MemberService) LeaveChannel(ctx context.Context, workspaceID, channelID
 	return nil
 }
 
+// requireChannelMemberManager is the removal path's authorization gate: an
+// active workspace and a caller domain.CanManageChannelMembers admits.
+//
+// Extracted rather than inlined so RemoveMemberFromChannel stays one sequence
+// of decisions after issue #469 added the self-removal refusal to it. It is
+// deliberately *not* requireActiveWorkspaceMember: that helper also requires
+// the caller's membership to be active, and adopting it here would change who
+// this route accepts — a separate question, and not this issue's to answer.
+func (s *MemberService) requireChannelMemberManager(ctx context.Context, workspaceID, callerID string) error {
+	workspace, err := s.workspaces.GetWorkspaceByID(ctx, workspaceID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return domain.ErrForbidden
+		}
+		return fmt.Errorf("get workspace: %w", err)
+	}
+	if workspace.Status != domain.WorkspaceStatusActive {
+		return domain.ErrForbidden
+	}
+
+	caller, err := s.members.GetWorkspaceMember(ctx, workspaceID, callerID)
+	if errors.Is(err, domain.ErrNotFound) {
+		return domain.ErrForbidden
+	}
+	if err != nil {
+		return fmt.Errorf("get caller workspace member: %w", err)
+	}
+	if !domain.CanManageChannelMembers(&caller) {
+		return domain.ErrForbidden
+	}
+	return nil
+}
+
 // RemoveMemberFromChannel removes targetUserID from channelID in workspaceID.
 //
-// Authorization is domain.CanManageChannelMembers — the same predicate the add
-// path uses, rather than a second inline role list that could drift from it.
-// Adding and removing the same row are the same authority, so RF-74 widening
-// the add to the workspace moderator widens the removal with it.
-// Returns ErrForbidden when removing from #geral or when caller lacks permission.
+// Authorization remains domain.CanManageChannelMembers. Issue #705 deliberately
+// uses a separate CanAddChannelMembers capability so plain members never reach
+// this removal path.
+// Returns ErrForbidden when removing from #geral or when caller lacks
+// permission, and ErrInvalidInput when the caller names themselves.
 //
 // The returned domain.Message is the conversation_member_removed event the
 // same transaction wrote, zero-valued when targetUserID was not a member —
 // the same "publish only when there is one" convention UpdateChannel's Event
 // uses, so a caller that asks to remove a non-member broadcasts nothing.
 func (s *MemberService) RemoveMemberFromChannel(ctx context.Context, workspaceID, channelID, callerID, targetUserID string) (domain.Message, error) {
+	// The one shape the store cannot tell apart from a real removal, refused
+	// here exactly as DMService.RemoveGroupParticipant refuses it: a manager
+	// naming themselves is leaving, and Leave is where that happens. Without
+	// this, self-removal through the admin route would delete the same row and
+	// write "removeu" into the timeline about the person who left.
+	if callerID != "" && callerID == targetUserID {
+		return domain.Message{}, fmt.Errorf("%w: use leave to remove yourself", domain.ErrInvalidInput)
+	}
 	channel, err := s.channels.GetChannelByIDInWorkspace(ctx, workspaceID, channelID)
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("get channel: %w", err)
@@ -354,26 +441,8 @@ func (s *MemberService) RemoveMemberFromChannel(ctx context.Context, workspaceID
 		return domain.Message{}, domain.ErrForbidden
 	}
 
-	workspace, err := s.workspaces.GetWorkspaceByID(ctx, workspaceID)
-	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return domain.Message{}, domain.ErrForbidden
-		}
-		return domain.Message{}, fmt.Errorf("get workspace: %w", err)
-	}
-	if workspace.Status != domain.WorkspaceStatusActive {
-		return domain.Message{}, domain.ErrForbidden
-	}
-
-	caller, err := s.members.GetWorkspaceMember(ctx, workspaceID, callerID)
-	if errors.Is(err, domain.ErrNotFound) {
-		return domain.Message{}, domain.ErrForbidden
-	}
-	if err != nil {
-		return domain.Message{}, fmt.Errorf("get caller workspace member: %w", err)
-	}
-	if !domain.CanManageChannelMembers(&caller) {
-		return domain.Message{}, domain.ErrForbidden
+	if err := s.requireChannelMemberManager(ctx, workspaceID, callerID); err != nil {
+		return domain.Message{}, err
 	}
 
 	event, err := s.members.RemoveChannelMemberByAdmin(ctx, workspaceID, channelID, callerID, targetUserID)

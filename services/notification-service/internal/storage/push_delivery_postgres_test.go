@@ -642,3 +642,43 @@ func recordGone(
 	}
 	return application
 }
+
+// SR-001, defense-in-depth: a globally inactive account has no deliverable
+// browser, so not even the generic version 1 banner reaches it.
+//
+// Distinct from TestPushDeliveryFanOutExcludesDisabledBrowsersPostgreSQL, which
+// is about the *subscription's* own status, and from the workspace_members
+// cases elsewhere. This is auth.users — the person, not the browser and not the
+// membership. The subscription and the membership are deliberately left intact,
+// because that is exactly the state an operator leaves behind when they suspend
+// somebody, and the reason the fan-out could still find a target at all.
+func TestPushDeliveryFanOutExcludesGloballyInactiveAccountsPostgreSQL(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		status  string
+		deleted bool
+		want    int
+	}{
+		{name: "active", status: "active", want: 1},
+		{name: "suspended", status: "suspended"},
+		{name: "locked", status: "locked"},
+		{name: "soft deleted", status: "active", deleted: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := seedDelivery(t)
+			fixture.browser(t, "laptop")
+
+			execFixture(t, fixture.pool, `
+				UPDATE auth.users
+				SET status = $2::text,
+				    deleted_at = CASE WHEN $3::boolean THEN now() END
+				WHERE id = $1::uuid`,
+				fixture.principal.UserID, test.status, test.deleted)
+
+			if got := len(fixture.deliverable(t)); got != test.want {
+				t.Fatalf("a %s account had %d deliverable browsers, want %d",
+					test.name, got, test.want)
+			}
+		})
+	}
+}

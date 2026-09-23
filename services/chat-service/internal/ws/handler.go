@@ -430,7 +430,7 @@ func readLoop(ctx context.Context, conn *websocket.Conn, hub *Hub, c *Client, lo
 						"error", msgErr,
 					)
 				}
-				handleSubscribeClientError(c, msgErr)
+				handleSubscribeClientError(c, msgErr, msg.TargetType, msg.TargetID)
 				continue
 			}
 			if handleInvalidInboundMessage(ctx, conn, logger, clientID, &invalidCount, cfg.MaxInvalidMessages, "ws: handleClientMessage error") {
@@ -467,11 +467,13 @@ func decodeClientMessage(data []byte) (ClientMessage, error) {
 }
 
 type clientErrorResponse struct {
-	Type       string `json:"type"`
-	Operation  string `json:"operation,omitempty"`
-	Code       string `json:"code"`
-	CallID     string `json:"call_id,omitempty"`
-	RetryAfter int    `json:"retry_after,omitempty"`
+	Type       string     `json:"type"`
+	Operation  string     `json:"operation,omitempty"`
+	Code       string     `json:"code"`
+	TargetType TargetType `json:"target_type,omitempty"`
+	TargetID   string     `json:"target_id,omitempty"`
+	CallID     string     `json:"call_id,omitempty"`
+	RetryAfter int        `json:"retry_after,omitempty"`
 	// ResponseTo correlates this error to the request_id/sync_id of the
 	// command that failed (issue #622). Empty for every call command that
 	// predates that correlation — see callResponseTo.
@@ -521,12 +523,14 @@ func handleSubscribeClientSuccess(c *Client, msg ClientMessage) bool {
 	return err == nil && c.enqueue(data)
 }
 
-func handleSubscribeClientError(c *Client, subscribeErr error) {
+func handleSubscribeClientError(c *Client, subscribeErr error, targetType TargetType, targetID string) {
 	code := "room_subscription_unavailable"
 	if errors.Is(subscribeErr, ErrSubscribeForbidden) {
 		code = "room_access_denied"
 	}
-	data, err := json.Marshal(clientErrorResponse{Type: "error", Operation: "subscribe", Code: code})
+	data, err := json.Marshal(clientErrorResponse{
+		Type: "error", Operation: "subscribe", Code: code, TargetType: targetType, TargetID: targetID,
+	})
 	if err == nil {
 		c.enqueue(data)
 	}

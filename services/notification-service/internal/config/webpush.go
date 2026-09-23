@@ -63,6 +63,30 @@ type WebPushConfig struct {
 	// both halves of expiry: an event past it is never sent, and one inside it
 	// carries the remainder as the push service's own TTL.
 	TTLSeconds int
+	// PushPreviewEnabled selects the payload contract (issue #870): false emits
+	// version 1, true emits version 2 with a server-approved title and preview.
+	//
+	// # Why this is a switch and not simply the new behaviour
+	//
+	// Two independent reasons, and either alone would justify it.
+	//
+	// Rollout. The Service Worker's lifecycle is deliberately the browser
+	// default — no skipWaiting(), no clients.claim() (#747) — so a new worker
+	// activates only once every tab of the origin has closed, which can take
+	// days. A worker from before #870 refuses a v2 payload and shows *nothing*,
+	// because failing closed on an unknown version is the rule that makes the
+	// contract safe in the first place. Raising the version unconditionally
+	// would therefore silence push for exactly the readers who have not
+	// restarted their browser. The order is: ship the worker, let it activate,
+	// then turn this on.
+	//
+	// Privacy. This is the switch that decides whether message text may leave
+	// the authenticated UI and appear on an operating system's lock screen.
+	// NChat has no per-user "hide notification content" preference today (see
+	// the privacy section of docs/architecture/notification-web-push.md), so
+	// the MVP policy is deployment-wide and off by default: a deployment that
+	// has not said yes keeps the generic banners it has always had.
+	PushPreviewEnabled bool
 }
 
 func loadWebPush() WebPushConfig {
@@ -71,6 +95,8 @@ func loadWebPush() WebPushConfig {
 		VAPIDPrivateKey: strings.TrimSpace(platformconfig.GetString("NOTIFICATION_VAPID_PRIVATE_KEY", "")),
 		VAPIDSubject:    strings.TrimSpace(platformconfig.GetString("NOTIFICATION_VAPID_SUBJECT", "")),
 		TTLSeconds:      platformconfig.GetInt("NOTIFICATION_PUSH_TTL_SECONDS", notificationDefaultPushTTLSeconds),
+		// Off by default, and the default is the decision — see the field.
+		PushPreviewEnabled: platformconfig.GetBool("NOTIFICATION_PUSH_PREVIEW_ENABLED", false),
 	}.Normalized()
 }
 

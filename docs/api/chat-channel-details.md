@@ -29,6 +29,8 @@ usuario), porque o painel refaz a consulta a cada troca de canal.
     "slug": "infraestrutura",
     "display_name": "Infraestrutura",
     "type": "private",
+    "description": "Infraestrutura, processos internos e operacoes.",
+    "creator_display_name": "Alvaro Neto",
     "created_at": "2024-01-12T09:30:00Z",
     "member_count": 12,
     "online_member_count": 5,
@@ -49,7 +51,18 @@ Campos:
 
 - `type` e o valor de dominio `chat.channels.type` (`public` | `private`). O
   cliente nunca deve inferir visibilidade pelo nome do canal.
-- `created_at` e RFC3339 em UTC.
+- `description` e `chat.channels.description` (issue #894). **Omitido** quando a
+  coluna e NULL ou vazia -- ausencia e o contrato para "nao ha descricao", e um
+  canal criado antes da migration 000053 nunca tem uma. Texto simples: nao existe
+  formato rich-text para metadado de conversa neste dominio, o valor e
+  serializado como esta armazenado e o cliente o renderiza como text node.
+- `creator_display_name` e o nome de apresentacao de `chat.channels.created_by`,
+  resolvido no servidor (issue #894). **Omitido** quando nao ha identidade
+  historicamente confiavel: `created_by` NULL, conta apagada ou desativada, ou
+  quem criou o canal nao e mais membro ativo deste workspace. O cliente mostra um
+  estado neutro nesse caso.
+- `created_at` e RFC3339 em UTC, e vem do agregado -- nunca da primeira mensagem,
+  da membership ou do relogio do cliente.
 
 As tres grandezas de membros respondem perguntas diferentes e **nenhuma deriva
 da outra**:
@@ -69,6 +82,23 @@ offline nunca ocupa uma vaga da previa e um membro online nunca perde a vaga
 para um offline. Um cliente que precise da lista completa de membros do canal
 precisa de um contrato proprio -- este nao serve para isso.
 
+> **`member_count` conta `chat.channel_members`, nao quem alcanca o canal.**
+> Num canal publico as duas populacoes nao coincidem: todo papel que
+> `domain.CanReachPublicChannels` admite le o canal sem linha nenhuma em
+> `chat.channel_members`, e a criacao de canal publico nao escreve essa linha
+> nem para o criador. Um canal publico recem-criado responde `member_count: 0`
+> enquanto owner/admin/moderator/member ativos o alcancam implicitamente.
+> Guest nao ganha acesso por `workspace_members` apenas: precisa de
+> `channel_members` explicita. Canais privados exigem essa membership para
+> todos os papeis. Workspace desabilitado ou membership de workspace inativa
+> continuam bloqueando acesso. O diagnostico completo, a matriz por
+> superficie e a decisao pendente estao em
+> [chat-membership-contracts.md](../architecture/chat-membership-contracts.md)
+> (issue #881; o fix pertence a #883). Na fixture, canal privado com membro explicito e `#geral` apos sync
+> alinham acesso e membership persistida; antes do sync, `#geral` tambem pode
+> ter leitores implicitos sem linha. `online_members` continua sendo previa
+> de presenca, nunca roster.
+
 Campos de cada entrada:
 
 - `role` e o papel no canal (`member` | `moderator`) -- o unico atributo
@@ -78,13 +108,42 @@ Campos de cada entrada:
   construcao. O campo e enviado assim mesmo para que o cliente possa **verificar**
   a afirmacao em vez de deduzi-la do nome da lista.
 
-Nao existe campo `description`: `chat.channels` nao tem coluna de descricao.
-Quando o dominio ganhar uma, ela entra aqui e o estado vazio do painel deixa de
-ser o unico resultado possivel.
-
 Campos deliberadamente ausentes de `members[]`: e-mail, papel no workspace, data
 de entrada, `auth_source` e qualquer outro atributo de perfil. Um painel de
 detalhes nao e uma exportacao de diretorio.
+
+### Descricao e criador (issue #894)
+
+`chat.channels.description` existe desde a migration 000053: coluna `TEXT`
+nullable, sem backfill, com CHECK de
+`domain.MaxConversationDescriptionCodePoints` (500) code points, validado em 000054. Ausencia historica continua valida e e o estado normal de todo canal
+criado antes dela.
+
+**Nao existe rota de escrita de descricao nesta entrega.** A issue #894
+implementa persistencia, leitura e apresentacao; a mutation de edicao pertence a
+uma issue propria. Nao ha, portanto, autorizacao nova a documentar: a leitura
+destes dois campos usa exatamente a autorizacao do `GET .../details` descrita
+acima, e um chamador que recebe `404` nao aprende nem que o canal existe, nem que
+ele tem descricao.
+
+O criador e resolvido **na mesma consulta** que le a descricao, por LEFT JOIN em
+`chat.workspace_members` + `auth.users`, com o mesmo
+`COALESCE(full_name, display_name)` que o resto do dominio usa para nome visivel.
+Nao existe rota `/creator`, nao ha busca de perfil depois do details e nao ha
+consulta por campo: o painel continua fazendo **uma** requisicao HTTP, e o
+handler passou de duas para tres consultas SQL, todas de custo constante e
+nenhuma por membro.
+
+**O UUID do criador nao e serializado.** Nada neste painel navega para ele, e um
+campo que so existe para ser enviado e como um UUID acaba na tela no lugar do
+nome que faltou. `creator_display_name` ausente significa ausente, e o cliente
+renderiza estado neutro -- nunca um id, nunca um prefixo de id, nunca e-mail ou
+slug.
+
+`member_count` continua sendo a unica fonte da contagem exibida no bloco
+`SOBRE`, com a mesma definicao (e a mesma divergencia conhecida) descrita acima:
+a #894 **consome** a autoridade de membership, nao a redefine. O fix pertence a
+issue #883.
 
 ### Presenca
 
@@ -100,10 +159,22 @@ alem do timeout) e **nao** e tratado como online; `PresenceOffline` nao tem
 entrada alguma no tracker. Nada e derivado de `last_seen` ou de atividade
 indireta.
 
-E estado por instancia: exato em deployment de instancia unica (todos os
-overlays em `infra/k8s` rodam chat-service com `replicas: 1`) e, se isso mudar,
-**sub**-reporta -- nunca super-reporta. Sem o tracker conectado, a previa volta
-vazia: ausencia de presenca nunca e lida como "online".
+E estado **por instancia**: o tracker so conhece as conexoes do proprio processo
+(`hub.go`, `h.presence.Connect`). Esta rota nao consulta o
+`ws.PresenceDirectory`, que e a resposta cluster-wide.
+
+Em deployment de instancia unica isso e exato -- `infra/k8s/base`, os overlays
+`k3s-dev`, `k3s-staging` e `nchat-dev-server` rodam chat-service com
+`replicas: 1`. **Producao nao e instancia unica**:
+`infra/k8s/overlays/k3s-prod/slots/workloads/runtime-patch.yaml` define
+`replicas: 2` por slot, entao la a previa e a contagem online **sub**-reportam.
+Sub-reportar e sempre a direcao segura -- nunca super-reporta -- mas a
+divergencia e real e esta registrada em
+[chat-membership-contracts.md](../architecture/chat-membership-contracts.md)
+(causa raiz R5, owner: issue #886).
+
+Sem o tracker conectado, a previa volta vazia: ausencia de presenca nunca e lida
+como "online".
 
 ### Erros
 
@@ -122,13 +193,16 @@ lista de participantes.
 
 ## Consultas
 
-Duas, nesta ordem:
+Tres, nesta ordem:
 
 1. `GetVisibleChannelByID` -- o mesmo predicado de visibilidade usado pelo resto
    da superficie de canais (workspace ativo, participacao ativa no workspace,
    canal ativo, publico ou com `channel_members`).
 2. `ListOnlineChannelMemberProfiles` -- as duas contagens + a previa limitada, em
    uma unica consulta.
+3. `GetChannelAbout` -- descricao + nome do criador, em uma unica consulta,
+   depois do gate. O filtro `workspace_id` ali e isolamento em profundidade, nao
+   a permissao: quem decide o acesso e a etapa 1.
 
 A ordem dentro dessa consulta e o ponto do contrato:
 
@@ -145,14 +219,19 @@ nunca aparecer.
 
 O predicado de participacao vive num lugar so (`active_members`) e e o mesmo de
 `SearchChannelMembers` (autocomplete de mencao), entao autocomplete, contagem
-total e previa nao podem divergir sobre quem esta no canal. O filtro
+total e previa nao podem divergir **entre si** sobre quem esta no canal. Os tres
+divergem, porem, de `chat.channel_visible_to_user` -- que e quem decide o
+acesso -- exatamente na medida em que canal publico tem membership implicita:
+ver o aviso sobre `member_count` acima. O filtro
 `chat.channels.workspace_id` impede um UUID de canal de outro tenant de resolver
 aqui, e o `user_id = ANY(...)` e uma **intersecao**: uma entrada de presenca de
 quem nao e membro deste canal nao seleciona nada.
 
-Sem N+1: uma consulta por requisicao, uma leitura de presenca por requisicao,
-ordenacao deterministica (`lower(display_name)` com `user_id` como desempate) e
-limite constante do servidor. O `LEFT JOIN LATERAL` sobre uma linha unica
+Sem N+1: uma consulta de membros por requisicao, uma leitura de presenca por
+requisicao, ordenacao deterministica (`lower(display_name)` com `user_id` como
+desempate) e limite constante do servidor. A consulta de descricao/criador
+(issue #894) e igualmente uma so por requisicao e de custo constante -- resolve
+um criador, nunca um por membro. O `LEFT JOIN LATERAL` sobre uma linha unica
 garante que as contagens voltem mesmo quando ninguem esta online.
 
 ## Adicionar membros (issue #398)
@@ -166,13 +245,19 @@ aparece na rota: e resolvido no servidor a partir da sessao, como nas demais.
 
 ### Autorizacao
 
-`owner` ou `admin` ativo do workspace, via `domain.CanManageChannelMembers` --
-que delega a `CanManageWorkspace`, o mesmo gate de update/archive de canal e de
-categorias. **Nao** e "qualquer membro do canal": isso permitiria a quem apenas
-le um canal privado ampliar a audiencia dele, que e exatamente a propriedade que
-um canal privado tem. O papel `moderator` de `chat.channel_members` nao e
-consultado porque nenhum caminho de codigo o atribui; a divergencia esta
-registrada em `SECURITY.md`.
+`owner`, `admin` ou `moderator` ativo do workspace, via
+`domain.CanManageChannelMembers` -- que delega a `CanModerateWorkspace`, o mesmo
+gate das categorias de canal. RF-74 (migration 000022) foi o que criou o papel
+`moderator` de workspace e gastou essa costura; antes dela o predicado so
+admitia owner/admin. O store re-deriva a mesma lista dentro da transacao
+(`wm.role IN ('owner', 'admin', 'moderator')`).
+
+**Nao** e "qualquer membro do canal": isso permitiria a quem apenas le um canal
+privado ampliar a audiencia dele, que e exatamente a propriedade que um canal
+privado tem. O papel `moderator` de `chat.channel_members` e por canal e nunca e
+lido como autoridade de workspace -- nenhum caminho de codigo o atribui e nenhum
+o consulta para autorizar. A matriz completa esta em
+[rbac-matrix.md](../security/rbac-matrix.md).
 
 A autorizacao e verificada **antes** de o canal ser lido, entao um chamador sem
 permissao nao descobre pela resposta se um UUID de canal existe.
@@ -255,7 +340,7 @@ nao divergir de uma adicao concorrente.
 | ------ | --------------------- | ------------------------------------------------------------------------------------------------ |
 | 400    | `bad_request`         | `channelID` invalido, JSON malformado, campo desconhecido, lista vazia, ID nao-UUID, acima de 25 |
 | 401    | `unauthorized`        | token ausente/invalido ou sessao inativa                                                         |
-| 403    | `forbidden`           | chamador nao e owner/admin, **ou** algum usuario nao e elegivel                                  |
+| 403    | `forbidden`           | chamador nao e owner/admin/moderator, **ou** algum usuario nao e elegivel                        |
 | 404    | `not_found`           | canal inexistente, arquivado, de outro workspace                                                 |
 | 415    | `bad_request`         | content type diferente de `application/json`                                                     |
 | 429    | `rate_limited`        | orcamento excedido                                                                               |
@@ -276,7 +361,7 @@ Parametros: `query` (2 a 64 caracteres) e `limit` opcional (padrao 20, maximo
 50, sempre clampado no servidor). Nada mais e aceito — workspace e ator vem da
 sessao, e um `workspace_id` na query string e simplesmente ignorado.
 
-Autorizacao: a mesma de `POST .../members` (`owner`/`admin` ativo), verificada
+Autorizacao: a mesma de `POST .../members` (`owner`/`admin`/`moderator` ativo), verificada
 **antes** de o canal ser lido. Isso e deliberado: a rota revela quem **nao** esta
 num canal, o que e um fato sobre a composicao de um canal privado.
 
@@ -379,3 +464,135 @@ o proprio escopo, e nada disso foi decidido por quem o recebe. Por isso:
 Uma falha de publicacao no barramento e best-effort, como nos demais eventos:
 custa uma visao desatualizada ate o proximo refetch, nunca a membership que ja
 foi commitada.
+
+## Roster administravel e remocao de membro (issue #469)
+
+O painel de detalhes precisa responder duas perguntas que `GET .../details` nao
+responde: **quem pertence ao canal** (e nao quem esta online agora) e **quem
+este chamador pode remover**. Sao duas rotas e um campo.
+
+| Metodo | Rota publica                                      | Descricao                     |
+| ------ | ------------------------------------------------- | ----------------------------- |
+| GET    | `/api/chat/channels/{channelID}/members`          | membership administravel      |
+| DELETE | `/api/chat/channels/{channelID}/members/{userID}` | remove um membro (issue #685) |
+
+### `GET .../members`
+
+Existe porque `online_members` **nao e roster**: o filtro de presenca e aplicado
+dentro da propria consulta, antes de `ORDER BY`/`LIMIT`, entao um membro offline
+nao tem linha na previa -- e um membro sem linha na tela nao pode ser removido.
+Esta rota le `chat.channel_members`, que e exatamente a populacao que o DELETE
+abaixo apaga.
+
+Autorizacao: a mesma do DELETE -- `domain.CanManageChannelMembers` e canal que
+nao seja `#geral` --, verificada **antes** de o canal ser lido. Um chamador que
+nao administra canais recebe `403` sem descobrir se o UUID existe; um canal que
+ele nao ve continua sendo `404`; `#geral` e recusado porque sua membership
+pertence ao sync do workspace e nao ha nada a administrar por aqui.
+
+```json
+{
+  "data": {
+    "member_count": 12,
+    "members": [
+      {
+        "user_id": "22222222-2222-4222-8222-222222222222",
+        "display_name": "Alvaro Neto",
+        "avatar_url": "/media/avatars/alvaro.png",
+        "role": "moderator"
+      }
+    ]
+  }
+}
+```
+
+- `member_count` e a membership inteira, via `COUNT(*) OVER ()` na mesma
+  consulta da pagina, e **nunca** `members.length`: a pagina e limitada a
+  `domain.MaxChannelDetailsMembers` (30), como a previa de participantes de
+  grupo.
+- `members[].role` e o papel no canal (`member` | `moderator`), lido da mesma
+  linha que o DELETE apaga.
+- **Sem `presence`.** Esta lista e membership; quem esta conectado e resposta do
+  store de realtime, e um campo aqui seria uma segunda resposta, mais velha,
+  para a mesma pergunta.
+- Predicado identico ao da CTE `active_members` da previa: canal ativo neste
+  workspace, membership de workspace ativa, conta ativa e nao apagada. Um canal
+  publico sem linhas explicitas responde `member_count: 0` -- os leitores
+  implicitos nao sao membros e nao aparecem aqui (ver a nota de `member_count`
+  acima; a decisao pertence a #883).
+
+Compartilha o orcamento de leitura, como `GET .../details`: o painel consulta
+esta rota ao abrir e apos cada mudanca de membership.
+
+**Uma pagina, sem cursor.** A rota entrega os 30 primeiros por nome e o total
+real; nao existe parametro de pagina e nenhuma rota lista o excedente hoje.
+Num canal com mais de 30 membros explicitos, o painel diz quantos tem em maos
+(`N de M membros carregados.`) e a acao de remocao alcanca exatamente essas
+linhas. Navegar a colecao inteira -- compacto de cinco, `Ver todos`/`Mostrar
+menos`, lista completa/paginada -- e a
+[issue #895](https://github.com/nicrepository/nchat/issues/895), que declara
+essa responsabilidade como sua e deixa a remocao com a #469. O contrato aqui
+foi desenhado para ela: a ordenacao e deterministica
+(`lower(display_name), user_id`), o total vem separado da pagina e um cursor
+pode ser acrescentado sem mudar nenhum campo existente.
+
+| Status | Codigo                | Quando                                                        |
+| ------ | --------------------- | ------------------------------------------------------------- |
+| 400    | `bad_request`         | `channelID` nao e UUID valido                                 |
+| 401    | `unauthorized`        | token ausente/invalido ou sessao inativa                      |
+| 403    | `forbidden`           | chamador nao administra membros, ou canal `#geral`            |
+| 404    | `not_found`           | canal inexistente, arquivado, de outro workspace ou invisivel |
+| 429    | `rate_limited`        | orcamento de leitura excedido                                 |
+| 503    | `service_unavailable` | handler nao conectado                                         |
+
+### `DELETE .../members/{userID}`
+
+A remocao administrativa, distinta do auto-desligamento
+(`DELETE /api/chat/channels/{channelID}/membership`, que so age sobre o proprio
+chamador). A rota nomeia o alvo; workspace e ator vem da sessao. **Nao ha
+corpo** -- nao existe campo para um cliente afirmar workspace, papel ou
+permissao.
+
+- **Autorizacao:** `domain.CanManageChannelMembers`, o mesmo predicado da
+  adicao, re-derivado no servidor a cada chamada; `#geral` e recusado.
+- **Auto-remocao e recusada** com `400`: sair da conversa e a operacao de
+  `DELETE .../membership`, e reusar esta rota escreveria "removeu" na timeline
+  sobre quem saiu.
+- **Idempotente:** remover quem ja nao e membro responde `204` e nao publica
+  nada -- nao ha mudanca a anunciar.
+- **Transacional:** a linha de `chat.channel_members` e o evento
+  `conversation_member_removed` sao escritos na mesma transacao, e o
+  `conversation.event` correspondente so e publicado **apos** o commit. O
+  historico do removido permanece: a operacao toca membership, nada mais.
+- **Resposta:** `204` sem corpo. O cliente reconcilia refazendo as leituras
+  autorizadas (`GET .../details` e `GET .../members`), nunca a partir da
+  resposta.
+
+| Status | Codigo                | Quando                                                       |
+| ------ | --------------------- | ------------------------------------------------------------ |
+| 204    | --                    | removido, ou o alvo ja nao era membro                        |
+| 400    | `bad_request`         | ID invalido, ou o alvo e o proprio chamador                  |
+| 401    | `unauthorized`        | token ausente/invalido ou sessao inativa                     |
+| 403    | `forbidden`           | sem permissao de gestao, ou `#geral`                         |
+| 404    | `not_found`           | workspace nao resolvido                                      |
+| 429    | `rate_limited`        | orcamento de escrita excedido (acao `remove_member`, 10/60s) |
+| 503    | `service_unavailable` | handler nao conectado                                        |
+
+### `can_remove_members` em `GET .../details`
+
+Campo booleano, sempre enviado, com a decisao do servidor sobre **remover**.
+Convive com `can_manage_members` (adicionar) e nao deve ser deduzido dele: num
+canal os dois avaliam hoje o mesmo predicado, mas sao perguntas diferentes -- e
+num grupo elas ja divergem (ver
+[chat-group-details.md](./chat-group-details.md)). Como o vizinho, e dica de
+renderizacao: ausente ou invalido e lido como `false`, e o DELETE reavalia a
+decisao de qualquer forma.
+
+### Tempo real
+
+A remocao publica `conversation.event` com o id da mensagem de sistema, apos o
+commit -- **nao existe** `members.removed`, e nenhum evento novo foi criado para
+esta issue. Para os demais clientes esse evento e sinal de invalidacao: o painel
+aberto refaz `details` e `members`, e o estado persistido continua sendo a
+autoridade. O removido perde acesso pela reautorizacao que o fan-out ja faz por
+assinante, e sua sidebar converge pelo refetch que o mesmo evento dispara.

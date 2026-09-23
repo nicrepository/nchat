@@ -61,14 +61,14 @@ func addInput(userIDs ...string) service.AddChannelMembersInput {
 	}
 }
 
-func TestAddChannelMembersAllowsWorkspaceManagers(t *testing.T) {
-	// RF-74 added the moderator: domain.CanManageChannelMembers is the workspace
-	// moderation gate now, not the administration gate.
+func TestAddChannelMembersAllowsAdministrativeRolesWithoutPrivateMembership(t *testing.T) {
+	// #705 preserves the administrative add scope even when these actors are not
+	// members of the private channel.
 	for _, role := range []domain.WorkspaceRole{
 		domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin, domain.WorkspaceRoleModerator,
 	} {
 		t.Run(string(role), func(t *testing.T) {
-			svc, members, _ := addMembersFixture(t, role)
+			svc, members, channels := addMembersFixture(t, role)
 
 			result, err := svc.AddChannelMembers(context.Background(), addInput(amTargetA, amTargetB))
 			if err != nil {
@@ -80,7 +80,47 @@ func TestAddChannelMembersAllowsWorkspaceManagers(t *testing.T) {
 			if _, ok := members.channelMembers[cmKey(amChannelID, amTargetA)]; !ok {
 				t.Fatal("target A was not persisted")
 			}
+			if channels.getVisibleByIDCalls != 0 {
+				t.Fatal("administrative add must not grant or require normal read access")
+			}
 		})
+	}
+}
+
+func TestAddChannelMembersAllowsMemberOnVisibleChannels(t *testing.T) {
+	for _, channelType := range []domain.ChannelType{domain.ChannelTypePublic, domain.ChannelTypePrivate} {
+		t.Run(string(channelType), func(t *testing.T) {
+			svc, members, channels := addMembersFixture(t, domain.WorkspaceRoleMember)
+			channels.channel.Type = channelType
+			if channelType == domain.ChannelTypePrivate {
+				// Private-channel creation seeds this exact membership atomically.
+				channels.channel.CreatedBy = amManagerID
+				members.channelMembers[cmKey(amChannelID, amManagerID)] = domain.ChannelMember{
+					ChannelID: amChannelID, UserID: amManagerID, Role: domain.ChannelRoleMember,
+				}
+			}
+
+			if _, err := svc.AddChannelMembers(context.Background(), addInput(amTargetA)); err != nil {
+				t.Fatalf("AddChannelMembers: %v", err)
+			}
+			if channels.getVisibleByIDCalls != 1 {
+				t.Fatalf("visible channel lookups = %d, want 1", channels.getVisibleByIDCalls)
+			}
+		})
+	}
+}
+
+func TestAddChannelMembersHidesPrivateChannelFromMemberWithoutAccess(t *testing.T) {
+	svc, members, channels := addMembersFixture(t, domain.WorkspaceRoleMember)
+	channels.getVisibleErr = domain.ErrNotFound
+
+	_, err := svc.AddChannelMembers(context.Background(), addInput(amTargetA))
+
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if len(members.addChannelMembersCalls) != 0 {
+		t.Fatal("an invisible private channel must not reach the write store")
 	}
 }
 
@@ -104,10 +144,9 @@ func TestAddChannelMembersWorksForPublicAndPrivateChannels(t *testing.T) {
 	}
 }
 
-// The core authorization assertion. A plain member and a guest can both read the
-// channel; neither may change who else can.
-func TestAddChannelMembersRejectsNonManagers(t *testing.T) {
-	for _, role := range []domain.WorkspaceRole{domain.WorkspaceRoleMember, domain.WorkspaceRoleGuest} {
+// Guest and unknown roles remain outside the add capability.
+func TestAddChannelMembersRejectsRolesWithoutAddCapability(t *testing.T) {
+	for _, role := range []domain.WorkspaceRole{domain.WorkspaceRoleGuest, domain.WorkspaceRole("wizard")} {
 		t.Run(string(role), func(t *testing.T) {
 			svc, members, _ := addMembersFixture(t, role)
 
@@ -122,21 +161,21 @@ func TestAddChannelMembersRejectsNonManagers(t *testing.T) {
 	}
 }
 
-// The endpoint must consult CanManageChannelMembers and nothing stricter above
-// it. If a second owner/admin gate were reintroduced, widening the named seam
-// for RF-74 would silently have no effect here — the seam would be decoration.
+// On a public channel, the endpoint must consult CanAddChannelMembers and
+// nothing stricter above it. Private-member visibility is tested separately.
 //
 // This proves the wiring by widening the predicate's own inputs: every role the
 // predicate accepts must be accepted by the service, and every role it rejects
 // must be rejected, with no third opinion in between.
-func TestAddChannelMembersDefersEntirelyToTheNamedPredicate(t *testing.T) {
+func TestAddChannelMembersFollowsAddCapabilityOnPublicChannel(t *testing.T) {
 	for _, role := range []domain.WorkspaceRole{
 		domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin, domain.WorkspaceRoleModerator,
 		domain.WorkspaceRoleMember, domain.WorkspaceRoleGuest, domain.WorkspaceRole("wizard"),
 	} {
 		t.Run(string(role), func(t *testing.T) {
-			svc, _, _ := addMembersFixture(t, role)
-			allowed := domain.CanManageChannelMembers(&domain.WorkspaceMember{
+			svc, _, channels := addMembersFixture(t, role)
+			channels.channel.Type = domain.ChannelTypePublic
+			allowed := domain.CanAddChannelMembers(&domain.WorkspaceMember{
 				Role: role, Status: domain.MemberStatusActive,
 			})
 
@@ -167,7 +206,7 @@ func TestAddChannelMembersRejectsSuspendedManager(t *testing.T) {
 // Authorization is checked before the channel is read, so a caller with no
 // management rights cannot use the error to learn whether a channel ID exists.
 func TestAddChannelMembersChecksAuthorizationBeforeReadingTheChannel(t *testing.T) {
-	svc, _, channels := addMembersFixture(t, domain.WorkspaceRoleMember)
+	svc, _, channels := addMembersFixture(t, domain.WorkspaceRoleGuest)
 	channels.getInWorkspaceErr = errors.New("must not be called")
 
 	_, err := svc.AddChannelMembers(context.Background(), addInput(amTargetA))
@@ -514,8 +553,8 @@ func TestSearchChannelMemberCandidatesExcludesCurrentMembers(t *testing.T) {
 
 // Same gate as the write, checked before the channel is read so a refused caller
 // cannot learn whether the channel exists.
-func TestSearchChannelMemberCandidatesRequiresManagementRights(t *testing.T) {
-	for _, role := range []domain.WorkspaceRole{domain.WorkspaceRoleMember, domain.WorkspaceRoleGuest} {
+func TestSearchChannelMemberCandidatesRequiresAddCapability(t *testing.T) {
+	for _, role := range []domain.WorkspaceRole{domain.WorkspaceRoleGuest, domain.WorkspaceRole("wizard")} {
 		t.Run(string(role), func(t *testing.T) {
 			svc, members, channels := addMembersFixture(t, role)
 			channels.getInWorkspaceErr = errors.New("must not be called")
@@ -529,6 +568,71 @@ func TestSearchChannelMemberCandidatesRequiresManagementRights(t *testing.T) {
 				t.Fatal("an unauthorised caller must not reach the store")
 			}
 		})
+	}
+}
+
+func TestSearchChannelMemberCandidatesAllowsVisibleMember(t *testing.T) {
+	svc, members, channels := addMembersFixture(t, domain.WorkspaceRoleMember)
+	members.channelMembers[cmKey(amChannelID, amManagerID)] = domain.ChannelMember{
+		ChannelID: amChannelID, UserID: amManagerID, Role: domain.ChannelRoleMember,
+	}
+	members.dmCandidates = []domain.DMCandidate{{UserID: amTargetA, DisplayName: "Ana"}}
+
+	got, err := svc.SearchChannelMemberCandidates(context.Background(), candidateInput("an"))
+
+	if err != nil {
+		t.Fatalf("SearchChannelMemberCandidates: %v", err)
+	}
+	if len(got) != 1 || channels.getVisibleByIDCalls != 1 {
+		t.Fatalf("candidates = %+v, visible lookups = %d", got, channels.getVisibleByIDCalls)
+	}
+}
+
+func TestSearchChannelMemberCandidatesAllowsAdministrativeRolesWithoutPrivateMembership(t *testing.T) {
+	for _, role := range []domain.WorkspaceRole{
+		domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin, domain.WorkspaceRoleModerator,
+	} {
+		t.Run(string(role), func(t *testing.T) {
+			svc, members, channels := addMembersFixture(t, role)
+			members.dmCandidates = []domain.DMCandidate{{UserID: amTargetA, DisplayName: "Ana"}}
+
+			got, err := svc.SearchChannelMemberCandidates(context.Background(), candidateInput("an"))
+			if err != nil {
+				t.Fatalf("SearchChannelMemberCandidates: %v", err)
+			}
+			if len(got) != 1 || channels.getVisibleByIDCalls != 0 {
+				t.Fatalf("candidates = %+v, visible lookups = %d", got, channels.getVisibleByIDCalls)
+			}
+		})
+	}
+}
+
+func TestSearchChannelMemberCandidatesHidesPrivateChannelFromMemberWithoutAccess(t *testing.T) {
+	svc, members, channels := addMembersFixture(t, domain.WorkspaceRoleMember)
+	channels.getVisibleErr = domain.ErrNotFound
+
+	_, err := svc.SearchChannelMemberCandidates(context.Background(), candidateInput("an"))
+
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if len(members.candidateCalls) != 0 {
+		t.Fatal("an invisible private channel must not reach candidate storage")
+	}
+}
+
+func TestSearchChannelMemberCandidatesRejectsGeneralChannel(t *testing.T) {
+	svc, members, channels := addMembersFixture(t, domain.WorkspaceRoleOwner)
+	channels.channel.IsGeneral = true
+	channels.channel.Type = domain.ChannelTypePublic
+
+	_, err := svc.SearchChannelMemberCandidates(context.Background(), candidateInput("an"))
+
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("err = %v, want ErrInvalidInput", err)
+	}
+	if len(members.candidateCalls) != 0 {
+		t.Fatal("general channel must not reach candidate storage")
 	}
 }
 

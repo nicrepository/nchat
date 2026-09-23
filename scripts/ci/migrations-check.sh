@@ -3,7 +3,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-MIGRATIONS_DIR="$ROOT_DIR/migrations"
+# Overridable so the gate's own tests can point it at a synthetic tree; CI and
+# every human run take the default.
+MIGRATIONS_DIR="${MIGRATIONS_DIR_OVERRIDE:-$ROOT_DIR/migrations}"
 
 ERRORS=0
 
@@ -117,6 +119,124 @@ for down in "${DOWN_FILES[@]}"; do
     fail "orphan down migration without matching up: $(basename "$down")"
   fi
 done
+echo
+
+# ---------------------------------------------------------------------------
+# 3b. One migration per ordinal, per domain
+# ---------------------------------------------------------------------------
+#
+# The hole this closes, found integrating issue #928: two branches each add
+# `migrations/chat/000055_*`, and every existing check passes. Git sees two
+# different *filenames*, so the merge is clean and silent; the runner keys
+# applied migrations on the whole basename, so both are applied; and nothing
+# anywhere asserts that an ordinal identifies one migration.
+#
+# What that costs is ordering. The number is the order, and two migrations
+# claiming one number have no defined order between them — only whatever
+# `sort` happens to do with the words after the underscore. Two deployments
+# can disagree about which ran first, and a third branch adding a third
+# 000055 can interleave differently again. Expand/contract reasoning, the
+# blue/green review and every runbook all assume an ordinal names one step.
+#
+# Scoped per domain, because each domain carries its own sequence.
+echo "--- one migration per ordinal ---"
+ORDINAL_EXCEPTIONS_FILE="${ORDINAL_EXCEPTIONS_FILE:-$ROOT_DIR/scripts/ci/migration-ordinal-exceptions.txt}"
+
+# sorted_words prints its arguments one per line, sorted, so two sets can be
+# compared as strings regardless of the order they were discovered in.
+sorted_words() {
+  printf '%s\n' "$@" | LC_ALL=C sort
+}
+
+# load_ordinal_exceptions fills ORDINAL_EXPECTED with the exact basenames each
+# historical collision is allowed to contain.
+#
+# Keyed on domain/ordinal, valued with the whole expected set: an exception
+# closes over *which* migrations may share the number, not merely over the fact
+# that some do. A third file appearing at a grandfathered ordinal is a new
+# collision and fails like any other, which is the whole point of the list being
+# closed.
+#
+# Format: <domain>/<ordinal>|<basename>|<basename>...
+load_ordinal_exceptions() {
+  declare -gA ORDINAL_EXPECTED=()
+  [[ -f "$ORDINAL_EXCEPTIONS_FILE" ]] || return 0
+  local line key members
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="${line//[[:space:]]/}"
+    [[ -n "$line" ]] || continue
+    key="${line%%|*}"
+    members="${line#*|}"
+    if [[ "$key" == "$line" || -z "$members" ]]; then
+      fail "malformed ordinal exception (want <domain>/<ordinal>|<basename>|...): $line"
+      continue
+    fi
+    ORDINAL_EXPECTED[$key]="${members//|/ }"
+  done < "$ORDINAL_EXCEPTIONS_FILE"
+}
+
+# check_ordinal_group decides one domain/ordinal that holds more than one
+# migration.
+#
+# Accepted only when the set found is exactly the set recorded. Not a superset,
+# not a subset, not a prefix, no wildcard: a migration removed, renamed or added
+# at a grandfathered ordinal all read as a change to something the exception was
+# written about, and a change to that is a review decision rather than
+# something a gate should wave through.
+check_ordinal_group() {
+  local key="$1"
+  shift
+  local found expected
+  found="$(sorted_words "$@")"
+  if [[ -z "${ORDINAL_EXPECTED[$key]+set}" ]]; then
+    fail "duplicate migration number $key: $(printf '%s ' "$@")"
+    return 1
+  fi
+  # shellcheck disable=SC2086 # the recorded members are a deliberate word list.
+  expected="$(sorted_words ${ORDINAL_EXPECTED[$key]})"
+  if [[ "$found" != "$expected" ]]; then
+    fail "ordinal exception $key no longer matches the migrations it was written for"
+    echo "         expected: $(tr '\n' ' ' <<<"$expected")" >&2
+    echo "         found:    $(tr '\n' ' ' <<<"$found")" >&2
+    return 1
+  fi
+  ok "$key is a recorded pre-existing duplicate, unchanged"
+  return 0
+}
+
+load_ordinal_exceptions
+declare -A ORDINAL_MEMBERS=()
+for up in "${UP_FILES[@]}"; do
+  up_domain="$(basename "$(dirname "$up")")"
+  up_base="$(basename "$up" .up.sql)"
+  key="$up_domain/${up_base%%_*}"
+  ORDINAL_MEMBERS[$key]="${ORDINAL_MEMBERS[$key]:-} $up_base"
+done
+
+ordinal_collisions=0
+for key in "${!ORDINAL_MEMBERS[@]}"; do
+  # shellcheck disable=SC2086 # the collected basenames are a deliberate word list.
+  set -- ${ORDINAL_MEMBERS[$key]}
+  [ "$#" -gt 1 ] || continue
+  check_ordinal_group "$key" "$@" || ordinal_collisions=$((ordinal_collisions + 1))
+done
+
+# An exception that no longer describes a collision at all is stale: the
+# migrations were renumbered, or the list outlived them. Left in place it would
+# silently pre-authorise the next collision at that ordinal.
+for key in "${!ORDINAL_EXPECTED[@]}"; do
+  # shellcheck disable=SC2086
+  set -- ${ORDINAL_MEMBERS[$key]:-}
+  if [ "$#" -le 1 ]; then
+    fail "ordinal exception $key no longer describes a duplicate; remove it"
+    ordinal_collisions=$((ordinal_collisions + 1))
+  fi
+done
+
+if [ "$ordinal_collisions" -eq 0 ]; then
+  ok "every migration number is used once per domain (${#ORDINAL_MEMBERS[@]} checked)"
+fi
 echo
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@
  */
 
 import { render, screen, act } from "@testing-library/react";
+import { useEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
@@ -31,8 +32,12 @@ import {
   reducePresence,
   presenceTargetKey,
   selectPresence,
+  selectTargetPresence,
+  emptyTargetPresence,
   usePresence,
+  usePresenceTarget,
   type PresenceSnapshotState,
+  type TargetPresence,
 } from "./presence";
 import PresenceDot from "./PresenceDot";
 
@@ -835,6 +840,143 @@ describe("usePresence", () => {
 });
 
 // ── session scope (CQ-4) ─────────────────────────────────────────────────────
+
+/**
+ * The roster's subscription (issue #895).
+ *
+ * `usePresence` answers about one person; this answers about one *conversation*,
+ * because a list that orders itself by presence has to read everybody in one
+ * consistent pass. The property that matters is the one a global snapshot did
+ * not have: a frame about conversation B must not wake the roster of
+ * conversation A. It is asserted as snapshot identity *and* as renders, because
+ * a stable snapshot that still re-rendered would have fixed nothing.
+ */
+describe("usePresenceTarget", () => {
+  const seen: { renders: number; snapshots: TargetPresence[] } = { renders: 0, snapshots: [] };
+
+  /**
+   * Records every *committed* render and the snapshot it drew, which is the
+   * observable that matters: a store notification React bails out of never
+   * commits, so the count stays where it was.
+   */
+  function Roster({ targetKey, label }: { targetKey: string; label: string }) {
+    const presence = usePresenceTarget(targetKey);
+    useEffect(() => {
+      seen.renders += 1;
+      seen.snapshots.push(presence);
+    });
+    return (
+      <span data-testid={label} data-covered={String(presence.covered)}>
+        {[...presence.entries.entries()]
+          .map(([userId, entry]) => `${userId}:${entry.state}`)
+          .join(",")}
+      </span>
+    );
+  }
+
+  beforeEach(() => {
+    seen.renders = 0;
+    seen.snapshots = [];
+  });
+
+  it("does not wake a roster when another conversation's presence moves", () => {
+    render(<Roster targetKey={target("chan-a")} label="a" />);
+    openSocket();
+    const rendersAfterMount = seen.renders;
+    const snapshotBefore = seen.snapshots.at(-1);
+
+    // Three frames, none of them about this conversation.
+    deliver(snapshotFrame([{ user_id: "u-9", state: "online", updated_at: T1 }], "chan-b"));
+    deliver(updateFrame("u-9", "away", T2, "chan-b"));
+    deliver(updateFrame("u-8", "offline", T2, "chan-c"));
+
+    // The store moved — the snapshot this conversation reads did not, so React
+    // bailed out and neither the sort nor a single row ran again.
+    expect(seen.snapshots.at(-1)).toBe(snapshotBefore);
+    expect(seen.renders).toBe(rendersAfterMount);
+    expect(screen.getByTestId("a")).toHaveTextContent("");
+  });
+
+  it("wakes the roster when its own conversation moves, and keeps the new identity", () => {
+    render(<Roster targetKey={target("chan-a")} label="a" />);
+    openSocket();
+    const before = seen.snapshots.at(-1);
+
+    deliver(snapshotFrame([{ user_id: "u-1", state: "online", updated_at: T1 }], "chan-a"));
+
+    expect(seen.snapshots.at(-1)).not.toBe(before);
+    expect(screen.getByTestId("a")).toHaveTextContent("u-1:online");
+    expect(screen.getByTestId("a")).toHaveAttribute("data-covered", "true");
+
+    // A second frame about someone else still does not move this one.
+    const afterOwn = seen.snapshots.at(-1);
+    deliver(updateFrame("u-9", "online", T2, "chan-b"));
+    expect(seen.snapshots.at(-1)).toBe(afterOwn);
+  });
+
+  it("gives two rosters independent snapshots", () => {
+    render(
+      <>
+        <Roster targetKey={target("chan-a")} label="a" />
+        <Roster targetKey={target("chan-b")} label="b" />
+      </>,
+    );
+    openSocket();
+
+    deliver(snapshotFrame([{ user_id: "u-1", state: "online", updated_at: T1 }], "chan-a"));
+    deliver(snapshotFrame([{ user_id: "u-2", state: "away", updated_at: T1 }], "chan-b"));
+
+    expect(screen.getByTestId("a")).toHaveTextContent("u-1:online");
+    expect(screen.getByTestId("b")).toHaveTextContent("u-2:away");
+  });
+
+  it("reads absence as offline only where the server answered completely", () => {
+    render(<Roster targetKey={target("chan-a")} label="a" />);
+    openSocket();
+    deliver(snapshotFrame([{ user_id: "u-1", state: "online", updated_at: T1 }], "chan-a"));
+
+    const view = seen.snapshots.at(-1)!;
+    expect(selectTargetPresence(view, "u-1")).toBe("online");
+    // Covered, so somebody the complete list did not name is genuinely away.
+    expect(selectTargetPresence(view, "u-2")).toBe("offline");
+    expect(selectTargetPresence(emptyTargetPresence, "u-2")).toBe("unknown");
+    expect(selectTargetPresence(view, "")).toBe("unknown");
+  });
+
+  it("stores nothing for a conversation the server has said nothing about", () => {
+    // Rendering a roster before any frame arrives, or for a conversation
+    // presence never reports on, must not leave a per-conversation entry
+    // behind. The shared empty view is what those all get — and it is the same
+    // object, so it is also a valid, unmoving snapshot.
+    render(
+      <>
+        <Roster targetKey={target("never-reported-a")} label="a" />
+        <Roster targetKey={target("never-reported-b")} label="b" />
+      </>,
+    );
+    openSocket();
+
+    const [first, second] = seen.snapshots.slice(-2);
+    expect(first).toBe(second);
+    expect(first.covered).toBe(false);
+    expect(first.entries.size).toBe(0);
+  });
+
+  it("follows a roster that switches conversation", () => {
+    const { rerender } = render(<Roster targetKey={target("chan-a")} label="a" />);
+    openSocket();
+    deliver(snapshotFrame([{ user_id: "u-1", state: "online", updated_at: T1 }], "chan-a"));
+    deliver(snapshotFrame([{ user_id: "u-2", state: "away", updated_at: T1 }], "chan-b"));
+    expect(screen.getByTestId("a")).toHaveTextContent("u-1:online");
+
+    rerender(<Roster targetKey={target("chan-b")} label="a" />);
+
+    // The new conversation's evidence, not the old one's — and no leftover
+    // subscriber keeping the previous target alive.
+    expect(screen.getByTestId("a")).toHaveTextContent("u-2:away");
+    expect(screen.getByTestId("a")).not.toHaveTextContent("u-1");
+  });
+});
 
 describe("presence scope", () => {
   it("clears on logout, without waiting for a socket to open", () => {

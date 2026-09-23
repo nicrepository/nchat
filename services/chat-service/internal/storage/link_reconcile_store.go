@@ -267,7 +267,11 @@ func (s *PGXMessageStore) reconcileSafe(
 func (s *PGXMessageStore) reconcileMalicious(
 	ctx context.Context, canonicalURL, scanUUID string,
 ) error {
-	return s.recordMaliciousLinkVerdict(ctx, canonicalURL, scanUUID, "inconclusive")
+	// No evidence ceiling: reconciliation reads a Cloudflare report, and
+	// Cloudflare states no expiry for a verdict. The local VerdictTTL governs,
+	// exactly as it did before issue #928.
+	return s.recordMaliciousLinkVerdict(
+		ctx, canonicalURL, scanUUID, "inconclusive", refColumnPrimary, time.Time{})
 }
 
 // refreshMessageLinkSafetyQuery recomputes the per-message link-safety marker for
@@ -311,8 +315,8 @@ const refreshMessageLinkSafetyQuery = `
 		SELECT candidate.id, candidate.fingerprint,
 		       CASE
 		         WHEN bool_or(ls.status = 'malicious') THEN 'malicious'
-		         WHEN bool_and(ls.status IN ('safe', 'malicious', 'inconclusive'))
-		          AND bool_or(ls.status = 'inconclusive') THEN 'inconclusive'
+		         WHEN bool_and(ls.status IN ('safe', 'malicious', 'inconclusive', 'unknown'))
+		          AND bool_or(ls.status IN ('inconclusive', 'unknown')) THEN 'inconclusive'
 		         WHEN bool_and(ls.status = 'safe') THEN 'safe'
 		         ELSE NULL
 		       END AS state
@@ -327,15 +331,15 @@ const refreshMessageLinkSafetyQuery = `
 		-- work and the caller's drain is guaranteed to make progress.
 		HAVING CASE
 		         WHEN bool_or(ls.status = 'malicious') THEN 'malicious'
-		         WHEN bool_and(ls.status IN ('safe', 'malicious', 'inconclusive'))
-		          AND bool_or(ls.status = 'inconclusive') THEN 'inconclusive'
+		         WHEN bool_and(ls.status IN ('safe', 'malicious', 'inconclusive', 'unknown'))
+		          AND bool_or(ls.status IN ('inconclusive', 'unknown')) THEN 'inconclusive'
 		         WHEN bool_and(ls.status = 'safe') THEN 'safe'
 		         ELSE NULL
 		       END IS DISTINCT FROM candidate.link_safety_state
 		   AND CASE
 		         WHEN bool_or(ls.status = 'malicious') THEN 'malicious'
-		         WHEN bool_and(ls.status IN ('safe', 'malicious', 'inconclusive'))
-		          AND bool_or(ls.status = 'inconclusive') THEN 'inconclusive'
+		         WHEN bool_and(ls.status IN ('safe', 'malicious', 'inconclusive', 'unknown'))
+		          AND bool_or(ls.status IN ('inconclusive', 'unknown')) THEN 'inconclusive'
 		         WHEN bool_and(ls.status = 'safe') THEN 'safe'
 		         ELSE NULL
 		       END IS NOT NULL
