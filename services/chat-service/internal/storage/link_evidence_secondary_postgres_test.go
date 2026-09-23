@@ -28,10 +28,16 @@ func decide(
 	verdict urlsafety.Verdict, expiresAt time.Time, verifySecondary bool,
 ) {
 	t.Helper()
-	f.target(t, url, "pending", -time.Hour)
-	if _, err := f.pool.Exec(f.ctx,
-		`UPDATE chat.link_scans SET scan_uuid = 'scan-807' WHERE canonical_url = $1`, url); err != nil {
-		t.Fatalf("bind scan: %v", err)
+	// Upsert rather than insert: a target may be decided more than once in one
+	// subtest, which is what a re-check after an expiry looks like.
+	if _, err := f.pool.Exec(f.ctx, `
+		INSERT INTO chat.link_scans (canonical_url, status, scan_uuid, deadline_at)
+		VALUES ($1, 'pending', 'scan-807', now() + interval '1 hour')
+		ON CONFLICT (canonical_url) DO UPDATE
+		   SET status = 'pending', scan_uuid = 'scan-807', decided_at = NULL,
+		       evidence_expires_at = NULL, deadline_at = now() + interval '1 hour',
+		       updated_at = now()`, url); err != nil {
+		t.Fatalf("seed target: %v", err)
 	}
 	write := storage.LinkVerdictWrite{
 		CanonicalURL:      url,
@@ -69,6 +75,43 @@ func shiftEvidenceExpiry(t *testing.T, f linkTargetFixture, url string, offset t
 		 WHERE canonical_url = $1`, url, offset.Seconds()); err != nil {
 		t.Fatalf("shift evidence expiry: %v", err)
 	}
+}
+
+// claimOneSecondary takes the lane and returns the attempt that now owns it.
+func claimOneSecondary(t *testing.T, f linkTargetFixture) storage.LinkSecondaryJob {
+	t.Helper()
+	jobs, err := f.store.ClaimDueSecondaryVerifications(f.ctx, 1)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("claim = %+v, %v; want exactly one", jobs, err)
+	}
+	return jobs[0]
+}
+
+// expireSecondaryLease makes the current lease lapse, which is what a worker
+// that died or stalled past its lease leaves behind. Done in the database
+// rather than by waiting, so nothing here depends on a clock.
+func expireSecondaryLease(t *testing.T, f linkTargetFixture, url string) {
+	t.Helper()
+	if _, err := f.pool.Exec(f.ctx, `
+		UPDATE chat.link_scans SET secondary_due_at = now() - interval '1 second'
+		 WHERE canonical_url = $1`, url); err != nil {
+		t.Fatalf("expire secondary lease: %v", err)
+	}
+}
+
+func secondaryLaneState(t *testing.T, f linkTargetFixture, url string) (ref string, generation int, open bool) {
+	t.Helper()
+	var storedRef *string
+	if err := f.pool.QueryRow(f.ctx, `
+		SELECT secondary_scan_uuid, secondary_generation, secondary_due_at IS NOT NULL
+		  FROM chat.link_scans WHERE canonical_url = $1`, url,
+	).Scan(&storedRef, &generation, &open); err != nil {
+		t.Fatalf("read secondary lane: %v", err)
+	}
+	if storedRef != nil {
+		ref = *storedRef
+	}
+	return ref, generation, open
 }
 
 func TestLinkEvidenceExpiryPostgreSQL(t *testing.T) {
@@ -201,6 +244,9 @@ func TestLinkSecondaryVerificationPostgreSQL(t *testing.T) {
 		if jobs[0].SecondaryRef != "" {
 			t.Fatalf("a fresh lane must carry no ref, got %q", jobs[0].SecondaryRef)
 		}
+		if jobs[0].Generation <= 0 {
+			t.Fatalf("generation = %d, want the claim to issue one", jobs[0].Generation)
+		}
 	})
 
 	t.Run("the claim leases, so a second worker takes nothing", func(t *testing.T) {
@@ -239,17 +285,24 @@ func TestLinkSecondaryVerificationPostgreSQL(t *testing.T) {
 	t.Run("the scan id is bound, then the condemnation flips the target", func(t *testing.T) {
 		f.reset(t)
 		decide(t, f, secondaryURL, urlsafety.VerdictSafe, time.Time{}, true)
-		if err := f.store.RecordSecondaryRef(f.ctx, secondaryURL, "cf-scan-1"); err != nil {
+		first := claimOneSecondary(t, f)
+		if err := f.store.RecordSecondaryRef(
+			f.ctx, secondaryURL, first.Generation, "cf-scan-1"); err != nil {
 			t.Fatalf("RecordSecondaryRef: %v", err)
 		}
+		expireSecondaryLease(t, f, secondaryURL)
 		jobs, err := f.store.ClaimDueSecondaryVerifications(f.ctx, 10)
 		if err != nil || len(jobs) != 1 || jobs[0].SecondaryRef != "cf-scan-1" {
 			t.Fatalf("claim = %+v, %v; want the bound ref", jobs, err)
 		}
+		if jobs[0].Generation <= first.Generation {
+			t.Fatalf("generation did not advance: %d then %d",
+				first.Generation, jobs[0].Generation)
+		}
 
 		// The transition issue #928 requires, at the SQL.
 		if err := f.store.RecordSecondaryMalicious(
-			f.ctx, secondaryURL, "cf-scan-1", time.Time{}); err != nil {
+			f.ctx, secondaryURL, jobs[0].Generation, "cf-scan-1", time.Time{}); err != nil {
 			t.Fatalf("RecordSecondaryMalicious: %v", err)
 		}
 
@@ -283,11 +336,14 @@ func TestLinkSecondaryVerificationPostgreSQL(t *testing.T) {
 	t.Run("a condemnation bound to the wrong scan changes nothing", func(t *testing.T) {
 		f.reset(t)
 		decide(t, f, secondaryURL, urlsafety.VerdictSafe, time.Time{}, true)
-		if err := f.store.RecordSecondaryRef(f.ctx, secondaryURL, "cf-scan-1"); err != nil {
+		job := claimOneSecondary(t, f)
+		if err := f.store.RecordSecondaryRef(
+			f.ctx, secondaryURL, job.Generation, "cf-scan-1"); err != nil {
 			t.Fatalf("RecordSecondaryRef: %v", err)
 		}
 
-		err := f.store.RecordSecondaryMalicious(f.ctx, secondaryURL, "cf-scan-other", time.Time{})
+		err := f.store.RecordSecondaryMalicious(
+			f.ctx, secondaryURL, job.Generation, "cf-scan-other", time.Time{})
 
 		if !errors.Is(err, storage.ErrLinkScanConflict) {
 			t.Fatalf("err = %v, want ErrLinkScanConflict", err)
@@ -300,8 +356,10 @@ func TestLinkSecondaryVerificationPostgreSQL(t *testing.T) {
 	t.Run("settling closes the lane and leaves the clearance alone", func(t *testing.T) {
 		f.reset(t)
 		decide(t, f, secondaryURL, urlsafety.VerdictSafe, time.Time{}, true)
+		job := claimOneSecondary(t, f)
 
-		if err := f.store.SettleSecondaryVerification(f.ctx, secondaryURL); err != nil {
+		if err := f.store.SettleSecondaryVerification(
+			f.ctx, secondaryURL, job.Generation); err != nil {
 			t.Fatalf("SettleSecondaryVerification: %v", err)
 		}
 
@@ -313,9 +371,11 @@ func TestLinkSecondaryVerificationPostgreSQL(t *testing.T) {
 		if err != nil || len(jobs) != 0 {
 			t.Fatalf("claim = %+v, %v; want a closed lane", jobs, err)
 		}
-		// Idempotent: settling again is the outcome it asks for, not an error.
-		if err := f.store.SettleSecondaryVerification(f.ctx, secondaryURL); err != nil {
-			t.Fatalf("second settle: %v", err)
+		// A repeated settle finds a lane that is already closed and reports the
+		// conflict, rather than silently claiming to have closed one.
+		if err := f.store.SettleSecondaryVerification(
+			f.ctx, secondaryURL, job.Generation); !errors.Is(err, storage.ErrLinkScanConflict) {
+			t.Fatalf("second settle = %v, want ErrLinkScanConflict", err)
 		}
 	})
 
@@ -346,6 +406,380 @@ func TestLinkSecondaryVerificationPostgreSQL(t *testing.T) {
 		}
 		if open {
 			t.Fatal("a reopened target kept a verification for a clearance that no longer exists")
+		}
+	})
+}
+
+// The finding the Code Quality review raised: freshness had grown the
+// provider-expiry clause in freshVerdictSQL, and the other queries that decide
+// the same question had not. Each subtest drives one of those queries directly
+// with a verdict whose decided_at is well inside VerdictTTL and whose provider
+// ceiling has already passed — the exact window where the definitions used to
+// disagree.
+//
+// None of these waits for a sweep. The invariant is that the queries themselves
+// are correct at the instant they run, whatever the sweep has or has not
+// reached.
+func TestExpiredProviderEvidenceIsNeverActedOnPostgreSQL(t *testing.T) {
+	f := newLinkTargetFixture(t)
+
+	// A: EnsureLinkScans must reopen a SAFE whose provider ceiling lapsed,
+	// rather than leaving it decided because decided_at still looks recent.
+	t.Run("EnsureLinkScans reopens a safe verdict past its provider ceiling", func(t *testing.T) {
+		f.reset(t)
+		decide(t, f, evidenceURL, urlsafety.VerdictSafe, time.Now().Add(time.Hour), false)
+		shiftEvidenceExpiry(t, f, evidenceURL, -time.Second)
+
+		if err := f.store.EnsureLinkScans(f.ctx, []string{evidenceURL}); err != nil {
+			t.Fatalf("EnsureLinkScans: %v", err)
+		}
+
+		status, _ := freshness(t, f, evidenceURL)
+		if status != "pending" {
+			t.Fatalf("status = %q, want pending — the clearance was reused past its ceiling", status)
+		}
+	})
+
+	// B: the same for a condemnation. Expiry is symmetric; it is the evidence
+	// that lapsed, not the direction of the verdict.
+	t.Run("EnsureLinkScans reopens a malicious verdict past its provider ceiling", func(t *testing.T) {
+		f.reset(t)
+		decide(t, f, evidenceURL, urlsafety.VerdictMalicious, time.Now().Add(time.Hour), false)
+		shiftEvidenceExpiry(t, f, evidenceURL, -time.Second)
+
+		if err := f.store.EnsureLinkScans(f.ctx, []string{evidenceURL}); err != nil {
+			t.Fatalf("EnsureLinkScans: %v", err)
+		}
+
+		status, _ := freshness(t, f, evidenceURL)
+		if status != "pending" {
+			t.Fatalf("status = %q, want pending", status)
+		}
+	})
+
+	// The send path's own verdict load. This is the query a message send
+	// consults, and it was reading the same stale clearance.
+	t.Run("LoadLinkVerdicts omits a verdict past its provider ceiling", func(t *testing.T) {
+		f.reset(t)
+		decide(t, f, evidenceURL, urlsafety.VerdictSafe, time.Now().Add(time.Hour), false)
+		if verdicts, err := f.store.LoadLinkVerdicts(f.ctx, []string{evidenceURL}); err != nil {
+			t.Fatalf("LoadLinkVerdicts: %v", err)
+		} else if verdicts[evidenceURL] != urlsafety.VerdictSafe {
+			t.Fatalf("before expiry: %v", verdicts)
+		}
+
+		shiftEvidenceExpiry(t, f, evidenceURL, -time.Second)
+
+		verdicts, err := f.store.LoadLinkVerdicts(f.ctx, []string{evidenceURL})
+		if err != nil {
+			t.Fatalf("LoadLinkVerdicts: %v", err)
+		}
+		if got, present := verdicts[evidenceURL]; present {
+			t.Fatalf("expired evidence is still served as %q", got)
+		}
+	})
+
+	// C: a withheld message must not be promoted on a clearance the provider
+	// has already retired, even though nothing has swept the row yet.
+	t.Run("a withheld message is not promoted on expired evidence", func(t *testing.T) {
+		f.reset(t)
+		decide(t, f, evidenceURL, urlsafety.VerdictSafe, time.Now().Add(time.Hour), false)
+		messageID := f.message(t, "veja "+evidenceURL, evidenceURL)
+		if _, err := f.pool.Exec(f.ctx,
+			`UPDATE chat.messages SET status = 'pending_link_scan' WHERE id = $1`,
+			messageID); err != nil {
+			t.Fatalf("withhold message: %v", err)
+		}
+		shiftEvidenceExpiry(t, f, evidenceURL, -time.Second)
+
+		summary, err := f.store.ResolveDecidedMessages(f.ctx)
+		if err != nil {
+			t.Fatalf("ResolveDecidedMessages: %v", err)
+		}
+
+		if summary.Published != 0 {
+			t.Fatalf("published %d message(s) on evidence the provider had retired",
+				summary.Published)
+		}
+		var status string
+		if err := f.pool.QueryRow(f.ctx,
+			`SELECT status FROM chat.messages WHERE id = $1`, messageID).Scan(&status); err != nil {
+			t.Fatalf("read message: %v", err)
+		}
+		if status != "pending_link_scan" {
+			t.Fatalf("message status = %q, want it still withheld", status)
+		}
+	})
+
+	// D: the boundary. Fresh requires `> now()`, so an expiry of exactly the
+	// database's own now() is expired — never fresh.
+	t.Run("an expiry of exactly now is expired", func(t *testing.T) {
+		f.reset(t)
+		decide(t, f, evidenceURL, urlsafety.VerdictSafe, time.Now().Add(time.Hour), false)
+		if _, err := f.pool.Exec(f.ctx, `
+			UPDATE chat.link_scans SET evidence_expires_at = now()
+			 WHERE canonical_url = $1`, evidenceURL); err != nil {
+			t.Fatalf("set boundary: %v", err)
+		}
+
+		if _, fresh := freshness(t, f, evidenceURL); fresh {
+			t.Fatal("an expiry of exactly now() read as fresh")
+		}
+		verdicts, err := f.store.LoadLinkVerdicts(f.ctx, []string{evidenceURL})
+		if err != nil {
+			t.Fatalf("LoadLinkVerdicts: %v", err)
+		}
+		if _, present := verdicts[evidenceURL]; present {
+			t.Fatal("an expiry of exactly now() was served by the send path")
+		}
+	})
+
+	// E: a NULL ceiling is not an expired one. The provider stated no limit, so
+	// the local window governs and nothing here shortens it.
+	t.Run("a null ceiling leaves the local window alone", func(t *testing.T) {
+		f.reset(t)
+		decide(t, f, evidenceURL, urlsafety.VerdictSafe, time.Time{}, false)
+
+		if _, fresh := freshness(t, f, evidenceURL); !fresh {
+			t.Fatal("a verdict with no stated ceiling was treated as expired")
+		}
+		if err := f.store.EnsureLinkScans(f.ctx, []string{evidenceURL}); err != nil {
+			t.Fatalf("EnsureLinkScans: %v", err)
+		}
+		if status, _ := freshness(t, f, evidenceURL); status != "safe" {
+			t.Fatalf("status = %q, want the clearance kept", status)
+		}
+		verdicts, err := f.store.LoadLinkVerdicts(f.ctx, []string{evidenceURL})
+		if err != nil || verdicts[evidenceURL] != urlsafety.VerdictSafe {
+			t.Fatalf("verdicts = %v, err = %v", verdicts, err)
+		}
+	})
+
+	// F/G: a restarted replica reading rows nothing has swept. Both halves of
+	// the review's concern at once — no in-process memory, no sweep.
+	t.Run("a fresh store over unswept rows refuses expired evidence", func(t *testing.T) {
+		f.reset(t)
+		decide(t, f, evidenceURL, urlsafety.VerdictSafe, time.Now().Add(time.Hour), false)
+		shiftEvidenceExpiry(t, f, evidenceURL, -time.Second)
+
+		restarted := storage.NewPGXMessageStore(f.pool)
+
+		targets, err := restarted.LoadLinkTargets(f.ctx, []string{evidenceURL})
+		if err != nil {
+			t.Fatalf("LoadLinkTargets: %v", err)
+		}
+		if targets[evidenceURL].Fresh {
+			t.Fatal("a restarted replica served evidence the provider had retired")
+		}
+		verdicts, err := restarted.LoadLinkVerdicts(f.ctx, []string{evidenceURL})
+		if err != nil {
+			t.Fatalf("LoadLinkVerdicts: %v", err)
+		}
+		if _, present := verdicts[evidenceURL]; present {
+			t.Fatal("a restarted replica served an expired verdict to the send path")
+		}
+		// And the lane that verifies such a clearance is not claimable either.
+		jobs, err := restarted.ClaimDueSecondaryVerifications(f.ctx, 10)
+		if err != nil || len(jobs) != 0 {
+			t.Fatalf("claim = %+v, %v; want nothing for expired evidence", jobs, err)
+		}
+	})
+}
+
+// The second finding: the lane's lease moved a due date but issued no identity,
+// so a worker whose lease had expired could still write into the attempt that
+// replaced it.
+//
+// Every scenario here expires the lease in the database rather than waiting for
+// one, so the ordering is exact and nothing is coordinated by a sleep.
+func TestSecondaryLaneWritesBelongToTheirAttemptPostgreSQL(t *testing.T) {
+	f := newLinkTargetFixture(t)
+
+	// Scenario 1: a stale worker cannot bind its scan id over the current one.
+	t.Run("a stale worker cannot record a scan id", func(t *testing.T) {
+		f.reset(t)
+		decide(t, f, secondaryURL, urlsafety.VerdictSafe, time.Time{}, true)
+		workerA := claimOneSecondary(t, f)
+		expireSecondaryLease(t, f, secondaryURL)
+		workerB := claimOneSecondary(t, f)
+
+		staleErr := f.store.RecordSecondaryRef(
+			f.ctx, secondaryURL, workerA.Generation, "uuid-A")
+		currentErr := f.store.RecordSecondaryRef(
+			f.ctx, secondaryURL, workerB.Generation, "uuid-B")
+
+		if !errors.Is(staleErr, storage.ErrLinkScanConflict) {
+			t.Fatalf("stale write = %v, want ErrLinkScanConflict", staleErr)
+		}
+		if currentErr != nil {
+			t.Fatalf("current write = %v, want it to succeed", currentErr)
+		}
+		ref, _, _ := secondaryLaneState(t, f, secondaryURL)
+		if ref != "uuid-B" {
+			t.Fatalf("scan id = %q, want the current attempt's", ref)
+		}
+	})
+
+	// Scenario 4, the other order: the stale write arrives *after* the current
+	// attempt has already bound its id, and still may not replace or clear it.
+	t.Run("a stale worker cannot overwrite the current scan id", func(t *testing.T) {
+		f.reset(t)
+		decide(t, f, secondaryURL, urlsafety.VerdictSafe, time.Time{}, true)
+		workerA := claimOneSecondary(t, f)
+		expireSecondaryLease(t, f, secondaryURL)
+		workerB := claimOneSecondary(t, f)
+		if err := f.store.RecordSecondaryRef(
+			f.ctx, secondaryURL, workerB.Generation, "uuid-B"); err != nil {
+			t.Fatalf("current write: %v", err)
+		}
+
+		if err := f.store.RecordSecondaryRef(
+			f.ctx, secondaryURL, workerA.Generation, "uuid-A"); !errors.Is(
+			err, storage.ErrLinkScanConflict) {
+			t.Fatalf("stale overwrite = %v, want ErrLinkScanConflict", err)
+		}
+
+		ref, _, open := secondaryLaneState(t, f, secondaryURL)
+		if ref != "uuid-B" || !open {
+			t.Fatalf("lane = %q open=%v, want uuid-B on an open lane", ref, open)
+		}
+	})
+
+	// Scenario 2: a stale settle must not close somebody else's lane — that
+	// would discard a verification in progress and look like success.
+	t.Run("a stale worker cannot settle the lane", func(t *testing.T) {
+		f.reset(t)
+		decide(t, f, secondaryURL, urlsafety.VerdictSafe, time.Time{}, true)
+		workerA := claimOneSecondary(t, f)
+		expireSecondaryLease(t, f, secondaryURL)
+		workerB := claimOneSecondary(t, f)
+
+		err := f.store.SettleSecondaryVerification(f.ctx, secondaryURL, workerA.Generation)
+
+		if !errors.Is(err, storage.ErrLinkScanConflict) {
+			t.Fatalf("stale settle = %v, want ErrLinkScanConflict", err)
+		}
+		_, generation, open := secondaryLaneState(t, f, secondaryURL)
+		if !open || generation != workerB.Generation {
+			t.Fatalf("lane closed or reassigned: open=%v generation=%d want %d",
+				open, generation, workerB.Generation)
+		}
+	})
+
+	// Scenario 3, the one that matters most: the current attempt's real
+	// condemnation must land even with an abandoned worker interfering, because
+	// losing it leaves a malicious link clickable.
+	t.Run("the current attempt's condemnation lands despite a stale worker", func(t *testing.T) {
+		f.reset(t)
+		decide(t, f, secondaryURL, urlsafety.VerdictSafe, time.Time{}, true)
+		workerA := claimOneSecondary(t, f)
+		if err := f.store.RecordSecondaryRef(
+			f.ctx, secondaryURL, workerA.Generation, "uuid-A"); err != nil {
+			t.Fatalf("worker A ref: %v", err)
+		}
+		expireSecondaryLease(t, f, secondaryURL)
+		workerB := claimOneSecondary(t, f)
+		if err := f.store.RecordSecondaryRef(
+			f.ctx, secondaryURL, workerB.Generation, "uuid-B"); err != nil {
+			t.Fatalf("worker B ref: %v", err)
+		}
+
+		// A wakes up and tries everything it could still do.
+		if err := f.store.SettleSecondaryVerification(
+			f.ctx, secondaryURL, workerA.Generation); !errors.Is(
+			err, storage.ErrLinkScanConflict) {
+			t.Fatalf("stale settle = %v", err)
+		}
+		if err := f.store.RecordSecondaryMalicious(
+			f.ctx, secondaryURL, workerA.Generation, "uuid-A", time.Time{}); !errors.Is(
+			err, storage.ErrLinkScanConflict) {
+			t.Fatalf("stale condemnation = %v", err)
+		}
+
+		// B's answer is the one that counts, and it goes through.
+		if err := f.store.RecordSecondaryMalicious(
+			f.ctx, secondaryURL, workerB.Generation, "uuid-B", time.Time{}); err != nil {
+			t.Fatalf("current condemnation: %v", err)
+		}
+
+		status, fresh := freshness(t, f, secondaryURL)
+		if status != "malicious" || !fresh {
+			t.Fatalf("status = %q fresh=%v, want a fresh condemnation", status, fresh)
+		}
+		var denied bool
+		if err := f.pool.QueryRow(f.ctx,
+			`SELECT EXISTS (SELECT 1 FROM files.link_fetch_denylist WHERE url_digest = $1)`,
+			urlsafety.URLDigest(secondaryURL)).Scan(&denied); err != nil {
+			t.Fatalf("read denylist: %v", err)
+		}
+		if !denied {
+			t.Fatal("the condemnation did not publish the global fetch denial")
+		}
+		_, _, open := secondaryLaneState(t, f, secondaryURL)
+		if open {
+			t.Fatal("the lane survived the condemnation it produced")
+		}
+	})
+
+	// Scenario 5: two replicas racing the same due lane. The claim is the
+	// update, so exactly one of them gets it.
+	t.Run("two replicas racing one lane yield exactly one claim", func(t *testing.T) {
+		f.reset(t)
+		decide(t, f, secondaryURL, urlsafety.VerdictSafe, time.Time{}, true)
+
+		start := make(chan struct{})
+		type claimed struct {
+			jobs []storage.LinkSecondaryJob
+			err  error
+		}
+		results := make(chan claimed, 2)
+		for i := 0; i < 2; i++ {
+			go func() {
+				<-start
+				jobs, err := f.store.ClaimDueSecondaryVerifications(f.ctx, 10)
+				results <- claimed{jobs, err}
+			}()
+		}
+		close(start)
+
+		total := 0
+		for i := 0; i < 2; i++ {
+			got := <-results
+			if got.err != nil {
+				t.Fatalf("claim: %v", got.err)
+			}
+			total += len(got.jobs)
+		}
+		if total != 1 {
+			t.Fatalf("claims = %d, want exactly one", total)
+		}
+	})
+
+	// Scenario 6: the ABA the monotonic counter closes. A lane settled at
+	// generation N and reopened later must not be writable by the worker
+	// abandoned by the first generation N.
+	t.Run("a reopened lane does not resurrect an abandoned attempt", func(t *testing.T) {
+		f.reset(t)
+		decide(t, f, secondaryURL, urlsafety.VerdictSafe, time.Time{}, true)
+		abandoned := claimOneSecondary(t, f)
+		if err := f.store.SettleSecondaryVerification(
+			f.ctx, secondaryURL, abandoned.Generation); err != nil {
+			t.Fatalf("settle: %v", err)
+		}
+
+		// The target is checked again and cleared again, opening a new lane.
+		decide(t, f, secondaryURL, urlsafety.VerdictSafe, time.Time{}, true)
+
+		err := f.store.RecordSecondaryRef(
+			f.ctx, secondaryURL, abandoned.Generation, "uuid-abandoned")
+
+		if !errors.Is(err, storage.ErrLinkScanConflict) {
+			t.Fatalf("the abandoned attempt wrote into a reopened lane: %v", err)
+		}
+		_, generation, _ := secondaryLaneState(t, f, secondaryURL)
+		if generation <= abandoned.Generation {
+			t.Fatalf("generation = %d, want it past the abandoned %d",
+				generation, abandoned.Generation)
 		}
 	})
 }

@@ -89,6 +89,10 @@ type fakeQueue struct {
 	secondaryGuilty  map[string]time.Time
 	secondaryRefErr  error
 	secondaryVerdErr error
+	// Which attempt currently owns each lane, so the fake can refuse a stale
+	// worker the way the store does.
+	secondaryGeneration     map[string]int
+	nextSecondaryGeneration int
 }
 
 // --- the background second opinion (issue #928) ------------------------------
@@ -111,33 +115,62 @@ func (q *fakeQueue) ClaimDueSecondaryVerifications(
 	}
 	claimed := q.secondaryJobs[:batchSize]
 	q.secondaryJobs = q.secondaryJobs[batchSize:]
+	// The claim issues the attempt identity, exactly as the store's does.
+	for i := range claimed {
+		q.nextSecondaryGeneration++
+		claimed[i].Generation = q.nextSecondaryGeneration
+		q.secondaryGeneration[claimed[i].CanonicalURL] = q.nextSecondaryGeneration
+	}
 	return claimed, nil
 }
 
-func (q *fakeQueue) RecordSecondaryRef(_ context.Context, canonicalURL, ref string) error {
+// The fake enforces the same rule the store does: a write whose generation is
+// not the one the lane currently holds changes nothing. Without that, a worker
+// test could pass while the real compare-and-set was absent.
+func (q *fakeQueue) ownsSecondaryLane(canonicalURL string, generation int) bool {
+	current, claimed := q.secondaryGeneration[canonicalURL]
+	return claimed && current == generation
+}
+
+func (q *fakeQueue) RecordSecondaryRef(
+	_ context.Context, canonicalURL string, generation int, ref string,
+) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.secondaryRefErr != nil {
 		return q.secondaryRefErr
 	}
+	if !q.ownsSecondaryLane(canonicalURL, generation) {
+		return storage.ErrLinkScanConflict
+	}
 	q.secondaryRefs[canonicalURL] = ref
 	return nil
 }
 
-func (q *fakeQueue) SettleSecondaryVerification(_ context.Context, canonicalURL string) error {
+func (q *fakeQueue) SettleSecondaryVerification(
+	_ context.Context, canonicalURL string, generation int,
+) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if !q.ownsSecondaryLane(canonicalURL, generation) {
+		return storage.ErrLinkScanConflict
+	}
+	delete(q.secondaryGeneration, canonicalURL)
 	q.secondarySettled = append(q.secondarySettled, canonicalURL)
 	return nil
 }
 
 func (q *fakeQueue) RecordSecondaryMalicious(
-	_ context.Context, canonicalURL, _ string, evidenceExpiresAt time.Time,
+	_ context.Context, canonicalURL string, generation int,
+	_ string, evidenceExpiresAt time.Time,
 ) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.secondaryVerdErr != nil {
 		return q.secondaryVerdErr
+	}
+	if !q.ownsSecondaryLane(canonicalURL, generation) {
+		return storage.ErrLinkScanConflict
 	}
 	// The store's statement flips the row in one shot; the fake records the same
 	// two facts the assertions care about.
@@ -148,12 +181,13 @@ func (q *fakeQueue) RecordSecondaryMalicious(
 
 func newFakeQueue(jobs ...storage.LinkScanJob) *fakeQueue {
 	return &fakeQueue{
-		jobs:            jobs,
-		submitted:       map[string]string{},
-		verdicts:        map[string]urlsafety.Verdict{},
-		evidenceExpiry:  map[string]time.Time{},
-		secondaryRefs:   map[string]string{},
-		secondaryGuilty: map[string]time.Time{},
+		jobs:                jobs,
+		submitted:           map[string]string{},
+		verdicts:            map[string]urlsafety.Verdict{},
+		evidenceExpiry:      map[string]time.Time{},
+		secondaryRefs:       map[string]string{},
+		secondaryGuilty:     map[string]time.Time{},
+		secondaryGeneration: map[string]int{},
 	}
 }
 

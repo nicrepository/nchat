@@ -32,10 +32,13 @@ const secondaryVerifyBatch = 4
 // statements about one column pair, and no access to the primary claim at all.
 type LinkSecondaryQueue interface {
 	ClaimDueSecondaryVerifications(ctx context.Context, batchSize int) ([]storage.LinkSecondaryJob, error)
-	RecordSecondaryRef(ctx context.Context, canonicalURL, secondaryRef string) error
-	SettleSecondaryVerification(ctx context.Context, canonicalURL string) error
-	RecordSecondaryMalicious(
-		ctx context.Context, canonicalURL, secondaryRef string, evidenceExpiresAt time.Time) error
+	// Every write after the claim carries the generation the claim issued, so a
+	// worker whose lease expired matches no row rather than writing into the
+	// attempt that replaced it.
+	RecordSecondaryRef(ctx context.Context, canonicalURL string, generation int, secondaryRef string) error
+	SettleSecondaryVerification(ctx context.Context, canonicalURL string, generation int) error
+	RecordSecondaryMalicious(ctx context.Context, canonicalURL string, generation int,
+		secondaryRef string, evidenceExpiresAt time.Time) error
 }
 
 // LinkSecondaryVerifier is the provider half: ask the *secondary* source only.
@@ -123,9 +126,11 @@ func (s *LinkScanService) bindSecondaryRef(
 		s.closeSecondary(ctx, queue, job, attemptResultError)
 		return
 	}
-	if err := queue.RecordSecondaryRef(ctx, job.CanonicalURL, ref); err != nil {
-		// The clearance lapsed or another worker settled the lane while the
-		// submission was in flight. Nothing to do: the row has moved on.
+	if err := queue.RecordSecondaryRef(ctx, job.CanonicalURL, job.Generation, ref); err != nil {
+		// The clearance lapsed, the lane was settled, or this worker's lease
+		// expired and another attempt owns the row. Nothing to do either way:
+		// the scan this worker started is not the one the lane is tracking, and
+		// forcing it in is precisely what the generation exists to prevent.
 		s.observeAttempt(operationVerify, attemptResultLeaseLost)
 		return
 	}
@@ -143,7 +148,7 @@ func (s *LinkScanService) condemnFromSecondary(
 	job storage.LinkSecondaryJob, result urlsafety.ReputationResult,
 ) {
 	err := queue.RecordSecondaryMalicious(
-		ctx, job.CanonicalURL, job.SecondaryRef, result.ExpiresAt)
+		ctx, job.CanonicalURL, job.Generation, job.SecondaryRef, result.ExpiresAt)
 	if err != nil {
 		// The row was reopened or condemned by somebody else first. Either way
 		// this answer is not the one that counts, and the lane is already gone.
@@ -158,12 +163,17 @@ func (s *LinkScanService) condemnFromSecondary(
 func (s *LinkScanService) closeSecondary(
 	ctx context.Context, queue LinkSecondaryQueue, job storage.LinkSecondaryJob, outcome string,
 ) {
-	if err := queue.SettleSecondaryVerification(ctx, job.CanonicalURL); err != nil {
-		if ctx.Err() == nil {
-			s.logger.WarnContext(ctx, "settle secondary verification",
-				slog.String("error", err.Error()))
-		}
-		return
+	switch err := queue.SettleSecondaryVerification(ctx, job.CanonicalURL, job.Generation); {
+	case err == nil:
+		s.observeAttempt(operationVerify, outcome)
+	case errors.Is(err, storage.ErrLinkScanConflict):
+		// The lane moved on: this worker's lease expired and another attempt
+		// owns it, or the target was reopened. Closing it would discard a
+		// verification in progress, so the statement matched nothing and this
+		// is counted as the lost lease it is rather than as a settlement.
+		s.observeAttempt(operationVerify, attemptResultLeaseLost)
+	case ctx.Err() == nil:
+		s.logger.WarnContext(ctx, "settle secondary verification",
+			slog.String("error", err.Error()))
 	}
-	s.observeAttempt(operationVerify, outcome)
 }

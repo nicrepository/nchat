@@ -51,12 +51,24 @@ import (
 // and it lives beside the loop that spends them.
 const secondaryVerifyLease = 60 * time.Second
 
-// LinkSecondaryJob is one outstanding verification.
+// LinkSecondaryJob is one outstanding verification, claimed by one attempt.
 type LinkSecondaryJob struct {
 	CanonicalURL string
 	// SecondaryRef is the provider ref this verification is tracking, empty
 	// before the secondary has been asked to start one.
 	SecondaryRef string
+	// Generation identifies the attempt that claimed the lane, and every write
+	// this attempt makes carries it back.
+	//
+	// The lease alone could not do this. It moves a due date, which says when
+	// somebody may try next — not who is trying now. A worker whose lease
+	// expired while it waited on the provider is still holding a valid-looking
+	// canonical URL and scan id, and without an identity it can write them into
+	// whatever attempt has since taken the row: overwriting the new scan id,
+	// closing the new lane, or making the new attempt's condemnation lose its
+	// compare-and-set. That last one is the dangerous shape — a real Cloudflare
+	// condemnation silently dropped, leaving a malicious link clickable.
+	Generation int
 }
 
 // claimDueSecondaryVerificationsQuery leases a batch of outstanding
@@ -84,10 +96,12 @@ var claimDueSecondaryVerificationsQuery = `
 		FOR UPDATE SKIP LOCKED
 	)
 	UPDATE chat.link_scans ls
-	   SET secondary_due_at = now() + ($2 * interval '1 second'), updated_at = now()
+	   SET secondary_due_at = now() + ($2 * interval '1 second'),
+	       secondary_generation = ls.secondary_generation + 1,
+	       updated_at = now()
 	  FROM due
 	 WHERE ls.canonical_url = due.canonical_url
-	RETURNING ls.canonical_url, COALESCE(ls.secondary_scan_uuid, '')`
+	RETURNING ls.canonical_url, COALESCE(ls.secondary_scan_uuid, ''), ls.secondary_generation`
 
 // ClaimDueSecondaryVerifications leases up to batchSize outstanding second
 // opinions.
@@ -107,7 +121,7 @@ func (s *PGXMessageStore) ClaimDueSecondaryVerifications(
 	var jobs []LinkSecondaryJob
 	for rows.Next() {
 		var job LinkSecondaryJob
-		if err := rows.Scan(&job.CanonicalURL, &job.SecondaryRef); err != nil {
+		if err := rows.Scan(&job.CanonicalURL, &job.SecondaryRef, &job.Generation); err != nil {
 			return nil, fmt.Errorf("scan secondary verification: %w", err)
 		}
 		jobs = append(jobs, job)
@@ -118,23 +132,26 @@ func (s *PGXMessageStore) ClaimDueSecondaryVerifications(
 	return jobs, nil
 }
 
-// RecordSecondaryRef binds the provider's scan id to an outstanding
-// verification, so the next pass reads that scan rather than starting another.
+// RecordSecondaryRef binds the provider's scan id to the attempt that started
+// it, so the next pass reads that scan rather than starting another.
 //
-// Bound to a row that is still a fresh safe verdict with the lane still open:
-// if the clearance lapsed or another worker settled the lane while the
-// submission was in flight, this id is not the one that counts.
+// Every precondition is checked in the one statement: the lane is still open,
+// this attempt still owns it, and the clearance it verifies is still a fresh
+// safe verdict. A worker whose lease expired matches nothing — it cannot
+// overwrite the scan id the current attempt has, or plant one on a lane it no
+// longer holds.
 func (s *PGXMessageStore) RecordSecondaryRef(
-	ctx context.Context, canonicalURL, secondaryRef string,
+	ctx context.Context, canonicalURL string, generation int, secondaryRef string,
 ) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE chat.link_scans ls
 		   SET secondary_scan_uuid = $2, updated_at = now()
 		 WHERE ls.canonical_url = $1
 		   AND ls.secondary_due_at IS NOT NULL
+		   AND ls.secondary_generation = $4
 		   AND ls.status = 'safe'
 		   AND `+freshVerdictSQL("ls", "$3"),
-		canonicalURL, secondaryRef, urlsafety.VerdictTTL.Seconds(),
+		canonicalURL, secondaryRef, urlsafety.VerdictTTL.Seconds(), generation,
 	)
 	if err != nil {
 		return fmt.Errorf("record secondary ref: %w", err)
@@ -152,20 +169,27 @@ func (s *PGXMessageStore) RecordSecondaryRef(
 // the clearance, so none of them may disturb it. Clearing the columns is the
 // only effect — the row keeps its status, its decided_at and its href.
 //
-// Idempotent, and deliberately not an error when it matches nothing: a lane
-// already closed by another worker, or a row already reopened, is the outcome
-// this asks for.
+// Bound to the attempt, like every other write after the claim. A worker whose
+// lease expired must not close a lane that now belongs to somebody else — doing
+// so would discard a verification in progress and, worse, look like success.
+// Matching nothing is reported as ErrLinkScanConflict so the caller counts a
+// lost lease rather than a settlement that never happened.
 func (s *PGXMessageStore) SettleSecondaryVerification(
-	ctx context.Context, canonicalURL string,
+	ctx context.Context, canonicalURL string, generation int,
 ) error {
-	_, err := s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 		UPDATE chat.link_scans ls
 		   SET secondary_due_at = NULL, secondary_scan_uuid = NULL, updated_at = now()
-		 WHERE ls.canonical_url = $1 AND ls.secondary_due_at IS NOT NULL`,
-		canonicalURL,
+		 WHERE ls.canonical_url = $1
+		   AND ls.secondary_due_at IS NOT NULL
+		   AND ls.secondary_generation = $2`,
+		canonicalURL, generation,
 	)
 	if err != nil {
 		return fmt.Errorf("settle secondary verification: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrLinkScanConflict
 	}
 	return nil
 }
@@ -184,9 +208,17 @@ func (s *PGXMessageStore) SettleSecondaryVerification(
 // status is `safe` rather than `pending`, and the id compared is the secondary
 // ref rather than the scan id the row was decided by — the primary's ref is
 // still there and still describes the answer that cleared it.
+// The compare-and-set is on three things at once: the attempt (generation), the
+// scan the answer came from (secondary_scan_uuid), and the lane still being
+// open. All three are needed. Without the generation an abandoned worker's
+// condemnation could land on somebody else's attempt; without the scan id an
+// answer could be written against a scan the lane has since replaced; without
+// the open lane a reopened target could be condemned on evidence about a
+// clearance that no longer exists.
 func (s *PGXMessageStore) RecordSecondaryMalicious(
-	ctx context.Context, canonicalURL, secondaryRef string, evidenceExpiresAt time.Time,
+	ctx context.Context, canonicalURL string, generation int,
+	secondaryRef string, evidenceExpiresAt time.Time,
 ) error {
-	return s.recordMaliciousLinkVerdict(
-		ctx, canonicalURL, secondaryRef, "safe", refColumnSecondary, evidenceExpiresAt)
+	return s.recordSecondaryMaliciousVerdict(
+		ctx, canonicalURL, generation, secondaryRef, evidenceExpiresAt)
 }

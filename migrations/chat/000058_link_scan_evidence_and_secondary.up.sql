@@ -39,6 +39,27 @@
 --    safe verdict, so when the clearance expires the lane ends with it and the
 --    ordinary reopen path takes over. There is no state in which a secondary
 --    verification outlives the thing it was verifying.
+--
+--    secondary_generation is which attempt owns the lane. A lease that moves a
+--    due date is not an identity: a worker whose lease expired while it waited
+--    on the provider wakes up and writes into whatever attempt has since taken
+--    the row, overwriting the new scan id, closing the new lane, or making the
+--    new attempt's condemnation lose its compare-and-set. The generation is the
+--    identity, every write after the claim carries it, and a stale worker
+--    therefore matches no row at all.
+--
+--    It increments on every claim *and* on every (re)opening of the lane, and it
+--    is never reset. That is what closes the ABA: a lane settled at generation 5
+--    and later reopened would otherwise be writable by the abandoned worker from
+--    the first generation 5, because "lane open" and "generation 5" would both
+--    be true again.
+--
+--    NOT NULL DEFAULT 0 rather than nullable: every comparison downstream is an
+--    equality, and a NULL generation would make each of them three-valued for no
+--    gain. The default is a metadata-only change on PostgreSQL 11+, so existing
+--    rows are not rewritten, and a slot on the previous release writes rows
+--    without naming the column and gets 0 — a generation no claim ever issues,
+--    since the first claim moves it to 1.
 
 BEGIN;
 
@@ -50,6 +71,9 @@ ALTER TABLE chat.link_scans
 
 ALTER TABLE chat.link_scans
     ADD COLUMN secondary_scan_uuid TEXT;
+
+ALTER TABLE chat.link_scans
+    ADD COLUMN secondary_generation INTEGER NOT NULL DEFAULT 0;
 
 -- A secondary scan id is only meaningful while a verification is outstanding.
 -- Stated as a constraint rather than a convention because the pair is written
