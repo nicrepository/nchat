@@ -9,7 +9,12 @@
  */
 
 import type { Message, MessageSecuritySnapshot } from "../chatTypes";
-import { isNotNewerSecurityVersion, isOlderSecurityVersion } from "./linkSafetyCorrections";
+import { mergeSnapshotLinks } from "../messageLinks";
+import {
+  bodyUnderAggregate,
+  isNotNewerSecurityVersion,
+  isOlderSecurityVersion,
+} from "./linkSafetyCorrections";
 import type { Action, ActionOf, LinkSafetyCorrections, MessagesState } from "./types";
 
 type AvailableSnapshot = Extract<MessageSecuritySnapshot, { available: true }>;
@@ -24,7 +29,13 @@ function resolveSnapshotVersion(
   message: Message,
   snapshot: AvailableSnapshot,
   corrections: LinkSafetyCorrections,
-): { state: Message["linkSafetyState"]; updatedAt: string; status: Message["status"] } {
+): {
+  state: Message["linkSafetyState"];
+  updatedAt: string;
+  status: Message["status"];
+  /** True when the snapshot is at least as new as the drawn message. */
+  snapshotWins: boolean;
+} {
   const correction = corrections.get(message.id);
   const correctionWins = Boolean(
     correction && isNotNewerSecurityVersion(snapshot.updatedAt, correction.updatedAt),
@@ -33,12 +44,12 @@ function resolveSnapshotVersion(
   const snapshotWins = !isOlderSecurityVersion(snapshot.updatedAt, message.updatedAt);
   const status = snapshotWins ? snapshot.status : message.status;
   if (correction && correctionWins) {
-    return { state: correction.state, updatedAt: correction.updatedAt, status };
+    return { state: correction.state, updatedAt: correction.updatedAt, status, snapshotWins };
   }
   if (snapshotWins) {
-    return { state: snapshot.linkSafetyState, updatedAt: snapshot.updatedAt, status };
+    return { state: snapshot.linkSafetyState, updatedAt: snapshot.updatedAt, status, snapshotWins };
   }
-  return { state: message.linkSafetyState, updatedAt: message.updatedAt, status };
+  return { state: message.linkSafetyState, updatedAt: message.updatedAt, status, snapshotWins };
 }
 
 /**
@@ -120,14 +131,24 @@ function applySnapshotToMessage(
   }
   const resolved = resolveSnapshotVersion(message, snapshot, corrections);
   const removed = resolved.status === "deleted";
-  const malicious = resolved.state === "malicious";
+  // Issue #807: the per-link state is merged occurrence by occurrence under
+  // the realtime version order, so a snapshot read before an update landed
+  // cannot regress it; the occurrence set follows the newer message version.
+  // The body follows the same rule as every other aggregate correction: kept
+  // as the server projected it whenever the per-link model is present.
+  const links = removed
+    ? undefined
+    : mergeSnapshotLinks(message.links, snapshot.links, resolved.snapshotWins);
   const next: Message = {
     ...message,
     status: resolved.status,
     linkSafetyState: resolved.state,
-    bodyText: removed || malicious ? "" : message.bodyText,
+    bodyText: removed
+      ? ""
+      : bodyUnderAggregate({ bodyText: message.bodyText, links }, resolved.state),
     isRemoved: removed,
     updatedAt: resolved.updatedAt,
+    links,
     ...(removed ? { quoted: undefined, reactions: [] } : {}),
   };
   const quoted = message.quoted;

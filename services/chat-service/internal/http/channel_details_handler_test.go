@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	httpapi "github.com/nicrepository/nchat/services/chat-service/internal/http"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
+	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
 // fakePresence answers a scripted online set and records every workspace it was
@@ -216,5 +218,79 @@ func TestChannelHandler_Details_IsUnavailableWithoutWiring(t *testing.T) {
 	rec := serveDetails(t, handler, testChannelID)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d", rec.Code)
+	}
+}
+
+// ── About metadata (issue #894) ──────────────────────────────────────────────
+
+// The two new fields are serialised under the names the client parses, and
+// nothing about the creator beyond a name crosses the wire.
+func TestChannelHandler_Details_SerialisesAboutMetadata(t *testing.T) {
+	channel := detailsChannel()
+	channel.CreatedBy = "11111111-2222-4333-8444-555555555555"
+	provider := &fakeChannelProvider{details: service.ChannelDetails{
+		Channel:     channel,
+		MemberCount: 12,
+		About: storage.ConversationAbout{
+			Description:        "Infraestrutura, redes internas e operações.",
+			CreatorDisplayName: "Álvaro Neto",
+		},
+	}}
+
+	rec := serveDetails(t, channelTestHandler(provider), testChannelID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	data := detailsData(t, rec)
+	if data["description"] != "Infraestrutura, redes internas e operações." {
+		t.Fatalf("description = %v", data["description"])
+	}
+	if data["creator_display_name"] != "Álvaro Neto" {
+		t.Fatalf("creator_display_name = %v", data["creator_display_name"])
+	}
+	// The creator's UUID has no field, and it must not have leaked into another
+	// one either: the panel never navigates to them, so the identifier has no
+	// reason to be in the payload at all.
+	if raw := rec.Body.String(); strings.Contains(raw, channel.CreatedBy) {
+		t.Fatalf("response carries the creator's identifier: %s", raw)
+	}
+}
+
+// Absent is absent: an undescribed channel and an unnameable creator omit their
+// fields rather than sending an empty string, so a client reads "there is none"
+// exactly as it reads it from a server that predates these fields.
+func TestChannelHandler_Details_OmitsAbsentAboutMetadata(t *testing.T) {
+	provider := &fakeChannelProvider{details: service.ChannelDetails{
+		Channel:     detailsChannel(),
+		MemberCount: 12,
+	}}
+
+	rec := serveDetails(t, channelTestHandler(provider), testChannelID)
+	data := detailsData(t, rec)
+	if _, present := data["description"]; present {
+		t.Fatalf("description must be omitted when there is none, got %v", data["description"])
+	}
+	if _, present := data["creator_display_name"]; present {
+		t.Fatalf("creator_display_name must be omitted when unresolved, got %v", data["creator_display_name"])
+	}
+	// The rest of the payload is unaffected — an absent description is not a
+	// degraded response.
+	if data["created_at"] != "2024-01-12T09:30:00Z" || data["member_count"] != float64(12) {
+		t.Fatalf("unexpected payload: %v", data)
+	}
+}
+
+// Whatever the description holds is a JSON string and only a string. Markup in
+// it is data the encoder escapes, never a second syntax the endpoint honours.
+func TestChannelHandler_Details_DescriptionIsCarriedAsText(t *testing.T) {
+	const hostile = `<script>alert(1)</script> & "quotes"`
+	provider := &fakeChannelProvider{details: service.ChannelDetails{
+		Channel: detailsChannel(),
+		About:   storage.ConversationAbout{Description: hostile},
+	}}
+
+	rec := serveDetails(t, channelTestHandler(provider), testChannelID)
+	if data := detailsData(t, rec); data["description"] != hostile {
+		t.Fatalf("description = %v, want the stored text verbatim", data["description"])
 	}
 }

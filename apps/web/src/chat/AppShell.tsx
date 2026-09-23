@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent,
@@ -13,11 +14,20 @@ import ChatSidebar, { chatNavigationId } from "./ChatSidebar";
 import InAppMessageAlert, { type InAppAlert } from "./InAppMessageAlert";
 import { useNavDrawer } from "./useNavDrawer";
 import SidebarDetailsPanel, { type SidebarDetailsTarget } from "./SidebarDetailsPanel";
+import { conversationRenameAction } from "./conversationRename";
 import type { Channel, DMConversation } from "./chatTypes";
+import {
+  useDirectMessageCoordinator,
+  useDirectMessageError,
+  type DirectMessageCoordinator,
+} from "./directMessage";
 import { useChatSidebar } from "./useChatSidebar";
 import { useConversationDrafts, type ConversationDraftsApi } from "./useConversationDrafts";
 import { onAuthChange } from "../lib/authSession";
 import { disposeNotificationSoundPlayer } from "../notifications/notificationSound";
+import { createCommandRegistry } from "../commands/commandRegistry";
+import KeyboardShortcutsDialog from "../commands/KeyboardShortcutsDialog";
+import { useShortcutManager } from "../commands/useShortcutManager";
 
 /**
  * Resolves a row menu's target to the details panel's own vocabulary.
@@ -54,6 +64,27 @@ function detailsTargetExists(
 ): boolean {
   const collection = target.kind === "channel" ? ready.channels : ready.dms;
   return collection.some((item) => item.id === target.id);
+}
+
+/**
+ * The canonical name of the conversation a details panel is open for
+ * (issue #893, CQ-893-02).
+ *
+ * Read from the same canonical collection as above, so it is the name the
+ * sidebar row itself renders and it moves whenever that list is refetched —
+ * after this actor's own rename, after conversation.updated, after a
+ * reconnect. The panel watches it to know its own projection went stale; it
+ * never displays it, so this cannot become a second source of truth for a
+ * name. "" for no target and for one the list no longer holds, which is inert:
+ * the panel is closed in both cases.
+ */
+function detailsTargetName(
+  target: SidebarDetailsTarget | null,
+  ready: { channels: Channel[]; dms: DMConversation[] },
+): string {
+  if (!target) return "";
+  const collection = target.kind === "channel" ? ready.channels : ready.dms;
+  return collection.find((item) => item.id === target.id)?.name ?? "";
 }
 
 /**
@@ -181,10 +212,52 @@ export type AppShellOutletContext = ReturnType<typeof useChatSidebar> & {
    * ChatOutletContext the same way currentUserId/channels/dms already are.
    */
   drafts: ConversationDraftsApi;
+  /**
+   * The one open-DM coordinator of this session (issue #895).
+   *
+   * Mounted here for the same reason `drafts` is — AppShell is the component
+   * that survives a conversation switch and a trip to /profile — plus one this
+   * flow has of its own: its in-flight registry is what stops a second request
+   * for a recipient already being resolved, and the surfaces that can start one
+   * (the timeline, the conversation's details panel, the sidebar's details
+   * panel) are on screen *together*. One registry per surface deduplicates
+   * within a surface and not between them, which is what two of them produced.
+   *
+   * Its identity never changes, which is the other half of why it is here: a
+   * capability that were replaced whenever something became pending would
+   * invalidate this context, and with it every consumer down to the message
+   * rows. Pending and error are read through per-recipient subscriptions
+   * instead — see `useDirectMessagePending`.
+   */
+  directMessage: DirectMessageCoordinator;
 };
+
+/**
+ * The one place a refused open-DM is reported (issue #895).
+ *
+ * At the shell rather than in either surface, because the flow is: one state
+ * with two renderers produced two alerts for one failure, and the surface that
+ * asked is not always the one still on screen — the sidebar's details panel can
+ * be open over /profile, where there is no conversation strip at all. A
+ * navigation failure belongs beside the other thing the shell announces.
+ *
+ * It subscribes to the error itself rather than being handed it, so a refusal
+ * re-renders this line and nothing else. The shell above does not read the
+ * error at all, and therefore neither does the conversation below it.
+ */
+function DirectMessageError({ coordinator }: { coordinator: DirectMessageCoordinator }) {
+  const error = useDirectMessageError(coordinator);
+  if (!error) return null;
+  return (
+    <p className="chat-app__dm-error" role="alert" data-testid="chat-open-dm-error">
+      {error}
+    </p>
+  );
+}
 
 const EMPTY_CHANNELS: Channel[] = [];
 const EMPTY_DMS: DMConversation[] = [];
+const GLOBAL_SHORTCUT_SCOPE = ["global"] as const;
 
 /** "/profile" or "/profile/..." gets the settings label; everything else (today, only "/chat/...") gets the chat one. */
 function mainAriaLabel(pathname: string): string {
@@ -198,12 +271,19 @@ export default function AppShell() {
   const sidebar = useChatSidebar();
   // Scoped by the authenticated user, not by workspace — the web client has
   // no workspace switcher; the server resolves workspace from the session.
-  // An empty id while the sidebar is still loading means no draft can be
-  // read or written yet, which is the same "nothing to show" state a fresh
-  // login already produces.
-  const drafts = useConversationDrafts(
-    sidebar.state.status === "ready" ? sidebar.state.currentUserId : "",
-  );
+  /*
+    The viewer, resolved once. Three things below are about the same person —
+    the draft store, the open-DM flow and the row-menu details panel — and each
+    used to re-derive this from the sidebar state, which is the same sentence
+    written three times and three places for it to drift.
+
+    An empty id while the sidebar is still loading means no draft can be read or
+    written yet, no DM can be refused as a conversation with yourself, and no
+    row is marked "Você" — which is the same "nothing to show" state a fresh
+    login already produces.
+  */
+  const currentUserId = sidebar.state.status === "ready" ? sidebar.state.currentUserId : "";
+  const drafts = useConversationDrafts(currentUserId);
   // Issue #769, "FASE 14 — LOGOUT": draft text/attachments/voice are
   // sensitive content. A logout, or a fresh login over a stale session,
   // both fire this — clearing on either direction is what keeps a second
@@ -239,6 +319,29 @@ export default function AppShell() {
   // here rather than in ChatMessageArea because the target may be a
   // conversation other than the open one, and opening it must not navigate.
   const { pathname } = useLocation();
+  const navigate = useNavigate();
+  /*
+    Owned here, but deliberately *not* given a lifetime here. The shell outlives
+    every surface that can start an open-DM, so it has no lifetime to lend: the
+    route looked like one and was not, because a details panel can close, or
+    turn to somebody else, without the URL moving at all — and a reply for the
+    person it had asked about would still have navigated. Each surface declares
+    its own lifetime instead, by registering an origin (see
+    `useDirectMessageOrigin`), and the coordinator cancels what nobody is
+    waiting for any more.
+  */
+  const directMessage = useDirectMessageCoordinator({
+    currentUserId,
+    refreshConversations: retry,
+    navigate,
+  });
+  const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
+  const [navigateSidebarRelative, setNavigateSidebarRelative] = useState<
+    (direction: -1 | 1) => void
+  >(() => () => {});
+  const setSidebarNavigation = useCallback((handler: (direction: -1 | 1) => void) => {
+    setNavigateSidebarRelative(() => handler);
+  }, []);
   // The route is part of the panel's identity, not something an effect syncs to
   // it: navigating away closes the panel because the value stored alongside it
   // stops matching, with no extra render pass. The panel is a peek at one
@@ -258,6 +361,25 @@ export default function AppShell() {
     sidebarDetails?.pathname === pathname && detailsTargetExists(sidebarDetails, { channels, dms })
       ? sidebarDetails
       : null;
+
+  const detailsCanonicalName = detailsTargetName(openDetailsTarget, { channels, dms });
+
+  // The rename the row-menu panel may offer for *its own* target (issue #893),
+  // which is not necessarily the conversation that is open. Resolved from the
+  // canonical sidebar list, so the capability is the server's own — and
+  // undefined whenever this caller may not rename it, which is what leaves the
+  // panel with no affordance at all.
+  const renameDetailsTarget = useMemo(
+    () =>
+      conversationRenameAction({
+        kind: openDetailsTarget?.kind ?? null,
+        targetId: openDetailsTarget?.id ?? "",
+        channels,
+        renameChannel,
+        renameGroup,
+      }),
+    [openDetailsTarget, channels, renameChannel, renameGroup],
+  );
 
   // The navigation is a column on wide viewports and a drawer below them
   // (issue #467). Only the open/closed boolean lives here; which of the two it
@@ -285,14 +407,27 @@ export default function AppShell() {
   const detailsOpenerRef = useRef<HTMLElement | null>(null);
   // Opening the alert is the one action it offers, and it is plain navigation:
   // the alert is a pointer at a conversation, not a place to read it.
-  const navigateFromAlert = useNavigate();
   const openInAppAlert = useCallback(
     (alert: InAppAlert) => {
       dismissInAppAlert();
-      navigateFromAlert(`/chat/${alert.targetKind}/${encodeURIComponent(alert.targetId)}`);
+      navigate(`/chat/${alert.targetKind}/${encodeURIComponent(alert.targetId)}`);
     },
-    [dismissInAppAlert, navigateFromAlert],
+    [dismissInAppAlert, navigate],
   );
+  const openSearch = useCallback(() => navigate("/chat/search"), [navigate]);
+  const commandRegistry = useMemo(
+    () =>
+      createCommandRegistry({
+        openSearch,
+        openShortcutHelp: () => setShortcutHelpOpen(true),
+        previousConversation: () => navigateSidebarRelative(-1),
+        nextConversation: () => navigateSidebarRelative(1),
+        historyBack: () => navigate(-1),
+        historyForward: () => navigate(1),
+      }),
+    [navigate, navigateSidebarRelative, openSearch],
+  );
+  useShortcutManager(commandRegistry, GLOBAL_SHORTCUT_SCOPE);
   const openSidebarDetails = useCallback(
     (kind: "channel" | "dm", targetId: string, opener: HTMLElement | null) => {
       const resolved = resolveDetailsTarget(kind, targetId, dms);
@@ -348,6 +483,8 @@ export default function AppShell() {
         setMuted={setMuted}
         leaveConversation={leaveConversation}
         onOpenDetails={openSidebarDetails}
+        onOpenSearch={() => commandRegistry.execute("search.open")}
+        onNavigateRelativeChange={setSidebarNavigation}
         draftSummaries={drafts.summaries}
       />
       {/* Pointer half of "the background is not interactive while the drawer is
@@ -365,13 +502,20 @@ export default function AppShell() {
         />
       )}
       <main className="chat-app__main" aria-label={mainAriaLabel(pathname)} inert={navModal}>
-        <Outlet context={{ ...sidebar, drafts }} />
+        <Outlet context={{ ...sidebar, drafts, directMessage }} />
       </main>
       <SidebarDetailsPanel
         target={openDetailsTarget}
-        currentUserId={state.status === "ready" ? state.currentUserId : ""}
+        currentUserId={currentUserId}
+        onRename={renameDetailsTarget}
+        canonicalName={detailsCanonicalName}
+        // The same coordinator the conversation's own surfaces use, so a
+        // recipient already being resolved there is joined rather than
+        // requested again. The panel declares its own lifetime on top of it.
+        coordinator={directMessage}
         onClose={closeSidebarDetails}
       />
+      <DirectMessageError coordinator={directMessage} />
       {/* The in-app channel of the delivery plan (issue #744). Whether it is
           here at all was decided by chat-service for this recipient; this shell
           only renders what the decision allowed. Keyed by the message so a newer
@@ -385,6 +529,7 @@ export default function AppShell() {
           onDismiss={dismissInAppAlert}
         />
       )}
+      {shortcutHelpOpen && <KeyboardShortcutsDialog onClose={() => setShortcutHelpOpen(false)} />}
     </div>
   );
 }

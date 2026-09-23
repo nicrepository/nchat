@@ -1,0 +1,25 @@
+# Migration numbers that were already duplicated before the one-per-ordinal
+# check existed.
+#
+# These files have already been applied to running environments. The migration
+# runner stores a SHA-256 per migration *basename* (scripts/db/migrate.sh
+# migration_checksum) and keys applied rows on that basename, so renumbering one
+# of them would present it to every environment as a migration that has never
+# run — re-applying an expand that is already there. Recording the exception
+# here costs nothing and is just as visible in review.
+#
+# An entry names the EXACT set of migrations allowed to share the number, and
+# the gate compares that set to what it finds. A third migration at a listed
+# ordinal fails, a removed one fails, a renamed one fails. The exception closes
+# over which migrations collided, not over the fact that some did — otherwise a
+# grandfathered number would stay open forever, which is the opposite of what
+# this list is for.
+#
+# This list is closed. A migration added from now on takes the next free number
+# in its domain.
+#
+# Format: <domain>/<ordinal>|<basename>|<basename>...
+
+auth/000008|000008_admin_console_rbac|000008_user_profile_fields
+chat/000050|000050_conversation_notification_level|000050_persistent_urgent_notifications
+chat/000051|000051_validate_conversation_notification_level_check|000051_validate_persistent_urgent_notifications

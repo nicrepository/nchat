@@ -2,10 +2,13 @@ package storage
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -27,9 +30,9 @@ type MemberStore interface {
 	AddChannelMember(ctx context.Context, channelID, userID string, role domain.ChannelRole) (domain.ChannelMember, error)
 	// AddChannelMembers adds every user in userIDs to channelID, or none (issue
 	// #398). callerID is the authenticated actor: the transaction re-establishes
-	// their owner/admin membership itself rather than trusting the service's
-	// earlier check, so a role revoked in between persists nothing. Eligibility
-	// of the targets is decided by the same statement that writes. Returns
+	// their add capability and channel scope itself rather than trusting the
+	// service's earlier check, so a role revoked in between persists nothing.
+	// Eligibility of the targets is decided by the same statement that writes. Returns
 	// domain.ErrForbidden — without naming anyone — for a revoked actor or an
 	// ineligible target.
 	AddChannelMembers(ctx context.Context, workspaceID, channelID, callerID string, userIDs []string) (AddMembersResult, error)
@@ -44,6 +47,9 @@ type MemberStore interface {
 	ListOnlineChannelMemberProfiles(
 		ctx context.Context, workspaceID, channelID string, onlineUserIDs []string, limit int,
 	) (ChannelMemberPage, error)
+	// ListChannelMemberRoster returns an authorized caller's complete effective
+	// membership as an opaque-cursor page. Presence is never part of this query.
+	ListChannelMemberRoster(ctx context.Context, workspaceID, channelID, cursor string, limit int) (ChannelRosterPage, error)
 	// ListChannelMemberProfilesByIDs resolves the subset of userIDs that are
 	// active members of channelID, for the call-participant avatar/name
 	// lookup (issue #612). Unlike ListOnlineChannelMemberProfiles this is not
@@ -75,6 +81,34 @@ type MemberStore interface {
 	RemoveChannelMemberByAdmin(ctx context.Context, workspaceID, channelID, actorID, targetUserID string) (domain.Message, error)
 	EnsureGeneralMembership(ctx context.Context, workspaceID, userID string) error
 	SyncGeneralMemberships(ctx context.Context, workspaceID string) (int64, error)
+}
+
+type rosterCursor struct {
+	Name   string `json:"n"`
+	UserID string `json:"u"`
+}
+
+func decodeRosterCursor(raw string) (rosterCursor, error) {
+	if raw == "" {
+		return rosterCursor{}, nil
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return rosterCursor{}, domain.ErrInvalidInput
+	}
+	var cursor rosterCursor
+	if json.Unmarshal(decoded, &cursor) != nil || cursor.UserID == "" {
+		return rosterCursor{}, domain.ErrInvalidInput
+	}
+	if _, err := uuid.Parse(cursor.UserID); err != nil {
+		return rosterCursor{}, domain.ErrInvalidInput
+	}
+	return cursor, nil
+}
+
+func encodeRosterCursor(profile domain.ChannelMemberProfile) string {
+	encoded, _ := json.Marshal(rosterCursor{Name: strings.ToLower(profile.DisplayName), UserID: profile.UserID})
+	return base64.RawURLEncoding.EncodeToString(encoded)
 }
 
 // PGXMemberStore implements MemberStore using a pgx connection pool.
@@ -329,8 +363,7 @@ func ensureWorkspaceActive(ctx context.Context, q memberQuerier, workspaceID str
 // member is joined to automatically. #geral is where a workspace's traffic
 // lives; auto-joining a guest to it would mean "restricted to the channels it
 // was explicitly added to" started with the busiest channel in the workspace
-// already granted. A guest reaches #geral the same way it reaches any other
-// channel: somebody with domain.CanManageChannelMembers adds it.
+// already granted. Manual add is a separate flow and refuses #geral.
 //
 // The role is not passed in and not read separately: the insert selects it from
 // the membership row inside the caller's transaction, so the decision cannot be
@@ -535,11 +568,11 @@ func (s *PGXMemberStore) AddChannelMembers(
 	// memberships. Locking the row also serialises this against a concurrent
 	// role change rather than merely observing it.
 	//
-	// The role list is the SQL statement of domain.CanManageChannelMembers,
-	// which RF-74 widened from owner/admin to include the workspace moderator.
-	// The two must agree; the service's decision is deliberately not passed down
-	// as a boolean, because a boolean computed a moment ago is exactly the thing
-	// this query exists to distrust.
+	// This is the SQL statement of domain.CanAddChannelMembers plus #705's
+	// channel rule: managers retain administrative add scope, while a plain
+	// member must still be able to read the channel. The service's decision is
+	// deliberately not passed down as a boolean, because a boolean computed a
+	// moment ago is exactly the thing this query exists to distrust.
 	//
 	// FOR SHARE rather than FOR UPDATE, matching managerAuthorizedWorkspace in
 	// channel_category_store.go: demoting a role, suspending a membership and
@@ -558,11 +591,21 @@ func (s *PGXMemberStore) AddChannelMembers(
 		JOIN chat.workspaces w
 		  ON w.id = wm.workspace_id AND w.status = 'active'
 		JOIN chat.channels c
-		  ON c.id = $2::uuid AND c.workspace_id = wm.workspace_id AND c.status = 'active'
+		  ON c.id = $2::uuid
+		 AND c.workspace_id = wm.workspace_id
+		 AND c.status = 'active'
+		 AND c.is_general = false
 		WHERE wm.workspace_id = $1::uuid
 		  AND wm.user_id = $3::uuid
 		  AND wm.status = 'active'
-		  AND wm.role IN ('owner', 'admin', 'moderator')
+		  AND wm.role IN ('owner', 'admin', 'moderator', 'member')
+		  AND (
+		        wm.role IN ('owner', 'admin', 'moderator')
+		        OR (
+		            wm.role = 'member'
+		            AND chat.channel_visible_to_user(c.id, wm.user_id)
+		        )
+		      )
 		FOR SHARE OF wm`,
 		workspaceID, channelID, callerID,
 	).Scan(&actorAuthorized)
@@ -884,6 +927,128 @@ func (s *PGXMemberStore) ListOnlineChannelMemberProfiles(
 	return page, nil
 }
 
+// ChannelRosterPage is the channel's administrable membership (issue #469): a
+// capped, ordered page of chat.channel_members and the total behind it.
+//
+// Deliberately not ChannelMemberPage. That type answers "who is here now" and
+// carries an online total; this one answers "who belongs", has no presence
+// dimension at all, and a wrong presence snapshot cannot subtract from it. Two
+// questions, two types, so a caller cannot read one as the other.
+type ChannelRosterPage struct {
+	Members    []domain.ChannelMemberProfile
+	TotalCount int
+	NextCursor string
+}
+
+// ListChannelMemberRoster returns a capped page of a channel's explicit
+// members and the full total, in a single query (issue #469).
+//
+// The predicate is the one active_members already encodes in
+// ListOnlineChannelMemberProfiles — active channel in this workspace, active
+// workspace membership, active non-deleted account — and nothing else: no
+// presence, no visibility. That matters twice over. chat.channel_members is
+// exactly the population RemoveChannelMemberByAdmin deletes from, so every
+// roster row is something the removal can act on; and a member who is offline,
+// or connected to another replica, stays administrable instead of disappearing
+// from the panel.
+//
+// What this deliberately does not do is widen membership. A public channel is
+// readable through chat.channel_visible_to_user without a row here, and those
+// readers are not members and do not appear — offering to remove a row that
+// does not exist would be a lie in the shape of a button. Which population a
+// public channel's roster *should* be is issue #883's to settle; this answer
+// tracks whatever it decides, because it reads the same table member_count
+// already counts.
+//
+// COUNT(*) OVER () is evaluated before LIMIT, so the total describes the whole
+// membership and not the page — the same single-query shape
+// ListParticipantProfiles uses for a group, and for the same reason: a second
+// COUNT statement is a second chance to drift from this one's predicate.
+func (s *PGXMemberStore) ListChannelMemberRoster(
+	ctx context.Context, workspaceID, channelID, rawCursor string, limit int,
+) (ChannelRosterPage, error) {
+	if limit <= 0 || limit > domain.MaxChannelDetailsMembers {
+		limit = domain.MaxChannelDetailsMembers
+	}
+	cursor, err := decodeRosterCursor(rawCursor)
+	if err != nil {
+		return ChannelRosterPage{}, err
+	}
+	hasCursor := rawCursor != ""
+	var cursorUserID any
+	if hasCursor {
+		cursorUserID = cursor.UserID
+	}
+	rows, err := s.pool.Query(ctx, `
+		WITH active_members AS (
+			SELECT cm.user_id,
+			       cm.role::text AS role,
+			       COALESCE(
+			           NULLIF(BTRIM(u.full_name), ''),
+			           NULLIF(BTRIM(u.display_name), ''),
+			           ''
+			       ) AS display_name,
+			       COALESCE(u.avatar_url, '') AS avatar_url
+			FROM chat.channel_members cm
+			JOIN chat.channels c
+			  ON c.id = cm.channel_id
+			 AND c.workspace_id = $1::uuid
+			 AND c.status = 'active'
+			JOIN chat.workspace_members wm
+			  ON wm.workspace_id = c.workspace_id
+			 AND wm.user_id = cm.user_id
+			 AND wm.status = 'active'
+			JOIN auth.users u ON u.id = cm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+			WHERE cm.channel_id = $2::uuid
+		)
+		SELECT total.total_count,
+		       page.user_id::text,
+		       page.display_name,
+		       page.avatar_url,
+		       page.role
+		FROM (SELECT count(*) AS total_count FROM active_members) total
+		LEFT JOIN LATERAL (
+			SELECT * FROM active_members
+			WHERE NOT $3::boolean OR (lower(display_name), user_id) > ($4, $5::uuid)
+			ORDER BY lower(display_name), user_id
+			LIMIT $6
+		) page ON true`, workspaceID, channelID, hasCursor, cursor.Name, cursorUserID, limit+1)
+	if err != nil {
+		return ChannelRosterPage{}, fmt.Errorf("list channel member roster: %w", err)
+	}
+	defer rows.Close()
+
+	page := ChannelRosterPage{Members: make([]domain.ChannelMemberProfile, 0, limit)}
+	for rows.Next() {
+		var (
+			profile     domain.ChannelMemberProfile
+			role        pgtype.Text
+			total       int
+			userID      pgtype.Text
+			displayName pgtype.Text
+			avatarURL   pgtype.Text
+		)
+		if err := rows.Scan(&total, &userID, &displayName, &avatarURL, &role); err != nil {
+			return ChannelRosterPage{}, fmt.Errorf("scan channel roster member: %w", err)
+		}
+		if !userID.Valid {
+			continue
+		}
+		profile.UserID, profile.DisplayName, profile.AvatarURL = userID.String, displayName.String, avatarURL.String
+		profile.Role = domain.ChannelRole(role.String)
+		page.TotalCount = total
+		if len(page.Members) == limit {
+			page.NextCursor = encodeRosterCursor(page.Members[len(page.Members)-1])
+			continue
+		}
+		page.Members = append(page.Members, profile)
+	}
+	if err := rows.Err(); err != nil {
+		return ChannelRosterPage{}, fmt.Errorf("iterate channel roster members: %w", err)
+	}
+	return page, nil
+}
+
 // ListChannelMemberProfilesByIDs resolves presentation identities for a
 // specific set of user IDs against one channel's active membership (issue
 // #612). It reuses the same active-membership predicate as
@@ -994,8 +1159,10 @@ func (s *PGXMemberStore) SearchDMCandidates(ctx context.Context, workspaceID, ca
 // Everything else mirrors SearchDMCandidates so the two searches cannot drift
 // about who counts as an eligible person: the workspace must be active, the
 // membership active, the account active and not deleted, and the caller must
-// still hold an active membership in the same workspace (the EXISTS below).
-// The caller is also excluded from their own results.
+// still satisfy the #705 add role and channel-scope policy (the EXISTS below).
+// The caller is also excluded from their own results. #geral is not refused
+// here: MemberService refuses it for the add-members search, while the mention
+// popup's auto-add preview reads this query as-is (issue #882 owns that gap).
 //
 // Ordering is the same deterministic (lower(display_name), id) the rest of the
 // candidate surface uses, so paging is stable.
@@ -1015,10 +1182,22 @@ func (s *PGXMemberStore) SearchChannelMemberCandidates(
 		  AND left(lower(u.display_name), length($4)) = lower($4)
 		  AND EXISTS (
 		      SELECT 1
-		      FROM chat.workspace_members caller
-		      WHERE caller.workspace_id = wm.workspace_id
-		        AND caller.user_id = $3::uuid
-		        AND caller.status = 'active'
+		      FROM chat.channels actor_channel
+		      JOIN chat.workspace_members actor
+		        ON actor.workspace_id = actor_channel.workspace_id
+		       AND actor.user_id = $3::uuid
+		       AND actor.status = 'active'
+		      WHERE actor_channel.id = $2::uuid
+		        AND actor_channel.workspace_id = $1::uuid
+		        AND actor_channel.status = 'active'
+		        AND actor.role IN ('owner', 'admin', 'moderator', 'member')
+		        AND (
+		              actor.role IN ('owner', 'admin', 'moderator')
+		              OR (
+		                  actor.role = 'member'
+		                  AND chat.channel_visible_to_user(actor_channel.id, actor.user_id)
+		              )
+		            )
 		  )
 		  AND NOT EXISTS (
 		      SELECT 1

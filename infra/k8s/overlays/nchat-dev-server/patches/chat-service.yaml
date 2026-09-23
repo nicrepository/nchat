@@ -31,7 +31,7 @@ spec:
                   name: nchat-secrets
                   key: VALKEY_URL
             # RF-21 Safe Browsing, from a Secret only this Deployment and
-            # file-service reference — the token has no business in
+            # file-service reference — these credentials have no business in
             # nchat-secrets, which every service mounts wholesale.
             #
             # Not optional, and the Secret must exist before
@@ -39,6 +39,15 @@ spec:
             # on, Config.Validate refuses to start on a missing credential
             # rather than running with the check silently absent. See
             # docs/runbooks/sealed-secrets-rotation.md.
+            #
+            # The primary provider (issue #928). Google Web Risk answers first;
+            # the Cloudflare pair below is the fallback. This key is referenced
+            # here and nowhere else — file-service has no Web Risk call site.
+            - name: CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-link-safety
+                  key: CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY
             - name: CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID
               valueFrom:
                 secretKeyRef:

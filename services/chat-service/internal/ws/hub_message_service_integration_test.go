@@ -37,6 +37,10 @@ func (s *integChannelStore) GetChannelByID(_ context.Context, _ string) (domain.
 func (s *integChannelStore) GetChannelByIDInWorkspace(_ context.Context, _, _ string) (domain.Channel, error) {
 	return s.ch, nil
 }
+func (s *integChannelStore) GetChannelAbout(_ context.Context, _, _ string) (storage.ConversationAbout, error) {
+	return storage.ConversationAbout{}, nil
+}
+
 func (s *integChannelStore) GetVisibleChannelByID(_ context.Context, _, _, _ string) (domain.Channel, error) {
 	return s.ch, nil
 }
@@ -114,6 +118,10 @@ func (s *integDMStore) ListVisibleConversationsWithParticipantIDs(_ context.Cont
 func (s *integDMStore) GetDirectCounterpartProfile(_ context.Context, _, _, _ string) (domain.DMDirectProfile, error) {
 	return domain.DMDirectProfile{}, nil
 }
+func (s *integDMStore) GetConversationAbout(_ context.Context, _, _ string) (storage.ConversationAbout, error) {
+	return storage.ConversationAbout{}, nil
+}
+
 func (s *integDMStore) GetVisibleConversationByID(_ context.Context, _, _, _ string) (domain.DMConversation, error) {
 	return s.conv, nil
 }
@@ -221,7 +229,7 @@ func (s *integMessageStore) RecordLinkScanSubmission(_ context.Context, _, _ str
 	return nil
 }
 
-func (s *integMessageStore) RecordLinkVerdict(_ context.Context, _, _ string, _ urlsafety.Verdict) error {
+func (s *integMessageStore) RecordLinkVerdict(_ context.Context, _ storage.LinkVerdictWrite) error {
 	return nil
 }
 

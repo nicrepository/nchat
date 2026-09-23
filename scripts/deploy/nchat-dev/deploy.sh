@@ -120,33 +120,17 @@ wait_for_rollouts() {
   done
 }
 
-check_internal_health() {
-  local service="$1" attempt output delay=1
-  for attempt in {1..5}; do
-    if output="$(kubectl get --request-timeout=10s --raw "/api/v1/namespaces/nchat-dev/services/http:$service:http/proxy/healthz" 2>&1)"; then
-      return 0
-    fi
-    if [[ "$attempt" -eq 5 ]]; then
-      echo "Internal health check failed for $service after $attempt attempts: $output" >&2
-      kubectl describe service "$service" -n nchat-dev || true
-      return 1
-    fi
-    echo "Internal health check attempt $attempt failed for $service; retrying in ${delay}s" >&2
-    sleep "$delay"
-    delay=$((delay * 2))
-  done
-}
-
-run_smoke_tests() {
-  local service
-  DEPLOY_STAGE=smoke-tests
-  for service in "${NCHAT_DEV_APPLICATION_DEPLOYMENTS[@]}"; do
-    check_internal_health "$service"
-  done
-  curl --fail --silent --show-error --retry 5 --retry-delay 1 --retry-max-time 30 \
-    "https://$NCHAT_DEV_HOST/" >/dev/null
-}
-
+# The operational proof moved to scripts/deploy/nchat-dev/smoke.sh with issue
+# #933, and with it the health probes and the public request that used to end
+# this script.
+#
+# Two reasons, and neither is tidiness. Applying manifests and proving the
+# release works are different jobs with different failure meanings -- one says
+# Kubernetes rejected the change, the other says the change is bad -- and the
+# CD workflow reports them as two steps because an operator reading a summary
+# needs to know which happened. And a smoke that only ever runs as the tail of
+# a deploy cannot be run on its own against an environment somebody is
+# debugging, which is when it is most useful.
 validate_commit_sha "${DEPLOY_SHA:-}"
 validate_digest_artifacts "$ARTIFACTS_DIR"
 require_prerequisites
@@ -155,5 +139,4 @@ start_data_services
 run_migrations
 apply_application
 wait_for_rollouts
-run_smoke_tests
 DEPLOY_STAGE=""

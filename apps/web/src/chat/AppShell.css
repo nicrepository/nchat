@@ -272,3 +272,31 @@ body.chat-root-locked {
     transition: none;
   }
 }
+
+/*
+ * The one line a refused open-DM gets (issue #895).
+ *
+ * At the shell rather than inside a conversation because the flow is: the
+ * timeline, the conversation's details panel and the sidebar's details panel can
+ * all start it, and the last of those is reachable from /profile, where no
+ * conversation is mounted. Positioned over the layout rather than in it so
+ * appearing does not reflow the grid under the reader's cursor.
+ */
+.chat-app__dm-error {
+  position: fixed;
+  z-index: 40;
+  inset-block-end: calc(16px + env(safe-area-inset-bottom));
+  inset-inline: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: min(92vw, 420px);
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: var(--color-danger-tint, #fee2e2);
+  color: var(--color-danger-ink, #991b1b);
+  border: 1px solid currentcolor;
+  font-size: 13px;
+  font-weight: 600;
+  box-shadow: 0 8px 24px rgb(22 18 31 / 18%);
+}

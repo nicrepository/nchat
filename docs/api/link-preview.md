@@ -1,4 +1,96 @@
-# File-service: preview de links externos por Open Graph (RF-10)
+# Preview de links externos por Open Graph (RF-10, issue #807)
+
+Duas superficies compartilham um unico fetcher hardened
+(`libs/go/platform/linkfetch`):
+
+1. **Rich previews em mensagens (chat-service, issue #807)** — pipeline
+   assincrono que so entra depois de `safety = safe` explicito, com imagem
+   derivada servida pelo NChat. Descrito na proxima secao.
+2. **`POST /api/files/link-preview` (file-service, RF-10)** — rota interativa
+   que devolve apenas metadados normalizados. Descrita a partir de
+   "File-service: rota interativa".
+
+## Chat-service: rich previews por link (issue #807)
+
+### Elegibilidade
+
+```
+chat.link_previews (workspace_id, canonical_url)  UNIQUE
+  queued -> fetching -> ready | unsupported | failed
+```
+
+Uma linha nasce `queued` quando um target com verdict `safe` fresco e nomeado
+por uma mensagem daquele workspace (no envio/edicao, ou pelo worker quando o
+verdict chega). O claim (`ClaimDueLinkPreviews`) faz JOIN em `chat.link_scans`
+e **so leva** `status = 'safe'` **e fresco** (`decided_at` dentro de
+`urlsafety.VerdictTTL`, a mesma definicao central `freshVerdictSQL` que o
+send path e a classificacao de custo usam); um safe vencido ou reaberto para
+recheck nao e reclamado ate um novo `safe` valido. A leitura
+(`LoadLinkPreviews`) so acontece para targets `safe`; a rota da imagem re-checa
+`safe` fresco no proprio statement. Cada claim gera um `claim_id` novo e o
+devolve no job; `CompleteLinkPreview`/`FailLinkPreview` fazem compare-and-set em
+`id + state = 'fetching' + claim_id` — um worker cuja lease expirou e foi
+reclamada por outro recebe `ErrLinkPreviewConflict` e nao altera nada. Um
+target que vira `malicious` tem todos os previews revogados
+(`RevokeLinkPreviews`: `failed/not_safe`, imagem apagada) e `message.link_updated`
+avisa cada mensagem.
+
+Workspace-scoped por chave: o workspace A nunca le a linha do workspace B, mesmo
+para a mesma URL.
+
+### Convergencia
+
+- `deadline_at` (`LinkPreviewDeadline`, 30 min) — queued/fetching alem disso
+  vira `failed/deadline`;
+- 3 tentativas (`linkPreviewMaxAttempts`) com backoff `lease x min(attempts, 5)`;
+- `expires_at` (`LinkPreviewTTL`, 24 h) — um `ready` vencido e reenfileirado
+  quando a URL e nomeada de novo; `Safety TTL != Preview TTL`;
+- `CHAT_LINK_PREVIEW_ENABLED=false` — nada e buscado, `queued/fetching` viram
+  `failed/disabled`, `ready` nao e servido; links `safe` continuam clicaveis.
+
+### Fetch (`linkfetch.Fetcher`)
+
+`FetchDocument` -> `Extract` (`og:*`, `twitter:*` como fallback, `<title>` e
+`<meta name=description>` por ultimo) -> `FetchImage` -> `DeriveThumbnail`.
+
+Limites (constantes, nao configuraveis por deployment): documento 512 KiB
+**descomprimidos**, imagem 3 MiB, 3 redirects, 5 s por exchange, timeouts por
+fase (dial 3 s, TLS 3 s, headers 4 s), headers 64 KiB, `text/html` para o
+documento e `image/*` para a imagem, decididos pelo header antes do corpo.
+
+Redirect: cada `Location` passa por SSRF (dialer) **e** pela `HopPolicy` do
+worker — `safe` segue; `pending`/ausente admite o hop para scan e reagenda o
+preview (`ErrRedirectTargetPending`); `unknown`/`malicious` encerra
+(`failed/redirect_refused`).
+
+### Imagem derivada
+
+```
+og:image -> canonicalize -> ClassifyURL (sensivel/interna: descarta)
+  -> FetchImage (SSRF + limites) -> sniff magic bytes (jpeg/png/gif)
+  -> DecodeConfig (<= 8192 px por lado, <= 20 Mpx) -> decode -> downscale 480x320
+  -> JPEG re-encodado (<= 160 KiB, CHECK no banco) -> chat.link_previews.image_data
+```
+
+O browser nunca ve a URL remota: o card carrega `preview.image_id` e busca
+`GET /api/chat/link-previews/{id}/image` (autenticado, membro ativo do
+workspace, `Cache-Control: private`, `nosniff`). Todo erro e `404`.
+
+### Contrato no card
+
+`links[].preview` (ver [link-safety.md](./link-safety.md)): `state`,
+`hostname` (host canonico, nunca `og:site_name`), `site_name`, `title`,
+`description`, `image_id`, `image_width`, `image_height`. Strings sao dados;
+o cliente renderiza como texto.
+
+### Observabilidade
+
+`nchat_link_previews_total{result}` e `nchat_link_preview_pending` (labels de
+conjunto fechado; nunca URL/host). Logs nunca carregam a URL.
+
+---
+
+## File-service: rota interativa (RF-10)
 
 Preview server-side de um link colado pelo usuario. O file-service busca a
 pagina, le os metadados Open Graph e devolve **apenas texto normalizado**.
@@ -165,7 +257,8 @@ A politica recusa destinos nao publicos em IPv4 e IPv6 -- incluindo as formas em
 que um endereco IPv4 viaja disfarcado dentro de um IPv6 -- e com isso recusa
 tambem os metadata services de nuvem e qualquer hostname ou alias que resolva
 para eles. As faixas exatas estao em
-`services/file-service/internal/linkpreview/policy.go`; nao sao repetidas aqui.
+`libs/go/platform/linkfetch/policy.go` (compartilhado com o chat-service desde
+a issue #807); nao sao repetidas aqui.
 
 Alem disso:
 

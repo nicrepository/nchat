@@ -19,6 +19,10 @@ func (f *fakeChannelChecker) CanRead(_ context.Context, _, _, _ string) (bool, e
 	return f.result, f.err
 }
 
+func (f *fakeChannelChecker) GetChannelAbout(_ context.Context, _, _ string) (storage.ConversationAbout, error) {
+	return storage.ConversationAbout{}, nil
+}
+
 func (f *fakeChannelChecker) GetVisibleChannelByID(_ context.Context, workspaceID, channelID, _ string) (domain.Channel, error) {
 	if f.err != nil {
 		return domain.Channel{}, f.err
@@ -108,6 +112,10 @@ func (f *fakeDMStore) ListVisibleConversationsByUser(_ context.Context, _, _ str
 func (f *fakeDMStore) GetDirectCounterpartProfile(_ context.Context, _, _, _ string) (domain.DMDirectProfile, error) {
 	return domain.DMDirectProfile{}, nil
 }
+func (f *fakeDMStore) GetConversationAbout(_ context.Context, _, _ string) (storage.ConversationAbout, error) {
+	return storage.ConversationAbout{}, nil
+}
+
 func (f *fakeDMStore) GetVisibleConversationByID(_ context.Context, workspaceID, conversationID, userID string) (domain.DMConversation, error) {
 	f.workspaceID = workspaceID
 	f.conversationID = conversationID

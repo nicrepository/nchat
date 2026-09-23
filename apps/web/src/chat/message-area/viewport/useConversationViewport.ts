@@ -19,11 +19,16 @@ import type { Message } from "../../chatTypes";
 import type { ViewportAnchor } from "../../chatViewportPersistence";
 import type { LastMutation } from "../../useMessages";
 import type { TimelineRow } from "../../timelineVirtualization";
+import { useCallback } from "react";
+
+import { scrollButtonState, type ScrollButtonState } from "./navigation";
 import { useViewportCore } from "./useViewportCore";
 import { useInstantPositioning, useOpenPositionResolution } from "./useOpenPosition";
 import { usePrependRestoreEffects, useRowResizeAdjustment } from "./usePrependRestore";
 import { useTimelineRows } from "./useTimelineRows";
-import { useTailFollow } from "./useTailFollow";
+import { useNavigator, useUnreadBoundary } from "./useNavigator";
+import { useTailArrival, useTailFollow } from "./useTailFollow";
+import { useUnreadCount } from "./useUnreadCount";
 import { useMessageJump } from "./useMessageJump";
 import { useAnchorCapture, useInfiniteTop, useListFocusRecovery } from "./useListBoundaries";
 
@@ -69,9 +74,10 @@ export interface ConversationViewport {
   firstUnreadMessageId: string | null;
   highlightedMessageId: string | null;
   jumpToMessage: (messageId: string) => void;
-  pendingCount: number;
-  scrollButtonVisible: boolean;
-  scrollToBottomNow: () => void;
+  /** #880: the one floating control — whether it shows, and what it offers. */
+  scrollButton: ScrollButtonState;
+  /** What pressing that control does, which depends on what it offers. */
+  onScrollButtonClick: () => void;
   /** Where focus lands when the row that held it has been unmounted. */
   focusList: () => void;
 }
@@ -84,13 +90,17 @@ export function useConversationViewport(input: ConversationViewportInput): Conve
   //
   //   1. the row model, so every position expressed as a row index is current
   //      before anything looks one up;
-  //   2. the opening position's one instant scroll, which looks one up;
-  //   3. the prepend restoration, whose first effect arms what its second
+  //   2. the navigator, whose per-commit pass re-derives its destination from
+  //      that model (#880);
+  //   3. the opening position's one instant scroll, which looks one up — and
+  //      which hands the unread boundary to the navigator above;
+  //   4. the prepend restoration, whose first effect arms what its second
   //      consumes in the very same commit.
   //
-  // Reordering these silently breaks #492/#675: a scroll resolved against a
-  // stale row index lands on the wrong message, and a restoration armed after
-  // its own pass effect never runs at all.
+  // Reordering these silently breaks #492/#675/#880: a scroll resolved against
+  // a stale row index lands on the wrong message, a restoration armed after its
+  // own pass effect never runs at all, and a navigation pass that runs before
+  // the row model is a destination computed from the previous page.
   const resolution = useOpenPositionResolution({
     core,
     messages: input.messages,
@@ -112,25 +122,56 @@ export function useConversationViewport(input: ConversationViewportInput): Conve
     adjustForRowResize,
   });
 
-  useInstantPositioning(core, resolution.scrollTarget, firstUnreadMessageId);
+  const unread = useUnreadCount(input.unreadCountAtOpen);
+  const arrival = useTailArrival(core, input.onReachedBottom, unread.clear);
+  const navigator = useNavigator({
+    core,
+    conversationKey: input.conversationKey,
+    onTailArrived: arrival.arrive,
+  });
+
+  useInstantPositioning(
+    core,
+    resolution.scrollTarget,
+    resolution.target,
+    navigator.navigateToTail,
+    navigator.navigateToFirstUnread,
+  );
 
   usePrependRestoreEffects({
     core,
-    phase,
     messages: input.messages,
     lastMutation: input.lastMutation,
     resolved,
   });
 
-  const { pendingCount, scrollToBottomNow } = useTailFollow({
+  useTailFollow({
     core,
     phase,
     messages: input.messages,
     currentUserId: input.currentUserId,
     lastMutation: input.lastMutation,
     resolved,
-    onReachedBottom: input.onReachedBottom,
+    arrival,
+    navigator,
+    onUnreadArrival: unread.countArrival,
   });
+
+  const boundaryAhead = useUnreadBoundary(core, firstUnreadMessageId);
+  const scrollButton = scrollButtonState({
+    awayFromTail: phase !== "AT_BOTTOM" && phase !== "RESTORING_POSITION",
+    unreadCount: unread.count,
+    hasBoundary: firstUnreadMessageId !== null,
+    boundaryAhead,
+  });
+  // #880 item 10: one control, two destinations. Which one it means is the
+  // button state's answer, so pressing it can only ever agree with what it
+  // says — there is no second source deciding where it goes.
+  const { navigateToFirstUnread, navigateToTail } = navigator;
+  const onScrollButtonClick = useCallback(() => {
+    if (scrollButton.mode === "first-unread") navigateToFirstUnread("button");
+    else navigateToTail("button");
+  }, [navigateToFirstUnread, navigateToTail, scrollButton.mode]);
 
   const { highlightedMessageId, jumpToMessage } = useMessageJump(
     core,
@@ -156,10 +197,8 @@ export function useConversationViewport(input: ConversationViewportInput): Conve
     firstUnreadMessageId,
     highlightedMessageId,
     jumpToMessage,
-    pendingCount,
-    scrollButtonVisible:
-      phase === "READING_HISTORY" || phase === "AT_FIRST_UNREAD" || phase === "SCROLLING_TO_BOTTOM",
-    scrollToBottomNow,
+    scrollButton,
+    onScrollButtonClick,
     focusList,
   };
 }

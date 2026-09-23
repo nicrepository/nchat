@@ -88,7 +88,7 @@ NOOP_SHA_GATES = {
     "conditional-sha-gate": 'false && [[ "$RELEASE_SHA" =~ ^[a-f0-9]{40}$ ]]',
 }
 WIRING_OPS = {"drop-images-output", "detached-build"}
-DISPATCH_OPS = {"caller-builds-elsewhere", "optional-dispatch-sha"}
+DISPATCH_OPS = {"caller-builds-elsewhere", "optional-call-sha"}
 GATE_OPS = {"gate-other-sha", "shallow-gate-history", "echoed-inventory"}
 JOB_OPS = {
     "checkout-head",
@@ -115,8 +115,6 @@ BUILD_OPS = {
     "duplicate-digest-artifact",
 }
 DAG_OPS = {
-    "manifest-blocks-deploy",
-    "deploy-blocks-manifest",
     "detached-manifest",
     "drop-manifest",
     "manifest-other-sha",
@@ -124,10 +122,10 @@ DAG_OPS = {
 CALLER_OPS = DAG_OPS | DISPATCH_OPS | {
     "dispatch-without-proof",
     "caller-builds-head",
-    "detached-deploy",
-    "unconditional-deploy",
-    "deploy-elsewhere",
-    "build-main-pushes",
+    "restore-deploy-job",
+    "push-trigger",
+    "require-main-not-boolean",
+    "caller-output-drift",
 }
 
 
@@ -242,7 +240,7 @@ def mutate_dispatch(workflow, operation):
     if operation == "caller-builds-elsewhere":
         workflow["jobs"]["build"]["uses"] = "./.github/workflows/deploy-nchat-dev.yml"
     else:
-        triggers(workflow)["workflow_dispatch"]["inputs"]["sha"]["required"] = False
+        triggers(workflow)["workflow_call"]["inputs"]["sha"]["required"] = False
     return True
 
 
@@ -320,11 +318,7 @@ def mutate_build(workflow, operation):
 
 
 def mutate_release_dag(jobs, operation):
-    if operation == "manifest-blocks-deploy":
-        jobs["deploy"]["needs"] = ["build", "release-manifest"]
-    elif operation == "deploy-blocks-manifest":
-        jobs["release-manifest"]["needs"] = ["build", "deploy"]
-    elif operation == "detached-manifest":
+    if operation == "detached-manifest":
         del jobs["release-manifest"]["needs"]
     elif operation == "drop-manifest":
         del jobs["release-manifest"]
@@ -348,15 +342,23 @@ def mutate_caller(workflow, operation):
         jobs["build"]["with"]["require_main"] = False
     elif operation == "caller-builds-head":
         jobs["build"]["with"]["sha"] = "${{ github.sha }}"
-    elif operation == "detached-deploy":
-        del jobs["deploy"]["needs"]
-    elif operation == "unconditional-deploy":
-        del jobs["deploy"]["if"]
-    elif operation == "deploy-elsewhere":
-        jobs["deploy"]["uses"] = "./.github/workflows/deploy-nchat-prod.yml"
+    elif operation == "restore-deploy-job":
+        jobs["deploy"] = {
+            "needs": "build",
+            "uses": "./.github/workflows/deploy-nchat-dev.yml",
+            "with": {"sha": "${{ inputs.sha }}"},
+        }
+    elif operation == "push-trigger":
+        triggers(workflow)["push"] = {"branches": ["develop"]}
+    elif operation == "require-main-not-boolean":
+        triggers(workflow)["workflow_call"]["inputs"]["require_main"]["type"] = "string"
     else:
-        triggers(workflow)["push"]["branches"] = ["develop", "main"]
+        call_outputs(workflow)["sha"]["value"] = "${{ inputs.sha }}"
     return True
+
+
+def call_outputs(workflow):
+    return triggers(workflow)["workflow_call"]["outputs"]
 
 
 def main(source, destination, operation):
@@ -510,33 +512,34 @@ test_build_and_digest() {
   expect_builder_refused "a duplicated digest artifact" duplicate-digest-artifact
 }
 
-# The regression a code review found: with the manifest inside the reusable
-# builder, a manifest that could not be written failed the whole call and took
-# the development deploy with it. They are siblings of the build now, and the
-# manifest still has to name the SHA the builder reported building.
+# The manifest is sealed from the build and names the SHA the builder reported
+# building, so the identity of a release cannot come from the caller's own ref.
 test_release_dag() {
-  echo "the release DAG: manifest and deploy are siblings of the build"
+  echo "the release DAG: the manifest is sealed from the build"
   expect_builder_refused "a builder that does not report the SHA it built" drop-sha-output
   expect_builder_refused "a reported SHA that is not the one requested" stale-sha-output
-  expect_caller_refused "a deploy held back by the release manifest" manifest-blocks-deploy
-  expect_caller_refused "a manifest held back by the deploy" deploy-blocks-manifest
   expect_caller_refused "a manifest that does not wait for the build" detached-manifest
   expect_caller_refused "a release with no manifest at all" drop-manifest
   expect_caller_refused "a manifest sealing a different SHA than the build" \
     manifest-other-sha
 }
 
+# Issue #933 made the release build a reusable unit with no trigger of its own.
+# Two regressions would undo that, and both are refused by name: a trigger here
+# builds in parallel with the CI of the same commit, and a deploy job here
+# delivers a commit whose CI / Required verdict nobody read.
 test_caller_contract() {
-  echo "the caller, and the development flow it must preserve"
-  expect_caller_refused "a dispatch that skips the main proof" dispatch-without-proof
-  expect_caller_refused "a dispatch that builds HEAD instead of the requested SHA" caller-builds-head
-  expect_caller_refused "a deploy that no longer waits for the build" detached-deploy
-  expect_caller_refused "a deploy that is no longer restricted to develop" unconditional-deploy
-  expect_caller_refused "a deploy routed away from nchat-dev" deploy-elsewhere
-  expect_caller_refused "pushes to main building images directly" build-main-pushes
+  echo "the release build: reusable, triggerless, and not a delivery decision"
+  expect_caller_refused "a build that skips the main proof" dispatch-without-proof
+  expect_caller_refused "a build of HEAD instead of the requested SHA" caller-builds-head
+  expect_caller_refused "a deploy job back inside the release build" restore-deploy-job
+  expect_caller_refused "a push trigger racing the CI of the same commit" push-trigger
+  expect_caller_refused "a require_main input that is not a boolean" require-main-not-boolean
+  expect_caller_refused "an output naming the requested SHA rather than the built one" \
+    caller-output-drift
   expect_caller_refused "a caller that builds outside the single builder" \
     caller-builds-elsewhere
-  expect_caller_refused "a dispatch that need not name a SHA" optional-dispatch-sha
+  expect_caller_refused "a call that need not name a SHA" optional-call-sha
 }
 
 # --- The reachable-from-main gate -------------------------------------------

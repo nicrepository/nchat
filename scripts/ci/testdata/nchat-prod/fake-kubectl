@@ -30,6 +30,22 @@
 #                        pod; a pod-env-<slot>/<KEY> overrides it for one slot,
 #                        which is how a stale slot is modelled
 #   exec-log             every exec attempt
+#   release-state/<KEY>  the nchat-release-state ConfigMap, one file per data
+#                        key; written by `apply -f -` and read whole by the
+#                        go-template form, so a recorded cutover is visible to
+#                        the next preparation. The directory being absent is
+#                        the ConfigMap not existing; present but empty is a
+#                        ConfigMap with empty `data`
+#   release-state-read-fails  "1" makes every read of that ConfigMap fail with
+#                        a server error that is not NotFound
+#   release-state-exists-fails "1" makes only the `-o name` existence probe
+#                        fail, which is the read that separates "no ConfigMap"
+#                        from "ConfigMap with empty data"
+#   release-state-write-fails "1" makes `apply -f -` of that ConfigMap fail, as
+#                        a refused write
+#   scale-log            every `scale` target, and the rollout record of the
+#                        scaled Deployment is rewritten to the new replica
+#                        count
 set -Eeuo pipefail
 
 STATE="${FAKE_STATE_DIR:?FAKE_STATE_DIR is required}"
@@ -176,9 +192,27 @@ if [[ "${1:-}" == "exec" ]]; then
   exit 1
 fi
 
-# kubectl scale deployment/<name> ...
+# kubectl scale deployment/<name> --replicas=N
+#
+# The replica count is written back into the rollout record, not just logged.
+# A drain is only meaningful if the next read sees the new desired count: with
+# a log-only fake, "the slot is scaled to zero" could never be proved and could
+# never be seen to fail.
 if [[ "${1:-}" == "scale" ]]; then
   printf '%s\n' "$2" >>"$STATE/scale-log"
+  scaled="${2#deployment/}"
+  # Found by scanning the arguments, not by `${*##*--replicas=}`: bash applies
+  # a pattern removal on `$*` to each positional parameter separately and then
+  # joins, so that spelling silently yielded the first word of the command.
+  replicas=""
+  for arg in "$@"; do
+    [[ "$arg" == --replicas=* ]] && replicas="${arg#--replicas=}"
+  done
+  if [[ -f "$STATE/ready/$scaled" && "$replicas" =~ ^[0-9]+$ ]]; then
+    read -r generation observed _ _ _ _ _ <"$STATE/ready/$scaled"
+    printf '%s %s %s %s %s %s 0\n' "$generation" "$observed" \
+      "$replicas" "$replicas" "$replicas" "$replicas" >"$STATE/ready/$scaled"
+  fi
   echo "$2 scaled"
   exit 0
 fi
@@ -436,6 +470,30 @@ if [[ "${1:-}" == "get" && "${2:-}" == "jobs" ]]; then
   exit 0
 fi
 
+# kubectl apply -f -
+#
+# The release record arrives this way, as the document `create --dry-run`
+# rendered. Storing it per key is what makes a write observable to the next
+# read, so a test can prove that a cutover recorded a reservation and that a
+# preparation carried one forward.
+if [[ "${1:-}" == "apply" && "${2:-}" == "-f" && "${3:-}" == "-" ]]; then
+  document="$(cat)"
+  printf 'apply -f -\n' >>"$STATE/apply-log"
+  if [[ "$document" == *"kind: ConfigMap"* && "$(read_state release-state-write-fails)" == "1" ]]; then
+    echo "Error from server (Forbidden): configmaps \"nchat-release-state\" is forbidden" >&2
+    exit 1
+  fi
+  if [[ "$document" == *"kind: ConfigMap"* ]]; then
+    mkdir -p "$STATE/release-state"
+    while IFS= read -r line; do
+      [[ "$line" =~ ^\ \ ([a-z_]+):\ \"(.*)\"$ ]] || continue
+      printf '%s' "${BASH_REMATCH[2]}" >"$STATE/release-state/${BASH_REMATCH[1]}"
+    done <<<"$document"
+  fi
+  echo "configured"
+  exit 0
+fi
+
 if [[ "${1:-}" == "apply" ]]; then
   printf '%s\n' "$*" >>"$STATE/apply-log"
   # Keep what was applied, not just that something was. The manifests are
@@ -477,6 +535,67 @@ if [[ "${1:-}" == "rollout" ]]; then
   printf '%s\n' "$*" >>"$STATE/rollout-log"
   [[ "$(read_state rollout-fails)" != "1" ]] || exit 1
   echo "rollout complete"
+  exit 0
+fi
+
+# The release lifecycle record (issue #933), read whole.
+#
+# Three outcomes, kept apart, because the code under test exists to tell them
+# apart and a fake that collapsed them would make that untestable:
+#
+#   release-state/ absent          the ConfigMap does not exist
+#   release-state/ present         the ConfigMap exists; its files are `data`
+#   release-state-read-fails=1     the read itself failed
+#
+# `--ignore-not-found` is honoured exactly as kubectl honours it: exit 0 and
+# no output for a missing object, so "not there" and "there but empty" produce
+# the same text and only `-o name` can separate them. That is precisely the
+# ambiguity release_state_read has to navigate, so the fake reproduces it
+# rather than smoothing it over.
+#
+# A read failure is a non-zero exit with a message that is NOT NotFound, which
+# is what an unreachable API, an expired credential or a refused permission
+# looks like.
+if [[ "${1:-}" == "get" && "${2:-}" == "configmap" && "$*" == *"nchat-release-state"* ]]; then
+  if [[ "$(read_state release-state-read-fails)" == "1" ]]; then
+    echo "Error from server (InternalError): an error on the server has prevented the request from succeeding" >&2
+    exit 1
+  fi
+  if [[ "$(read_state release-state-exists-fails)" == "1" && "$*" == *"-o name"* ]]; then
+    echo "Error from server (InternalError): an error on the server has prevented the request from succeeding" >&2
+    exit 1
+  fi
+  if [[ ! -d "$STATE/release-state" ]]; then
+    # --ignore-not-found: kubectl says nothing and succeeds.
+    [[ "$*" == *"--ignore-not-found"* ]] || { echo "Error from server (NotFound)" >&2; exit 1; }
+    exit 0
+  fi
+  # `-o name` is how a caller distinguishes an existing-but-empty ConfigMap
+  # from a missing one; the go-template render cannot.
+  if [[ "$*" == *"-o name"* ]]; then
+    echo "configmap/nchat-release-state"
+    exit 0
+  fi
+  for entry in "$STATE"/release-state/*; do
+    [[ -e "$entry" ]] || break
+    printf '%s=%s\n' "$(basename "$entry")" "$(cat "$entry")"
+  done
+  exit 0
+fi
+
+# kubectl create configmap <name> --from-literal=k=v ... --dry-run=client -o yaml
+#
+# Rendered, never applied: release-state.sh pipes this into `kubectl apply -f -`
+# so that no value is ever interpolated into a manifest. The rendering here is
+# only as good as it needs to be -- the values in this record are slots, SHAs,
+# run ids and RFC3339 instants, none of which contain a quote.
+if [[ "${1:-}" == "create" && "${2:-}" == "configmap" ]]; then
+  printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\ndata:\n' "$3"
+  for arg in "$@"; do
+    [[ "$arg" == --from-literal=* ]] || continue
+    pair="${arg#--from-literal=}"
+    printf '  %s: "%s"\n' "${pair%%=*}" "${pair#*=}"
+  done
   exit 0
 fi
 

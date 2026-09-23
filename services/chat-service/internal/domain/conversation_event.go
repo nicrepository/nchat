@@ -104,6 +104,13 @@ type ConversationEventUser struct {
 // own columns, TargetUsers (see its own doc comment for why that one field
 // carries a name), or something it must resolve through an authorized read.
 type ConversationEventPayload struct {
+	// CreatedConversationEventID is internal create-result metadata. It is never
+	// persisted in an event payload or exposed by HTTP; the message store clears
+	// it after transferring the value to Message.CreatedConversationEventID.
+	CreatedConversationEventID string   `json:"_created_conversation_event_id,omitempty"`
+	AutoAddedMemberIDs         []string `json:"_auto_added_member_ids,omitempty"`
+	MemberCount                int      `json:"_member_count,omitempty"`
+
 	// conversation_renamed
 	OldName string `json:"old_name,omitempty"`
 	NewName string `json:"new_name,omitempty"`

@@ -59,14 +59,22 @@ const MentionList = forwardRef<MentionListRef, MentionListProps>(
       );
     }
 
+    const hasOutsidePeople = items.some((item) => item.mentionType === "user" && item.willBeAdded);
+    const section = (item: MentionCandidate) =>
+      item.mentionType === "user" ? (item.willBeAdded ? "outside" : "people") : item.mentionType;
+
     return (
       <div className="mention-list" role="listbox" aria-label="Sugestões de menção">
         {items.map((item, index) => (
           <Fragment key={`${item.mentionType}:${item.id}`}>
-            {(index === 0 || items[index - 1].mentionType !== item.mentionType) && (
+            {(index === 0 || section(items[index - 1]) !== section(item)) && (
               <div className="mention-list__heading" role="presentation">
                 {item.mentionType === "user"
-                  ? "Pessoas"
+                  ? item.willBeAdded
+                    ? "Fora da conversa"
+                    : hasOutsidePeople
+                      ? "Nesta conversa"
+                      : "Pessoas"
                   : item.mentionType === "channel"
                     ? "Canais"
                     : "Especial"}
@@ -90,6 +98,9 @@ const MentionList = forwardRef<MentionListRef, MentionListProps>(
                 {item.mentionType === "channel" ? "#" : "@"}
               </span>
               <span className="mention-list__label">{item.label}</span>
+              {item.willBeAdded && (
+                <span className="mention-list__add-hint">Será adicionada ao enviar</span>
+              )}
               {index === selectedIndex && (
                 <span
                   className="material-symbols-outlined mention-list__selected"

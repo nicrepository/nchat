@@ -96,6 +96,8 @@ export interface WSMessagePayload {
    * the client that reads it.
    */
   link_safety_state?: unknown;
+  /** Issue #807 per-link entities, the same shape the HTTP contract carries. */
+  links?: unknown;
   /**
    * The author's stated priority (issue #821): standard, important or urgent.
    * Typed unknown because it is a value this client classifies rather than
@@ -261,6 +263,24 @@ export interface WSMessageLinkSafetyChangedEvent {
   };
 }
 
+/**
+ * One link of a published message changed state (issue #807): its safety, what
+ * the reader may do with it, or its preview. The payload is the link entity
+ * for one target; the reducer patches every occurrence of that URL. Validated
+ * by the same decoder the HTTP path uses, so an unknown value never becomes an
+ * anchor.
+ */
+export interface WSMessageLinkUpdatedEvent {
+  type: "message.link_updated";
+  target_type: "channel" | "dm";
+  target_id: string;
+  message_id: string;
+  link_update: {
+    message_id: string;
+    link: unknown;
+  };
+}
+
 export interface WSMessageUpdatedEvent {
   type: "message.updated";
   target_type: "channel" | "dm";
@@ -274,6 +294,8 @@ export interface WSMessageUpdatedEvent {
     body: string;
     body_format: "v1" | "v2" | "v3";
     link_safety_state?: unknown;
+    /** Issue #807: the edited body's link entities. */
+    links?: unknown;
     edited_at: string;
     edit_count: number;
     is_edited: boolean;
@@ -318,6 +340,19 @@ function isLinkSafetyPayload(d: Record<string, unknown>): boolean {
     payload["message_id"] === d["message_id"] &&
     typeof payload["state"] === "string" &&
     typeof payload["updated_at"] === "string"
+  );
+}
+
+/** A link-update frame must carry a block that names the frame's own message. */
+function isLinkUpdatePayload(d: Record<string, unknown>): boolean {
+  const update = d["link_update"];
+  if (!update || typeof update !== "object") return false;
+  const payload = update as Record<string, unknown>;
+  return (
+    typeof payload["message_id"] === "string" &&
+    payload["message_id"] === d["message_id"] &&
+    typeof payload["link"] === "object" &&
+    payload["link"] !== null
   );
 }
 
@@ -500,6 +535,8 @@ interface UseChatWebSocketOptions {
   onMessageCreated: (event: WSMessageCreatedEvent) => void;
   onMessageBlocked?: (event: WSMessageBlockedEvent) => void;
   onMessageLinkSafetyChanged?: (event: WSMessageLinkSafetyChangedEvent) => void;
+  /** Issue #807: one link of a message the reader holds changed state. */
+  onMessageLinkUpdated?: (event: WSMessageLinkUpdatedEvent) => void;
   onMessageUpdated?: (event: WSMessageUpdatedEvent) => void;
   onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
   onTypingUpdated?: (event: WSTypingUpdatedEvent) => void;
@@ -550,6 +587,7 @@ export function useChatWebSocket({
   onMessageCreated,
   onMessageBlocked,
   onMessageLinkSafetyChanged,
+  onMessageLinkUpdated,
   onMessageUpdated,
   onReactionUpdated,
   onTypingUpdated,
@@ -584,6 +622,7 @@ export function useChatWebSocket({
   const onMessageRef = useRef(onMessageCreated);
   const onMessageBlockedRef = useRef(onMessageBlocked);
   const onLinkSafetyRef = useRef(onMessageLinkSafetyChanged);
+  const onLinkUpdatedRef = useRef(onMessageLinkUpdated);
   const onMessageUpdatedRef = useRef(onMessageUpdated);
   const onReactionRef = useRef(onReactionUpdated);
   const onTypingRef = useRef(onTypingUpdated);
@@ -611,6 +650,7 @@ export function useChatWebSocket({
     onMessageRef.current = onMessageCreated;
     onMessageBlockedRef.current = onMessageBlocked;
     onLinkSafetyRef.current = onMessageLinkSafetyChanged;
+    onLinkUpdatedRef.current = onMessageLinkUpdated;
     onMessageUpdatedRef.current = onMessageUpdated;
     onReactionRef.current = onReactionUpdated;
     onTypingRef.current = onTypingUpdated;
@@ -764,13 +804,23 @@ export function useChatWebSocket({
       return true;
     }
 
-    function routeClientError(d: Record<string, unknown>, generation: number): boolean {
+    function routeClientError(
+      control: SubscriptionControl,
+      d: Record<string, unknown>,
+      generation: number,
+      incoming: IncomingTarget,
+    ): boolean {
       if (d["type"] !== "error" || typeof d["code"] !== "string") return false;
       const clientError = d as unknown as WSClientErrorEvent;
       if (d["operation"] !== "subscribe") {
         onReactionErrorRef.current?.(clientError);
         return true;
       }
+      // Older servers did not identify a failed subscription, so retain their
+      // conservative handling. Newer frames are target-scoped: an additional
+      // sidebar subscription must not make the currently open conversation
+      // appear disconnected.
+      if (incoming.type && !control.expected.has(incoming.key)) return true;
       onSubscriptionErrorRef.current?.(clientError);
       if (d["code"] === "room_subscription_unavailable" && handle?.isOpen()) {
         scheduleSubscriptionRecovery(generation);
@@ -810,12 +860,7 @@ export function useChatWebSocket({
       d: Record<string, unknown>,
       incoming: IncomingTarget,
     ): boolean {
-      if (d["type"] === "message.link_safety_changed" && typeof d["message_id"] === "string") {
-        if (isLinkSafetyPayload(d)) {
-          onLinkSafetyRef.current?.(incoming.data as unknown as WSMessageLinkSafetyChangedEvent);
-        }
-        return true;
-      }
+      if (routeLinkSafetyEvent(d, incoming)) return true;
       if (d["type"] === "message.created") {
         onMessageRef.current(incoming.data as unknown as WSMessageCreatedEvent);
         return true;
@@ -826,6 +871,29 @@ export function useChatWebSocket({
       }
       if (routeAcknowledgementUpdated(d, incoming)) return true;
       return routeConversationEvent(d, incoming);
+    }
+
+    /**
+     * RF-21 and issue #807: the aggregate correction and the per-link update,
+     * both about one message. A frame naming no message has nothing to apply
+     * to; a malformed block is dropped rather than handed on.
+     */
+    function routeLinkSafetyEvent(d: Record<string, unknown>, incoming: IncomingTarget): boolean {
+      const type = d["type"];
+      const aboutOne = typeof d["message_id"] === "string";
+      if (type === "message.link_safety_changed" && aboutOne) {
+        if (isLinkSafetyPayload(d)) {
+          onLinkSafetyRef.current?.(incoming.data as unknown as WSMessageLinkSafetyChangedEvent);
+        }
+        return true;
+      }
+      if (type === "message.link_updated" && aboutOne) {
+        if (isLinkUpdatePayload(d)) {
+          onLinkUpdatedRef.current?.(incoming.data as unknown as WSMessageLinkUpdatedEvent);
+        }
+        return true;
+      }
+      return false;
     }
 
     /**
@@ -950,7 +1018,7 @@ export function useChatWebSocket({
         if (!control) return;
         const incoming = incomingTarget(d);
         if (routeSubscriptionAck(control, d, incoming)) return;
-        if (routeClientError(d, generation)) return;
+        if (routeClientError(control, d, generation, incoming)) return;
         if (routeUnscopedEvent(d, incoming)) return;
         if (!control.expected.has(incoming.key)) return;
         if (routeSubscribedTargetEvent(d, incoming)) return;

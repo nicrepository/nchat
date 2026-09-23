@@ -25,6 +25,7 @@ import type { Channel, ChannelDetails, DMConversation, Message } from "./chatTyp
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
 import { emptyEmojiUsage } from "./emoji/emojiUsage";
 import MessageBubble from "./MessageBubble";
+import { inertDirectMessage } from "./directMessage";
 import { _resetPresenceStore } from "./presence";
 import type { ConversationDetailsState } from "./useConversationDetails";
 
@@ -242,6 +243,7 @@ function channelDetails(): ChannelDetails {
     slug: "geral",
     name: "geral",
     type: "public",
+    description: "",
     createdAt: "2026-01-01T00:00:00Z",
     memberCount: 3,
     onlineCount: 1,
@@ -254,6 +256,7 @@ function channelDetails(): ChannelDetails {
       },
     ],
     canManageMembers: false,
+    canRemoveMembers: false,
   };
 }
 
@@ -267,6 +270,13 @@ function detailsStateFor(userId: string): ConversationDetailsState {
   return {
     details: { status: "ready", data: { kind: "channel", ...data } },
     files: { status: "ready", data: [] },
+    roster: {
+      status: "ready",
+      data: {
+        memberCount: 1,
+        members: [{ userId, displayName: "Juliane Lino", role: "member" }],
+      },
+    },
     reload: () => {},
   };
 }
@@ -328,6 +338,130 @@ describe("channel details member list", () => {
     expect(screen.getByText(/Membro · Offline/)).toBeInTheDocument();
     // And the dot carries a hover tooltip with the same word.
     expect(screen.getByTestId("presence-dot")).toHaveAttribute("title", "Offline");
+  });
+});
+
+// ── roster ordering (issue #895) ─────────────────────────────────────────────
+
+/**
+ * The group roster reorders itself as presence moves, and stays the same set of
+ * people while it does.
+ *
+ * Delivered through the fake socket rather than by poking the store, so what is
+ * proved is that a live frame reaches the ordering — the reason the section
+ * subscribes to the whole snapshot instead of letting each row ask separately.
+ */
+describe("group participant roster follows presence", () => {
+  const conversationId = "group-1";
+
+  /** The open-DM capability, so the rows are the activatable kind. */
+  const openDM = { coordinator: inertDirectMessage, origin: "presence-surfaces" };
+
+  function renderRoster() {
+    return render(
+      <MemoryRouter>
+        <ConversationDetailsPanel
+          kind="group"
+          state={{
+            details: {
+              status: "ready",
+              data: {
+                kind: "group",
+                id: conversationId,
+                name: "Time de Infra",
+                description: "",
+                createdAt: "2026-01-01T00:00:00Z",
+                participantCount: 3,
+                participants: [
+                  { userId: "user-ana", displayName: "Ana" },
+                  { userId: "user-bruno", displayName: "Bruno" },
+                  { userId: "user-carla", displayName: "Carla" },
+                ],
+                canManageMembers: false,
+                canRemoveMembers: false,
+              },
+            },
+            files: { status: "ready", data: [] },
+            roster: { status: "loading" },
+            reload: () => {},
+          }}
+          currentUserId="user-self"
+          latestPin={null}
+          openDM={openDM}
+          onClose={() => {}}
+        />
+      </MemoryRouter>,
+    );
+  }
+
+  function rosterNames(): (string | null)[] {
+    return within(screen.getByRole("list", { name: "Participantes do grupo" }))
+      .getAllByRole("listitem")
+      .map((row) => within(row).getByText(/^(Ana|Bruno|Carla)$/).textContent);
+  }
+
+  function presenceIn(userId: string, state: string, updatedAt: string) {
+    return {
+      type: "presence.updated",
+      target_type: "dm",
+      target_id: conversationId,
+      presence: { user_id: userId, state, updated_at: updatedAt },
+    };
+  }
+
+  it("promotes whoever the server says is online, without losing or duplicating anyone", () => {
+    renderRoster();
+    openSocket();
+
+    // Nothing reported yet: the deterministic fallback alone.
+    expect(rosterNames()).toEqual(["Ana", "Bruno", "Carla"]);
+
+    deliver(presenceIn("user-carla", "online", T1));
+    deliver(presenceIn("user-bruno", "away", T1));
+
+    // online, then away, then the two nobody has reported — by name.
+    expect(rosterNames()).toEqual(["Carla", "Bruno", "Ana"]);
+
+    deliver(presenceIn("user-carla", "offline", T2));
+
+    // Offline is the only claim of absence, so Carla goes last — below the
+    // person nobody has said anything about at all.
+    expect(rosterNames()).toEqual(["Bruno", "Ana", "Carla"]);
+    // Three people throughout: reordering is not a membership change.
+    expect(rosterNames()).toHaveLength(3);
+  });
+
+  it("states the new status in words beside the dot", () => {
+    renderRoster();
+    openSocket();
+    deliver(presenceIn("user-ana", "away", T1));
+
+    expect(screen.getByText(/Participante · Ausente/)).toBeInTheDocument();
+    // The other two have had nothing said about them and claim nothing.
+    expect(screen.getAllByText("Participante")).toHaveLength(2);
+    expect(screen.getAllByTestId("presence-dot")).toHaveLength(1);
+  });
+
+  it("carries the live status into the row's accessible name", () => {
+    renderRoster();
+    openSocket();
+
+    // Before the server answers, the name is the action and the role only: a
+    // status nobody has established is not announced as one.
+    expect(
+      screen.getByRole("button", { name: "Abrir conversa com Ana. Participante" }),
+    ).toBeInTheDocument();
+
+    deliver(presenceIn("user-ana", "away", T1));
+
+    // Naming the action must not cost the information the visible row gives, so
+    // the word the row gained is in the announced name too.
+    expect(
+      screen.getByRole("button", { name: "Abrir conversa com Ana. Participante, Ausente" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Abrir conversa com Ana. Participante" }),
+    ).not.toBeInTheDocument();
   });
 });
 

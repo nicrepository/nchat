@@ -561,10 +561,8 @@ func TestMemberService_RemoveMemberFromChannel_GuestRoleDenied(t *testing.T) {
 	}
 }
 
-// Adding and removing the same channel_members row are the same authority, so
-// the moderator RF-74 created reaches both. The assertion is against
-// domain.CanManageChannelMembers itself, not a second role list: the route must
-// consult the named predicate and nothing stricter above it.
+// Removal deliberately remains on the pre-#705 management predicate. The route
+// must consult that predicate and never inherit CanAddChannelMembers.
 func TestMemberService_RemoveMemberFromChannel_FollowsCanManageChannelMembers(t *testing.T) {
 	for _, role := range []domain.WorkspaceRole{
 		domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin, domain.WorkspaceRoleModerator,
@@ -955,4 +953,27 @@ func TestFakeMemberStore_GeneralMembershipMirrorsTheStoreForGuests(t *testing.T)
 			t.Fatal("sync removed a guest's explicit #geral membership")
 		}
 	})
+}
+
+// The minus control must never be a second way out (issue #469). A manager
+// naming themselves is leaving, and Leave is the operation that says so — the
+// store would happily delete the same row and write "removeu" into the
+// timeline about the person who actually left.
+func TestMemberService_RemoveMemberFromChannel_RefusesSelfRemoval(t *testing.T) {
+	ms := newFakeMemberStore()
+	ch := domain.Channel{ID: "ch-1", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
+	ws := domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusActive}
+	ms.workspaceMembers[wmKey("ws-1", "owner-1")] = domain.WorkspaceMember{
+		WorkspaceID: "ws-1", UserID: "owner-1", Role: domain.WorkspaceRoleOwner, Status: domain.MemberStatusActive,
+	}
+	ms.channelMembers[cmKey("ch-1", "owner-1")] = domain.ChannelMember{ChannelID: "ch-1", UserID: "owner-1", Role: domain.ChannelRoleMember}
+	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{workspace: ws})
+
+	_, err := svc.RemoveMemberFromChannel(context.Background(), "ws-1", "ch-1", "owner-1", "owner-1")
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("self-removal should be ErrInvalidInput, got: %v", err)
+	}
+	if _, ok := ms.channelMembers[cmKey("ch-1", "owner-1")]; !ok {
+		t.Fatal("a refused self-removal deleted the caller's own membership")
+	}
 }

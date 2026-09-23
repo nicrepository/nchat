@@ -120,9 +120,31 @@ type Config struct {
 	// nil checker means one thing and one thing only — the flag is false — so
 	// there is no state in which the service runs believing the check is on
 	// while nothing is being checked.
-	LinkSafetyEnabled           bool
+	LinkSafetyEnabled bool
+	// LinkSafetyGoogleWebRiskKey is the primary reputation source (issue #928).
+	//
+	// Google Web Risk answers the question RF-21 actually asks — "do the malware
+	// and social-engineering lists name this URL?" — synchronously, and answers
+	// it for ordinary URLs. Cloudflare URL Scanner, which used to be the only
+	// source, is a scanner: it is entitled to decline, and in production it did,
+	// leaving perfectly ordinary links permanently interstitial because this
+	// system correctly refuses to read "no verdict" as a clearance.
+	//
+	// Required whenever the feature is on, for the reason the Cloudflare
+	// credentials are: a primary that cannot be built is a security control that
+	// is silently absent. Never logged, echoed in an error, or sent to a client.
+	LinkSafetyGoogleWebRiskKey  string
 	LinkSafetyCloudflareAccount string
 	LinkSafetyCloudflareToken   string
+
+	// LinkPreviewEnabled gates rich previews (issue #807): the server-side
+	// fetch of a cleared URL's Open Graph metadata and image. Off by default,
+	// because on it makes this service open outbound connections to hosts users
+	// named. Independent of LinkSafetyEnabled: safety decides what may be
+	// clicked and fetched; this decides only whether the fetch happens. Off, safe
+	// links stay clickable, no preview is queued, stored cards are not served
+	// and queued work drains as failed.
+	LinkPreviewEnabled bool
 
 	// What this deployment is willing to spend at the provider (RF-21 capacity).
 	//
@@ -183,12 +205,14 @@ type Config struct {
 	ConversationNotificationLevelsEnabled bool
 
 	linkSafetyEnabledInvalid                     bool
+	linkPreviewEnabledInvalid                    bool
 	conversationNotificationLevelsEnabledInvalid bool
 }
 
 func Load() Config {
 	wsDefaults := ws.DefaultHandlerConfig()
 	linkSafetyEnabled, linkSafetyEnabledInvalid := configuredBool("CHAT_LINK_SAFETY_ENABLED", false)
+	linkPreviewEnabled, linkPreviewEnabledInvalid := configuredBool("CHAT_LINK_PREVIEW_ENABLED", false)
 	notificationLevelsEnabled, notificationLevelsInvalid := configuredBool(
 		"CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED", false)
 	return Config{
@@ -220,13 +244,16 @@ func Load() Config {
 		TypingRateLimitWindowSeconds: getPositiveInt(
 			"TYPING_RATE_LIMIT_WINDOW_SECONDS", defaultTypingRateLimitWindowSecs,
 		),
-		ValkeyWSBroadcastEnabled:    platformconfig.GetBool("VALKEY_WS_BROADCAST_ENABLED", false),
-		WSInstanceID:                sanitizeWSInstanceID(platformconfig.GetString("WS_INSTANCE_ID", "")),
-		WSMaxConnectionsPerUser:     getPositiveInt("WS_MAX_CONNECTIONS_PER_USER", wsDefaults.MaxConnectionsPerUser),
-		WSInboundMessagesPerMinute:  getPositiveInt("WS_INBOUND_MESSAGES_PER_MINUTE", wsDefaults.InboundMessagesPerMinute),
-		WSInboundBurst:              getPositiveInt("WS_INBOUND_BURST", wsDefaults.InboundBurst),
-		WSMaxInvalidMessages:        getPositiveInt("WS_MAX_INVALID_MESSAGES", wsDefaults.MaxInvalidMessages),
-		LinkSafetyEnabled:           linkSafetyEnabled,
+		ValkeyWSBroadcastEnabled:   platformconfig.GetBool("VALKEY_WS_BROADCAST_ENABLED", false),
+		WSInstanceID:               sanitizeWSInstanceID(platformconfig.GetString("WS_INSTANCE_ID", "")),
+		WSMaxConnectionsPerUser:    getPositiveInt("WS_MAX_CONNECTIONS_PER_USER", wsDefaults.MaxConnectionsPerUser),
+		WSInboundMessagesPerMinute: getPositiveInt("WS_INBOUND_MESSAGES_PER_MINUTE", wsDefaults.InboundMessagesPerMinute),
+		WSInboundBurst:             getPositiveInt("WS_INBOUND_BURST", wsDefaults.InboundBurst),
+		WSMaxInvalidMessages:       getPositiveInt("WS_MAX_INVALID_MESSAGES", wsDefaults.MaxInvalidMessages),
+		LinkSafetyEnabled:          linkSafetyEnabled,
+		LinkPreviewEnabled:         linkPreviewEnabled,
+		// Never logged, echoed in an error, or sent to a client.
+		LinkSafetyGoogleWebRiskKey:  platformconfig.GetString("CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY", ""),
 		LinkSafetyCloudflareAccount: platformconfig.GetString("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", ""),
 		// Never logged, echoed in an error, or sent to a client.
 		LinkSafetyCloudflareToken: platformconfig.GetString("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", ""),
@@ -243,6 +270,7 @@ func Load() Config {
 		ConversationNotificationLevelsEnabled: notificationLevelsEnabled,
 
 		linkSafetyEnabledInvalid:                     linkSafetyEnabledInvalid,
+		linkPreviewEnabledInvalid:                    linkPreviewEnabledInvalid,
 		conversationNotificationLevelsEnabledInvalid: notificationLevelsInvalid,
 	}
 }
@@ -287,6 +315,9 @@ func (c Config) validateLinkSafety() error {
 	if c.linkSafetyEnabledInvalid {
 		return errors.New("CHAT_LINK_SAFETY_ENABLED must be a valid boolean")
 	}
+	if c.linkPreviewEnabledInvalid {
+		return errors.New("CHAT_LINK_PREVIEW_ENABLED must be a valid boolean")
+	}
 	// A typo in the rollout gate must not read as "off" *or* as "on": the first
 	// would hide a deliberate enablement, the second would open a writer nobody
 	// asked to open. Refusing to start is the only answer that cannot be
@@ -297,6 +328,20 @@ func (c Config) validateLinkSafety() error {
 	if !c.LinkSafetyEnabled {
 		return nil
 	}
+	// The primary. There is no reading of "enabled with no primary": the
+	// composition would degrade to Cloudflare alone, which is the configuration
+	// issue #928 exists to replace, and it would do so without a symptom other
+	// than links staying interstitial.
+	if c.LinkSafetyGoogleWebRiskKey == "" {
+		return errors.New("CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY is required when CHAT_LINK_SAFETY_ENABLED is true")
+	}
+	// The fallback, and it is required rather than optional — the explicit
+	// choice issue #928 §6 asks for, made the way every other credential on this
+	// path is made. A deployment that could start with a primary and no fallback
+	// would have two meanings for the same state: "we chose Web Risk only" and
+	// "the Cloudflare secret failed to mount", and nothing distinguishes them at
+	// run time except links that quietly stop resolving whenever Web Risk is
+	// down. Refusing to start names the second one immediately.
 	if c.LinkSafetyCloudflareAccount == "" {
 		return errors.New("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID is required when CHAT_LINK_SAFETY_ENABLED is true")
 	}

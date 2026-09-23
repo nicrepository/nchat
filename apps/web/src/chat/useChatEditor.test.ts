@@ -64,6 +64,22 @@ describe("useChatEditor — initial state", () => {
   });
 });
 
+describe("useChatEditor — native undo", () => {
+  it("lets Ctrl+Z undo typing in the rich-text composer", async () => {
+    const { result } = renderHook(() => useChatEditor(defaults));
+    await waitForEditor(result);
+
+    act(() => {
+      result.current.editor!.commands.insertContent("Olá mundo teste");
+      result.current.editor!.view.dom.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }),
+      );
+    });
+
+    expect(result.current.editor!.getText()).toBe("");
+  });
+});
+
 describe("useChatEditor — canSend guard", () => {
   it("handleSend does nothing when canSend=false (empty editor)", async () => {
     const { result } = renderHook(() => useChatEditor(defaults));
@@ -388,5 +404,115 @@ describe("useChatEditor — bodyFormat switch on the same mounted composer", () 
         id: "channel-a",
       }),
     );
+  });
+});
+
+// ── Clearing exactly what was sent (issue #875) ───────────────────────────────
+
+/**
+ * The editor owns its own text, so "may I clear it?" is a question only the
+ * document can answer: has *it* changed since this send was submitted? Issue
+ * #875: the composer used to ask the conversation's draft instead, and the
+ * draft is bumped by reply/attachment/voice mutations too — so consuming the
+ * reply a message answered read as "the reader typed something new" and the
+ * text that had just been sent stayed on screen.
+ */
+describe("useChatEditor — clearing exactly what was sent (issue #875)", () => {
+  it("clears the sent text when the document did not change while the send was in flight", async () => {
+    let resolveSend!: (result: SendResult) => void;
+    mockOnSend.mockReturnValue(new Promise<SendResult>((resolve) => (resolveSend = resolve)));
+    const { result } = renderHook(() => useChatEditor(defaults));
+    await waitForEditor(result);
+    await fill(result, "mensagem enviada");
+
+    const sendPromise = result.current.handleSend();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      resolveSend({ status: "sent" });
+      await sendPromise;
+    });
+
+    expect(result.current.editor?.getText()).toBe("");
+  });
+
+  it("leaves the editor alone when the document itself changed while the send was in flight", async () => {
+    let resolveSend!: (result: SendResult) => void;
+    mockOnSend.mockReturnValue(new Promise<SendResult>((resolve) => (resolveSend = resolve)));
+    const { result } = renderHook(() => useChatEditor(defaults));
+    await waitForEditor(result);
+    await fill(result, "A");
+
+    const sendPromise = result.current.handleSend();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // The reader starts the next message before A's acknowledgement lands.
+    act(() => {
+      result.current.editor!.commands.insertContent("B");
+    });
+
+    await act(async () => {
+      resolveSend({ status: "sent" });
+      await sendPromise;
+    });
+
+    expect(result.current.editor?.getText()).toContain("B");
+  });
+});
+
+describe("useChatEditor — reconciling with the draft (issue #929, review)", () => {
+  const textDoc = (text: string) => ({
+    type: "doc",
+    content: [{ type: "paragraph", content: [{ type: "text", text }] }],
+  });
+
+  it("empties the document without reporting an edit or activity, and canSend follows", async () => {
+    const onTextChange = vi.fn();
+    const onActivity = vi.fn();
+    const { result } = renderHook(() => useChatEditor({ ...defaults, onTextChange, onActivity }));
+    await waitForEditor(result);
+    await fill(result, "T1");
+    onTextChange.mockClear();
+    onActivity.mockClear();
+
+    act(() => result.current.reconcileContent(null));
+
+    await waitFor(() => expect(result.current.canSend).toBe(false));
+    expect(result.current.editor?.getText()).toBe("");
+    expect(onTextChange).not.toHaveBeenCalled();
+    expect(onActivity).not.toHaveBeenCalled();
+  });
+
+  it("shows the draft's text when it differs, and leaves a document that already matches alone", async () => {
+    const onTextChange = vi.fn();
+    const { result } = renderHook(() => useChatEditor({ ...defaults, onTextChange }));
+    await waitForEditor(result);
+    await fill(result, "T1");
+    onTextChange.mockClear();
+
+    act(() => result.current.reconcileContent(textDoc("T2")));
+    expect(result.current.editor?.getText()).toBe("T2");
+    expect(onTextChange).not.toHaveBeenCalled();
+
+    // Same document again: no transaction, so an undo history and a cursor
+    // the reader is in the middle of are not disturbed.
+    const before = result.current.editor!.state;
+    act(() => result.current.reconcileContent(result.current.editor!.getJSON()));
+    expect(result.current.editor!.state).toBe(before);
+  });
+
+  it("is a no-op on an empty document asked to become empty", async () => {
+    const { result } = renderHook(() => useChatEditor(defaults));
+    await waitForEditor(result);
+    const before = result.current.editor!.state;
+
+    act(() => result.current.reconcileContent(null));
+
+    expect(result.current.editor!.state).toBe(before);
+    expect(result.current.canSend).toBe(false);
   });
 });

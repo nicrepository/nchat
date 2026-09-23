@@ -1,0 +1,214 @@
+name: Production / Rollback
+
+# Return production traffic to a named slot, during an incident (issues #801,
+# #933).
+#
+# Independent of the release pipeline on purpose. It shares no job, no output
+# and no artifact with CD / Prepare Production or Production / Cutover, so a
+# broken release pipeline -- which is very often why a rollback is needed --
+# cannot take the rollback down with it. All it needs is this repository, the
+# production runner and a cluster to read.
+#
+# The target is the operator's and is never derived. That is the one place this
+# deliberately differs from the cutover, and it is not an oversight: a rollback
+# runs under pressure and may be run twice, and a destination computed from the
+# state it is about to change would send production, on the second run, back to
+# the release it had just been rescued from. Named, a second run converges on
+# the same slot. A partial rollback is finished by running this again with the
+# same target, never by choosing the other one.
+#
+# It runs no build, no migration and no `migrate down`. Rolling back an
+# application is a selector change; rolling back a database is not, and the
+# release contract -- migrations stay compatible with the previous slot -- is
+# what makes the first possible without the second. That contract is checked
+# here, before anything moves, and a schema that has moved past the target
+# release blocks the rollback with the incident procedure named rather than
+# serving requests against a schema the target cannot use.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_slot:
+        description: The slot to return production traffic to.
+        required: true
+        type: choice
+        options:
+          - blue
+          - green
+      reason:
+        description: Why production is being rolled back. Recorded in the release log.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# The shared production mutation lock, the same group candidate preparation and
+# cutover take. A rollback stays available during an incident, but "available"
+# does not mean "may run beside a cutover": it waits for the lock like
+# everything else that mutates nchat-prod, and a run holding it is a run whose
+# effect on the selectors this one would otherwise be racing.
+#
+# cancel-in-progress must be the boolean false: cancelling a rollback part-way
+# through the Service patches leaves production mixed, during an incident.
+concurrency:
+  group: nchat-prod-release-mutation
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: Return traffic to the named slot
+    runs-on: [self-hosted, linux, x64, nchat-prod-deploy]
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      # Both inputs are untrusted strings, and they are validated before either
+      # reaches a command.
+      #
+      # `target_slot` is a choice input, but a choice is a form affordance and
+      # not an enforcement boundary -- the API accepts any string for it -- so
+      # it is matched against the allowlist here as well, and require_target_slot
+      # inside every script matches it a third time.
+      #
+      # `reason` is free text and is never executed, never interpolated into a
+      # command line, and never written into a GitHub command file. It is
+      # constrained to a single line of printable ASCII: a newline in it could
+      # forge lines in a step summary, and a control character could forge
+      # terminal output in the log an operator reads during the incident. It
+      # reaches rollback.sh as a quoted argument and nothing else.
+      - name: Validate the request
+        env:
+          TARGET_SLOT: ${{ inputs.target_slot }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$TARGET_SLOT" == blue || "$TARGET_SLOT" == green ]]
+          [[ -n "$REASON" ]] || { echo "a reason is required" >&2; exit 1; }
+          [[ "${#REASON}" -le 200 ]] || { echo "the reason must be at most 200 characters" >&2; exit 1; }
+          [[ "$REASON" =~ ^[[:print:]]+$ ]] ||
+            { echo "the reason must be one line of printable characters" >&2; exit 1; }
+      - name: Checkout main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      # Context, namespace, promotable selectors, target readiness and one
+      # consistent release on the target -- all before any mutation. It also
+      # reports the release currently in front of the target, which is the
+      # other end of the schema comparison below.
+      - name: Revalidate the rollback target
+        id: target
+        env:
+          TARGET_SLOT: ${{ inputs.target_slot }}
+          SELECTORS_BEFORE: ${{ runner.temp }}/stable-selectors-before.txt
+        run: |
+          set -euo pipefail
+          scripts/deploy/nchat-prod/rollback-preflight.sh \
+            --target "$TARGET_SLOT" "$SELECTORS_BEFORE" >>"$GITHUB_OUTPUT"
+      # "Target Ready" and "the database can still serve it" are different
+      # properties and the second is the one that gets assumed. Every migration
+      # added between the two releases must be expand-only; a contract-phase
+      # operation among them means the target's code depends on a shape the
+      # schema no longer has, and the rollback is refused rather than serving
+      # users a release the database has moved past.
+      - name: Prove the schema still serves the target release
+        id: schema
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.target_release_sha }}
+          FROM_SHA: ${{ steps.target.outputs.from_release_sha }}
+        run: scripts/deploy/nchat-prod/rollback-schema-gate.sh "$TARGET_SHA" "$FROM_SHA"
+      # The mutation, and the only one. The reason is passed as a quoted
+      # argument from the environment; nothing builds a command string from it.
+      - name: Return traffic to the target slot
+        id: revert
+        env:
+          TARGET_SLOT: ${{ inputs.target_slot }}
+          REASON: ${{ inputs.reason }}
+          NCHAT_PROD_ASSUME_YES: "1"
+        run: scripts/deploy/nchat-prod/rollback.sh --target "$TARGET_SLOT" "$REASON"
+      # Read and print, assert nothing, and run whenever the rollback was
+      # reached at all. A rollback that stopped part-way is the run whose
+      # after-state matters most, and it is exactly the run in which a single
+      # asserting step would never execute.
+      - name: Record the stable Services after the rollback
+        if: ${{ !cancelled() && (steps.revert.conclusion == 'success' || steps.revert.conclusion == 'failure') }}
+        env:
+          SELECTORS_AFTER: ${{ runner.temp }}/stable-selectors-after.txt
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/deploy/nchat-prod/lib.sh
+          source scripts/deploy/nchat-prod/lib.sh
+          collect_service_slots >"$SELECTORS_AFTER"
+          echo "stable Service selectors after the rollback:"
+          cat "$SELECTORS_AFTER"
+      # Mixed state fails explicitly. There is no spelling of partial success
+      # that passes here, and the remedy is this same workflow with this same
+      # target, never the other slot.
+      - name: Prove every stable Service converged on the target
+        env:
+          TARGET_SLOT: ${{ inputs.target_slot }}
+          SELECTORS_AFTER: ${{ runner.temp }}/stable-selectors-after.txt
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/deploy/nchat-prod/lib.sh
+          source scripts/deploy/nchat-prod/lib.sh
+          all_services_on_slot "$(cat "$SELECTORS_AFTER")" "$TARGET_SLOT" || {
+            echo "Production is mixed. Re-run this workflow with the same target ($TARGET_SLOT)." >&2
+            exit 1
+          }
+          echo "Every stable Service selects slot $TARGET_SLOT."
+      # The state, recalculated rather than assumed. A rollback makes the
+      # target active and creates no new reservation: the slot that just
+      # stopped serving is under investigation, and offering it as a one-click
+      # rollback target would offer a path straight back into the incident.
+      - name: Record the rollback
+        env:
+          TARGET_SLOT: ${{ inputs.target_slot }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/deploy/nchat-prod/lib.sh
+          source scripts/deploy/nchat-prod/lib.sh
+          # shellcheck source=scripts/deploy/nchat-prod/release-state.sh
+          source scripts/deploy/nchat-prod/release-state.sh
+          record_rollback "$TARGET_SLOT"
+      - name: Post-rollback smoke
+        id: smoke
+        env:
+          TARGET_SLOT: ${{ inputs.target_slot }}
+        run: scripts/deploy/nchat-prod/record-traffic-smoke.sh --target "$TARGET_SLOT" --after rollback
+      # The audit record. The reason is written through an environment
+      # variable into a single table cell, after the validation above proved it
+      # is one line of printable characters -- a newline here would forge rows
+      # in the summary an incident review reads.
+      - name: Publish the rollback summary
+        if: ${{ !cancelled() && steps.revert.conclusion != '' && steps.revert.conclusion != 'skipped' }}
+        env:
+          FROM_SLOT: ${{ steps.target.outputs.from_slot }}
+          TARGET_SLOT: ${{ inputs.target_slot }}
+          TARGET_RELEASE: ${{ steps.target.outputs.target_release }}
+          REASON: ${{ inputs.reason }}
+          REVERT_RESULT: ${{ steps.revert.conclusion }}
+          SCHEMA_RESULT: ${{ steps.schema.conclusion }}
+          SMOKE_RESULT: ${{ steps.smoke.conclusion }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Production Rollback"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| From | \`$FROM_SLOT\` |"
+            echo "| To | \`$TARGET_SLOT\` |"
+            echo "| Target release | \`$TARGET_RELEASE\` |"
+            printf '| Reason | %s |\n' "$REASON"
+            echo "| Schema compatibility | ${SCHEMA_RESULT:-not reached} |"
+            echo "| Selector patch | $REVERT_RESULT |"
+            echo "| Post-rollback smoke | ${SMOKE_RESULT:-not reached} |"
+            echo
+            echo "No build, no image publication and no migration ran in this workflow."
+            echo "Slot \`$FROM_SLOT\` is left running for investigation; capture its logs and"
+            echo "events before anything else touches it."
+          } >>"$GITHUB_STEP_SUMMARY"

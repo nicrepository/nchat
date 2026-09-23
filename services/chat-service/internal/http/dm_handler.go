@@ -150,24 +150,36 @@ type groupParticipantJSON struct {
 
 // groupDetailsResponse is the panel payload for a group conversation.
 //
-// Deliberately absent, because a group is not a channel: there is no
-// visibility (public/private), no slug, no category and no description. The
-// domain has none of them for chat.dm_conversations, so none is invented here.
+// Deliberately absent, because a group is not a channel: there is no visibility
+// (public/private), no slug and no category. The domain has none of them for
+// chat.dm_conversations, so none is invented here.
+//
+// description and creator_display_name are the About block's metadata
+// (issue #894), on the same terms as the channel payload's: both omitted rather
+// than sent empty, absence meaning "there is none", and the creator carried as
+// a name with no identifier beside it.
 //
 // participant_count is every active participant; participants is the capped
 // preview and its length must never be shown as the count.
 type groupDetailsResponse struct {
-	ID               string                 `json:"id"`
-	Type             string                 `json:"type"`
-	Name             string                 `json:"name"`
-	CreatedAt        string                 `json:"created_at"`
-	ParticipantCount int                    `json:"participant_count"`
-	Participants     []groupParticipantJSON `json:"participants"`
+	ID                 string                 `json:"id"`
+	Type               string                 `json:"type"`
+	Name               string                 `json:"name"`
+	Description        string                 `json:"description,omitempty"`
+	CreatorDisplayName string                 `json:"creator_display_name,omitempty"`
+	CreatedAt          string                 `json:"created_at"`
+	ParticipantCount   int                    `json:"participant_count"`
+	Participants       []groupParticipantJSON `json:"participants"`
 	// CanManageMembers (issue #398) is always sent, so a client that predates it
 	// reads absent-as-false and hides the add action — the safe direction. It is
 	// a rendering hint: POST .../members re-derives the decision in its own
 	// transaction.
 	CanManageMembers bool `json:"can_manage_members"`
+	// CanRemoveMembers (issue #469) is sent for the same reason and read the
+	// same way, and it is a genuinely different answer: adding is open to every
+	// participant, removing is the creator's alone. A client that folded the
+	// two would offer an action the store refuses.
+	CanRemoveMembers bool `json:"can_remove_members"`
 }
 
 // GroupDetails handles GET /api/chat/dm/{conversationID}/details.
@@ -235,13 +247,16 @@ func (h *DMHandler) groupDetailsBody(workspaceID string, details service.GroupDe
 		})
 	}
 	return groupDetailsResponse{
-		ID:               details.Conversation.ID,
-		Type:             string(details.Conversation.Type),
-		Name:             details.Conversation.Title,
-		CreatedAt:        details.Conversation.CreatedAt.UTC().Format(time.RFC3339),
-		ParticipantCount: details.ParticipantCount,
-		Participants:     participants,
-		CanManageMembers: details.CanManageMembers,
+		ID:                 details.Conversation.ID,
+		Type:               string(details.Conversation.Type),
+		Name:               details.Conversation.Title,
+		Description:        details.About.Description,
+		CreatorDisplayName: details.About.CreatorDisplayName,
+		CreatedAt:          details.Conversation.CreatedAt.UTC().Format(time.RFC3339),
+		ParticipantCount:   details.ParticipantCount,
+		Participants:       participants,
+		CanManageMembers:   details.CanManageMembers,
+		CanRemoveMembers:   details.CanRemoveMembers,
 	}
 }
 

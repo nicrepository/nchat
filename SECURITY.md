@@ -50,6 +50,27 @@ Falsos positivos devem ser tratados explicitamente:
 4. Registrar qualquer ignore com escopo minimo e motivo.
 5. Nunca ignorar silenciosamente.
 
+Os ignores vivem em arquivos versionados, um por scanner:
+
+- Trivy: `.trivyignore.yaml`.
+- govulncheck: `.govulncheckignore.yaml`.
+
+Os dois exigem o mesmo de cada entrada: um id exato, o motivo, a issue de
+acompanhamento e um `expired_at`. Nao existe wildcard e nao existe ignore por
+modulo — um advisory que nao esteja listado reprova o gate, e um advisory
+listado volta a reprovar assim que a data passa, para que a excecao seja
+revisitada em vez de herdada.
+
+Para Go a decisao de aprovacao pertence a `scripts/security/govulncheck_gate.py`,
+nao ao codigo de saida do govulncheck: o gate reprova qualquer vulnerabilidade
+_alcancada pelo nosso codigo_ que nao esteja aceita, e imprime quais aceitou.
+`scripts/security/test_govulncheck_gate.py` cobre justamente que aceitar um
+advisory nao carrega nenhum outro junto.
+
+Uma excecao mitiga o impacto alcancavel; ela nao faz a vulnerabilidade upstream
+desaparecer. O texto da entrada deve dizer o que foi mitigado e o que continua
+valendo.
+
 ## Modelo de confianca do Repository governance
 
 O workflow `Repository governance` usa o evento `pull_request`. Pull Requests
@@ -73,6 +94,58 @@ Nao use `pull_request_target` com checkout ou execucao de codigo nao confiavel
 apenas para tentar resolver essa limitacao. Mudancas futuras que aumentem
 permissoes, adicionem secrets ou alterem este modelo de confianca exigem nova
 Security Review.
+
+## Modelo de confianca do CD de producao (issue #933)
+
+Tres workflows podem tocar `nchat-prod`, e apenas dois deles mudam trafego:
+
+| Workflow                    | Trigger             | Muda selector? |
+| --------------------------- | ------------------- | -------------- |
+| `cd-prepare-production.yml` | `workflow_run`      | nao            |
+| `cutover-nchat-prod.yml`    | `workflow_dispatch` | sim            |
+| `rollback-nchat-prod.yml`   | `workflow_dispatch` | sim            |
+
+O boundary e o pre-job guard host-side do runner de producao
+(`scripts/deploy/nchat-prod/runner-job-guard.sh`), instalado como copia
+root-owned fora do alcance do runner. Ele autoriza exatamente tres contextos,
+comparados como um todo — arquivo do workflow, ref e evento juntos — e recusa
+qualquer combinacao cruzada.
+
+**Preparacao roda a partir da default branch.** Um handler `workflow_run`
+sempre executa a copia do proprio YAML que esta na default branch (`develop`);
+o GitHub nao oferece forma de roda-lo a partir de `main`. A concessao e
+limitada: os scripts que aquele workflow executa vem do commit de release que
+ele faz checkout, que esta em `main` e passou por `CI / Required`, e a
+preparacao nao move trafego nenhum. Cutover e rollback continuam sendo
+`workflow_dispatch` a partir de `main`, e so.
+
+**Identidades separadas (issue #714).** O collector de capacidade roda em um
+runner proprio (`nchat-prod-capacity`) com um contexto read-only cluster-wide;
+o deployer de producao continua namespaced e continua respondendo `no` a
+`get nodes` e a `get pods --all-namespaces`. Nenhuma das duas identidades tem o
+alcance da outra, e o collector nao le kubeconfig de producao nem Secret algum.
+A evidencia trafega como artifact do run e e validada por schema, freshness,
+namespace, checksums e caminho antes de ser usada; ausencia ou inconsistencia
+reprova o deploy. O checksum detecta truncamento e edicao acidental — **nao** e
+autenticidade, e o documento de runbook diz isso explicitamente.
+
+**Estado do ciclo de vida.** O ConfigMap `nchat-release-state` em `nchat-prod`
+registra candidate, cutover e reserva de rollback. E uma **afirmacao**, nunca
+uma autorizacao: todo consumidor revalida contra o cluster e recusa quando os
+dois discordam. O registro pode tornar uma operacao permitida em recusada;
+nunca o contrario. Nao guarda segredo algum.
+
+**Inputs de `workflow_dispatch` sao nao confiaveis.** `target_slot` e validado
+contra allowlist no workflow e novamente em cada script; `reason` nunca e
+executado, nunca compoe linha de comando e e limitado a uma linha de ASCII
+imprimivel, para que nao possa forjar linhas no step summary lido em revisao de
+incidente.
+
+Nenhum job de CD declara `id-token: write`, nenhum imprime kubeconfig, token ou
+DSN, e nenhum publica artifact contendo credencial. Toda action de terceiro e
+pinada por commit SHA e todo checkout de producao usa
+`persist-credentials: false`. Mudancas que ampliem permissoes, adicionem
+secrets ou alterem este modelo de confianca exigem nova Security Review.
 
 ## TLS dev/staging
 
@@ -183,9 +256,15 @@ Consequencias deliberadas para o Guest:
   o isolamento seria contornavel em uma requisicao;
 - **nao** cria canal (`domain.CanCreateChannel`), re-verificado no proprio
   `INSERT`;
-- **nao** e adicionado automaticamente a `#geral`; chega la sendo adicionado,
-  como a qualquer outro canal. O backfill `SyncGeneralMemberships` deixou de
-  criar essas linhas e nunca remove as existentes.
+- **nao** e adicionado automaticamente a `#geral`: `generalMembershipRoles`
+  exclui guest, tanto no sync individual quanto no backfill. Uma row explicita
+  existente (legada ou administrativa) pode satisfazer o predicate de
+  visibilidade, mantidas as demais condicoes de acesso; o sync nao a remove.
+  O fluxo de `MemberService.AddChannelMembers` no chat-service rejeita
+  `is_general`. Ha um caminho administrativo distinto: a API do admin-service,
+  com `admin.channels.manage`, chama `PGXChannelDirectoryStore.AddChannelMembers`,
+  que admite alvos elegiveis sem recusar `is_general`, inclusive guest.
+  Esta e a descricao CURRENT; a consolidacao futura pertence a #882.
 
 Canal privado continua exigindo membership de canal para **todos** os papeis:
 nem owner, nem admin, nem moderador leem um canal privado do qual nao
@@ -618,9 +697,13 @@ O scan em si e assincrono (RF-22) e falha fechada em todas as direcoes:
 ## Regras para fetch de conteudo externo
 
 Vale para toda requisicao de saida cujo destino e escolhido, direta ou
-indiretamente, por um usuario. Hoje o unico caso e o preview de links por Open
-Graph (RF-10) no file-service; a regra e permanente e vale para qualquer feature
-futura com a mesma forma.
+indiretamente, por um usuario. Hoje sao dois casos, ambos sobre o mesmo fetcher
+(`libs/go/platform/linkfetch`): o preview de links por Open Graph (RF-10) no
+file-service e os rich previews de mensagens no chat-service (issue #807), que
+so buscam uma URL depois de um verdict `safe` explicito e nunca entregam ao
+browser um asset remoto — a `og:image` vira thumbnail derivado servido pelo
+NChat. A regra e permanente e vale para qualquer feature futura com a mesma
+forma.
 
 - O destino e julgado pelo **endereco IP que a conexao vai usar**, nunca pelo
   hostname. Resolver, verificar **todas** as respostas e conectar ao endereco ja

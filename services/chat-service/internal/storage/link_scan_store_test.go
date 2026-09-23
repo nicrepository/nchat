@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"slices"
 	"strings"
 	"testing"
@@ -56,15 +57,20 @@ func TestProjectionPredicateExcludesPendingOutright(t *testing.T) {
 // value written by a newer version, or a hand-edited database cannot clear a
 // message. Asserted here because it is a one-line guard that is easy to lose.
 func TestOnlyFinalVerdictsAreLoadable(t *testing.T) {
-	for _, status := range []string{"", "pending", "unknown", "SAFE", "future"} {
+	for _, status := range []string{"", "pending", "SAFE", "future"} {
 		if verdictIsLoadable(status) {
 			t.Fatalf("%q was accepted as a verdict", status)
 		}
 	}
-	for _, status := range []string{"safe", "malicious"} {
+	for _, status := range []string{"safe", "malicious", "inconclusive", "unknown"} {
 		if !verdictIsLoadable(status) {
 			t.Fatalf("%q was rejected as a verdict", status)
 		}
+	}
+	// The issue #807 terminal-without-clearance status reaches the decision
+	// layer as the same fact inconclusive is: decided, and never a clearance.
+	if loadableVerdict("unknown") != urlsafety.VerdictInconclusive || loadableVerdict("safe") != urlsafety.VerdictSafe {
+		t.Fatal("loadableVerdict must fold unknown onto inconclusive and keep the rest")
 	}
 }
 

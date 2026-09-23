@@ -83,3 +83,14 @@ export function goToBottomAccessibleName(pendingCount: number): string {
   if (pendingCount <= 0) return "Ir para o final da conversa";
   return `Ir para o final da conversa, ${formatPendingCount(pendingCount)} novas mensagens`;
 }
+
+/**
+ * The same control, when what it offers is the unread boundary (#880 item 10).
+ *
+ * A different destination deserves a different name: pressing it does not take
+ * the reader to the end, it takes them to the first message they have not read
+ * — and a screen reader announcing "ir para o final" for that would be wrong.
+ */
+export function goToFirstUnreadAccessibleName(unreadCount: number): string {
+  return `Começar pelas ${formatPendingCount(unreadCount)} novas mensagens`;
+}

@@ -171,8 +171,14 @@ type Scanner interface {
 // part that must not differ between them.
 type Service struct {
 	scanner Scanner
-	cache   *cache
-	metrics *Metrics
+	// provider is the provider-agnostic contract (issue #807). It is the same
+	// object as scanner when the adapter implements both, and it is what Check
+	// drives; Submit and Poll remain for the file-service queue that still
+	// speaks the two-step shape directly.
+	provider URLReputationProvider
+	breaker  *Breaker
+	cache    *cache
+	metrics  *Metrics
 }
 
 // NewService wraps a provider with the shared cache and metrics. metrics may be
@@ -184,7 +190,193 @@ func NewService(scanner Scanner, metrics *Metrics) *Service {
 // newService is NewService with the clock supplied, so a test can drive expiry
 // without sleeping.
 func newService(scanner Scanner, metrics *Metrics, now func() time.Time) *Service {
-	return &Service{scanner: scanner, cache: newCache(maxCacheEntries, now), metrics: metrics}
+	service := &Service{scanner: scanner, cache: newCache(maxCacheEntries, now), metrics: metrics}
+	if provider, ok := scanner.(URLReputationProvider); ok {
+		service.provider = provider
+	}
+	service.breaker = newBreaker(0, 0, now)
+	return service
+}
+
+// NewReputationService wraps a provider that speaks only the provider-agnostic
+// contract. Submit and Poll on the result report ErrUnavailable: there is no
+// two-step shape to drive.
+func NewReputationService(provider URLReputationProvider, metrics *Metrics) *Service {
+	service := newService(nil, metrics, time.Now)
+	service.provider = provider
+	return service
+}
+
+// NewFallbackService is the composition issue #928 adopted: a synchronous
+// primary reputation source, with the Cloudflare scanner behind it.
+//
+// The two roles are separate and both are kept, which is the whole reason this
+// is a constructor rather than a setter:
+//
+//   - provider becomes the composition, so Check asks the primary first and
+//     falls back only when the primary has no answer to act on;
+//   - scanner stays the Cloudflare client itself, because the submit-then-poll
+//     half of this package is not part of the reputation contract and must not
+//     be routed through a composition. Reconcile, FindRecentScan and
+//     GetScanReport all recover a scan *this deployment created at Cloudflare*,
+//     and there is no such thing at the primary — a lookup leaves nothing to
+//     find. Pointing them at the composition would have silently disabled the
+//     recovery path that issue #135 exists for.
+func NewFallbackService(
+	primary URLReputationProvider, secondary *CloudflareScanner, metrics *Metrics,
+) *Service {
+	service := newService(secondary, metrics, time.Now)
+	service.provider = NewPrimaryFallbackProvider(primary, secondary, metrics)
+	return service
+}
+
+// SetBreaker replaces the circuit breaker, so a deployment can tune the
+// threshold and cooldown. nil restores the default.
+func (s *Service) SetBreaker(breaker *Breaker) {
+	if breaker == nil {
+		breaker = NewBreaker(0, 0)
+	}
+	s.breaker = breaker
+}
+
+// CircuitState reports the breaker's position for the pipeline gauge.
+func (s *Service) CircuitState() BreakerState {
+	return s.breaker.State()
+}
+
+// Check is the provider-agnostic exchange (issue #807): the circuit breaker in
+// front, the strict verdict rules behind, and the cache updated from the answer.
+//
+// Outcomes, in the vocabulary the pipeline persists:
+//
+//   - a terminal result (safe, malicious, unknown) is returned with a nil error.
+//     Safe and malicious are cached for VerdictTTL; unknown is not, because the
+//     cache here is a clearance shortcut and unknown is not a clearance;
+//   - ErrCheckInProgress carries the ref to persist and hand back next time;
+//   - ErrUnavailable — including ErrCircuitOpen — is a failed exchange. It is
+//     cached as a failure for FailureTTL and retried by the caller's schedule.
+//
+// A caller going away is reported as its own error and neither cached nor
+// counted: the breaker sees it as neutral, which releases the probe it may
+// have been. A deadline elapsing on the provider is a failure, like a timeout.
+func (s *Service) Check(ctx context.Context, canonicalURL, providerRef string) (ReputationResult, error) {
+	if s.provider == nil {
+		s.observe(resultError)
+		return ReputationResult{}, ErrUnavailable
+	}
+	if !s.breaker.Allow() {
+		s.observe(resultCircuitOpen)
+		return ReputationResult{}, ErrCircuitOpen
+	}
+	result, err := s.provider.Check(ctx, canonicalURL, providerRef)
+	// Exactly one settlement per admitted exchange, decided before any return.
+	s.breaker.Complete(breakerOutcome(ctx, err))
+	if ctx.Err() != nil {
+		return ReputationResult{}, ctx.Err()
+	}
+	return s.settleCheck(canonicalURL, result, err)
+}
+
+// settleCheck records what a completed exchange means for the cache and the
+// counter, and refuses any result that is not one of the three known verdicts.
+func (s *Service) settleCheck(canonicalURL string, result ReputationResult, err error) (ReputationResult, error) {
+	switch {
+	case errors.Is(err, ErrCheckInProgress):
+		s.observe(resultPending)
+		return result, err
+	case err != nil:
+		s.cache.set(canonicalURL, VerdictUnknown, FailureTTL)
+		s.observe(resultError)
+		return ReputationResult{}, ErrUnavailable
+	}
+	switch result.Verdict {
+	case ReputationSafe, ReputationMalicious:
+		s.cache.set(canonicalURL, result.Verdict.LegacyVerdict(), s.evidenceLifetime(result))
+		s.observe(string(result.Verdict))
+		return result, nil
+	case ReputationUnknown:
+		s.observe(resultInconclusive)
+		return result, nil
+	default:
+		// A provider that returned neither an error nor a known verdict has a
+		// bug, and a bug is never a clearance.
+		s.cache.set(canonicalURL, VerdictUnknown, FailureTTL)
+		s.observe(resultError)
+		return ReputationResult{}, ErrUnavailable
+	}
+}
+
+// evidenceLifetime is how long one provider answer may be reused: VerdictTTL,
+// or less when the provider stated a shorter limit (issue #928).
+//
+// The shorter of the two, always, and never the longer. VerdictTTL is what this
+// deployment is willing to reuse; ExpiresAt is what the provider is willing to
+// stand behind. Exceeding either would be reusing evidence somebody has already
+// said is finished.
+//
+// A non-positive result is a caller's answer that is already expired, and
+// cache.set refuses it — an entry that cannot be served is not written.
+func (s *Service) evidenceLifetime(result ReputationResult) time.Duration {
+	if result.ExpiresAt.IsZero() {
+		return VerdictTTL
+	}
+	stated := result.ExpiresAt.Sub(s.cache.now())
+	if stated < VerdictTTL {
+		return stated
+	}
+	return VerdictTTL
+}
+
+// ErrSecondaryUnsupported reports a provider with no second source to ask. It
+// is a working deployment: there is simply no background verification to run.
+var ErrSecondaryUnsupported = errors.New("url safety: provider has no secondary source")
+
+// secondaryChecker is the optional half a composed provider exposes.
+type secondaryChecker interface {
+	CheckSecondary(ctx context.Context, canonicalURL, providerRef string) (ReputationResult, error)
+}
+
+// CheckSecondary asks the secondary source about a URL the primary already
+// decided (issue #928).
+//
+// The cache rule here is the whole reason this is not Check, and it is
+// deliberately asymmetric:
+//
+//   - a condemnation is written to the cache, because it must displace the
+//     clearance that is sitting there. Without it, Lookup would keep answering
+//     "safe" for the rest of VerdictTTL about a URL this deployment has just
+//     decided is malicious;
+//   - a clearance, a terminal non-answer and every failure write nothing. The
+//     primary's answer is already cached, it is still the verdict of record, and
+//     a second opinion that agreed, abstained or could not be obtained has
+//     changed nothing about it. In particular a failure must not cache
+//     VerdictUnknown the way a failed Check does — that would erase a live
+//     clearance because a background double-check timed out.
+func (s *Service) CheckSecondary(
+	ctx context.Context, canonicalURL, providerRef string,
+) (ReputationResult, error) {
+	verifier, ok := s.provider.(secondaryChecker)
+	if !ok {
+		return ReputationResult{}, ErrSecondaryUnsupported
+	}
+	if !s.breaker.Allow() {
+		s.observe(resultCircuitOpen)
+		return ReputationResult{}, ErrCircuitOpen
+	}
+	result, err := verifier.CheckSecondary(ctx, canonicalURL, providerRef)
+	s.breaker.Complete(breakerOutcome(ctx, err))
+	if ctx.Err() != nil {
+		return ReputationResult{}, ctx.Err()
+	}
+	if err != nil {
+		s.observe(resultError)
+		return ReputationResult{}, err
+	}
+	if result.Verdict == ReputationMalicious {
+		s.cache.set(canonicalURL, VerdictMalicious, s.evidenceLifetime(result))
+	}
+	s.observe(string(result.Verdict))
+	return result, nil
 }
 
 // Lookup answers from memory only, and never blocks.
@@ -217,13 +409,24 @@ func (s *Service) Submit(ctx context.Context, canonicalURL string) (string, erro
 		s.observe(resultError)
 		return "", ErrUnavailable
 	}
+	if !s.breaker.Allow() {
+		s.observe(resultCircuitOpen)
+		return "", ErrCircuitOpen
+	}
 	scanID, err := s.scanner.SubmitScan(ctx, canonicalURL)
+	if err == nil && strings.TrimSpace(scanID) == "" {
+		// A submission without an id is a scan nobody can ever read: the
+		// provider did not answer usefully.
+		err = ErrUnavailable
+	}
+	// Exactly one settlement per admitted exchange, decided before any return.
+	s.breaker.Complete(breakerOutcome(ctx, err))
 	if ctx.Err() != nil {
 		// The caller going away is not a fact about the URL, so it is neither
 		// cached nor counted.
 		return "", ctx.Err()
 	}
-	if err != nil || strings.TrimSpace(scanID) == "" {
+	if err != nil {
 		s.cache.set(canonicalURL, VerdictUnknown, FailureTTL)
 		s.observe(resultError)
 		return "", ErrUnavailable
@@ -280,7 +483,14 @@ func (s *Service) Poll(ctx context.Context, canonicalURL, scanID string) (Verdic
 		s.observe(resultError)
 		return VerdictUnknown, ErrUnavailable
 	}
+	if !s.breaker.Allow() {
+		s.observe(resultCircuitOpen)
+		return VerdictUnknown, ErrCircuitOpen
+	}
 	verdict, err := s.scanner.GetScanResult(ctx, scanID)
+	// Exactly one settlement per admitted exchange, decided before any return.
+	// Pending and inconclusive are the provider working, not failing.
+	s.breaker.Complete(breakerOutcome(ctx, err))
 	if ctx.Err() != nil {
 		return VerdictUnknown, ctx.Err()
 	}

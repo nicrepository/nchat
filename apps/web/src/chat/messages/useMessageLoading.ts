@@ -1,12 +1,25 @@
 import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 
 import type { MessagePage } from "../chatTypes";
+import { ApiRequestError } from "../../lib/api";
 import { insertMessageChronologically } from "./messageOrder";
 import type { MessagesGateway } from "./messagesGateway";
 import type { ConversationScope } from "./useConversationScope";
 import type { ReactionTimers } from "./useReactionTimers";
 import { isAbortError, type RequestRegistry } from "./useRequestRegistry";
 import type { Action } from "./types";
+
+/**
+ * Issue #475: the backend deliberately answers a non-member with the same
+ * non-enumerating 404 it uses for an unknown id (see chat-service's
+ * mapServiceError), so a 404 on the conversation's own message page is this
+ * client's only signal that the real cause is "not a member", not "gone
+ * missing". Anything else (network, timeout, 5xx, or a 401 the auth client
+ * itself did not already recover from) keeps the existing generic error path.
+ */
+function isAccessDenied(error: unknown): boolean {
+  return error instanceof ApiRequestError && error.status === 404;
+}
 
 /**
  * The first page of a conversation, and the pages behind it.
@@ -114,7 +127,7 @@ export function useMessageLoading({
       (error: unknown) => {
         if (!scope.isCurrent(loadKey)) return;
         if (isAbortError(error)) return;
-        dispatch({ type: "error" });
+        dispatch({ type: isAccessDenied(error) ? "denied" : "error" });
       },
     );
 

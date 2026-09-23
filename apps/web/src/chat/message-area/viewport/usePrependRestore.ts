@@ -14,7 +14,6 @@ import type { Virtualizer } from "@tanstack/react-virtual";
 
 import type { LastMutation } from "../../useMessages";
 import type { Message } from "../../chatTypes";
-import type { ViewportPhase } from "../../chatViewportState";
 import {
   MAX_PREPEND_RESTORE_PASSES,
   prependRestoreStep,
@@ -25,7 +24,6 @@ import type { PrependRestore, ViewportCore } from "./useViewportCore";
 
 interface Params {
   core: ViewportCore;
-  phase: ViewportPhase;
   messages: Message[];
   lastMutation: LastMutation;
   resolved: boolean;
@@ -42,7 +40,7 @@ interface Params {
  * effects have to be registered after the row model it works against.
  */
 export function useRowResizeAdjustment(core: ViewportCore) {
-  const { prependRestoreRef, phaseRef } = core;
+  const { prependRestoreRef, navigationRef } = core;
   return useCallback(
     (
       item: { key: unknown; start: number; size: number },
@@ -65,9 +63,9 @@ export function useRowResizeAdjustment(core: ViewportCore) {
         // No per-row state of our own, and no second cache to keep in sync.
         isFirstMeasurement: !instance.itemSizeCache.has(item.key as never),
         restoring: prependRestoreRef.current !== null,
-        scrollingToEnd: phaseRef.current === "SCROLLING_TO_BOTTOM",
+        navigating: navigationRef.current !== null,
       }),
-    [prependRestoreRef, phaseRef],
+    [prependRestoreRef, navigationRef],
   );
 }
 
@@ -76,14 +74,8 @@ export function useRowResizeAdjustment(core: ViewportCore) {
  * in this order, and after the row model, because the mutation effect arms the
  * restoration that the pass effect consumes in the very same commit.
  */
-export function usePrependRestoreEffects({
-  core,
-  phase,
-  messages,
-  lastMutation,
-  resolved,
-}: Params) {
-  useMutationScroll(core, phase, messages, lastMutation, resolved);
+export function usePrependRestoreEffects({ core, messages, lastMutation, resolved }: Params) {
+  useMutationScroll(core, messages, lastMutation, resolved);
   useRestorePasses(core);
 }
 
@@ -99,6 +91,15 @@ export function usePrependRestoreEffects({
  *                there.
  * "none"       → no action (intermediate transition).
  *
+ * The dependency list is the mutation, and deliberately not the phase (#880).
+ * It used to include it, which meant every phase change re-ran this effect with
+ * whatever the last mutation had been — so a conversation whose last mutation
+ * was a prepend re-armed the restoration each time the phase moved, including
+ * the moment a trip to the end confirmed. That is one half of the two-writer
+ * race this issue fixes. The phase is still read, through the ref that is
+ * always current, because "was the reader at the end when this arrived" is a
+ * question about now rather than about the render that scheduled this.
+ *
  * prevScrollHeightRef is captured ONLY on stable mutations ("initial",
  * "append", "ws_append", "prepend") — never on "none". This prevents the
  * spinner's height from polluting the reference value used to compute the
@@ -108,7 +109,6 @@ export function usePrependRestoreEffects({
  */
 function useMutationScroll(
   core: ViewportCore,
-  phase: ViewportPhase,
   messages: Message[],
   lastMutation: LastMutation,
   resolved: boolean,
@@ -118,13 +118,13 @@ function useMutationScroll(
     if (!el) return;
     if (lastMutation === "prepend") {
       restorePrependedPosition(core, el);
-    } else if (resolved && lastMutation === "ws_append" && phase === "AT_BOTTOM") {
+    } else if (resolved && lastMutation === "ws_append" && core.phaseRef.current === "AT_BOTTOM") {
       scrollToBottom(core.bottomRef, "auto");
     }
     // Only snapshot scrollHeight in a stable state — not during "none"
     // transitions where the loading spinner may inflate the measurement.
     if (lastMutation !== "none") core.snapshotScrollHeight(el.scrollHeight);
-  }, [core, messages, lastMutation, resolved, phase]);
+  }, [core, messages, lastMutation, resolved]);
 }
 
 /**
@@ -264,13 +264,15 @@ function useRestorePasses(core: ViewportCore) {
  * Whether something outranks putting this reading position back.
  *
  * The pass ceiling is never the expected exit: every branch either finishes or
- * moves the viewport, and a move is what produces the next pass. An explicit
- * "take me to the end" does outrank it — the reader has just said they do not
- * want the old position any more, and two writers pulling in opposite
- * directions would leave them at neither end.
+ * moves the viewport, and a move is what produces the next pass. A programmatic
+ * navigation (#880) does outrank it — the reader has just said they do not want
+ * the old position any more, and two writers pulling in opposite directions is
+ * exactly what left them at neither end: a DEV capture of #880 has this
+ * restoration writing a stale anchor back 238px short of the tail, after the
+ * trip there had already been declared finished.
  */
 function isRestoreOutranked(core: ViewportCore, passes: number): boolean {
-  return passes > MAX_PREPEND_RESTORE_PASSES || core.phaseRef.current === "SCROLLING_TO_BOTTOM";
+  return passes > MAX_PREPEND_RESTORE_PASSES || core.navigationRef.current !== null;
 }
 
 /** Where this pass has to put the scrollport, measured against the real rows. */

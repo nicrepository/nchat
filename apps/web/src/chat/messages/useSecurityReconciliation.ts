@@ -5,8 +5,10 @@ import {
   reconcileMessageLinkSafety,
   type LinkSafetyStatus,
 } from "../chatApi";
-import type { LinkSafetyRecheck, Message } from "../chatTypes";
+import type { LinkSafetyRecheck, Message, MessageSecuritySnapshot } from "../chatTypes";
+import { findLinkOccurrence, isStaleLinkUpdate, type MessageLink } from "../messageLinks";
 import { blockedMessageReason } from "./composerReducer";
+import { isOlderSecurityVersion } from "./linkSafetyCorrections";
 import { batchMessageIds, type MessagesGateway } from "./messagesGateway";
 import type { AuthoritativeReads } from "./useAuthoritativeReads";
 import type { ConversationScope } from "./useConversationScope";
@@ -22,6 +24,8 @@ import type { Action } from "./types";
  * reconnect into an unbounded query.
  */
 const linkSafetyReconcileBatchSize = 100;
+
+type AvailableSnapshot = Extract<MessageSecuritySnapshot, { available: true }>;
 
 const pendingScanKey = "link-safety-reconcile";
 const securityRefreshKey = "message-security-refresh";
@@ -53,16 +57,96 @@ function applyLinkSafetyStatus(status: LinkSafetyStatus, sink: StatusSink): void
   });
 }
 
-/** Messages whose own or whose quote's links the server never resolved. */
+/** An aggregate marker the server may still change: unresolved, or a condemnation it may lift. */
+function markerCanMove(state: Message["linkSafetyState"] | undefined): boolean {
+  return state === "inconclusive" || state === "malicious";
+}
+
+/**
+ * Messages whose security state can still move: any with link entities (issue
+ * #807 — a pending link converges, a safe one may be revoked), plus the ones
+ * whose own or whose quote's aggregate marker the server never resolved or
+ * condemned — a condemnation lifted while this client was offline is what
+ * restores a withheld body or quote excerpt.
+ */
 function inconclusiveMessageIDs(messages: Message[]): string[] {
   return messages
     .filter(
       (message) =>
         message.status === "active" &&
-        (message.linkSafetyState === "inconclusive" ||
-          message.quoted?.linkSafetyState === "inconclusive"),
+        (Boolean(message.links?.length) ||
+          markerCanMove(message.linkSafetyState) ||
+          markerCanMove(message.quoted?.linkSafetyState)),
     )
     .map((message) => message.id);
+}
+
+/**
+ * Whether an authoritative snapshot reveals state this client cannot draw from
+ * what it holds (issue #807).
+ *
+ * The client never rebuilds text the server withheld. Three things therefore
+ * need the message re-read rather than patched: a link the snapshot condemns
+ * that this client still draws — the redacted body lives only on the read; a
+ * link this client holds redacted that the snapshot no longer condemns — the
+ * withheld text comes back only through the read; and a link this client holds
+ * redacted that a newer snapshot no longer lists at all — the occurrence was
+ * edited away offline, and the body that replaced it is likewise only on the
+ * read. The quote a message carries is the same: its excerpt was emptied on
+ * condemnation and only a read restores it. Occurrences are matched by
+ * identity, never by URL. Absence counts only from a snapshot at least as new
+ * as the drawn message — the same authority the reducer gives it over the
+ * occurrence set — so a snapshot read before a realtime update cannot fake a
+ * removal. A snapshot that merely agrees with what is drawn (safe still safe,
+ * blocked still blocked) costs no request.
+ */
+export function snapshotNeedsReread(
+  current: Message | undefined,
+  snapshot: MessageSecuritySnapshot,
+): boolean {
+  if (!snapshot.available || !current) return false;
+  const drawn = current.links ?? [];
+  const listed = snapshot.links ?? [];
+  const snapshotIsNewer = !isOlderSecurityVersion(snapshot.updatedAt, current.updatedAt);
+  return (
+    condemnationChanged(drawn, listed) ||
+    (snapshotIsNewer && heldRedactionRemoved(drawn, listed)) ||
+    quoteReleased(current, snapshot)
+  );
+}
+
+/** A snapshot occurrence whose condemnation differs from what is drawn, and is not stale. */
+function condemnationChanged(
+  drawn: readonly MessageLink[],
+  listed: readonly MessageLink[],
+): boolean {
+  return listed.some((link) => {
+    const held = findLinkOccurrence(drawn, link);
+    const condemns = link.safety === "malicious";
+    const holdsBlocked = held?.safety === "malicious";
+    return condemns !== holdsBlocked && !(held && isStaleLinkUpdate(link, held));
+  });
+}
+
+/** A redacted occurrence this client holds that the snapshot no longer lists. */
+function heldRedactionRemoved(
+  drawn: readonly MessageLink[],
+  listed: readonly MessageLink[],
+): boolean {
+  return drawn.some(
+    (held) => held.safety === "malicious" && findLinkOccurrence(listed, held) === undefined,
+  );
+}
+
+/** The quote's excerpt was withheld and the snapshot says its links are clear again. */
+function quoteReleased(current: Message, snapshot: AvailableSnapshot): boolean {
+  const quoted = current.quoted;
+  const snapshotQuote = snapshot.quoted;
+  if (!quoted || !snapshotQuote || snapshotQuote.messageId !== quoted.id) return false;
+  if (quoted.linkSafetyState !== "malicious" || snapshotQuote.linkSafetyState === "malicious") {
+    return false;
+  }
+  return !isOlderSecurityVersion(snapshotQuote.updatedAt, quoted.updatedAt ?? quoted.createdAt);
 }
 
 function referencingMessageIDs(messages: Message[]): string[] {
@@ -161,8 +245,16 @@ export function useSecurityReconciliation({
     ]).then(([snapshotResult, referenceResult]) => {
       fallbacks.finish(securityRefreshKey, controller);
       if (controller.signal.aborted || !scope.isCurrent(loadKey)) return;
+      const drawn = new Map(scope.messages().map((message) => [message.id, message]));
       if (snapshotResult.status === "fulfilled") {
+        // Decided against what was drawn *before* the snapshot is applied: the
+        // comparison is between the two states, and the read is what brings
+        // the body the snapshot cannot carry.
+        const rereads = snapshotResult.value
+          .filter((snapshot) => snapshotNeedsReread(drawn.get(snapshot.messageId), snapshot))
+          .map((snapshot) => snapshot.messageId);
         dispatch({ type: "security_snapshots_refreshed", snapshots: snapshotResult.value });
+        for (const messageId of rereads) readMessageSnapshot(messageId, false);
       }
       if (referenceIDs.length === 0) return;
       const references = referenceResult.status === "fulfilled" ? referenceResult.value : {};
@@ -176,7 +268,7 @@ export function useSecurityReconciliation({
         ),
       });
     });
-  }, [dispatch, fallbacks, gateway, scope]);
+  }, [dispatch, fallbacks, gateway, readMessageSnapshot, scope]);
 
   /**
    * "Verificar novamente": ask the server to take a second look at one message's

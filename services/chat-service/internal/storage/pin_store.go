@@ -182,6 +182,19 @@ func (s *PGXPinStore) ListPins(ctx context.Context, workspaceID, targetType, tar
 		FROM target_access a
 		JOIN pin_rows r ON TRUE
 		UNION ALL
+		-- One literal per column of r.* above (messageColumns + the four
+		-- sender columns + pinned_at/pinned_by_user_id/total_count), in the
+		-- same order and with matching types, so PostgreSQL accepts this as
+		-- the UNION's second arm. This is the row a caller with no visible
+		-- pins gets — including a non-member, whose authorized_pins CTE is
+		-- always empty by construction — so its "allowed" column is what
+		-- carries the ErrNotFound signal below; NOT EXISTS (SELECT 1 FROM
+		-- pin_rows) is the only thing this row exists to make true. Every
+		-- column messageColumns/listMessageColumns gains needs a matching
+		-- literal added here, in position, or this query fails outright with
+		-- a UNION column-count error (a real 500, not the ErrNotFound this
+		-- row is supposed to produce) for anyone this branch would otherwise
+		-- serve.
 		SELECT a.allowed, FALSE AS has_pin,
 			''::text, ''::text, ''::text, ''::text, ''::text,
 			'user'::text, ''::text, 'v1'::text, 'active'::text,
@@ -189,7 +202,9 @@ func (s *PGXPinStore) ListPins(ctx context.Context, workspaceID, targetType, tar
 			NULL::timestamptz, 0::integer, NULL::timestamptz,
 			'epoch'::timestamptz, 'epoch'::timestamptz,
 			''::text,
-			''::text, ''::text, FALSE,
+			''::text, '{}'::jsonb,
+			'standard'::text, FALSE, FALSE,
+			''::text, ''::text, ''::text, FALSE,
 			'epoch'::timestamptz, '00000000-0000-0000-0000-000000000000'::uuid, 0::bigint
 		FROM target_access a
 		WHERE NOT EXISTS (SELECT 1 FROM pin_rows)

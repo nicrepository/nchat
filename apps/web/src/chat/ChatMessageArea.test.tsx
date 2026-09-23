@@ -10,6 +10,13 @@ import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { MemoryRouter, Outlet, Route, Routes, useLocation, useNavigate } from "react-router";
 
+import SidebarDetailsPanel, { type SidebarDetailsTarget } from "./SidebarDetailsPanel";
+import {
+  useDirectMessageCoordinator,
+  useDirectMessageError,
+  type DirectMessageCoordinator,
+} from "./directMessage";
+
 import { ApiRequestError } from "../lib/api";
 
 import type {
@@ -25,10 +32,13 @@ import { flushResizeObservers, observedElements } from "../setupTests";
 import ChatMessageArea from "./ChatMessageArea";
 import { isCatalogedEmoji, loadEmojiCatalog, resetEmojiCatalogCache } from "./emoji/emojiCatalog";
 import { avatarColorFor } from "./messageDisplay";
-import type { Message, MessagePage } from "./chatTypes";
+import type { Message, MessagePage, MessageSecuritySnapshot } from "./chatTypes";
+import type { MessageLink } from "./messageLinks";
 import type {
   WSClientErrorEvent,
   WSMessageCreatedEvent,
+  WSMessageLinkSafetyChangedEvent,
+  WSMessageLinkUpdatedEvent,
   WSMessageUpdatedEvent,
   WSReactionUpdatedEvent,
   WSSubscribedEvent,
@@ -78,6 +88,7 @@ const {
   mockDeleteMessage,
   mockGetMessageHistory,
   mockFetchChannelDetails,
+  mockFetchChannelMembers,
   mockFetchGroupDetails,
   mockFetchDirectProfile,
   mockFetchChannelAttachments,
@@ -143,6 +154,7 @@ const {
   mockDeleteMessage: vi.fn<(messageId: string) => Promise<Message>>(),
   mockGetMessageHistory: vi.fn(),
   mockFetchChannelDetails: vi.fn(),
+  mockFetchChannelMembers: vi.fn(),
   mockFetchGroupDetails: vi.fn(),
   mockFetchDirectProfile: vi.fn(),
   mockFetchChannelAttachments: vi.fn(),
@@ -156,6 +168,8 @@ const {
   wsMockState: {
     capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
     capturedWSMessageUpdated: null as ((event: WSMessageUpdatedEvent) => void) | null,
+    capturedWSLinkUpdated: null as ((event: WSMessageLinkUpdatedEvent) => void) | null,
+    capturedWSLinkSafetyChanged: null as ((event: WSMessageLinkSafetyChangedEvent) => void) | null,
     capturedReactionUpdated: null as ((event: WSReactionUpdatedEvent) => void) | null,
     capturedReactionError: null as ((event: WSClientErrorEvent) => void) | null,
     capturedSubscribed: null as ((event: WSSubscribedEvent) => void) | null,
@@ -223,6 +237,8 @@ vi.mock("./chatApi", () => ({
   getMessageHistory: (...args: unknown[]) => mockGetMessageHistory(...args),
   fetchChannelDetails: (channelId: string, signal?: AbortSignal) =>
     mockFetchChannelDetails(channelId, signal),
+  fetchChannelMembers: (channelId: string, signal?: AbortSignal, cursor?: string) =>
+    mockFetchChannelMembers(channelId, signal, cursor),
   fetchGroupDetails: (conversationId: string, signal?: AbortSignal) =>
     mockFetchGroupDetails(conversationId, signal),
   fetchDirectProfile: (conversationId: string, signal?: AbortSignal) =>
@@ -253,6 +269,8 @@ vi.mock("./useChatWebSocket", () => ({
     ({
       onMessageCreated,
       onMessageUpdated,
+      onMessageLinkUpdated,
+      onMessageLinkSafetyChanged,
       onReactionUpdated,
       onReactionError,
       onSubscribed,
@@ -260,6 +278,8 @@ vi.mock("./useChatWebSocket", () => ({
     }: {
       onMessageCreated: (event: WSMessageCreatedEvent) => void;
       onMessageUpdated?: (event: WSMessageUpdatedEvent) => void;
+      onMessageLinkUpdated?: (event: WSMessageLinkUpdatedEvent) => void;
+      onMessageLinkSafetyChanged?: (event: WSMessageLinkSafetyChangedEvent) => void;
       onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
       onReactionError?: (event: WSClientErrorEvent) => void;
       onSubscribed?: (event: WSSubscribedEvent) => void;
@@ -267,6 +287,8 @@ vi.mock("./useChatWebSocket", () => ({
     }) => {
       wsMockState.capturedWSMessageCreated = onMessageCreated;
       wsMockState.capturedWSMessageUpdated = onMessageUpdated ?? null;
+      wsMockState.capturedWSLinkUpdated = onMessageLinkUpdated ?? null;
+      wsMockState.capturedWSLinkSafetyChanged = onMessageLinkSafetyChanged ?? null;
       wsMockState.capturedReactionUpdated = onReactionUpdated ?? null;
       wsMockState.capturedReactionError = onReactionError ?? null;
       wsMockState.capturedSubscribed = onSubscribed ?? null;
@@ -323,6 +345,22 @@ function settleListLayout(list: HTMLElement, scrollHeight: number, clientHeight:
   Object.defineProperty(list, "scrollHeight", { configurable: true, value: scrollHeight });
   Object.defineProperty(list, "clientHeight", { configurable: true, value: clientHeight });
   fireEvent.scroll(list);
+}
+
+/**
+ * A scrollport whose scrollbar is part of the page (#880).
+ *
+ * The border box is wider than the content box by the bar's width, which is
+ * what lets a drag on it reach the page as a pointer — and therefore what
+ * makes an animated trip interruptible. jsdom lays out neither, so a test that
+ * wants an animation has to say so.
+ */
+function withClassicScrollbar(list: HTMLElement, clientWidth = 400, scrollbarWidth = 15) {
+  Object.defineProperty(list, "clientWidth", { configurable: true, value: clientWidth });
+  Object.defineProperty(list, "offsetWidth", {
+    configurable: true,
+    value: clientWidth + scrollbarWidth,
+  });
 }
 
 /** The reader's own scroll: only scrollTop moves, exactly as in a browser. */
@@ -547,6 +585,8 @@ beforeEach(() => {
   layoutSpy = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(layoutRect);
   wsMockState.capturedWSMessageCreated = null;
   wsMockState.capturedWSMessageUpdated = null;
+  wsMockState.capturedWSLinkUpdated = null;
+  wsMockState.capturedWSLinkSafetyChanged = null;
   wsMockState.capturedReactionUpdated = null;
   wsMockState.capturedReactionError = null;
   wsMockState.capturedSubscribed = null;
@@ -556,6 +596,8 @@ beforeEach(() => {
     ({
       onMessageCreated,
       onMessageUpdated,
+      onMessageLinkUpdated,
+      onMessageLinkSafetyChanged,
       onReactionUpdated,
       onReactionError,
       onSubscribed,
@@ -563,6 +605,8 @@ beforeEach(() => {
     }) => {
       wsMockState.capturedWSMessageCreated = onMessageCreated;
       wsMockState.capturedWSMessageUpdated = onMessageUpdated ?? null;
+      wsMockState.capturedWSLinkUpdated = onMessageLinkUpdated ?? null;
+      wsMockState.capturedWSLinkSafetyChanged = onMessageLinkSafetyChanged ?? null;
       wsMockState.capturedReactionUpdated = onReactionUpdated ?? null;
       wsMockState.capturedReactionError = onReactionError ?? null;
       wsMockState.capturedSubscribed = onSubscribed ?? null;
@@ -600,6 +644,18 @@ beforeEach(() => {
   mockGetMessageHistory.mockResolvedValue({ entries: [], nextCursor: undefined });
   mockFetchChannelDetails.mockImplementation((channelId: string) =>
     Promise.resolve(channelDetailsFor(channelId)),
+  );
+  mockFetchChannelMembers.mockImplementation((channelId: string) =>
+    Promise.resolve({
+      memberCount: 1,
+      members: [
+        {
+          userId: "me-123",
+          displayName: `Membro de ${channelId}`,
+          role: "member" as const,
+        },
+      ],
+    }),
   );
   mockFetchGroupDetails.mockRejectedValue(new Error("group details not stubbed for this test"));
   mockFetchChannelAttachments.mockResolvedValue([]);
@@ -843,7 +899,26 @@ describe("ChatMessageArea — RF-08 forwarding", () => {
 describe("ChatMessageArea — channel header", () => {
   it("renders channel header with channel name", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
-    renderChannelArea("geral");
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
 
     const header = await screen.findByTestId("chat-msg-header");
     expect(header).toBeInTheDocument();
@@ -852,7 +927,26 @@ describe("ChatMessageArea — channel header", () => {
 
   it("renders DM header with DM name", async () => {
     mockFetchDMMessages.mockResolvedValue(emptyPage);
-    renderDMArea("dm-juliane");
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-juliane"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [],
+                  dms: [{ id: "dm-juliane", type: "1:1", name: "dm-juliane", participants: [] }],
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
 
     const header = await screen.findByTestId("chat-msg-header");
     expect(header).toBeInTheDocument();
@@ -2402,24 +2496,46 @@ describe("ChatMessageArea — error state", () => {
     });
   });
 
-  it("inaccessible channel route shows safe error state and disables composer", async () => {
-    mockFetchChannelMessages.mockRejectedValue(new Error("not_found"));
-    renderChannelArea("private-target");
+  // Issue #475: the backend answers a non-member with the same
+  // non-enumerating 404 it uses for an id that does not exist at all (see
+  // chat-service's mapServiceError) — this is that response reaching the
+  // client, distinct from the generic network/5xx failure covered above.
+  it("inaccessible channel route shows the access-denied state, leaks nothing, and 'voltar' navigates to /chat", async () => {
+    mockFetchChannelMessages.mockRejectedValue(new ApiRequestError(404, "not_found", "not found"));
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/private-target"]}>
+        <Routes>
+          <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+          <Route path="/chat" element={<div data-testid="chat-index" />} />
+        </Routes>
+      </MemoryRouter>,
+    );
 
-    expect(await screen.findByTestId("chat-msg-error")).toBeInTheDocument();
-    expect(screen.queryByTestId("chat-msg-empty")).not.toBeInTheDocument();
-    expect(screen.getByTestId("chat-composer-input")).toHaveAttribute("aria-disabled", "true");
-    expect(screen.getByTestId("chat-send-btn")).toBeDisabled();
+    expect(await screen.findByTestId("chat-msg-access-denied")).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: /você não tem acesso a esta conversa/i }),
+    ).toBeInTheDocument();
+    // Nothing from the old generic-error UX, and nothing that could enumerate
+    // or otherwise expose the conversation this reader cannot see into.
+    expect(screen.queryByTestId("chat-msg-error")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /tentar novamente/i })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-msg-header")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-composer-input")).not.toBeInTheDocument();
+    expect(screen.queryByText("private-target")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /voltar para minhas conversas/i }));
+    expect(await screen.findByTestId("chat-index")).toBeInTheDocument();
   });
 
-  it("inaccessible DM route shows safe error state and disables composer", async () => {
-    mockFetchDMMessages.mockRejectedValue(new Error("not_found"));
+  it("inaccessible DM route shows the access-denied state, not a generic error", async () => {
+    mockFetchDMMessages.mockRejectedValue(new ApiRequestError(404, "not_found", "not found"));
     renderDMArea("dm-private-target");
 
-    expect(await screen.findByTestId("chat-msg-error")).toBeInTheDocument();
-    expect(screen.queryByTestId("chat-msg-empty")).not.toBeInTheDocument();
-    expect(screen.getByTestId("chat-composer-input")).toHaveAttribute("aria-disabled", "true");
-    expect(screen.getByTestId("chat-send-btn")).toBeDisabled();
+    expect(await screen.findByTestId("chat-msg-access-denied")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-msg-error")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-composer-input")).not.toBeInTheDocument();
+    expect(screen.queryByText("dm-private-target")).not.toBeInTheDocument();
   });
 
   it("shows a discreet realtime instability banner without technical details", async () => {
@@ -5311,7 +5427,7 @@ describe("ChatMessageArea — infinite scroll", () => {
     expect(scrollMock).not.toHaveBeenCalled();
   });
 
-  it("calls scrollIntoView when a new message is sent (append)", async () => {
+  it("returns the viewport to the end when a message is sent (append)", async () => {
     mockFetchChannelMessages.mockResolvedValue({
       messages: [makeMessage({ id: "m1" })],
       nextCursor: "",
@@ -5321,10 +5437,10 @@ describe("ChatMessageArea — infinite scroll", () => {
     renderChannelArea();
     await waitFor(() => expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(1));
 
-    // beforeEach sets window.Element.prototype.scrollIntoView = vi.fn().
-    // Clear its call history here to only count calls triggered by the send.
-    const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
-    scrollMock.mockClear();
+    // A reader up in the history, with the geometry jsdom lays out for nobody.
+    const list = screen.getByRole("log");
+    settleListLayout(list, 1000, 400);
+    userScrollTo(list, 0);
 
     const input = screen.getByTestId("chat-composer-input");
     await fillEditor(input, "Enviada");
@@ -5332,8 +5448,11 @@ describe("ChatMessageArea — infinite scroll", () => {
 
     await waitFor(() => expect(screen.getByText("Enviada")).toBeInTheDocument());
 
-    // Append (sent) must scroll to bottom.
-    expect(scrollMock).toHaveBeenCalledTimes(1);
+    // #880: sending is an explicit intent to come back to the present, and it
+    // gets there through the same navigator the button uses — a scroll
+    // position derived from the layout, rather than a scrollIntoView aimed at
+    // a sentinel whose own position trails that layout by a commit.
+    await waitFor(() => expect(list.scrollTop).toBe(600));
   });
 });
 
@@ -5381,16 +5500,36 @@ describe("ChatMessageArea — route decoding", () => {
   it("decodes percent-encoded channel ID correctly", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
 
+    // Proves decoding happens before the id is matched against the sidebar
+    // payload: the route carries the encoded form, the fixture only the
+    // decoded one, so the header can resolve the name only if the two IDs
+    // were reconciled correctly (issue #475 removed the raw-id fallback that
+    // used to make this indirection unnecessary to prove).
     render(
       <MemoryRouter initialEntries={["/chat/channel/equipe%20infra"]}>
         <Routes>
-          <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [
+                    { id: "equipe infra", name: "Equipe Infra", type: "public", canWrite: true },
+                  ],
+                  dms: [],
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
         </Routes>
       </MemoryRouter>,
     );
 
     const header = await screen.findByTestId("chat-msg-header");
-    expect(header).toHaveTextContent("equipe infra");
+    expect(header).toHaveTextContent("Equipe Infra");
   });
 
   it("does not crash with malformed percent-encoded ID", async () => {
@@ -5411,13 +5550,390 @@ describe("ChatMessageArea — route decoding", () => {
 
 // ── Outlet context helper ─────────────────────────────────────────────────────
 
-function ParentWithContext({ ctx }: { ctx: ChatOutletContext }) {
+/**
+ * The shell, as far as these tests need one.
+ *
+ * Faithful to AppShell in the three things that matter for the open-DM flow
+ * (issue #895): it owns one coordinator, it hands that coordinator to the
+ * conversation *and* to a real SidebarDetailsPanel, and it is the single place
+ * a refusal is drawn. ChatMessageArea owns none of those any more, so a parent
+ * that did not provide them would be testing a component wired to nothing.
+ *
+ * The sidebar's target is state here rather than a prop, because that is the
+ * point of several tests below: a panel closing, or turning to a different
+ * conversation, changes nothing about the route.
+ */
+function ParentWithContext({
+  ctx,
+  sidebarTargets,
+  onRender,
+  onNavigate,
+}: {
+  ctx: ChatOutletContext;
+  /** Renders a real sidebar details panel, switchable between these targets. */
+  sidebarTargets?: SidebarDetailsTarget[];
+  /** Counts this component's renders — the shell's, and so the whole tree's. */
+  onRender?: () => void;
+  onNavigate?: (path: string) => void;
+}) {
+  const routerNavigate = useNavigate();
+  onRender?.();
+  const navigate = (path: string) => {
+    onNavigate?.(path);
+    routerNavigate(path);
+  };
+  const coordinator = useDirectMessageCoordinator({
+    currentUserId: ctx.currentUserId,
+    refreshConversations: ctx.refreshConversations,
+    navigate,
+  });
+  const [sidebarTarget, setSidebarTarget] = useState<SidebarDetailsTarget | null>(null);
   return (
     <div>
-      <Outlet context={ctx} />
+      <Outlet context={{ ...ctx, directMessage: coordinator }} />
+      {sidebarTargets?.map((target) => (
+        <button
+          key={target.id}
+          type="button"
+          onClick={() => setSidebarTarget(target)}
+          data-testid={`harness-open-${target.id}`}
+        >
+          abrir painel {target.id}
+        </button>
+      ))}
+      {sidebarTargets && (
+        <button
+          type="button"
+          onClick={() => setSidebarTarget(null)}
+          data-testid="harness-close-sidebar"
+        >
+          fechar painel
+        </button>
+      )}
+      {sidebarTargets && (
+        <SidebarDetailsPanel
+          target={sidebarTarget}
+          currentUserId={ctx.currentUserId}
+          canonicalName=""
+          coordinator={coordinator}
+          onClose={() => setSidebarTarget(null)}
+        />
+      )}
+      <HarnessDirectMessageError coordinator={coordinator} />
     </div>
   );
 }
+
+/** AppShell's single error renderer, in the harness's own words. */
+function HarnessDirectMessageError({ coordinator }: { coordinator: DirectMessageCoordinator }) {
+  const error = useDirectMessageError(coordinator);
+  if (!error) return null;
+  return <p role="alert">{error}</p>;
+}
+
+/**
+ * Two real surfaces of the shell, one open-DM flow (issue #895).
+ *
+ * The timeline and a details panel opened from the sidebar are on screen
+ * together and both can address the same person. Two things went wrong in turn:
+ * a registry per surface meant two POSTs for one person, and then a single
+ * shared *snapshot* meant every pending change re-rendered the whole tree. So
+ * this mounts both real surfaces under one real coordinator and asserts the
+ * consequences — one request, one navigation, one alert, and a shell that does
+ * not re-render because somebody became pending.
+ *
+ * The sidebar panel is the real component, not a stand-in: its lifetime is the
+ * conversation it is describing, and only the real one has that.
+ */
+describe("ChatMessageArea — one open-DM flow across real surfaces (issue #895)", () => {
+  const recipientId = "other-456";
+  const groupA: SidebarDetailsTarget = { kind: "group", id: "conv-a" };
+  const groupB: SidebarDetailsTarget = { kind: "group", id: "conv-b" };
+
+  function groupDetailsFor(id: string) {
+    return {
+      kind: "group" as const,
+      id,
+      name: `Grupo ${id}`,
+      description: "",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      participantCount: 3,
+      participants: [
+        { userId: "me-123", displayName: "Eu" },
+        { userId: recipientId, displayName: "Fernanda" },
+        { userId: "other-789", displayName: "Marina" },
+      ],
+      canManageMembers: false,
+    };
+  }
+
+  function renderShell(
+    options: { onRender?: () => void; onNavigate?: (path: string) => void } = {},
+  ) {
+    return render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{ currentUserId: "me-123", channels: [], dms: [] }}
+                sidebarTargets={[groupA, groupB]}
+                onRender={options.onRender}
+                onNavigate={options.onNavigate}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  /** The roster row for a person inside the sidebar's panel. */
+  function rosterRow(displayName: string) {
+    return screen.getByRole("button", {
+      name: new RegExp(`^Abrir conversa com ${displayName}\\.`),
+    });
+  }
+
+  /** The timeline's author action for the message Fernanda sent. */
+  function timelineAuthorAction() {
+    return screen.findByRole("button", { name: "Abrir conversa com Fernanda" });
+  }
+
+  async function openSidebar(target: SidebarDetailsTarget, participantName: string) {
+    fireEvent.click(screen.getByTestId(`harness-open-${target.id}`));
+    return waitFor(() => rosterRow(participantName));
+  }
+
+  let resolveOpen!: (value: { conversationId: string; created: boolean }) => void;
+  let rejectOpen!: (cause: unknown) => void;
+
+  beforeEach(() => {
+    mockGetOrCreateDirectDM.mockReturnValue(
+      new Promise((resolve, reject) => {
+        resolveOpen = resolve as typeof resolveOpen;
+        rejectOpen = reject;
+      }),
+    );
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: recipientId, senderDisplayName: "Fernanda" })]),
+    );
+    mockFetchGroupDetails.mockImplementation((conversationId: string) =>
+      Promise.resolve(groupDetailsFor(conversationId)),
+    );
+  });
+
+  it("sends one request when the timeline starts and the sidebar joins", async () => {
+    const navigations: string[] = [];
+    renderShell({ onNavigate: (path) => navigations.push(path) });
+
+    fireEvent.click(await timelineAuthorAction());
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+
+    const row = await openSidebar(groupA, "Fernanda");
+    fireEvent.click(row);
+    fireEvent.click(row);
+
+    // One registry: the panel found the recipient already being resolved and
+    // joined the request in flight rather than sending another.
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+    expect(row).toHaveAttribute("aria-busy", "true");
+
+    await act(async () => {
+      resolveOpen({ conversationId: "dm-456", created: true });
+    });
+    // One result, one navigation — not one per waiting origin.
+    expect(navigations).toEqual(["/chat/dm/dm-456"]);
+  });
+
+  it("sends one request when the sidebar starts and the timeline joins", async () => {
+    const navigations: string[] = [];
+    renderShell({ onNavigate: (path) => navigations.push(path) });
+
+    fireEvent.click(await openSidebar(groupA, "Fernanda"));
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(await timelineAuthorAction());
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveOpen({ conversationId: "dm-456", created: true });
+    });
+    expect(navigations).toEqual(["/chat/dm/dm-456"]);
+  });
+
+  it("does not navigate for a panel that closed, with the route never moving", async () => {
+    const navigations: string[] = [];
+    renderShell({ onNavigate: (path) => navigations.push(path) });
+
+    fireEvent.click(await openSidebar(groupA, "Fernanda"));
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+
+    // Closing is this panel's whole lifetime ending. The route is untouched,
+    // which is exactly why it could never have expressed this.
+    fireEvent.click(screen.getByTestId("harness-close-sidebar"));
+    await act(async () => {
+      resolveOpen({ conversationId: "dm-456", created: true });
+    });
+
+    expect(navigations).toEqual([]);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("does not navigate for a panel that turned to another conversation", async () => {
+    const navigations: string[] = [];
+    renderShell({ onNavigate: (path) => navigations.push(path) });
+
+    fireEvent.click(await openSidebar(groupA, "Fernanda"));
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+
+    // Same panel, different conversation, same route: a new lifetime, and the
+    // previous one released.
+    fireEvent.click(screen.getByTestId(`harness-open-${groupB.id}`));
+    await act(async () => {
+      resolveOpen({ conversationId: "dm-456", created: true });
+    });
+
+    expect(navigations).toEqual([]);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    // And the panel still works under its new lifetime.
+    mockGetOrCreateDirectDM.mockReturnValue(new Promise(() => {}));
+    fireEvent.click(await waitFor(() => rosterRow("Marina")));
+    expect(mockGetOrCreateDirectDM).toHaveBeenLastCalledWith("other-789", expect.any(AbortSignal));
+  });
+
+  it("keeps an operation the timeline still wants when the panel that started it closes", async () => {
+    // The timeline joins through a mention rather than the author action: the
+    // author button disables itself while its recipient is pending, so it
+    // cannot express a second interest, and a mention stays activatable.
+    const mentionId = "11111111-1111-1111-1111-111111111111";
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({ bodyText: `Oi @[Fernanda](mention:user:${mentionId})`, bodyFormat: "v3" }),
+      ]),
+    );
+    mockFetchGroupDetails.mockImplementation((conversationId: string) =>
+      Promise.resolve({
+        ...groupDetailsFor(conversationId),
+        participants: [
+          { userId: "me-123", displayName: "Eu" },
+          { userId: mentionId, displayName: "Fernanda" },
+        ],
+      }),
+    );
+    const navigations: string[] = [];
+    renderShell({ onNavigate: (path) => navigations.push(path) });
+
+    fireEvent.click(await openSidebar(groupA, "Fernanda"));
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+
+    // The timeline joins the very same operation.
+    fireEvent.click(await screen.findByRole("button", { name: "Abrir conversa com Fernanda" }));
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByTestId("harness-close-sidebar"));
+    await act(async () => {
+      resolveOpen({ conversationId: "dm-456", created: true });
+    });
+
+    // Releasing one origin must not cancel what another is still waiting for,
+    // and the surviving origin still gets exactly one navigation.
+    expect(navigations).toEqual(["/chat/dm/dm-456"]);
+  });
+
+  it("keeps different recipients independent when their origin goes away", async () => {
+    const started: string[] = [];
+    mockGetOrCreateDirectDM.mockImplementation((userId: string) => {
+      started.push(userId);
+      return new Promise(() => {});
+    });
+    renderShell();
+
+    fireEvent.click(await openSidebar(groupA, "Fernanda"));
+    fireEvent.click(rosterRow("Marina"));
+
+    // Two people, two operations: deduplication is per recipient and never
+    // collapses different ones.
+    expect(started).toEqual([recipientId, "other-789"]);
+    expect(rosterRow("Fernanda")).toHaveAttribute("aria-busy", "true");
+    expect(rosterRow("Marina")).toHaveAttribute("aria-busy", "true");
+
+    fireEvent.click(screen.getByTestId("harness-close-sidebar"));
+    expect(started).toEqual([recipientId, "other-789"]);
+  });
+
+  it("announces one failure once, and nothing at all for a panel that closed", async () => {
+    renderShell();
+
+    fireEvent.click(await openSidebar(groupA, "Fernanda"));
+    await act(async () => {
+      rejectOpen(new ApiRequestError(404, "not_found", "user not available"));
+    });
+
+    const message = "Esta pessoa não está mais disponível para conversa direta.";
+    expect(
+      screen.getAllByRole("alert").filter((alert) => alert.textContent === message),
+    ).toHaveLength(1);
+
+    // A second attempt whose origin is gone before it fails publishes nothing,
+    // so no refusal outlives the surface that asked for it.
+    mockGetOrCreateDirectDM.mockReturnValue(
+      new Promise((_resolve, reject) => {
+        rejectOpen = reject;
+      }),
+    );
+    fireEvent.click(rosterRow("Marina"));
+    fireEvent.click(screen.getByTestId("harness-close-sidebar"));
+    await act(async () => {
+      rejectOpen(new ApiRequestError(500, "internal", "boom"));
+    });
+
+    expect(screen.queryByText("Não foi possível abrir a conversa. Tente novamente.")).toBeNull();
+  });
+
+  it("does not re-render the shell — and so the conversation — for a sidebar pending change", async () => {
+    let renders = 0;
+    renderShell({ onRender: () => (renders += 1) });
+    const row = await openSidebar(groupA, "Fernanda");
+    const rendersBeforeOpening = renders;
+
+    fireEvent.click(row);
+
+    // The row learned it is pending and the shell did not. Everything the
+    // conversation is — ChatShell, ChatMessageArea, the timeline, every message
+    // row — is below this component, so a shell that does not re-render is a
+    // tree that does not re-render. Before the coordinator, the capability
+    // itself changed identity here on every pending change and invalidated all
+    // of it.
+    expect(row).toHaveAttribute("aria-busy", "true");
+    expect(renders).toBe(rendersBeforeOpening);
+
+    await act(async () => {
+      resolveOpen({ conversationId: "dm-456", created: true });
+    });
+  });
+
+  it("does not re-render the shell for a failure either", async () => {
+    let renders = 0;
+    renderShell({ onRender: () => (renders += 1) });
+    const row = await openSidebar(groupA, "Fernanda");
+    const rendersBeforeOpening = renders;
+
+    fireEvent.click(row);
+    await act(async () => {
+      rejectOpen(new ApiRequestError(500, "internal", "boom"));
+    });
+
+    // Drawn by the one component that subscribes to the error, and by nothing
+    // above it.
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    expect(renders).toBe(rendersBeforeOpening);
+  });
+});
 
 function CurrentPath() {
   return <span data-testid="current-path">{useLocation().pathname}</span>;
@@ -6227,12 +6743,16 @@ describe("ChatMessageArea — resolved display name", () => {
     expect(input).toHaveAttribute("aria-label", "Mensagem para #geral…");
   });
 
-  it("falls back to raw targetId when channel not found in context", async () => {
+  // Issue #475: a channel absent from the sidebar payload used to fall back to
+  // showing its raw route id as the header title — exactly what a non-member's
+  // target looks like. It must never leak that id, even while status is still
+  // "loading"/"ready" and unrelated to the dedicated access-denied state.
+  it("never falls back to the raw targetId when the channel is not in context", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
-    renderChannelArea("geral");
+    renderChannelArea("ch-not-in-sidebar");
 
     const header = await screen.findByTestId("chat-msg-header");
-    expect(header).toHaveTextContent("geral");
+    expect(header).not.toHaveTextContent("ch-not-in-sidebar");
   });
 });
 
@@ -6453,9 +6973,12 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
 
     await waitFor(() => expect(screen.getByText("Última mensagem")).toBeInTheDocument());
 
+    // #880: opening at the end is a navigation like any other, driven to the
+    // tail by the navigator — and, like #492 always required, never animated
+    // and never flashing the control on the way there.
     const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
-    expect(scrollMock).toHaveBeenCalledWith({ behavior: "auto" });
     expect(scrollMock).not.toHaveBeenCalledWith(expect.objectContaining({ behavior: "smooth" }));
+    expect(screen.queryByRole("button", { name: /Ir para o final/ })).not.toBeInTheDocument();
   });
 
   it("opens directly at the first unread message with a 'Novas mensagens' separator when unreadCount > 0", async () => {
@@ -6637,13 +7160,354 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
 
     scrollAwayFromBottom(list);
     const button = await screen.findByRole("button", { name: "Ir para o final da conversa" });
+    const animated = vi.fn();
+    list.scrollTo = animated as unknown as typeof list.scrollTo;
 
-    const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
-    scrollMock.mockClear();
     await userEvent.click(button);
 
-    expect(scrollMock).toHaveBeenCalledWith({ behavior: "auto" });
-    expect(scrollMock).not.toHaveBeenCalledWith(expect.objectContaining({ behavior: "smooth" }));
+    // Same destination, same retargeting, no animation: the reader arrives
+    // at the end (scrollHeight 1000 − clientHeight 400) in one step.
+    expect(list.scrollTop).toBe(600);
+    expect(animated).not.toHaveBeenCalled();
+  });
+
+  it("animates a short trip to the end when motion is allowed", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+    );
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+
+    withClassicScrollbar(list);
+    scrollAwayFromBottom(list);
+    const button = await screen.findByRole("button", { name: "Ir para o final da conversa" });
+    const animated = vi.fn();
+    list.scrollTo = animated as unknown as typeof list.scrollTo;
+
+    await userEvent.click(button);
+
+    expect(animated).toHaveBeenCalledWith({ top: 600, behavior: "smooth" });
+  });
+
+  it("never animates across a whole conversation of loaded history", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+    );
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+
+    // #675: past MAX_SMOOTH_SCROLL_DISTANCE_PX an animation is a teleport
+    // with extra steps, and one nothing can correct while it runs.
+    settleListLayout(list, 40_000, 400);
+    userScrollTo(list, 0);
+    const button = await screen.findByRole("button", { name: "Ir para o final da conversa" });
+    const animated = vi.fn();
+    list.scrollTo = animated as unknown as typeof list.scrollTo;
+
+    await userEvent.click(button);
+
+    expect(list.scrollTop).toBe(39_600);
+    expect(animated).not.toHaveBeenCalled();
+  });
+
+  it("hands the viewport back to a reader who scrolls during a trip to the end", async () => {
+    const initialMsg = makeMessage({ id: "m1", bodyText: "Msg" });
+    const wsMsg = makeMessage({ id: "m2", senderId: "other-1", bodyText: "Chegou depois" });
+    mockFetchChannelMessages.mockResolvedValue(messagePage([initialMsg]));
+    vi.mocked(chatApi.fetchChannelMessage).mockResolvedValue(wsMsg);
+    vi.mocked(useChatWebSocket).mockImplementation(
+      ({ onMessageCreated }: { onMessageCreated: (evt: WSMessageCreatedEvent) => void }) => {
+        capturedOnMessageCreatedForBadge = onMessageCreated;
+        return {
+          toggleReaction: wsMockState.toggleReaction,
+          sendTyping: wsMockState.sendTyping,
+          connectionStatus: "connected",
+        };
+      },
+    );
+
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+    withClassicScrollbar(list);
+    scrollAwayFromBottom(list);
+
+    // A short trip, so it animates — and the animation never moves here, which
+    // is a trip still in flight when the reader reaches for the wheel.
+    const animated = vi.fn();
+    list.scrollTo = animated as unknown as typeof list.scrollTo;
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    );
+    expect(animated).toHaveBeenCalledTimes(1);
+
+    fireEvent.wheel(list);
+
+    // The trip is over and the reader is where they are: up in the history. A
+    // message arriving now is unread for them, and nothing moves to show it.
+    await act(async () => {
+      capturedOnMessageCreatedForBadge?.({
+        type: "message.created",
+        event_id: "evt-cancel",
+        created_at: new Date().toISOString(),
+        workspace_id: "ws-1",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m2",
+      });
+    });
+    await waitFor(() => expect(screen.getByText("Chegou depois")).toBeInTheDocument());
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa, 1 novas mensagens" }),
+    ).toBeInTheDocument();
+
+    // And a later reflow is not mistaken for the old trip still being alive.
+    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1400 });
+    act(() => flushResizeObservers());
+    expect(list.scrollTop).toBe(0);
+    expect(animated).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a reader who dragged the scrollbar out of a trip to the end", async () => {
+    const initialMsg = makeMessage({ id: "m1", bodyText: "Msg" });
+    const wsMsg = makeMessage({ id: "m2", senderId: "other-1", bodyText: "Chegou depois" });
+    mockFetchChannelMessages.mockResolvedValue(messagePage([initialMsg]));
+    vi.mocked(chatApi.fetchChannelMessage).mockResolvedValue(wsMsg);
+    vi.mocked(useChatWebSocket).mockImplementation(
+      ({ onMessageCreated }: { onMessageCreated: (evt: WSMessageCreatedEvent) => void }) => {
+        capturedOnMessageCreatedForBadge = onMessageCreated;
+        return {
+          toggleReaction: wsMockState.toggleReaction,
+          sendTyping: wsMockState.sendTyping,
+          connectionStatus: "connected",
+        };
+      },
+    );
+
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+    withClassicScrollbar(list);
+    scrollAwayFromBottom(list);
+
+    const animated = vi.fn();
+    list.scrollTo = animated as unknown as typeof list.scrollTo;
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    );
+    expect(animated).toHaveBeenCalledTimes(1);
+
+    // The reader grabs the scrollbar while the trip is still travelling: the
+    // pointer lands past the content box, where nothing else can be.
+    const drag = new Event("pointerdown", { bubbles: true });
+    Object.defineProperty(drag, "offsetX", { value: 406 });
+    act(() => {
+      list.dispatchEvent(drag);
+    });
+    userScrollTo(list, 100);
+
+    // A message arriving now is unread, and the viewport is theirs.
+    await act(async () => {
+      capturedOnMessageCreatedForBadge?.({
+        type: "message.created",
+        event_id: "evt-drag",
+        created_at: new Date().toISOString(),
+        workspace_id: "ws-1",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m2",
+      });
+    });
+    await waitFor(() => expect(screen.getByText("Chegou depois")).toBeInTheDocument());
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa, 1 novas mensagens" }),
+    ).toBeInTheDocument();
+    expect(list.scrollTop).toBe(100);
+
+    // And a reflow afterwards belongs to nobody: the trip is over.
+    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1400 });
+    act(() => flushResizeObservers());
+    expect(list.scrollTop).toBe(100);
+    expect(animated).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a reader who dragged an overlay scrollbar, which reaches the page only as a scroll", async () => {
+    const initialMsg = makeMessage({ id: "m1", bodyText: "Msg" });
+    const wsMsg = makeMessage({ id: "m2", senderId: "other-1", bodyText: "Chegou depois" });
+    mockFetchChannelMessages.mockResolvedValue(messagePage([initialMsg]));
+    vi.mocked(chatApi.fetchChannelMessage).mockResolvedValue(wsMsg);
+    vi.mocked(useChatWebSocket).mockImplementation(
+      ({ onMessageCreated }: { onMessageCreated: (evt: WSMessageCreatedEvent) => void }) => {
+        capturedOnMessageCreatedForBadge = onMessageCreated;
+        return {
+          toggleReaction: wsMockState.toggleReaction,
+          sendTyping: wsMockState.sendTyping,
+          connectionStatus: "connected",
+        };
+      },
+    );
+
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+
+    // A whole conversation of history below them: the trip there is instant
+    // (#675), so nothing is animating and the scrollport's position is the
+    // navigation's own until somebody else moves it.
+    settleListLayout(list, 40_000, 400);
+    userScrollTo(list, 0);
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    );
+    expect(list.scrollTop).toBe(39_600);
+
+    // The drag: no pointer event reaches the page, only the scroll it caused.
+    userScrollTo(list, 5_000);
+
+    await act(async () => {
+      capturedOnMessageCreatedForBadge?.({
+        type: "message.created",
+        event_id: "evt-overlay",
+        created_at: new Date().toISOString(),
+        workspace_id: "ws-1",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m2",
+      });
+    });
+    await waitFor(() => expect(screen.getByText("Chegou depois")).toBeInTheDocument());
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa, 1 novas mensagens" }),
+    ).toBeInTheDocument();
+    expect(list.scrollTop).toBe(5_000);
+
+    // And the reflow that follows has no trip left to retarget.
+    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 41_000 });
+    act(() => flushResizeObservers());
+    expect(list.scrollTop).toBe(5_000);
+  });
+
+  it("never leaves an animation running where a drag would reach the page as nothing", async () => {
+    const initialMsg = makeMessage({ id: "m1", bodyText: "Msg" });
+    const wsMsg = makeMessage({ id: "m2", senderId: "other-1", bodyText: "Chegou depois" });
+    mockFetchChannelMessages.mockResolvedValue(messagePage([initialMsg]));
+    vi.mocked(chatApi.fetchChannelMessage).mockResolvedValue(wsMsg);
+    vi.mocked(useChatWebSocket).mockImplementation(
+      ({ onMessageCreated }: { onMessageCreated: (evt: WSMessageCreatedEvent) => void }) => {
+        capturedOnMessageCreatedForBadge = onMessageCreated;
+        return {
+          toggleReaction: wsMockState.toggleReaction,
+          sendTyping: wsMockState.sendTyping,
+          connectionStatus: "connected",
+        };
+      },
+    );
+
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+
+    // An overlay scrollbar: the border box has no room for one, so a drag on
+    // it is browser chrome and the page is told nothing but the scroll.
+    Object.defineProperty(list, "clientWidth", { configurable: true, value: 400 });
+    Object.defineProperty(list, "offsetWidth", { configurable: true, value: 400 });
+    scrollAwayFromBottom(list);
+
+    const animated = vi.fn();
+    list.scrollTo = animated as unknown as typeof list.scrollTo;
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    );
+
+    // Short enough to animate (#675) and instant anyway: an animation nobody
+    // could interrupt here is worse than none.
+    expect(animated).not.toHaveBeenCalled();
+    expect(list.scrollTop).toBe(600);
+
+    // And so the drag — a scroll event and nothing else — is recognised.
+    userScrollTo(list, 120);
+    await act(async () => {
+      capturedOnMessageCreatedForBadge?.({
+        type: "message.created",
+        event_id: "evt-overlay-smooth",
+        created_at: new Date().toISOString(),
+        workspace_id: "ws-1",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m2",
+      });
+    });
+    await waitFor(() => expect(screen.getByText("Chegou depois")).toBeInTheDocument());
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa, 1 novas mensagens" }),
+    ).toBeInTheDocument();
+    expect(list.scrollTop).toBe(120);
+
+    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1400 });
+    act(() => flushResizeObservers());
+    expect(list.scrollTop).toBe(120);
+  });
+
+  it("does not mistake the frames of its own animation for the reader", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+    );
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+    withClassicScrollbar(list);
+    scrollAwayFromBottom(list);
+
+    const animated = vi.fn();
+    list.scrollTo = animated as unknown as typeof list.scrollTo;
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    );
+    expect(animated).toHaveBeenCalledWith({ top: 600, behavior: "smooth" });
+
+    // The animation travelling: every one of these positions is one the trip
+    // put the scrollport in, and none of them ends it.
+    for (const top of [180, 360, 540]) {
+      userScrollTo(list, top);
+      expect(
+        screen.getByRole("button", { name: "Ir para o final da conversa" }),
+      ).toBeInTheDocument();
+    }
+
+    // A reflow mid-animation retargets rather than cancels: the trip is still
+    // the owner, and it is the one that writes.
+    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1600 });
+    act(() => flushResizeObservers());
+    expect(list.scrollTop).toBe(1200);
+  });
+
+  it("settles on the end when the reader takes over a trip that has already arrived there", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+    );
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+    withClassicScrollbar(list);
+    scrollAwayFromBottom(list);
+
+    const animated = vi.fn();
+    list.scrollTo = animated as unknown as typeof list.scrollTo;
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    );
+    // The animation reached the end, but the sentinel has not reported yet.
+    list.scrollTop = 600;
+
+    fireEvent.keyDown(list, { key: "ArrowDown" });
+
+    // At the end by the geometry, so that is the phase — not a trip that
+    // nobody owns any more, which would leave the control on screen for good.
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /Ir para o final/ })).not.toBeInTheDocument(),
+    );
   });
 
   it("names the button with the pending count once new messages arrive while reading history", async () => {
@@ -7226,6 +8090,19 @@ describe("ChatMessageArea — edição e histórico (RF-13)", () => {
         editCount: 1,
         editedAt: "2026-08-18T12:00:00Z",
         linkSafetyState: "inconclusive",
+        links: [
+          {
+            ordinal: 0,
+            targetKey: "key-edit",
+            text: url,
+            url,
+            hostname: "example.test",
+            safety: "unknown",
+            click: "interstitial",
+            href: "",
+            updatedAt: "2026-08-18T12:00:00Z",
+          },
+        ],
       }),
     );
     renderChannelAreaForUser();
@@ -7234,8 +8111,12 @@ describe("ChatMessageArea — edição e histórico (RF-13)", () => {
     await replaceEditorText(editor, url);
     await userEvent.click(screen.getByRole("button", { name: "Salvar" }));
 
-    expect(await screen.findByTestId("chat-message-link-unverified")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: url })).toHaveAttribute("href", url);
+    // Issue #807: the per-link state from the response, without a reload — an
+    // unverified link is the interstitial button, not an anchor.
+    expect(
+      await screen.findByRole("button", { name: `${url} — Link não verificado` }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: url })).not.toBeInTheDocument();
     expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
   });
 
@@ -7956,6 +8837,97 @@ describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
   });
 });
 
+// ── Ciclo de vida da superfície de detalhes (issue #891) ─────────────────────
+//
+// #435/#441/#443 already cover what the panel *shows* and that opening it does
+// not throw the draft away. What was never pinned down is the rest of the
+// shell's promise: that the toggle is the only authority for open/closed, that
+// closing through it leaves the reader where they were, and that the reading
+// position and the reply in progress survive the surface coming and going.
+
+describe("ChatMessageArea — ciclo de vida do painel de detalhes (#891)", () => {
+  it("keeps focus on the trigger when the panel is closed through it", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    await screen.findByTestId("chat-conversation-details");
+    // The panel took focus on open; closing through the header control has to
+    // hand it back to that control rather than drop it on <body>.
+    expect(screen.getByRole("button", { name: "Fechar detalhes do canal" })).toHaveFocus();
+
+    await userEvent.click(detailsToggle());
+
+    expect(screen.queryByTestId("chat-conversation-details")).not.toBeInTheDocument();
+    expect(detailsToggle()).toHaveFocus();
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
+  it("keeps the reading position and the scroll-to-bottom affordance across a toggle", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Antiga" })]),
+    );
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    const list = screen.getByRole("log", { name: "Mensagens" });
+    settleListLayout(list, 1000, 400);
+    userScrollTo(list, 240);
+    await screen.findByRole("button", { name: "Ir para o final da conversa" });
+
+    await userEvent.click(detailsToggle());
+    await screen.findByTestId("chat-conversation-details");
+    await userEvent.click(detailsToggle());
+
+    // Same element, same offset: nothing remounted the scrollport, and no
+    // scroll authority treated the panel's arrival as a reason to re-position.
+    expect(screen.getByRole("log", { name: "Mensagens" })).toBe(list);
+    expect(list.scrollTop).toBe(240);
+    expect(screen.getByRole("button", { name: "Ir para o final da conversa" })).toBeInTheDocument();
+  });
+
+  it("keeps the reply in progress across a toggle", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({ id: "m1", senderDisplayName: "Ana", bodyText: "mensagem respondida" }),
+      ]),
+    );
+    renderChannelAreaForUser();
+
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+    await userEvent.click(screen.getByRole("button", { name: "Responder" }));
+    expect(screen.getByTestId("chat-composer-quote")).toHaveTextContent("Ana");
+
+    await userEvent.click(detailsToggle());
+    await screen.findByTestId("chat-conversation-details");
+    await userEvent.click(detailsToggle());
+
+    const quote = screen.getByTestId("chat-composer-quote");
+    expect(quote).toHaveTextContent("Ana");
+    expect(quote).toHaveTextContent("mensagem respondida");
+  });
+
+  it("keeps the draft through open, close and open again", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    await fillEditor(screen.getByTestId("chat-composer-input"), "rascunho entre aberturas");
+    const toggle = detailsToggle();
+
+    await userEvent.click(toggle);
+    await screen.findByTestId("chat-conversation-details");
+    await userEvent.click(toggle);
+    await userEvent.click(toggle);
+
+    expect(await screen.findByTestId("chat-conversation-details")).toBeInTheDocument();
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("chat-composer-input")).toHaveTextContent("rascunho entre aberturas");
+  });
+});
+
 // ── Painel de detalhes do grupo (issue #441) ─────────────────────────────────
 
 const groupConversationId = "grupo-infra";
@@ -8507,6 +9479,23 @@ describe("ChatMessageArea — ação indisponível do perfil por teclado (#443)"
 // a fresh load of the conversation.
 describe("ChatMessageArea — RF-21 link safety", () => {
   const linkURL = "https://example.test/artigo";
+  const linkEntity = (overrides: Partial<MessageLink> = {}): MessageLink => ({
+    ordinal: 0,
+    targetKey: "key-artigo",
+    text: linkURL,
+    url: linkURL,
+    hostname: "example.test",
+    safety: "safe",
+    click: "direct",
+    href: linkURL,
+    updatedAt: "2026-08-18T12:00:00Z",
+    ...overrides,
+  });
+  const unknownEntity = () => linkEntity({ safety: "unknown", click: "interstitial", href: "" });
+  const blockedEntity = () =>
+    linkEntity({ text: "", url: "", hostname: "", safety: "malicious", click: "none", href: "" });
+  const unverifiedButton = () =>
+    screen.findByRole("button", { name: `${linkURL} — Link não verificado` });
 
   beforeEach(() => {
     mockFetchAllowedReactionEmojis.mockResolvedValue([]);
@@ -8514,7 +9503,7 @@ describe("ChatMessageArea — RF-21 link safety", () => {
     mockFetchChannelAttachments.mockResolvedValue([]);
   });
 
-  it("keeps the notice and a clickable link across a reload", async () => {
+  it("keeps an unverified link as an interstitial across a reload", async () => {
     mockFetchChannelMessages.mockResolvedValue(
       messagePage([
         makeMessage({
@@ -8522,25 +9511,24 @@ describe("ChatMessageArea — RF-21 link safety", () => {
           bodyText: `veja ${linkURL} depois`,
           bodyFormat: "v2",
           linkSafetyState: "inconclusive",
+          links: [unknownEntity()],
         }),
       ]),
     );
 
     renderChannelArea();
 
-    // The notice, verbatim.
-    const notice = await screen.findByTestId("chat-message-link-unverified");
-    expect(notice).toHaveTextContent(
-      "Não foi possível verificar este link agora. A prévia automática não foi carregada.",
-    );
-
-    // And the link is genuinely clickable: a real anchor, with the address the
-    // sender wrote, opening in a new tab without leaking this workspace's URL.
-    const anchor = await screen.findByRole("link", { name: linkURL });
-    expect(anchor).toHaveAttribute("href", linkURL);
-    expect(anchor).toHaveAttribute("target", "_blank");
-    expect(anchor.getAttribute("rel")).toContain("noopener");
-    expect(anchor.getAttribute("rel")).toContain("noreferrer");
+    // Not an anchor: a button that opens the interstitial, with the real host.
+    const button = await unverifiedButton();
+    expect(screen.queryByRole("link", { name: linkURL })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-message-link-unverified")).not.toBeInTheDocument();
+    fireEvent.click(button);
+    expect(screen.getByTestId("chat-link-interstitial-host")).toHaveTextContent("example.test");
+    const open = screen.getByRole("link", { name: "Abrir mesmo assim" });
+    expect(open).toHaveAttribute("href", linkURL);
+    expect(open).toHaveAttribute("target", "_blank");
+    expect(open.getAttribute("rel")).toContain("noopener");
+    expect(open.getAttribute("rel")).toContain("noreferrer");
   });
 
   it("withdraws a malicious link after reconnect recovers a missed event", async () => {
@@ -8548,9 +9536,10 @@ describe("ChatMessageArea — RF-21 link safety", () => {
       messagePage([
         makeMessage({
           id: "msg-unverified",
-          bodyText: linkURL,
+          bodyText: `abra ${linkURL} agora`,
           bodyFormat: "v2",
           linkSafetyState: "inconclusive",
+          links: [unknownEntity()],
         }),
       ]),
     );
@@ -8561,52 +9550,22 @@ describe("ChatMessageArea — RF-21 link safety", () => {
         status: "active",
         linkSafetyState: "malicious",
         updatedAt: "2099-08-18T12:00:00Z",
+        links: [blockedEntity()],
       },
     ]);
-    renderChannelArea();
-    expect(await screen.findByRole("link", { name: linkURL })).toBeInTheDocument();
-
-    act(() =>
-      wsMockState.capturedSubscribed?.({
-        type: "subscribed",
-        operation: "subscribe",
-        target_type: "channel",
-        target_id: "geral",
+    // The authoritative re-read answers with the redacted body.
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({
+        id: "msg-unverified",
+        bodyText: "abra \uFFFC agora",
+        bodyFormat: "v2",
+        linkSafetyState: "malicious",
+        updatedAt: "2099-08-18T12:00:00Z",
+        links: [blockedEntity()],
       }),
     );
-
-    await waitFor(() => expect(screen.queryByRole("link", { name: linkURL })).toBeNull());
-    expect(screen.queryByText(linkURL)).toBeNull();
-    expect(screen.getByTestId("chat-message-link-blocked")).toBeInTheDocument();
-    expect(mockFetchChannelMessageSecuritySnapshots).toHaveBeenCalledWith(
-      "geral",
-      ["msg-unverified"],
-      expect.any(AbortSignal),
-    );
-  });
-
-  it("removes the warning but keeps the anchor after an offline clearance", async () => {
-    mockFetchChannelMessages.mockResolvedValue(
-      messagePage([
-        makeMessage({
-          id: "msg-unverified",
-          bodyText: linkURL,
-          bodyFormat: "v2",
-          linkSafetyState: "inconclusive",
-        }),
-      ]),
-    );
-    mockFetchChannelMessageSecuritySnapshots.mockResolvedValueOnce([
-      {
-        messageId: "msg-unverified",
-        available: true,
-        status: "active",
-        linkSafetyState: "safe",
-        updatedAt: "2099-08-18T12:00:00Z",
-      },
-    ]);
     renderChannelArea();
-    expect(await screen.findByTestId("chat-message-link-unverified")).toBeInTheDocument();
+    expect(await unverifiedButton()).toBeInTheDocument();
 
     act(() =>
       wsMockState.capturedSubscribed?.({
@@ -8618,31 +9577,706 @@ describe("ChatMessageArea — RF-21 link safety", () => {
     );
 
     await waitFor(() =>
-      expect(screen.queryByTestId("chat-message-link-unverified")).not.toBeInTheDocument(),
+      expect(screen.queryByRole("button", { name: `${linkURL} — Link não verificado` })).toBeNull(),
     );
-    expect(screen.getByRole("link", { name: linkURL })).toHaveAttribute("href", linkURL);
+    await waitFor(() =>
+      expect(screen.getByText("Link bloqueado por segurança")).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(new RegExp(linkURL.replace(/[/.?]/g, "\\$&")))).toBeNull();
+    // The rest of the text is preserved: only the span was withheld.
+    expect(screen.getByTestId("chat-msg-bubble")).toHaveTextContent("abra");
+    expect(screen.getByTestId("chat-msg-bubble")).toHaveTextContent("agora");
+    expect(mockFetchChannelMessageSecuritySnapshots).toHaveBeenCalledWith(
+      "geral",
+      ["msg-unverified"],
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("turns an unverified link into an anchor after an offline clearance", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-unverified",
+          bodyText: linkURL,
+          bodyFormat: "v2",
+          linkSafetyState: "inconclusive",
+          links: [unknownEntity()],
+        }),
+      ]),
+    );
+    mockFetchChannelMessageSecuritySnapshots.mockResolvedValueOnce([
+      {
+        messageId: "msg-unverified",
+        available: true,
+        status: "active",
+        linkSafetyState: "safe",
+        updatedAt: "2099-08-18T12:00:00Z",
+        links: [linkEntity({ updatedAt: "2099-08-18T12:00:00Z" })],
+      },
+    ]);
+    renderChannelArea();
+    expect(await unverifiedButton()).toBeInTheDocument();
+
+    act(() =>
+      wsMockState.capturedSubscribed?.({
+        type: "subscribed",
+        operation: "subscribe",
+        target_type: "channel",
+        target_id: "geral",
+      }),
+    );
+
+    expect(await screen.findByRole("link", { name: linkURL })).toHaveAttribute("href", linkURL);
+    expect(screen.queryByRole("button", { name: `${linkURL} — Link não verificado` })).toBeNull();
+  });
+
+  it("applies a realtime per-link update, and ignores a stale one", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-pending",
+          bodyText: linkURL,
+          bodyFormat: "v2",
+          links: [
+            linkEntity({
+              safety: "pending",
+              click: "none",
+              href: "",
+              updatedAt: "2026-08-18T12:00:00Z",
+            }),
+          ],
+        }),
+      ]),
+    );
+    renderChannelArea();
+    await screen.findByTestId("chat-msg-bubble");
+    expect(screen.queryByRole("link", { name: linkURL })).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("Verificando segurança do link…");
+
+    const wire = (safety: string, click: string, href: string, updatedAt: string) =>
+      act(() =>
+        wsMockState.capturedWSLinkUpdated?.({
+          type: "message.link_updated",
+          target_type: "channel",
+          target_id: "geral",
+          message_id: "msg-pending",
+          link_update: {
+            message_id: "msg-pending",
+            link: {
+              ordinal: 0,
+              target_key: "key-artigo",
+              url: linkURL,
+              hostname: "example.test",
+              safety,
+              click,
+              href,
+              updated_at: updatedAt,
+            },
+          },
+        }),
+      );
+
+    wire("safe", "direct", linkURL, "2026-08-18T12:05:00Z");
+    expect(await screen.findByRole("link", { name: linkURL })).toHaveAttribute("href", linkURL);
+
+    // An older event must not undo a newer state.
+    wire("pending", "none", "", "2026-08-18T12:01:00Z");
+    expect(screen.getByRole("link", { name: linkURL })).toBeInTheDocument();
+
+    // A revocation: the anchor goes, the interstitial takes its place.
+    wire("unknown", "interstitial", "", "2026-08-18T12:06:00Z");
+    expect(await unverifiedButton()).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: linkURL })).toBeNull();
+  });
+
+  it("re-reads the message when a realtime update condemns a link", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-safe",
+          bodyText: `veja ${linkURL}`,
+          bodyFormat: "v2",
+          linkSafetyState: "safe",
+          links: [linkEntity()],
+        }),
+      ]),
+    );
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({
+        id: "msg-safe",
+        bodyText: "veja \uFFFC",
+        bodyFormat: "v2",
+        linkSafetyState: "malicious",
+        updatedAt: "2026-08-18T12:10:00Z",
+        links: [blockedEntity()],
+      }),
+    );
+    renderChannelArea();
+    expect(await screen.findByRole("link", { name: linkURL })).toBeInTheDocument();
+
+    act(() =>
+      wsMockState.capturedWSLinkUpdated?.({
+        type: "message.link_updated",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "msg-safe",
+        link_update: {
+          message_id: "msg-safe",
+          link: {
+            ordinal: 0,
+            target_key: "key-artigo",
+            safety: "malicious",
+            click: "none",
+            updated_at: "2026-08-18T12:10:00Z",
+          },
+        },
+      }),
+    );
+
+    await waitFor(() => expect(screen.queryByRole("link", { name: linkURL })).toBeNull());
+    expect(await screen.findByText("Link bloqueado por segurança")).toBeInTheDocument();
+    expect(mockFetchChannelMessage).toHaveBeenCalledWith("geral", "msg-safe", expect.anything());
+  });
+
+  /** One realtime per-link update on the wire, as the server sends it. */
+  const wireLinkUpdate = (
+    messageId: string,
+    link: Record<string, unknown>,
+    targetKey = "key-artigo",
+  ) =>
+    act(() =>
+      wsMockState.capturedWSLinkUpdated?.({
+        type: "message.link_updated",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: messageId,
+        link_update: {
+          message_id: messageId,
+          link: { ordinal: 0, target_key: targetKey, hostname: "example.test", ...link },
+        },
+      }),
+    );
+  const safeOnWire = (updatedAt: string) => ({
+    url: linkURL,
+    safety: "safe",
+    click: "direct",
+    href: linkURL,
+    updated_at: updatedAt,
+  });
+
+  it("restores a blocked link when a realtime update releases it, without a reload", async () => {
+    // The occurrence was condemned and redacted; its URL is gone from the
+    // client. The release is matched by the target's identity, and the body
+    // the server withheld comes back through one authoritative re-read of the
+    // message — never a reload of the conversation.
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-blocked",
+          bodyText: "veja \uFFFC agora",
+          bodyFormat: "v2",
+          linkSafetyState: "malicious",
+          links: [blockedEntity()],
+        }),
+      ]),
+    );
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({
+        id: "msg-blocked",
+        bodyText: `veja ${linkURL} agora`,
+        bodyFormat: "v2",
+        linkSafetyState: "safe",
+        updatedAt: "2026-08-18T12:20:00Z",
+        links: [linkEntity({ updatedAt: "2026-08-18T12:20:00Z" })],
+      }),
+    );
+    renderChannelArea();
+    expect(await screen.findByText("Link bloqueado por segurança")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: linkURL })).toBeNull();
+
+    wireLinkUpdate("msg-blocked", safeOnWire("2026-08-18T12:20:00Z"));
+
+    expect(await screen.findByRole("link", { name: linkURL })).toHaveAttribute("href", linkURL);
+    expect(screen.queryByText("Link bloqueado por segurança")).toBeNull();
+    expect(screen.getByTestId("chat-msg-bubble")).toHaveTextContent("veja");
+    expect(screen.getByTestId("chat-msg-bubble")).toHaveTextContent("agora");
+    expect(mockFetchChannelMessage).toHaveBeenCalledWith("geral", "msg-blocked", expect.anything());
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not release a blocked link on a release older than the condemnation", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-blocked",
+          bodyText: "veja \uFFFC agora",
+          bodyFormat: "v2",
+          linkSafetyState: "malicious",
+          links: [blockedEntity()],
+        }),
+      ]),
+    );
+    renderChannelArea();
+    expect(await screen.findByText("Link bloqueado por segurança")).toBeInTheDocument();
+
+    wireLinkUpdate("msg-blocked", safeOnWire("2026-08-18T11:00:00Z"));
+
+    expect(screen.getByText("Link bloqueado por segurança")).toBeInTheDocument();
+    expect(mockFetchChannelMessage).not.toHaveBeenCalled();
+  });
+
+  it("patches every occurrence of the same target and leaves the others alone", async () => {
+    const other = "https://other.test/x";
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-twice",
+          bodyText: `${linkURL} e ${other} e ${linkURL}`,
+          bodyFormat: "v2",
+          linkSafetyState: "inconclusive",
+          links: [
+            unknownEntity(),
+            linkEntity({
+              ordinal: 1,
+              targetKey: "key-other",
+              text: other,
+              url: other,
+              hostname: "other.test",
+              safety: "unknown",
+              click: "interstitial",
+              href: "",
+            }),
+            { ...unknownEntity(), ordinal: 2 },
+          ],
+        }),
+      ]),
+    );
+    renderChannelArea();
+    expect(
+      await screen.findAllByRole("button", { name: `${linkURL} — Link não verificado` }),
+    ).toHaveLength(2);
+
+    wireLinkUpdate("msg-twice", safeOnWire("2026-08-18T12:05:00Z"));
+
+    expect(await screen.findAllByRole("link", { name: linkURL })).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: `${linkURL} — Link não verificado` })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: `${other} — Link não verificado` }),
+    ).toBeInTheDocument();
+  });
+
+  it("orders realtime updates as instants, not as strings", async () => {
+    // "…00Z" sorts after "…00.9Z" as a string but is the earlier instant, so an
+    // update carrying it must not undo the state written at .9.
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-precise",
+          bodyText: linkURL,
+          bodyFormat: "v2",
+          linkSafetyState: "safe",
+          links: [linkEntity({ updatedAt: "2026-08-18T12:00:00.9Z" })],
+        }),
+      ]),
+    );
+    renderChannelArea();
+    expect(await screen.findByRole("link", { name: linkURL })).toBeInTheDocument();
+
+    wireLinkUpdate("msg-precise", {
+      url: linkURL,
+      safety: "pending",
+      click: "none",
+      updated_at: "2026-08-18T12:00:00Z",
+    });
+    expect(screen.getByRole("link", { name: linkURL })).toBeInTheDocument();
+
+    // The later instant, written with more digits, does apply.
+    wireLinkUpdate("msg-precise", {
+      url: linkURL,
+      safety: "unknown",
+      click: "interstitial",
+      updated_at: "2026-08-18T12:00:00.900000001Z",
+    });
+    expect(await unverifiedButton()).toBeInTheDocument();
+  });
+
+  it("ignores a realtime update without a target identity", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-unverified",
+          bodyText: linkURL,
+          bodyFormat: "v2",
+          linkSafetyState: "inconclusive",
+          links: [unknownEntity()],
+        }),
+      ]),
+    );
+    renderChannelArea();
+    expect(await unverifiedButton()).toBeInTheDocument();
+
+    wireLinkUpdate("msg-unverified", safeOnWire("2026-08-18T12:05:00Z"), "");
+    expect(screen.queryByRole("link", { name: linkURL })).toBeNull();
+    expect(await unverifiedButton()).toBeInTheDocument();
+  });
+
+  const reconnect = () =>
+    act(() =>
+      wsMockState.capturedSubscribed?.({
+        type: "subscribed",
+        operation: "subscribe",
+        target_type: "channel",
+        target_id: "geral",
+      }),
+    );
+
+  it("restores a redacted body when a reconnect snapshot says the link was cleared offline", async () => {
+    // Blocked while online, cleared while the socket was down: the snapshot
+    // carries the verdict but not the withheld text, so the message is re-read
+    // and the anchor comes back with the body — without a reload of the list.
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-blocked",
+          bodyText: "veja \uFFFC agora",
+          bodyFormat: "v2",
+          linkSafetyState: "malicious",
+          updatedAt: "2026-08-18T12:00:00Z",
+          links: [blockedEntity()],
+        }),
+      ]),
+    );
+    mockFetchChannelMessageSecuritySnapshots.mockResolvedValueOnce([
+      {
+        messageId: "msg-blocked",
+        available: true,
+        status: "active",
+        linkSafetyState: "safe",
+        updatedAt: "2026-08-18T12:30:00Z",
+        links: [linkEntity({ updatedAt: "2026-08-18T12:30:00Z" })],
+      },
+    ]);
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({
+        id: "msg-blocked",
+        bodyText: `veja ${linkURL} agora`,
+        bodyFormat: "v2",
+        linkSafetyState: "safe",
+        updatedAt: "2026-08-18T12:30:00Z",
+        links: [linkEntity({ updatedAt: "2026-08-18T12:30:00Z" })],
+      }),
+    );
+    renderChannelArea();
+    expect(await screen.findByText("Link bloqueado por segurança")).toBeInTheDocument();
+
+    reconnect();
+
+    expect(await screen.findByRole("link", { name: linkURL })).toHaveAttribute("href", linkURL);
+    expect(screen.queryByText("Link bloqueado por segurança")).toBeNull();
+    expect(screen.getByTestId("chat-msg-bubble")).toHaveTextContent("veja");
+    expect(screen.getByTestId("chat-msg-bubble")).toHaveTextContent("agora");
+    expect(mockFetchChannelMessage).toHaveBeenCalledWith("geral", "msg-blocked", expect.anything());
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores the body when the blocked link was edited away offline", async () => {
+    // Case 7: the marker the condemnation left is still drawn, the server no
+    // longer knows the occurrence, and only the read has the body that
+    // replaced it. No anchor is invented, and the list is not reloaded.
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-blocked",
+          bodyText: "veja \uFFFC agora",
+          bodyFormat: "v2",
+          linkSafetyState: "malicious",
+          updatedAt: "2026-08-18T12:00:00Z",
+          links: [blockedEntity()],
+        }),
+      ]),
+    );
+    mockFetchChannelMessageSecuritySnapshots.mockResolvedValueOnce([
+      {
+        messageId: "msg-blocked",
+        available: true,
+        status: "active",
+        linkSafetyState: "",
+        updatedAt: "2026-08-18T12:30:00Z",
+      },
+    ]);
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({
+        id: "msg-blocked",
+        bodyText: "veja o documento agora",
+        bodyFormat: "v2",
+        linkSafetyState: "",
+        updatedAt: "2026-08-18T12:30:00Z",
+        isEdited: true,
+        editCount: 1,
+      }),
+    );
+    renderChannelArea();
+    expect(await screen.findByText("Link bloqueado por segurança")).toBeInTheDocument();
+
+    reconnect();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("chat-msg-bubble")).toHaveTextContent("veja o documento agora"),
+    );
+    expect(screen.getByTestId("chat-msg-bubble").textContent).not.toContain("\uFFFC");
+    expect(screen.queryByText("Link bloqueado por segurança")).toBeNull();
+    expect(screen.queryByRole("link")).toBeNull();
+    expect(mockFetchChannelMessage).toHaveBeenCalledWith("geral", "msg-blocked", expect.anything());
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the span-level body when the aggregate condemnation arrives and the re-read fails", async () => {
+    // The server has already redacted the one span; the aggregate event is a
+    // compatibility projection, and a per-link event whose authoritative
+    // re-read fails leaves the legitimate text exactly where it was.
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-blocked",
+          bodyText: "veja \uFFFC agora",
+          bodyFormat: "v2",
+          linkSafetyState: "",
+          updatedAt: "2026-08-18T12:00:00Z",
+          links: [blockedEntity()],
+        }),
+      ]),
+    );
+    mockFetchChannelMessage.mockRejectedValue(new Error("network down"));
+    renderChannelArea();
+    expect(await screen.findByText("Link bloqueado por segurança")).toBeInTheDocument();
+
+    act(() =>
+      wsMockState.capturedWSLinkSafetyChanged?.({
+        type: "message.link_safety_changed",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "msg-blocked",
+        link_safety: {
+          message_id: "msg-blocked",
+          state: "malicious",
+          updated_at: "2026-08-18T12:05:00Z",
+        },
+      }),
+    );
+    wireLinkUpdate("msg-blocked", {
+      safety: "malicious",
+      click: "none",
+      updated_at: "2026-08-18T12:05:00Z",
+    });
+
+    await waitFor(() => expect(mockFetchChannelMessage).toHaveBeenCalled());
+    const bubble = screen.getByTestId("chat-msg-bubble");
+    expect(bubble).toHaveTextContent("veja");
+    expect(bubble).toHaveTextContent("agora");
+    expect(screen.getByText("Link bloqueado por segurança")).toBeInTheDocument();
+    expect(screen.queryByText("Conteúdo ocultado por segurança.")).toBeNull();
+    expect(bubble.textContent).not.toContain(linkURL);
+  });
+
+  it("restores a withheld quote excerpt when a reconnect snapshot clears the quoted message", async () => {
+    const quoted = {
+      id: "msg-parent",
+      authorId: "user-parent",
+      bodyText: "",
+      bodyFormat: "v2" as const,
+      isRemoved: false,
+      deletedAt: null,
+      createdAt: "2026-08-18T11:00:00Z",
+      updatedAt: "2026-08-18T12:00:00Z",
+      linkSafetyState: "malicious" as const,
+    };
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-reply",
+          bodyText: "concordo",
+          bodyFormat: "v2",
+          updatedAt: "2026-08-18T12:00:00Z",
+          quoted,
+        }),
+      ]),
+    );
+    mockFetchChannelMessageSecuritySnapshots.mockResolvedValueOnce([
+      {
+        messageId: "msg-reply",
+        available: true,
+        status: "active",
+        linkSafetyState: "",
+        updatedAt: "2026-08-18T12:00:00Z",
+        quoted: {
+          messageId: "msg-parent",
+          status: "active",
+          linkSafetyState: "safe",
+          updatedAt: "2026-08-18T12:30:00Z",
+        },
+      },
+    ]);
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({
+        id: "msg-reply",
+        bodyText: "concordo",
+        bodyFormat: "v2",
+        updatedAt: "2026-08-18T12:00:00Z",
+        quoted: {
+          ...quoted,
+          bodyText: `original com ${linkURL}`,
+          linkSafetyState: "safe",
+          updatedAt: "2026-08-18T12:30:00Z",
+        },
+      }),
+    );
+    renderChannelArea();
+    await screen.findByTestId("chat-msg-bubble");
+    expect(screen.getByText("Conteúdo ocultado por segurança.")).toBeInTheDocument();
+
+    reconnect();
+
+    await waitFor(() =>
+      expect(screen.queryByText("Conteúdo ocultado por segurança.")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("chat-msg-bubble")).toHaveTextContent("original com");
+    expect(mockFetchChannelMessage).toHaveBeenCalledWith("geral", "msg-reply", expect.anything());
+  });
+
+  it("re-reads nothing when a reconnect snapshot only confirms what is drawn", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-safe",
+          bodyText: linkURL,
+          bodyFormat: "v2",
+          linkSafetyState: "safe",
+          links: [linkEntity()],
+        }),
+        makeMessage({
+          id: "msg-pending",
+          bodyText: linkURL,
+          bodyFormat: "v2",
+          links: [linkEntity({ safety: "pending", click: "none", href: "" })],
+        }),
+      ]),
+    );
+    mockFetchChannelMessageSecuritySnapshots.mockResolvedValueOnce([
+      {
+        messageId: "msg-safe",
+        available: true,
+        status: "active",
+        linkSafetyState: "safe",
+        updatedAt: "2026-08-18T12:30:00Z",
+        links: [linkEntity()],
+      },
+      {
+        // pending -> safe: the patch is enough, nothing was withheld.
+        messageId: "msg-pending",
+        available: true,
+        status: "active",
+        linkSafetyState: "safe",
+        updatedAt: "2026-08-18T12:30:00Z",
+        links: [linkEntity({ updatedAt: "2026-08-18T12:30:00Z" })],
+      },
+    ]);
+    renderChannelArea();
+    expect(await screen.findByRole("link", { name: linkURL })).toBeInTheDocument();
+
+    reconnect();
+
+    await waitFor(() => expect(screen.getAllByRole("link", { name: linkURL })).toHaveLength(2));
+    expect(mockFetchChannelMessage).not.toHaveBeenCalled();
+  });
+
+  it("drops a reconciliation that resolves after a newer one was started", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-pending",
+          bodyText: linkURL,
+          bodyFormat: "v2",
+          links: [
+            linkEntity({
+              safety: "pending",
+              click: "none",
+              href: "",
+              updatedAt: "2026-08-18T12:00:00Z",
+            }),
+          ],
+        }),
+      ]),
+    );
+    let resolveOld: (value: MessageSecuritySnapshot[]) => void = () => {};
+    const old = new Promise<MessageSecuritySnapshot[]>((resolve) => {
+      resolveOld = resolve;
+    });
+    mockFetchChannelMessageSecuritySnapshots.mockReturnValueOnce(old).mockResolvedValueOnce([
+      {
+        messageId: "msg-pending",
+        available: true,
+        status: "active",
+        linkSafetyState: "safe",
+        updatedAt: "2026-08-18T12:30:00Z",
+        links: [linkEntity({ updatedAt: "2026-08-18T12:30:00Z" })],
+      },
+    ]);
+    renderChannelArea();
+    await screen.findByTestId("chat-msg-bubble");
+
+    reconnect(); // the old request, still in flight
+    reconnect(); // the new one, which aborts the old
+    await waitFor(() => expect(mockFetchChannelMessageSecuritySnapshots).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole("link", { name: linkURL })).toBeInTheDocument();
+
+    // The old answer arrives late, still saying pending: it must not apply.
+    await act(async () => {
+      resolveOld([
+        {
+          messageId: "msg-pending",
+          available: true,
+          status: "active",
+          linkSafetyState: "",
+          updatedAt: "2026-08-18T12:00:00Z",
+          links: [
+            linkEntity({
+              safety: "pending",
+              click: "none",
+              href: "",
+              updatedAt: "2026-08-18T12:00:00Z",
+            }),
+          ],
+        },
+      ]);
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("link", { name: linkURL })).toBeInTheDocument();
   });
 
   it.each([
     ["", "safe"],
-    ["", "inconclusive"],
-    ["safe", "inconclusive"],
-    ["inconclusive", "safe"],
+    ["", "unknown"],
+    ["safe", "unknown"],
+    ["unknown", "safe"],
     ["safe", ""],
-  ] as const)("renders message.updated link safety %s -> %s", async (before, after) => {
+  ] as const)("renders message.updated links %s -> %s", async (before, after) => {
+    const entityFor = (safety: string) =>
+      safety === "safe" ? linkEntity() : safety === "unknown" ? unknownEntity() : undefined;
     mockFetchChannelMessages.mockResolvedValue(
       messagePage([
         makeMessage({
           id: "msg-updated",
-          bodyText: linkURL,
+          bodyText: before === "" ? "sem URL" : linkURL,
           bodyFormat: "v2",
-          linkSafetyState: before,
+          ...(entityFor(before) ? { links: [entityFor(before)!] } : {}),
         }),
       ]),
     );
     renderChannelArea();
     await screen.findByTestId("chat-msg-bubble");
 
+    const wireLink = entityFor(after);
     act(() =>
       wsMockState.capturedWSMessageUpdated?.({
         type: "message.updated",
@@ -8656,21 +10290,39 @@ describe("ChatMessageArea — RF-21 link safety", () => {
           edited_at: "2026-08-18T12:00:00Z",
           edit_count: 1,
           is_edited: true,
-          link_safety_state: after,
+          link_safety_state: after === "unknown" ? "inconclusive" : after,
+          ...(wireLink
+            ? {
+                links: [
+                  {
+                    ordinal: 0,
+                    target_key: "key-artigo",
+                    text: linkURL,
+                    url: linkURL,
+                    hostname: "example.test",
+                    safety: wireLink.safety,
+                    click: wireLink.click,
+                    href: wireLink.href,
+                    updated_at: wireLink.updatedAt,
+                  },
+                ],
+              }
+            : {}),
         },
       }),
     );
 
-    if (after === "safe" || after === "inconclusive") {
+    if (after === "safe") {
       expect(await screen.findByRole("link", { name: linkURL })).toHaveAttribute("href", linkURL);
     } else {
       await waitFor(() => expect(screen.queryByRole("link", { name: linkURL })).toBeNull());
     }
-    if (after === "inconclusive") {
-      expect(screen.getByTestId("chat-message-link-unverified")).toBeInTheDocument();
+    if (after === "unknown") {
+      expect(await unverifiedButton()).toBeInTheDocument();
     } else {
-      expect(screen.queryByTestId("chat-message-link-unverified")).toBeNull();
+      expect(screen.queryByRole("button", { name: `${linkURL} — Link não verificado` })).toBeNull();
     }
+    expect(screen.queryByTestId("chat-message-link-unverified")).toBeNull();
   });
 
   it("renders a safe message's link as an anchor with no notice", async () => {
@@ -8681,6 +10333,7 @@ describe("ChatMessageArea — RF-21 link safety", () => {
           bodyText: `veja ${linkURL}`,
           bodyFormat: "v2",
           linkSafetyState: "safe",
+          links: [linkEntity()],
         }),
       ]),
     );
@@ -8691,7 +10344,43 @@ describe("ChatMessageArea — RF-21 link safety", () => {
     expect(screen.queryByTestId("chat-message-link-unverified")).not.toBeInTheDocument();
   });
 
-  it("renders no link at all for a message whose link was condemned", async () => {
+  it("renders the blocked chip, and the rest of the text, for a condemned link", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-blocked",
+          bodyText: "veja \uFFFC e https://good.test/x",
+          bodyFormat: "v2",
+          linkSafetyState: "malicious",
+          links: [
+            blockedEntity(),
+            linkEntity({
+              ordinal: 1,
+              text: "https://good.test/x",
+              url: "https://good.test/x",
+              href: "https://good.test/x",
+              hostname: "good.test",
+            }),
+          ],
+        }),
+      ]),
+    );
+
+    renderChannelArea();
+
+    expect(await screen.findByText("Link bloqueado por segurança")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "https://good.test/x" })).toHaveAttribute(
+      "href",
+      "https://good.test/x",
+    );
+    expect(screen.queryByRole("link", { name: linkURL })).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(new RegExp(linkURL.replace(/[/.?]/g, "\\$&"))),
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId("chat-msg-bubble")).toHaveTextContent("veja");
+  });
+
+  it("renders no link at all for a legacy condemned message", async () => {
     mockFetchChannelMessages.mockResolvedValue(
       messagePage([
         makeMessage({
@@ -8712,5 +10401,197 @@ describe("ChatMessageArea — RF-21 link safety", () => {
     expect(
       screen.queryByText(new RegExp(linkURL.replace(/[/.?]/g, "\\$&"))),
     ).not.toBeInTheDocument();
+  });
+});
+
+// ── Renomeação inline pelo painel (issue #893) ───────────────────────────────
+//
+// The integration half of the inline editor: the panel is handed a rename only
+// when the canonical channel list says this caller may, the mutation it calls
+// is the sidebar's own, and the three surfaces converge from the one refetch
+// that mutation triggers — never from the typed draft.
+
+/**
+ * Renders the message area over a canonical channel list the *mutation* moves.
+ *
+ * `renameChannel` mirrors useChatSidebar's: it awaits the write and then
+ * refreshes the canonical list, which is what the header reads and what makes
+ * the panel refetch. The details fixture is moved in the same step, exactly as
+ * the server's own row would be, so nothing in the test invents a name the
+ * "backend" never stored.
+ */
+function renderInlineRenameHost(channel: ChatOutletContext["channels"][number]) {
+  const names = new Map<string, string>([[channel.id, channel.name]]);
+  mockFetchChannelDetails.mockImplementation((channelId: string) =>
+    Promise.resolve({
+      ...channelDetailsFor(channelId),
+      name: names.get(channelId) ?? `Canal ${channelId}`,
+    }),
+  );
+  const renameChannel = vi.fn(async (channelId: string, displayName: string) => {
+    names.set(channelId, displayName);
+  });
+
+  function Host() {
+    const [channels, setChannels] = useState([channel]);
+    const rename = async (channelId: string, displayName: string) => {
+      await renameChannel(channelId, displayName);
+      // The refetch the real mutation performs: the canonical list, re-read.
+      setChannels((current) =>
+        current.map((row) => (row.id === channelId ? { ...row, name: displayName } : row)),
+      );
+    };
+    return (
+      <ParentWithContext
+        ctx={{ currentUserId: "me-123", channels, dms: [], renameChannel: rename }}
+      />
+    );
+  }
+
+  render(
+    <MemoryRouter initialEntries={[`/chat/channel/${channel.id}`]}>
+      <Routes>
+        <Route path="/chat" element={<Host />}>
+          <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  );
+  return { renameChannel };
+}
+
+describe("ChatMessageArea — renomeação inline pelo painel (#893)", () => {
+  it("renames from the panel and converges the panel and the header without a reload", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    const { renameChannel } = renderInlineRenameHost({
+      ...namedChannel("geral", "Geral"),
+      canRename: true,
+    });
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    const panel = await screen.findByTestId("chat-conversation-details");
+    await within(panel).findByTestId("chat-details-channel-name");
+
+    await userEvent.click(within(panel).getByRole("button", { name: "Renomear canal" }));
+    const field = within(panel).getByRole("textbox", { name: "Nome do canal" });
+    await userEvent.clear(field);
+    await userEvent.type(field, "Plataforma{Enter}");
+
+    // The sidebar's own mutation, with the route's id — not a second endpoint.
+    await waitFor(() => expect(renameChannel).toHaveBeenCalledWith("geral", "Plataforma"));
+    // The header reads the canonical list; the panel refetched its own row.
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Plataforma"),
+    );
+    await waitFor(() =>
+      expect(within(panel).getByTestId("chat-details-channel-name")).toHaveTextContent(
+        "Plataforma",
+      ),
+    );
+    // The panel never unmounted and the editor closed: the edit happened in
+    // place, with no modal and no remount of the conversation.
+    expect(screen.getByTestId("chat-conversation-details")).toBe(panel);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(within(panel).queryByRole("textbox", { name: "Nome do canal" })).not.toBeInTheDocument();
+  });
+
+  // ── CQ-893-03: one rename, one reconciliation ───────────────────────────
+  //
+  // There used to be two reconciliation paths for the same fact. The editor
+  // asked the panel to reload on success, *and* the canonical name moving
+  // asked it again through useReloadOnRename — so one local rename issued two
+  // GET /details on top of the panel's opening read. useConversationDetails
+  // aborts the earlier of the two, which hides the cost without removing it.
+  //
+  // The opening read is counted separately from the reconciliation on purpose:
+  // what the fix is about is how many refetches the *rename* causes.
+  it("causes exactly one details refetch for one local rename", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderInlineRenameHost({ ...namedChannel("geral", "Geral"), canRename: true });
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    const panel = await screen.findByTestId("chat-conversation-details");
+    await within(panel).findByTestId("chat-details-channel-name");
+    // The panel's opening read, and nothing else yet.
+    await waitFor(() => expect(detailsRequestsFor("geral")).toBe(1));
+
+    await userEvent.click(within(panel).getByRole("button", { name: "Renomear canal" }));
+    const field = within(panel).getByRole("textbox", { name: "Nome do canal" });
+    await userEvent.clear(field);
+    await userEvent.type(field, "Plataforma{Enter}");
+
+    await waitFor(() =>
+      expect(within(panel).getByTestId("chat-details-channel-name")).toHaveTextContent(
+        "Plataforma",
+      ),
+    );
+    // One reconciliation on top of the opening read. Two would be the bug.
+    expect(detailsRequestsFor("geral")).toBe(2);
+
+    // And it settles there: a reload replaces details.data.name, and if that
+    // were what the watcher observed it would ask for another reload, forever.
+    // It observes the canonical name instead, so there is no cycle.
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(detailsRequestsFor("geral")).toBe(2);
+  });
+
+  // A confirmation that changes nothing sends nothing, so the canonical name
+  // never moves and there is nothing to reconcile.
+  it("refetches nothing when the confirmed name is the one already persisted", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    const { renameChannel } = renderInlineRenameHost({
+      ...namedChannel("geral", "Geral"),
+      canRename: true,
+    });
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    const panel = await screen.findByTestId("chat-conversation-details");
+    const persisted = within(panel).getByTestId("chat-details-channel-name").textContent ?? "";
+    await waitFor(() => expect(detailsRequestsFor("geral")).toBe(1));
+
+    await userEvent.click(within(panel).getByRole("button", { name: "Renomear canal" }));
+    const field = within(panel).getByRole("textbox", { name: "Nome do canal" });
+    await userEvent.clear(field);
+    await userEvent.type(field, `  ${persisted}  {Enter}`);
+
+    expect(renameChannel).not.toHaveBeenCalled();
+    expect(detailsRequestsFor("geral")).toBe(1);
+  });
+
+  // The capability is the server's, carried by the canonical list. Absent is
+  // read as "no", and the panel simply has no control.
+  it("offers no rename when the canonical list withholds the capability", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderInlineRenameHost(namedChannel("geral", "Geral"));
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    const panel = await screen.findByTestId("chat-conversation-details");
+    await within(panel).findByTestId("chat-details-channel-name");
+
+    expect(within(panel).queryByRole("button", { name: "Renomear canal" })).not.toBeInTheDocument();
+  });
+
+  // The workspace's general channel, by its structural flag alone. The backend
+  // refuses a rename of it regardless; the panel does not offer one.
+  it("offers no rename on the general channel even when the capability is set", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderInlineRenameHost({
+      ...namedChannel("geral", "Geral"),
+      canRename: true,
+      isGeneral: true,
+    });
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    const panel = await screen.findByTestId("chat-conversation-details");
+    await within(panel).findByTestId("chat-details-channel-name");
+
+    expect(within(panel).queryByRole("button", { name: "Renomear canal" })).not.toBeInTheDocument();
   });
 });

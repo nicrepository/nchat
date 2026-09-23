@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# A curl stand-in for the nchat-dev smoke tests (issue #933).
+#
+# The smoke asks the public host three questions and reads only the status
+# code, so this answers with one. Statuses come from FAKE_STATE_DIR/status/,
+# keyed by the request path with `/` replaced by `_`:
+#
+#   status/_               the application root
+#   status/_api_chat_sidebar
+#   status/_api_chat_ws
+#
+# A key holding the word `unreachable` makes the request fail the way a host
+# that does not answer does: a non-zero exit and `000` written out, which is
+# what curl itself reports.
+set -Eeuo pipefail
+
+STATE="${FAKE_STATE_DIR:?FAKE_STATE_DIR is required}"
+
+url="${*: -1}"
+path="/${url#*://*/}"
+[[ "$url" == */* ]] || path="/"
+key="${path//\//_}"
+file="$STATE/status/$key"
+
+if [[ ! -f "$file" ]]; then
+  printf '000'
+  exit 7
+fi
+
+status="$(cat "$file")"
+if [[ "$status" == unreachable ]]; then
+  printf '000'
+  exit 7
+fi
+printf '%s' "$status"

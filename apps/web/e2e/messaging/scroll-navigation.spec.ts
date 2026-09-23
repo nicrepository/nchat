@@ -1,10 +1,12 @@
 import { expect, test, type Page } from "@playwright/test";
 
+import { installPaginatedMessages } from "../helpers/largeConversationFixture";
 import {
   CURRENT_USER_ID,
   OTHER_USER_ID,
   OTHER_USER_NAME,
   createScenario,
+  emitMessageCreated,
   installMessagingMocks,
   makeMessage,
   uniqueId,
@@ -527,4 +529,496 @@ test.describe("chat scroll navigation (#492)", () => {
     );
     expect(distanceFromTail).toBeGreaterThan(0);
   });
+});
+
+/**
+ * #880 — a programmatic navigation that keeps its destination.
+ *
+ * The defect these reproduce was captured in DEV with every scrollTop write
+ * attributed to its caller. The sequence, on a conversation with a prepended
+ * page and a row growing mid-trip:
+ *
+ *   t+36   click ↓          → one scrollIntoView at the sentinel
+ *   t+64   a row reflows    → the sentinel is positioned by the virtualizer's
+ *                             canvas, whose height trails that measurement, so
+ *                             it reports "intersecting" with 214px still below
+ *                             the fold — and the operation ends there
+ *   t+81   the tail-lock pins to the (now taller) end
+ *   t+108  the prepend restoration, re-armed by that very phase change, puts a
+ *          stale anchor back: 238px short of the tail
+ *   ...    nothing resizes again, so nothing corrects it: the reader is parked
+ *          mid-conversation with the control hidden, claiming they arrived
+ *
+ * Both halves are asserted numerically here — the distance to the end, the
+ * sentinel, and the control — because "it looks like it got there" is exactly
+ * what the previous version also looked like.
+ */
+test.describe("chat tail navigation under reflow (#880)", () => {
+  /** remainingPx = scrollHeight - scrollTop - clientHeight, as the issue defines it. */
+  const remainingPx = (page: Page) =>
+    page
+      .locator(".chat-msg-area__list")
+      .evaluate((el) => Math.round(el.scrollHeight - el.scrollTop - el.clientHeight));
+
+  /**
+   * Grows a mounted row on each of the next `count` scroll events.
+   *
+   * Reflows *during* the navigation, which is the case at issue, and driven by
+   * the navigation's own movement rather than by a timer — no wait, no sleep,
+   * and no assumption about how long the trip takes.
+   */
+  async function growRowsWhileNavigating(page: Page, count: number, px: number) {
+    await page.evaluate(
+      ([count, px]) => {
+        const list = document.querySelector(".chat-msg-area__list") as HTMLElement;
+        let done = 0;
+        const onScroll = () => {
+          if (done >= count) {
+            list.removeEventListener("scroll", onScroll);
+            return;
+          }
+          const rows = [...list.querySelectorAll<HTMLElement>("[data-message-id]")];
+          const target = rows[rows.length - 1 - done];
+          if (!target) return;
+          done += 1;
+          const filler = document.createElement("div");
+          filler.style.height = `${px}px`;
+          filler.setAttribute("data-testid", `reflow-${done}`);
+          target.appendChild(filler);
+        };
+        list.addEventListener("scroll", onScroll);
+      },
+      [count, px],
+    );
+  }
+
+  function longHistory(targetId: string, count: number) {
+    return Array.from({ length: count }, (_, i) =>
+      makeMessage({
+        id: `${targetId}-msg-${i}`,
+        sender_id: i % 3 === 0 ? OTHER_USER_ID : CURRENT_USER_ID,
+        sender_display_name: i % 3 === 0 ? OTHER_USER_NAME : undefined,
+        // Deliberately uneven: every row the same height would let a single
+        // estimate stand in for the whole conversation, and the retargeting
+        // under test is about estimates turning into real measurements.
+        body_text: `Mensagem ${i} ` + "texto ".repeat((i * 37) % 90),
+        created_at: new Date(Date.UTC(2026, 6, 15, 8, 0, 0) + i * 61_000).toISOString(),
+      }),
+    );
+  }
+
+  /** The end really reached: the geometry, the sentinel and the control agree. */
+  async function expectAtTheRealTail(page: Page) {
+    await expect.poll(() => remainingPx(page), { timeout: 10_000 }).toBeLessThanOrEqual(2);
+    await expect(page.getByTestId("chat-bottom-sentinel")).toBeInViewport();
+    await expect(page.getByRole("button", { name: /Ir para o final|Começar pelas/ })).toBeHidden();
+  }
+
+  test("reaches the tail through three consecutive reflows during the navigation", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "tail-reflows");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Canal longo",
+      messages: longHistory(targetId, 300),
+    });
+    await installMessagingMocks(page, scenario);
+    await disableNativeScrollAnchoring(page);
+
+    await page.goto(`/chat/channel/${targetId}`);
+    await expect(page.getByTestId("chat-bottom-sentinel")).toBeInViewport();
+
+    const list = page.locator(".chat-msg-area__list");
+    await list.evaluate((el) => {
+      el.scrollTop = 0;
+    });
+    const button = page.getByRole("button", { name: /Ir para o final da conversa/ });
+    await expect(button).toBeVisible();
+
+    await growRowsWhileNavigating(page, 3, 400);
+    await button.click();
+
+    await expectAtTheRealTail(page);
+    // The growth really happened, so the assertions above are about a timeline
+    // that moved underneath the navigation rather than about a static one.
+    await expect(page.getByTestId("reflow-3")).toHaveCount(1);
+  });
+
+  test("is not undone by the restoration a prepended page left behind", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "tail-after-prepend");
+    const all = longHistory(targetId, 200);
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Canal paginado",
+      messages: all,
+    });
+    await installMessagingMocks(page, scenario);
+    const messages = await installPaginatedMessages(page, targetId, all);
+    await disableNativeScrollAnchoring(page);
+
+    await page.goto(`/chat/channel/${targetId}`);
+    await expect(page.getByTestId("chat-bottom-sentinel")).toBeInViewport();
+
+    const list = page.locator(".chat-msg-area__list");
+    // Two pages of history, so "prepend" is the last mutation this timeline
+    // saw and the position it would restore is screens away — the state the
+    // capture above was taken in.
+    for (let page_ = 0; page_ < 2; page_ += 1) {
+      await list.evaluate((el) => {
+        el.scrollTop = 0;
+      });
+      await expect.poll(() => messages.pagesInFlight()).toBe(1);
+      await expect.poll(() => messages.pagesInFlight(), { timeout: 20_000 }).toBe(0);
+      await settledTimeline(page);
+    }
+
+    // Walk down through the whole tail region first, so every row there is
+    // already measured: without this the strand is hidden by an incidental
+    // later remeasure, which is exactly how it survived until now.
+    for (let top = 3_000; top < 20_000; top += 400) {
+      await list.evaluate((el, value) => {
+        el.scrollTop = value;
+      }, top);
+      await page.evaluate(
+        () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+      );
+    }
+    await settledTimeline(page);
+    await list.evaluate((el) => {
+      el.scrollTop = 3_000;
+    });
+    // Quiet before the trip, as two equal readings rather than as a wait: with
+    // a remeasure still in flight the strand is repaired by accident, which is
+    // how this defect survived a suite that already covered reflow.
+    await settledTimeline(page);
+
+    const button = page.getByRole("button", { name: /Ir para o final da conversa/ });
+    await expect(button).toBeVisible();
+    await growRowsWhileNavigating(page, 1, 400);
+    await button.click();
+
+    await expectAtTheRealTail(page);
+  });
+});
+
+/**
+ * #880 — the one floating control, and what it means at each moment.
+ *
+ * `↓ N` takes the reader to the boundary the unread messages start at, and
+ * only the *next* press takes them to the end. Jumping straight to the end
+ * would skip exactly what they came back for.
+ *
+ * Run over a channel, a group and a direct conversation, from one body: the
+ * navigation is shared, and a branch per kind is what this must not become.
+ */
+const CONTEXTUAL_BUTTON_KINDS = [
+  { label: "canal", kind: "channel" as const, path: "channel" },
+  { label: "grupo", kind: "dm" as const, path: "dm", conversationType: "group" as const },
+  {
+    label: "conversa direta",
+    kind: "dm" as const,
+    path: "dm",
+    conversationType: "direct" as const,
+  },
+];
+
+test.describe("the contextual scroll control (#880)", () => {
+  for (const target of CONTEXTUAL_BUTTON_KINDS) {
+    test(`leads to the unread boundary first and to the end afterwards — ${target.label}`, async ({
+      page,
+    }, testInfo) => {
+      const targetId = uniqueId(testInfo, `unread-${target.path}-${target.conversationType ?? ""}`);
+      const read = Array.from({ length: 40 }, (_, i) =>
+        makeMessage({
+          id: `${targetId}-read-${i}`,
+          sender_id: OTHER_USER_ID,
+          sender_display_name: OTHER_USER_NAME,
+          body_text: `Mensagem lida ${i}`,
+          created_at: new Date(Date.UTC(2026, 6, 15, 9, 0, 0) + i * 60_000).toISOString(),
+        }),
+      );
+      const unread = Array.from({ length: 30 }, (_, i) =>
+        makeMessage({
+          id: `${targetId}-unread-${i}`,
+          sender_id: OTHER_USER_ID,
+          sender_display_name: OTHER_USER_NAME,
+          body_text: `Mensagem não lida ${i}`,
+          created_at: new Date(Date.UTC(2026, 6, 15, 11, 0, 0) + i * 60_000).toISOString(),
+        }),
+      );
+      const scenario = createScenario({
+        kind: target.kind,
+        targetId,
+        targetName: "Conversa com não lidas",
+        conversationType: target.conversationType,
+        messages: [...read, ...unread],
+      });
+      const sidebar =
+        target.kind === "channel"
+          ? scenario.sidebarChannels.find((channel) => channel.id === targetId)
+          : scenario.sidebarDMs.find((dm) => dm.id === targetId);
+      sidebar!.unread_count = unread.length;
+      await installMessagingMocks(page, scenario);
+      await disableNativeScrollAnchoring(page);
+
+      await page.goto(`/chat/${target.path}/${targetId}`);
+
+      // Opens on the boundary, with read context above it: the separator is on
+      // screen and so is at least one message the reader had already seen.
+      const separator = page.getByRole("separator", { name: "Novas mensagens" });
+      await expect(separator).toBeInViewport();
+      await expect(page.getByText("Mensagem lida 39")).toBeInViewport();
+      const list = page.locator(".chat-msg-area__list");
+      const separatorOffset = () =>
+        page.evaluate(() => {
+          const el = document.querySelector(".chat-msg-area__list") as HTMLElement;
+          const row = document.querySelector('[role="separator"]') as HTMLElement;
+          return Math.round(row.getBoundingClientRect().top - el.getBoundingClientRect().top);
+        });
+      expect(await separatorOffset()).toBeGreaterThan(0);
+
+      // Up into the history: the boundary is below the fold again, and the
+      // control goes back to offering it.
+      await list.evaluate((el) => {
+        el.scrollTop = 0;
+      });
+      await settledTimeline(page);
+      const toBoundary = page.getByRole("button", { name: "Começar pelas 30 novas mensagens" });
+      await expect(toBoundary).toBeVisible();
+
+      // A message arrives while they read: the viewport must not move, and the
+      // count is unread — not "messages below the fold".
+      await emitMessageCreated(page, scenario, {
+        kind: target.kind,
+        targetId,
+        message: makeMessage({
+          id: `${targetId}-live-1`,
+          sender_id: OTHER_USER_ID,
+          sender_display_name: OTHER_USER_NAME,
+          body_text: "Chegou agora",
+          created_at: "2026-07-15T12:00:00.000Z",
+        }),
+      });
+      await expect(
+        page.getByRole("button", { name: "Começar pelas 31 novas mensagens" }),
+      ).toBeVisible();
+      expect(await list.evaluate((el) => Math.round(el.scrollTop))).toBe(0);
+
+      // The first press lands on the boundary, not on the end.
+      await page.getByRole("button", { name: "Começar pelas 31 novas mensagens" }).click();
+      await expect(separator).toBeInViewport();
+      await expect
+        .poll(() => list.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight))
+        .toBeGreaterThan(2);
+      expect(await separatorOffset()).toBeGreaterThan(0);
+
+      // And from there the same control means the end.
+      const toTail = page.getByRole("button", { name: /^Ir para o final da conversa/ });
+      await expect(toTail).toBeVisible();
+      await toTail.click();
+      await expect
+        .poll(() =>
+          list.evaluate((el) => Math.round(el.scrollHeight - el.scrollTop - el.clientHeight)),
+        )
+        .toBeLessThanOrEqual(2);
+      await expect(page.getByTestId("chat-bottom-sentinel")).toBeInViewport();
+      await expect(
+        page.getByRole("button", { name: /Ir para o final|Começar pelas/ }),
+      ).toBeHidden();
+    });
+  }
+});
+
+/**
+ * #880 item 19 — the same control on a phone-sized viewport.
+ *
+ * The contextual offset is proportional to the viewport, so a short screen
+ * must not spend it on already-read history; and the control has to stay above
+ * the composer, where a thumb can reach it and the keyboard does not cover it.
+ */
+test.describe("the contextual scroll control on a small viewport (#880)", () => {
+  test("keeps the boundary reachable and the control above the composer", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize({ width: 390, height: 760 });
+    const targetId = uniqueId(testInfo, "unread-mobile");
+    const messages = [
+      ...Array.from({ length: 30 }, (_, i) =>
+        makeMessage({
+          id: `${targetId}-read-${i}`,
+          sender_id: OTHER_USER_ID,
+          sender_display_name: OTHER_USER_NAME,
+          body_text: `Mensagem lida ${i}`,
+          created_at: new Date(Date.UTC(2026, 6, 15, 9, 0, 0) + i * 60_000).toISOString(),
+        }),
+      ),
+      ...Array.from({ length: 20 }, (_, i) =>
+        makeMessage({
+          id: `${targetId}-unread-${i}`,
+          sender_id: OTHER_USER_ID,
+          sender_display_name: OTHER_USER_NAME,
+          body_text: `Mensagem não lida ${i}`,
+          created_at: new Date(Date.UTC(2026, 6, 15, 11, 0, 0) + i * 60_000).toISOString(),
+        }),
+      ),
+    ];
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Canal móvel",
+      messages,
+    });
+    scenario.sidebarChannels.find((channel) => channel.id === targetId)!.unread_count = 20;
+    await installMessagingMocks(page, scenario);
+    await disableNativeScrollAnchoring(page);
+
+    await page.goto(`/chat/channel/${targetId}`);
+
+    const separator = page.getByRole("separator", { name: "Novas mensagens" });
+    await expect(separator).toBeInViewport();
+    // Context above the boundary, and not half the screen of it: on a short
+    // viewport the proportional offset is clamped, never a fixed desktop value.
+    const offset = await page.evaluate(() => {
+      const list = document.querySelector(".chat-msg-area__list") as HTMLElement;
+      const row = document.querySelector('[role="separator"]') as HTMLElement;
+      return Math.round(row.getBoundingClientRect().top - list.getBoundingClientRect().top);
+    });
+    const viewportPx = await page.locator(".chat-msg-area__list").evaluate((el) => el.clientHeight);
+    expect(offset).toBeGreaterThan(0);
+    expect(offset).toBeLessThan(viewportPx / 2);
+
+    const list = page.locator(".chat-msg-area__list");
+    await list.evaluate((el) => {
+      el.scrollTop = 0;
+    });
+    await settledTimeline(page);
+    const control = page.getByRole("button", { name: "Começar pelas 20 novas mensagens" });
+    await expect(control).toBeVisible();
+
+    // Above the composer, and a target a thumb can hit.
+    const controlBox = (await control.boundingBox())!;
+    const composerBox = (await page.getByTestId("chat-composer-input").boundingBox())!;
+    expect(controlBox.y + controlBox.height).toBeLessThanOrEqual(composerBox.y);
+    expect(Math.min(controlBox.width, controlBox.height)).toBeGreaterThanOrEqual(36);
+
+    // Operable from the keyboard, and it never steals focus by appearing.
+    expect(await page.evaluate(() => document.activeElement?.tagName)).not.toBe("BUTTON");
+    await control.focus();
+    await page.keyboard.press("Enter");
+    await expect(separator).toBeInViewport();
+
+    await page.getByRole("button", { name: /^Ir para o final da conversa/ }).press("Space");
+    await expect
+      .poll(() =>
+        list.evaluate((el) => Math.round(el.scrollHeight - el.scrollTop - el.clientHeight)),
+      )
+      .toBeLessThanOrEqual(2);
+    await expect(page.getByTestId("chat-bottom-sentinel")).toBeInViewport();
+  });
+});
+
+/**
+ * #880 — a scrollbar drag in a real browser.
+ *
+ * Which event a drag produces depends on how the browser draws its scrollbars:
+ * a classic one is part of the page and reports a pointer past the content
+ * box; an overlay one (what this Chromium draws, and what the assertion below
+ * records) is browser chrome, and the page sees only the scroll it caused. The
+ * viewport recognises both, and this test is here to keep the observable half
+ * honest — the reader keeps the position they dragged to, whatever the engine
+ * chose to tell the page.
+ */
+test.describe("a scrollbar drag during a programmatic navigation (#880)", () => {
+  // Both sides of the distance rule (#675): the long trip is instant by that
+  // rule, and the short one is instant because this browser's overlay
+  // scrollbar would leave an animation impossible to interrupt.
+  for (const trip of [
+    { label: "de longe", startAtTopPx: 0, draggedTo: [9_000, 5_500, 4_000] },
+    { label: "de perto", startAtTopPx: -1_200, draggedTo: [1_400, 900, 600] },
+  ]) {
+    test(`ends the trip to the end and leaves the reader where they dragged to — ${trip.label}`, async ({
+      page,
+    }, testInfo) => {
+      const targetId = uniqueId(testInfo, `scrollbar-drag-${trip.label.replace(" ", "-")}`);
+      const scenario = createScenario({
+        kind: "channel",
+        targetId,
+        targetName: "Canal com scrollbar",
+        messages: Array.from({ length: 200 }, (_, i) =>
+          makeMessage({
+            id: `${targetId}-msg-${i}`,
+            sender_id: i % 3 === 0 ? OTHER_USER_ID : CURRENT_USER_ID,
+            sender_display_name: i % 3 === 0 ? OTHER_USER_NAME : undefined,
+            body_text: `Mensagem ${i} ` + "texto ".repeat((i * 37) % 90),
+            created_at: new Date(Date.UTC(2026, 6, 15, 8, 0, 0) + i * 61_000).toISOString(),
+          }),
+        ),
+      });
+      await installMessagingMocks(page, scenario);
+      await disableNativeScrollAnchoring(page);
+
+      await page.goto(`/chat/channel/${targetId}`);
+      await expect(page.getByTestId("chat-bottom-sentinel")).toBeInViewport();
+
+      const list = page.locator(".chat-msg-area__list");
+      await list.evaluate((el, startAtTopPx) => {
+        el.scrollTop =
+          startAtTopPx >= 0 ? startAtTopPx : el.scrollHeight - el.clientHeight + startAtTopPx;
+      }, trip.startAtTopPx);
+      await settledTimeline(page);
+
+      // A trip to the end, and the reader taking the scrollbar mid-way: the
+      // pointer goes down on the bar (classic scrollbars) and the drag scrolls
+      // (every kind), which is what an overlay scrollbar leaves behind.
+      const box = (await list.boundingBox())!;
+      await page.getByRole("button", { name: /Ir para o final da conversa/ }).click();
+      await page.mouse.move(box.x + box.width - 3, box.y + box.height / 2);
+      await page.mouse.down();
+      // A drag is a stream of scroll events, not one: the viewport reads a
+      // reader's position from an event whose layout did not move under it
+      // (#788), and a single event could land on a measurement.
+      await list.evaluate(async (el, tops) => {
+        const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+        for (const top of tops) {
+          el.scrollTop = top;
+          await frame();
+        }
+      }, trip.draggedTo);
+      await page.mouse.move(box.x + box.width - 3, box.y + box.height / 4, { steps: 6 });
+      await page.mouse.up();
+      await settledTimeline(page);
+
+      // Far from the end, which is the invariant — not a pixel, since a row
+      // above the fold being measured legitimately moves the offset to keep
+      // the content still (#675).
+      const remainingAfterDrag = await list.evaluate((el) =>
+        Math.round(el.scrollHeight - el.scrollTop - el.clientHeight),
+      );
+      expect(remainingAfterDrag).toBeGreaterThan(1_000);
+      await expect(page.getByRole("button", { name: /Ir para o final da conversa/ })).toBeVisible();
+
+      // A row above the fold grows afterwards: the navigation is over, so
+      // nothing retargets the end, and what the reader is looking at stays put.
+      await mountedMessage(page, "first").evaluate((el) => {
+        const filler = document.createElement("div");
+        filler.style.height = "300px";
+        filler.setAttribute("data-testid", "post-drag-reflow");
+        el.appendChild(filler);
+      });
+      await expect(page.getByTestId("post-drag-reflow")).toHaveCount(1);
+      await settledTimeline(page);
+
+      await expect
+        .poll(() =>
+          list.evaluate((el) => Math.round(el.scrollHeight - el.scrollTop - el.clientHeight)),
+        )
+        .toBeGreaterThan(2);
+      await expect(page.getByRole("button", { name: /Ir para o final da conversa/ })).toBeVisible();
+    });
+  }
 });

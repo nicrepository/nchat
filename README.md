@@ -152,21 +152,116 @@ esses pacotes.
 
 GitHub Actions e o pipeline principal do NChat. GitLab CI foi adicionado como espelho futuro para um mirror GitLab, sem deploy automatico nesta etapa.
 
-Workflows GitHub Actions:
+A arquitetura de CI segue uma regra unica: **um gate, um owner, uma execucao**. Cada
+validacao obrigatoria e exatamente um job, com nome que descreve a falha e comando local
+equivalente. `.github/workflows/ci.yml` e o unico workflow de gates; `Security` e
+`Governance` sao workflows chamados por ele (`workflow_call`), o que mantem o schedule
+semanal de seguranca e o modelo de confianca da governanca separados sem duplicar execucao.
 
-- `Governance`: valida governanca basica do repositorio.
-- `Backend`: valida formatacao, vet, testes, coverage e lint Go.
-- `Frontend`: valida formatacao, lint, typecheck, testes, coverage e build web.
-- `Quality`: executa o gate agregado local.
-- `CI`: agrega metadata, quality, backend, frontend e manifests para facilitar required checks futuros.
-- `Security`: executa secret scan, `govulncheck` e Trivy em PR, push e schedule semanal.
+`scripts/ci/check_ci_architecture.py` (`make ci-architecture-check`) e o gate que impede a
+regressao: recusa um mesmo comando com dois owners, um gate sem owner, `pnpm ci`/`make ci`
+dentro do GitHub Actions, `continue-on-error` em gate, o agregador executando trabalho real
+e o SonarQube voltando a bloquear.
 
-Comandos locais:
+### Gates obrigatorios (Required)
+
+Todos entram em `CI / Required` e rodam em paralelo.
+
+| Check                     | Responsabilidade                                                                                                                                                    | Comando local                                 |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `Static / Web`            | Prettier, ESLint e TypeScript de `apps/web`                                                                                                                         | `make ci-static-web`                          |
+| `Static / Admin`          | Prettier, ESLint e TypeScript de `apps/admin-web`                                                                                                                   | `make ci-static-admin-web`                    |
+| `Static / Go`             | `gofmt`, `go vet`, `golangci-lint` em todos os modulos Go                                                                                                           | `make ci-static-go`                           |
+| `Static / Repository`     | Prettier de docs/YAML/JSON, config e arquitetura da CI, inputs de imagem                                                                                            | `make ci-static-repository`                   |
+| `Tests / Web Unit`        | Vitest de `apps/web` com coverage e thresholds                                                                                                                      | `make web-coverage`                           |
+| `Tests / Admin Unit`      | Vitest de `apps/admin-web` com coverage e thresholds                                                                                                                | `pnpm test:coverage:admin-web`                |
+| `Tests / Go Unit`         | `go test ./...` sem infraestrutura externa                                                                                                                          | `make test-go`                                |
+| `Tests / Go Race`         | `go test -race ./...`                                                                                                                                               | `bash scripts/ci/go-test.sh -race`            |
+| `Tests / Go Integration`  | Suites Go que exigem PostgreSQL real: admin, auth, media e o contrato de membership do chat, cada uma com banco proprio (ver [taxonomia](docs/testing/taxonomy.md)) | `make test-integration-go`                    |
+| `Tests / Go Coverage`     | Threshold de 90% por modulo, com os perfis PostgreSQL mesclados                                                                                                     | `make go-coverage-check`                      |
+| `E2E / Web`               | Playwright de `apps/web`                                                                                                                                            | `pnpm test:e2e:web`                           |
+| `E2E / Admin`             | Playwright de `apps/admin-web`                                                                                                                                      | `pnpm test:e2e:admin-web`                     |
+| `Build / Web`             | `vite build` de `apps/web`                                                                                                                                          | `make build-web`                              |
+| `Build / Admin`           | `vite build` de `apps/admin-web`                                                                                                                                    | `make build-admin-web`                        |
+| `Security / Secrets`      | gitleaks sobre o historico                                                                                                                                          | `make security-secrets`                       |
+| `Security / Govulncheck`  | `govulncheck` + gate versionado de excecoes                                                                                                                         | `make security-govulncheck`                   |
+| `Security / Trivy FS`     | Vulnerabilidades HIGH/CRITICAL no filesystem                                                                                                                        | `make security-trivy-fs`                      |
+| `Security / Trivy Config` | IaC e Kubernetes renderizados                                                                                                                                       | `make security-trivy-config`                  |
+| `Infra / Config`          | Config operacional versionada, sem cluster ou banco (dev env, gateway, headers, TLS, media, WebRTC, observabilidade, Grafana, PoC, health contract)                 | `make ci-infra-config`                        |
+| `Infra / Kubernetes`      | Manifests k8s e politica de Sealed Secrets                                                                                                                          | `make ci-infra-kubernetes`                    |
+| `Infra / Migrations`      | Check estatico de migrations e gate Blue/Green                                                                                                                      | `make ci-infra-migrations`                    |
+| `Infra / Release Safety`  | Testes do mecanismo de release (blue/green, stateful, capacity, build-images, release manifest, deploy workflow, runner guard)                                      | `make ci-infra-release-safety`                |
+| `Infra / Web Image`       | Build Docker da imagem web + CSP LiveKit real no nginx em execucao                                                                                                  | `make web-livekit-integration-check`          |
+| `Governance / Repository` | Convencoes Git, arquivos obrigatorios, `.env`, marcadores de segredo                                                                                                | `python3 scripts/ci/git-conventions-check.py` |
+
+### Agregacao
+
+`CI / Required` e o unico check que a branch protection precisa exigir. Ele nao roda teste,
+build nem scanner: le o resultado de cada gate obrigatorio e **falha fechado**. Qualquer
+dependencia em `failure`, `cancelled` ou `skipped` -- e tambem um contexto ausente ou
+malformado -- reprova o agregador (`scripts/ci/check_required_gates.py`). Nenhum gate
+obrigatorio e legitimamente skippable: todos rodam incondicionalmente em `pull_request` e em
+`push`.
+
+### Advisory
+
+| Check                 | Responsabilidade                                                                                                                                            |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Quality / SonarQube` | Analise completa: bugs, vulnerabilities, security hotspots, code smells, duplicacao, complexidade, coverage, maintainability, technical debt e Quality Gate |
+
+O SonarQube e **advisory** nesta fase. A analise continua rodando e publicando tudo, mas o
+enforcement bloqueante (`sonar.qualitygate.wait`) foi removido: um Quality Gate reprovado nao
+entra em `CI / Required` e nao bloqueia merge nem deploy. Falha tecnica do scanner (token,
+upload, configuracao) continua reprovando o job e visivel -- nada e mascarado com
+`continue-on-error`. O job consome os artifacts de coverage dos jobs de teste em vez de
+reexecutar as suites, e so roda em push para `develop`, porque o SonarQube Community Build
+analisa uma unica branch principal.
+
+### Taxonomia de testes
+
+`docs/testing/taxonomy.md` define as categorias (Unit, Component, Integration, Contract,
+E2E, Performance, Security) e a qual gate cada uma pertence. E o que decide onde um teste
+novo mora e qual job o executa.
+
+### Paralelismo
+
+Os unicos `needs` da pipeline sao dependencias tecnicas reais:
+
+- `Quality / SonarQube` depende de `Tests / Web Unit`, `Tests / Admin Unit` e
+  `Tests / Go Coverage` porque consome os relatorios de coverage que eles publicam;
+- `CI / Required` depende dos gates obrigatorios porque precisa observar o status deles.
+
+Todo o resto roda em paralelo. `Tests / Go Integration` e `Tests / Go Coverage` sobem o
+proprio PostgreSQL; nenhum outro job espera banco.
+
+### CD
+
+Build de imagens e deploy permanecem fora da arvore de gates de PR, e consomem
+`CI / Required` em vez de rodar em paralelo com ela (#933):
+
+| Workflow                    | Trigger                      | O que faz                                     |
+| --------------------------- | ---------------------------- | --------------------------------------------- |
+| `ci-eligibility.yml`        | `workflow_call`              | le `CI / Required` do SHA exato               |
+| `build-nchat-images.yml`    | `workflow_call`              | constroi as onze imagens, uma vez, por digest |
+| `images.yml`                | `workflow_call`              | build + release manifest selado               |
+| `cd-develop.yml`            | `workflow_run` (CI, develop) | deploy automatico do nchat-dev, single-slot   |
+| `deploy-nchat-dev.yml`      | `workflow_call`              | apply, smoke e summary do nchat-dev           |
+| `cd-prepare-production.yml` | `workflow_run` (CI, main)    | candidate Blue/Green automatico, sem cutover  |
+| `cutover-nchat-prod.yml`    | `workflow_dispatch`          | decisao humana: move o trafego                |
+| `rollback-nchat-prod.yml`   | `workflow_dispatch`          | decisao humana: volta o trafego, com motivo   |
+
+`Quality / SonarQube` permanece advisory: um Quality Gate reprovado nao bloqueia
+o CD, porque a elegibilidade e lida do job `CI / Required` e nao da conclusao do
+run. Detalhes operacionais em `docs/runbooks/production-blue-green-deployment.md`
+(secao 11b) e `docs/runbooks/nchat-dev-server.md`.
+
+Comandos locais agregados:
 
 ```bash
 make ci
 make security
 make ci-config-check
+make ci-architecture-check
 ```
 
 Equivalentes pnpm:
@@ -175,14 +270,18 @@ Equivalentes pnpm:
 pnpm run ci
 pnpm security
 pnpm ci:config-check
+pnpm ci:architecture-check
 ```
+
+`pnpm ci`/`make ci` continuam existindo como conveniencia local e sao compostos dos mesmos
+comandos por owner que o workflow usa, para nao divergirem. O GitHub Actions nao os executa:
+cada gate que eles encadeiam ja tem job proprio la. Gates que exigem browser ou Docker
+(`E2E / Web`, `E2E / Admin`, `Infra / Web Image`) ficam fora do agregado local, como sempre.
 
 Ainda nao existe nesta etapa:
 
-- deploy automatico;
 - ArgoCD;
-- build/push de imagens;
-- ambientes staging/prod reais.
+- ambientes staging reais.
 
 ## Local development infrastructure
 
@@ -444,6 +543,17 @@ As rotas de anexo do file-service (RF-30/RF-32/RF-33) ficam atras de
 `FILE_UPLOADS_ENABLED` e respondem 503 enquanto o recurso estiver desligado.
 Contrato, autorizacao, limites, estados de scan e envelope encryption:
 [docs/api/file-attachments.md](docs/api/file-attachments.md).
+
+Links em mensagens (RF-21, issues #807 e #928): o chat-service e a autoridade
+sobre cada URL — estado por link, clique autorizado por policy e rich preview so
+depois de `safe`. `CHAT_LINK_SAFETY_ENABLED` liga a consulta de reputacao, que
+usa **Google Web Risk como provider primario e Cloudflare URL Scanner como
+fallback**; `CHAT_LINK_PREVIEW_ENABLED` (default `false`) liga o fetch
+server-side de Open Graph com imagem derivada servida pelo NChat. Nenhum erro de
+provider vira `safe`, e URLs sensiveis ou internas nunca saem do NChat.
+Contratos:
+[docs/api/link-safety.md](docs/api/link-safety.md) e
+[docs/api/link-preview.md](docs/api/link-preview.md).
 
 ## Auth data model
 

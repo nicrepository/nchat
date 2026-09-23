@@ -139,8 +139,16 @@ function canLeave(target: ConversationTarget): boolean {
  * group needs only participation, which the row implies — every group in this
  * sidebar is one the viewer is in. A 1:1 is never renameable: its name is the
  * counterpart's, resolved per viewer, so there is nothing to rename.
+ *
+ * Exported and narrowed to the three fields it actually reads, because the
+ * details panel's inline editor (issue #893) offers the same operation from a
+ * different surface and must offer it under the same rule — not a second copy
+ * of it. It takes no whole row so a caller holding only the server's flags can
+ * ask, and it remains presentation: both endpoints re-derive the decision.
  */
-function canRenameTarget(target: ConversationTarget): boolean {
+export function canRenameConversation(
+  target: Pick<ConversationTarget, "kind" | "canRename" | "isGeneral">,
+): boolean {
   if (target.kind === "dm") return false;
   if (target.kind === "group") return true;
   return Boolean(target.canRename) && !target.isGeneral;
@@ -186,7 +194,7 @@ function frequentActions(target: ConversationTarget): ConversationAction[] {
 /** The management and navigation group. Details is offered for every target. */
 function manageActions(target: ConversationTarget): ConversationAction[] {
   const actions: ConversationAction[] = [];
-  if (canRenameTarget(target)) {
+  if (canRenameConversation(target)) {
     actions.push({
       id: "rename",
       label: renameLabel[target.kind],

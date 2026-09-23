@@ -1,0 +1,91 @@
+name: Release eligibility
+
+# The one gate between CI and CD (issues #931, #933).
+#
+# Continuous delivery consumes commits that passed `CI / Required`, and only
+# that. Both delivery flows call this first and deploy the SHA it returns; a
+# commit it refuses is never built and never reaches a cluster.
+#
+# `CI / Required` is a *job* inside ci.yml, not a workflow, and that is the
+# whole reason this exists as a step rather than as a `workflow_run`
+# conclusion. A run's own conclusion is `failure` whenever any job in it
+# failed, `Quality / SonarQube` included -- so a handler that trusted it would
+# turn the advisory Sonar gate back into a blocking one, through the CD
+# pipeline, which is the one place #931 says it must not reach. The verdict is
+# therefore read from the aggregation job by name, and a failed Quality Gate
+# does not hold back a release.
+#
+# The scripts run here come from the default branch, not from the commit being
+# judged: `actions/checkout` is deliberately left without a `ref`. A commit
+# cannot be allowed to supply the checker that decides whether it is eligible.
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: The branch the CI run must have been for.
+        required: true
+        type: string
+    outputs:
+      sha:
+        description: The eligible commit, as reported by the CI run itself.
+        value: ${{ jobs.eligibility.outputs.sha }}
+
+permissions:
+  contents: read
+
+jobs:
+  eligibility:
+    name: Verify CI / Required
+    runs-on: ubuntu-latest
+    permissions:
+      # Reading this repository's workflow runs and their jobs. No write of any
+      # kind, and no id-token: nothing here federates to anything.
+      actions: read
+      contents: read
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.verdict.outputs.sha }}
+    steps:
+      # No `ref`: the default branch's copy of the checker, on purpose.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      # The run is fetched by its id AND its attempt, and the SHA is read back
+      # out of the run rather than out of the event. They are the same value,
+      # and requiring the API to agree with the payload is what closes the gap
+      # between "a run passed" and "this commit passed".
+      #
+      # The attempt-scoped endpoints, not `/runs/{id}` and `/runs/{id}/jobs`:
+      # those answer for the latest attempt, so a re-run started while this
+      # handler is in flight would have it read a verdict its own event never
+      # announced. `/attempts/{n}` is immutable once that attempt finished.
+      - name: Fetch the CI run attempt and its jobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$RUN_ID" =~ ^[1-9][0-9]{0,18}$ ]]
+          [[ "$RUN_ATTEMPT" =~ ^[1-9][0-9]{0,4}$ ]]
+          attempt="repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT"
+          gh api "$attempt" >ci-run.json
+          # One page of a hundred, and the checker refuses a listing whose
+          # total_count exceeds what it was handed. Paginating and stitching
+          # would be the version that silently returns a first page.
+          gh api "$attempt/jobs?per_page=100" >ci-jobs.json
+      - name: Decide eligibility
+        id: verdict
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/check_ci_eligibility.py \
+            --run ci-run.json --jobs ci-jobs.json \
+            --expect-sha "$HEAD_SHA" --expect-branch "$BRANCH" \
+            --expect-attempt "$RUN_ATTEMPT"
+          echo "sha=$HEAD_SHA" >>"$GITHUB_OUTPUT"

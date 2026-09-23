@@ -13,15 +13,16 @@
  * for user-submitted content.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useEditor } from "@tiptap/react";
-import { Extension } from "@tiptap/core";
+import { Extension, type Editor } from "@tiptap/core";
 import Bold from "@tiptap/extension-bold";
 import BulletList from "@tiptap/extension-bullet-list";
 import Code from "@tiptap/extension-code";
 import CodeBlock from "@tiptap/extension-code-block";
 import Document from "@tiptap/extension-document";
 import HardBreak from "@tiptap/extension-hard-break";
+import History from "@tiptap/extension-history";
 import Italic from "@tiptap/extension-italic";
 import ListItem from "@tiptap/extension-list-item";
 import OrderedList from "@tiptap/extension-ordered-list";
@@ -95,15 +96,6 @@ export interface UseChatEditorOptions {
    * switch reads it.
    */
   onTextChange?: (doc: TTNode) => void;
-  /**
-   * Issue #769, "ACK ATRASADO": evaluated once the send this handleSend call
-   * started has resolved with `{status: "sent"}`, right before clearing the
-   * editor. If it returns false, the editor content is left exactly as it
-   * is — the reader has already written something new since pressing Enter,
-   * and clearing now would erase that, not the message that was actually
-   * sent. Absent, the pre-existing unconditional-clear behavior is kept.
-   */
-  shouldClearOnSent?: () => boolean;
 }
 
 // ── Shared extension factory ──────────────────────────────────────────────────
@@ -128,6 +120,7 @@ export function createChatEditorExtensions(enableMentions = true) {
     OrderedList,
     ChatListItem,
     HardBreak,
+    History,
   ];
   return enableMentions
     ? [...extensions, MentionTargetContext, createMentionExtension()]
@@ -148,7 +141,6 @@ export function useChatEditor({
   onSend,
   onActivity,
   onTextChange,
-  shouldClearOnSent,
 }: UseChatEditorOptions) {
   const [sending, setSending] = useState(false);
   const [hasContent, setHasContent] = useState(false);
@@ -169,6 +161,23 @@ export function useChatEditor({
   useEffect(() => {
     onTextChangeRef.current = onTextChange;
   });
+
+  /**
+   * Issue #769 "ACK ATRASADO", corrected by issue #875: how many times this
+   * editor's *document* has actually changed. handleSend records it at
+   * submit and compares it when the send resolves, so it clears only the
+   * text that was actually sent — and never text the reader wrote in the
+   * meantime.
+   *
+   * It counts document changes specifically, and that is the whole point.
+   * #769 asked the conversation's draft the same question through its
+   * `revision`, but that is bumped by every mutation of the draft, including
+   * the ones a confirmed send performs itself: consuming the reply the
+   * message answered, and consuming the attachments it published. Those read
+   * as "the reader typed something new" and left the just-sent text in the
+   * editor (issue #875).
+   */
+  const textRevisionRef = useRef(0);
 
   // Ref keeps the latest handleSend accessible to the submitOnEnter extension
   // without causing the extension (useMemo'd) to be recreated on every render.
@@ -209,6 +218,10 @@ export function useChatEditor({
         },
       },
       onUpdate: ({ editor: e }) => {
+        // TipTap fires this only on a real document mutation — never on
+        // cursor movement, selection or focus — which is exactly the signal
+        // handleSend needs below (issue #875).
+        textRevisionRef.current += 1;
         const hasContentNow = !e.isEmpty;
         setHasContent(hasContentNow);
         onActivityRef.current?.(hasContentNow);
@@ -272,10 +285,22 @@ export function useChatEditor({
     const body = tiptapDocToMarkdown(editor.getJSON(), bodyFormat).trim();
     if (!body && !canSendEmpty) return;
     restoreFocusAfterSendRef.current = editor.isFocused;
+    const textRevisionAtSubmit = textRevisionRef.current;
     setSending(true);
     try {
       const result = await onSend(body);
-      if (result.status === "sent" && clearOnSend && (shouldClearOnSent?.() ?? true)) {
+      // Unchanged revision means the document still holds exactly what went
+      // out, so clearing it removes the sent message and nothing else. A
+      // changed one means the reader has moved on to the next message, and
+      // this acknowledgement has no claim on it (issue #769 "ACK ATRASADO",
+      // issue #875).
+      //
+      // A destroyed editor is one the reader navigated away from while the
+      // send was in flight (issue #929): the acknowledgement is still real
+      // and the draft store reconciles it by its own snapshot, but there is
+      // no document left here to clear.
+      const stillHoldsWhatWasSent = textRevisionRef.current === textRevisionAtSubmit;
+      if (result.status === "sent" && clearOnSend && stillHoldsWhatWasSent && !editor.isDestroyed) {
         // emitUpdate=true fires the onUpdate above, which is what mirrors
         // the now-empty document back into the draft (issue #769).
         editor.commands.clearContent(true);
@@ -293,5 +318,34 @@ export function useChatEditor({
     handleSendRef.current = handleSend;
   });
 
-  return { editor, canSend, sending, handleSend };
+  /**
+   * Makes the document reflect the conversation draft's authoritative text
+   * (issue #929): a send acknowledged by a previous instance of this
+   * composer consumed the draft this editor was seeded from, and the store
+   * — not the reader — is the one changing the text here.
+   *
+   * Deliberately not a user edit: nothing is emitted, so neither the draft
+   * (already authoritative) nor the typing indicator hears of it, and
+   * textRevisionRef — which counts the reader's own edits during a send —
+   * is left alone. A document already equal to `doc` is not touched, so a
+   * cursor and an undo history the reader is in the middle of survive a
+   * reconciliation that had nothing to change.
+   */
+  const reconcileContent = useCallback(
+    (doc: TTNode | null) => {
+      if (!editor || editor.isDestroyed || isSameDocument(editor, doc)) return;
+      if (doc) editor.commands.setContent(doc, false);
+      else editor.commands.clearContent(false);
+      setHasContent(!editor.isEmpty);
+    },
+    [editor],
+  );
+
+  return { editor, canSend, sending, handleSend, reconcileContent };
+}
+
+/** Whether the editor already shows `doc` (null: an empty document). */
+function isSameDocument(editor: Editor, doc: TTNode | null): boolean {
+  if (!doc) return editor.isEmpty;
+  return JSON.stringify(editor.getJSON()) === JSON.stringify(doc);
 }

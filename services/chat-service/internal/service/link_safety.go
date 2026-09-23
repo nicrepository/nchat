@@ -5,10 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"sort"
 	"strings"
 
@@ -96,74 +94,42 @@ const maxCheckedURLs = 10
 
 // linkDecision is what the gate concluded about one body.
 //
-// Three outcomes, and the caller must handle all three: publish now, withhold
-// until the worker answers, or refuse. The URLs are carried so the caller can
-// record what a withheld message is waiting on, in the same statement that
-// creates it.
+// Since issue #807 there is exactly one outcome for the message: publish. The
+// decision carries which URLs the body names, so the create statement records
+// the associations, and which of them need new provider work, so the admission
+// can charge for them. Nothing here withholds or refuses a message: a URL that
+// turns out malicious is blocked *as a link*, individually, and the rest of the
+// text is delivered as written.
 type linkDecision struct {
 	// UndecidedURLs are the canonical URLs with no terminal state at all: never
 	// scanned, or scanned and expired. Non-empty means new provider work.
 	UndecidedURLs []string
 	// InconclusiveURLs are the ones whose scan reached a terminal state without a
-	// usable verdict. They are *decided* — asking again produces nothing — but they
-	// are not a clearance, so they are tracked apart from both other groups.
+	// usable verdict (inconclusive, or unknown after a deadline). Decided, not a
+	// clearance, tracked apart so the aggregate marker can say so.
 	InconclusiveURLs []string
-	// URLs is every distinct canonical URL in the body. It is what gets recorded
-	// against a message, including the ones already safe, so a verdict that expires
-	// and flips later still has an edge to be found by.
+	// MaliciousURLs are the ones already condemned. The message publishes with
+	// those links withheld.
+	MaliciousURLs []string
+	// SafeURLs hold a fresh explicit clearance and are eligible for a preview.
+	SafeURLs []string
+	// URLs is every distinct canonical URL in the body, in order of first
+	// appearance. It is what gets recorded against a message, including the ones
+	// already safe, so a verdict that expires and flips later still has an edge
+	// to be found by.
 	URLs []string
-}
-
-// pending reports whether the message must be withheld at creation.
-//
-// Both groups withhold, for different reasons: an undecided URL has no answer
-// yet, and an inconclusive one is published by the resolver rather than by the
-// send, so that the aggregation over *all* of a message's links happens in one
-// place. See resolvePendingMessagesQuery.
-func (d linkDecision) pending() bool {
-	return len(d.UndecidedURLs) > 0 || len(d.InconclusiveURLs) > 0
 }
 
 // admissionURLs are the URLs that need new provider work.
 //
-// Deliberately only the undecided ones. An inconclusive scan is terminal — there
-// is nothing to admit, and passing it here would ask the capacity gate to
-// consider work that will never be done.
+// Deliberately only the undecided ones. A terminal row — inconclusive, unknown,
+// a fresh verdict — has nothing to admit, and passing it here would ask the
+// capacity gate to consider work that will never be done.
 func (d linkDecision) admissionURLs() []string { return d.UndecidedURLs }
 
-// editState reports the link-safety state an *edit* would publish with, and
-// whether the edit may proceed at all.
-//
-// Editing cannot go pending — see EditMessage — so the two groups are not
-// equivalent here, and this is the one place that distinction is visible:
-//
-//   - an undecided URL means the edit must wait, because nothing has decided it
-//     and nothing about this path will;
-//   - an inconclusive URL is decided. The edit publishes, carrying the same
-//     marker a created message would end up with, and the same rules follow from
-//     it: the reader may click, this server may not fetch.
-//
-// It is derived from the same classification the send path uses rather than from
-// a second one. A divergent copy is how the two doors start answering
-// differently.
-func (d linkDecision) editState() (domain.MessageLinkSafety, bool) {
-	if len(d.UndecidedURLs) > 0 {
-		return domain.MessageLinkSafetyNone, false
-	}
-	switch {
-	case len(d.InconclusiveURLs) > 0:
-		return domain.MessageLinkSafetyInconclusive, true
-	case len(d.URLs) > 0:
-		return domain.MessageLinkSafetySafe, true
-	default:
-		// A body with no links has no link-safety opinion at all.
-		return domain.MessageLinkSafetyNone, true
-	}
-}
-
 // fingerprint identifies the content this decision was made about, so the
-// promotion can refuse to publish anything else. Empty for a body with no links
-// at all: there is nothing to withhold and nothing to bind.
+// associations recorded for one body can never decide another. Empty for a
+// body with no links at all: there is nothing to bind.
 func (d linkDecision) fingerprint(body string) string {
 	if len(d.URLs) == 0 {
 		return ""
@@ -173,23 +139,27 @@ func (d linkDecision) fingerprint(body string) string {
 
 // messageStatus is the state a message carrying these links is created in.
 //
-// It returns the empty status for a cleared body rather than spelling out
-// "active", so a body with no links takes exactly the same path it took before
-// RF-21 existed and the storage layer's own default decides.
-func (d linkDecision) messageStatus() domain.MessageStatus {
-	if d.pending() {
-		return domain.MessageStatusPendingLinkScan
-	}
-	return ""
-}
+// Always the empty status, so the storage default — active — decides, exactly
+// as for a body with no links. The provider is no longer on the publication
+// path: this method exists so the create call sites read the same as before
+// and so the rule "a link never withholds a message" has one place to live.
+func (d linkDecision) messageStatus() domain.MessageStatus { return "" }
 
-// initialState is the marker stored with a message published directly from the
-// verdict cache. Pending messages get their aggregate marker from the resolver.
-func (d linkDecision) initialState() domain.MessageLinkSafety {
-	if !d.pending() && len(d.URLs) > 0 {
+// aggregateState is the message-level marker derived from the per-link states
+// (issue #807). It is a projection for the surfaces that still read one value —
+// quotes, references, edit history — never the authority; the per-link states
+// are. Precedence: malicious > undecided (no opinion yet) > inconclusive > safe.
+func (d linkDecision) aggregateState() domain.MessageLinkSafety {
+	switch {
+	case len(d.MaliciousURLs) > 0:
+		return domain.MessageLinkSafetyMalicious
+	case len(d.UndecidedURLs) > 0, len(d.URLs) == 0:
+		return domain.MessageLinkSafetyNone
+	case len(d.InconclusiveURLs) > 0:
+		return domain.MessageLinkSafetyInconclusive
+	default:
 		return domain.MessageLinkSafetySafe
 	}
-	return domain.MessageLinkSafetyNone
 }
 
 // classifyBodyLinks decides what happens to a body carrying links.
@@ -224,10 +194,7 @@ func (s *MessageService) classifyBodyLinks(
 	if err != nil {
 		return linkDecision{}, err
 	}
-	decision, err := aggregateLinkDecision(urls, verdicts)
-	if err != nil {
-		return linkDecision{}, err
-	}
+	decision := aggregateLinkDecision(urls, verdicts)
 	return decision, s.admitScans(ctx, workspaceID, decision)
 }
 
@@ -249,38 +216,27 @@ func (s *MessageService) loadVerdicts(
 	return nil, domain.ErrURLCheckUnavailable
 }
 
-// aggregateLinkDecision turns per-URL verdicts into one decision about the
-// message.
+// aggregateLinkDecision sorts the body's URLs by what is known about each.
 //
-// The policy lives here, in one place, stated as a fold over the URLs:
-//
-//   - one condemned URL refuses the whole message, immediately. Nothing is
-//     recorded and nothing is submitted — the message is already refused, so the
-//     remaining URLs would only spend quota on an answer nobody will read;
-//   - a URL with no fresh clearance is pending. Absent, expired, or any value
-//     that is not an explicit clearance all land here, which is what keeps a
-//     corrupted or future status from reading as safe;
-//   - only when every URL is explicitly cleared does the message publish now.
-func aggregateLinkDecision(urls []string, verdicts map[string]urlsafety.Verdict) (linkDecision, error) {
+// Nothing here refuses. A condemned URL is a condemned *link*: the message is
+// published with that link withheld and every other link untouched. A URL with
+// no fresh clearance is undecided, which is what keeps a corrupted or future
+// status from reading as safe.
+func aggregateLinkDecision(urls []string, verdicts map[string]urlsafety.Verdict) linkDecision {
 	decision := linkDecision{URLs: urls}
 	for _, canonical := range urls {
 		switch verdicts[canonical] {
 		case urlsafety.VerdictMalicious:
-			return linkDecision{}, domain.ErrMaliciousURL
+			decision.MaliciousURLs = append(decision.MaliciousURLs, canonical)
 		case urlsafety.VerdictSafe:
-			// Cleared and still fresh — this URL holds nothing up.
+			decision.SafeURLs = append(decision.SafeURLs, canonical)
 		case urlsafety.VerdictInconclusive:
-			// Decided, and decided to say nothing. It withholds a *new* message, so
-			// the aggregation over all of its links happens in one place, but it does
-			// not block an edit — see linkDecision.editState.
 			decision.InconclusiveURLs = append(decision.InconclusiveURLs, canonical)
 		default:
-			// Absent, expired, or any value that is not one this package recognises.
-			// All of them mean the same thing: nothing has decided this URL.
 			decision.UndecidedURLs = append(decision.UndecidedURLs, canonical)
 		}
 	}
-	return decision, nil
+	return decision
 }
 
 // admitScans reserves capacity for the undecided URLs and queues them.
@@ -346,18 +302,11 @@ func extractURLs(body string) ([]string, error) {
 	for _, candidate := range scanURLCandidates(unescaped) {
 		canonical, err := urlsafety.CanonicalizeURL(candidate)
 		if err != nil {
-			// Not something the provider can answer about. An IP literal is one
-			// of these, and it is deliberately *not* skipped: leaving it
-			// unquestioned would make "host the phishing page on a bare address"
-			// the obvious way past this check. It is refused with the same
-			// permanent error a condemned URL gets.
-			//
-			// A candidate that is not a URL at all — the scanner found "http://"
-			// inside a word — has no host and is simply not a link, so it is
-			// skipped rather than refused.
-			if errors.Is(err, urlsafety.ErrNotCheckable) && hasHost(candidate) {
-				return nil, domain.ErrMaliciousURL
-			}
+			// Not something the pipeline can decide about: an IP literal, a
+			// credential-bearing authority, a name that is not a name. Since
+			// issue #807 it is not a link at all — no entity, no href, plain
+			// text — which is exactly what the client already draws for it. The
+			// text is delivered; nothing about it is navigable.
 			continue
 		}
 		if _, exists := seen[canonical]; exists {
@@ -371,16 +320,6 @@ func extractURLs(body string) ([]string, error) {
 		urls = append(urls, canonical)
 	}
 	return urls, nil
-}
-
-// hasHost reports whether a candidate names a host at all.
-//
-// It separates "this is a link to somewhere the provider cannot vouch for",
-// which must be refused, from "this is not a link", which must be ignored.
-// Without it, `https://` on its own would refuse the whole message.
-func hasHost(candidate string) bool {
-	parsed, err := url.Parse(candidate)
-	return err == nil && parsed.Hostname() != ""
 }
 
 // scanURLCandidates finds the http and https URLs in a text.
@@ -416,25 +355,10 @@ func hasHost(candidate string) bool {
 // asserts that every href the client produces is a candidate this function
 // extracted from the same text.
 func scanURLCandidates(text string) []string {
-	var candidates []string
-	for index := 0; index < len(text); {
-		start := indexOfScheme(text[index:])
-		if start < 0 {
-			break
-		}
-		start += index
-		end := start
-		for end < len(text) && !isURLTerminator(text[end]) {
-			end++
-		}
-		candidate := text[start:trimTrailingDelimiters(text, start, end)]
-		if candidate != "" {
-			candidates = append(candidates, candidate)
-		}
-		index = end
-		if index == start {
-			index++
-		}
+	spans := scanURLSpans(text)
+	candidates := make([]string, 0, len(spans))
+	for _, span := range spans {
+		candidates = append(candidates, text[span.start:span.end])
 	}
 	return candidates
 }

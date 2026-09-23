@@ -1,0 +1,248 @@
+name: Production / Cutover
+
+# The human decision, and the only automation in this repository that changes a
+# stable Service selector (issues #626, #789, #933).
+#
+# The operator clicks Run workflow. There is nothing to fill in: the candidate
+# slot, the release, the sealed manifest and the build run are all derived from
+# the cluster and the lifecycle record that CD / Prepare Production wrote, and
+# every one of them is proved against the cluster before a Service is touched.
+# Transcribing four identifiers into a form was never the decision; promoting
+# is.
+#
+# It does not decide the promotion either. It proves the cluster still matches
+# what was prepared, hands cutover.sh an explicit target, and then proves the
+# result. Every gate that decides whether the traffic may move -- context,
+# namespace, readiness, one consistent release, the sealed manifest identity,
+# the smoke evidence, the mixed-state refusal, the read-back after each patch
+# -- lives in cutover.sh, where the operator procedure of the runbook runs the
+# same code down the same path. Restating any of them here would be a second
+# implementation of the gate, and two implementations of one gate is one gate
+# nobody maintains.
+#
+# It does not drain the old slot. After this run the previous slot is still
+# running and is the rollback; retiring it happens when the next release is
+# prepared, and only after the retention window and a health preflight.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The shared production mutation lock, the same group candidate preparation and
+# rollback take. A cutover may not overlap a candidate deploy, a rollback or a
+# drain.
+#
+# cancel-in-progress must be the boolean false: cancelling a run part-way
+# through ten Service patches leaves production mixed.
+concurrency:
+  group: nchat-prod-release-mutation
+  cancel-in-progress: false
+
+jobs:
+  cutover:
+    name: Promote the prepared candidate
+    # The human gate as GitHub records it. A required reviewer on this
+    # environment, if the organisation configures one, adds a second
+    # confirmation after Run workflow; the workflow supports either shape and
+    # does not try to work around the policy. Which is configured is an
+    # operational setting on the environment, deliberately not written here --
+    # an approval rule in this file would be editable by the same change it
+    # gates.
+    environment: production
+    runs-on: [self-hosted, linux, x64, nchat-prod-deploy]
+    permissions:
+      # actions: read is what lets this job download the sealed manifest from
+      # the preparation run. It carries no write of any kind.
+      actions: read
+      contents: read
+    # Ten sequential patches, each read back, plus the readiness and identity
+    # reads either side of them and the post-cutover smoke. Minutes, not tens
+    # of minutes -- and a limit at all, because this run holds the production
+    # mutation lock.
+    timeout-minutes: 20
+    steps:
+      # A dispatch carries the workflow file of the ref it was started from, so
+      # a feature branch would run its own copy of these gates. Refusing here
+      # keeps production from being promoted out of an unreviewed pipeline; the
+      # runner's pre-job guard is the boundary behind it.
+      - name: Require an authorised ref
+        run: '[[ "$GITHUB_REF" == "refs/heads/main" ]]'
+      # main, at full depth. The release commit is on main and its
+      # reachability is proved below; the tree this job needs is the scripts,
+      # and the canonical ones are main's.
+      - name: Checkout main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      # Derivation and revalidation in one place: the recorded candidate is
+      # read, refused if it is incomplete or stale, and then required to be
+      # what the cluster is actually carrying -- Ready, one release, exactly
+      # the release recorded. Everything after this point is about a candidate
+      # that has already been proved to exist as claimed.
+      - name: Revalidate the prepared candidate
+        id: candidate
+        env:
+          SELECTORS_BEFORE: ${{ runner.temp }}/stable-selectors-before.txt
+          NCHAT_PROD_CANDIDATE_MAX_AGE_SECONDS: ${{ vars.NCHAT_PROD_CANDIDATE_MAX_AGE_SECONDS }}
+        run: scripts/deploy/nchat-prod/cutover-preflight.sh "$SELECTORS_BEFORE" >>"$GITHUB_OUTPUT"
+      # Re-proved here and not inherited: a preparation run can be days old,
+      # and a commit main could reach then may have been rewritten out of it
+      # since.
+      - name: Require a SHA reachable from main
+        env:
+          RELEASE_SHA: ${{ steps.candidate.outputs.release_sha }}
+        run: scripts/deploy/nchat-prod/require-main-sha.sh "$RELEASE_SHA"
+      # From the preparation run named in the lifecycle record, because
+      # cutover.sh verifies the seal and recomputes the release id from it. The
+      # run id is derived, never typed, and it cannot point anywhere useful to
+      # an attacker: a manifest from another run seals a different release id,
+      # and cutover.sh compares that against what the slot is running.
+      - name: Download the sealed release manifest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-manifest
+          path: release-manifest
+          run-id: ${{ steps.candidate.outputs.prepare_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      # The mutation, and the only one. The target is named, so a retry after a
+      # partial failure converges to the same slot instead of reversing; the
+      # evidence names the slot and the release together, so a promotion cannot
+      # be replayed against a candidate that has changed; and cutover.sh
+      # recomputes that expectation from the cluster itself, so the token built
+      # here is checked rather than believed.
+      - name: Cut production traffic over to the candidate
+        id: promote
+        env:
+          CANDIDATE_SLOT: ${{ steps.candidate.outputs.candidate }}
+          NCHAT_PROD_SMOKE_CONFIRMED: ${{ steps.candidate.outputs.candidate }}:${{ steps.candidate.outputs.release_sha }}:${{ steps.candidate.outputs.release_id }}
+          NCHAT_PROD_RELEASE_MANIFEST_DIR: release-manifest
+          NCHAT_PROD_ASSUME_YES: "1"
+        run: scripts/deploy/nchat-prod/cutover.sh --target "$CANDIDATE_SLOT"
+      # Recording what the cutover left behind, separately from judging it, and
+      # the separation is the point: a cutover that stops part-way is the run
+      # whose after-state matters most, and it is exactly the run in which a
+      # single asserting step would never execute. So this one reads and
+      # prints, it asserts nothing, and it runs whenever the promotion was
+      # reached at all -- success or failure.
+      #
+      # The condition is an allowlist of the two conclusions that mean the
+      # promotion actually ran, and it has to be: naming a status function at
+      # all stops Actions inserting the implicit `success()`, so a looser test
+      # would run this step in cases where nothing was promoted. `conclusion !=
+      # ''` is the one to avoid -- a step skipped because an earlier one failed
+      # reports `skipped`, which is not the empty string.
+      #
+      # Read-only. It repairs nothing and rolls nothing back: the mixed state
+      # it may be recording is the only evidence of what happened, and the
+      # operator procedure in the runbook is what acts on it.
+      - name: Record the stable Services after the cutover
+        if: ${{ !cancelled() && (steps.promote.conclusion == 'success' || steps.promote.conclusion == 'failure') }}
+        env:
+          SELECTORS_AFTER: ${{ runner.temp }}/stable-selectors-after.txt
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/deploy/nchat-prod/lib.sh
+          source scripts/deploy/nchat-prod/lib.sh
+          collect_service_slots >"$SELECTORS_AFTER"
+          echo "stable Service selectors after the cutover:"
+          cat "$SELECTORS_AFTER"
+      # Total convergence, proved from the recording above. An ordinary step,
+      # so a failed promotion never reaches it and no success is claimed for
+      # one. `all_services_on_slot` is true only when every stable Service
+      # reports exactly the target: a Service that is missing, carries no
+      # release-slot key, kept the old slot or holds an unexpected value all
+      # read as a distinct value and fail here. Partial success has no spelling
+      # that passes.
+      - name: Prove every stable Service converged on the promoted slot
+        env:
+          CANDIDATE_SLOT: ${{ steps.candidate.outputs.candidate }}
+          SELECTORS_AFTER: ${{ runner.temp }}/stable-selectors-after.txt
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/deploy/nchat-prod/lib.sh
+          source scripts/deploy/nchat-prod/lib.sh
+          all_services_on_slot "$(cat "$SELECTORS_AFTER")" "$CANDIDATE_SLOT"
+          echo "Every stable Service selects slot $CANDIDATE_SLOT."
+      # Convergence is about selectors; it says nothing about what the slot
+      # they now point at is running. A slot that degraded or was redeployed
+      # during the patches would satisfy the step above and still be serving
+      # something other than the prepared release.
+      - name: Prove the promoted slot still carries the prepared release
+        env:
+          CANDIDATE_SLOT: ${{ steps.candidate.outputs.candidate }}
+          EXPECTED_RELEASE: ${{ steps.candidate.outputs.release_sha }}:${{ steps.candidate.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/deploy/nchat-prod/lib.sh
+          source scripts/deploy/nchat-prod/lib.sh
+          require_slot_release_identity "$CANDIDATE_SLOT" "$EXPECTED_RELEASE"
+          echo
+          echo "Production serves $EXPECTED_RELEASE on slot $CANDIDATE_SLOT."
+      # Before the post-cutover smoke, deliberately. The traffic has moved and
+      # the previous slot is the rollback from this moment on, whether or not
+      # the smoke below passes -- a failing smoke is exactly when that
+      # reservation matters most, and recording it afterwards would mean the
+      # run that needs it never wrote it.
+      - name: Record the cutover and reserve the previous slot for rollback
+        env:
+          CANDIDATE_SLOT: ${{ steps.candidate.outputs.candidate }}
+          ROLLBACK_SLOT: ${{ steps.candidate.outputs.rollback_target }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/deploy/nchat-prod/lib.sh
+          source scripts/deploy/nchat-prod/lib.sh
+          # shellcheck source=scripts/deploy/nchat-prod/release-state.sh
+          source scripts/deploy/nchat-prod/release-state.sh
+          record_cutover "$CANDIDATE_SLOT" "$ROLLBACK_SLOT"
+      # Through the stable Services, which is what a user reaches, and a
+      # different profile from the candidate smoke: that one requires the slot
+      # to carry no traffic, this one requires it to carry all of it.
+      #
+      # It records the result as well as producing it, because the lifecycle
+      # needs to know later whether this release was ever proved to work: the
+      # next release refuses to retire the rollback slot of a release whose
+      # post-cutover smoke is not recorded as passed. The record is written
+      # only when the smoke exits zero.
+      #
+      # A failure here fails the run and nothing else. There is no automatic
+      # rollback: one failing probe is not a reason for a second unattended
+      # traffic move, the previous slot is still running, Production / Rollback
+      # is one click away with a reason recorded, and the unrecorded smoke now
+      # blocks the next release from retiring the way back.
+      - name: Post-cutover smoke
+        id: smoke
+        env:
+          CANDIDATE_SLOT: ${{ steps.candidate.outputs.candidate }}
+        run: scripts/deploy/nchat-prod/record-traffic-smoke.sh --target "$CANDIDATE_SLOT" --after cutover
+      - name: Publish the cutover summary
+        if: ${{ !cancelled() && steps.promote.conclusion != '' && steps.promote.conclusion != 'skipped' }}
+        env:
+          PREVIOUS_SLOT: ${{ steps.candidate.outputs.rollback_target }}
+          CANDIDATE_SLOT: ${{ steps.candidate.outputs.candidate }}
+          EXPECTED_RELEASE: ${{ steps.candidate.outputs.release_sha }}:${{ steps.candidate.outputs.release_id }}
+          PROMOTE_RESULT: ${{ steps.promote.conclusion }}
+          SMOKE_RESULT: ${{ steps.smoke.conclusion }}
+          RETENTION: ${{ vars.NCHAT_PROD_ROLLBACK_RETENTION_SECONDS }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Production Cutover"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Previous active | \`$PREVIOUS_SLOT\` |"
+            echo "| New active | \`$CANDIDATE_SLOT\` |"
+            echo "| Release | \`$EXPECTED_RELEASE\` |"
+            echo "| Selector patch | $PROMOTE_RESULT |"
+            echo "| Post-cutover smoke | ${SMOKE_RESULT:-not reached} |"
+            echo
+            echo "Rollback target: \`$PREVIOUS_SLOT\`, still running and untouched."
+            echo "It is reserved for rollback for ${RETENTION:-1800}s from now and is retired"
+            echo "by the next **CD / Prepare Production** run, never by this one."
+            echo
+            echo "Roll back with **Actions -> Production / Rollback**, target \`$PREVIOUS_SLOT\`."
+          } >>"$GITHUB_STEP_SUMMARY"

@@ -180,7 +180,24 @@ export default function ReactionBadge({
       className={`chat-msg-area__reaction-slot${exiting ? " chat-msg-area__reaction-slot--exiting" : ""}`}
       aria-hidden={exiting || undefined}
       data-exiting={exiting || undefined}
-      onAnimationEnd={exiting ? () => onExited?.(reaction.emoji) : undefined}
+      // Only this slot's own animation ends the exit.
+      //
+      // The emoji inside the badge has an animation of its own
+      // (chat-reaction-pop, 200ms) and animationend bubbles, so a reaction
+      // removed shortly after it arrived ended its exit on that foreign event:
+      // the badge was unmounted before it had animated at all, which is the
+      // very "vanishes between two frames" this whole mechanism exists to
+      // prevent. Compared by target rather than by animation name, because the
+      // name differs under prefers-reduced-motion and the question here is
+      // *whose* animation ended, not which one.
+      onAnimationEnd={
+        exiting
+          ? (event) => {
+              if (event.target !== event.currentTarget) return;
+              onExited?.(reaction.emoji);
+            }
+          : undefined
+      }
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       // React's focus events bubble, so focusing the button inside is enough:

@@ -194,6 +194,27 @@ type Channel struct {
 // utf8.RuneCountInString and PostgreSQL char_length.
 const MaxChannelDisplayNameCodePoints = 100
 
+// MaxConversationDescriptionCodePoints bounds a conversation's description
+// (issue #894) — the same number the CHECK constraints migration 000053 adds to
+// chat.channels and chat.dm_conversations enforce.
+//
+// One constant for both aggregates because it is one product concept: "what
+// this conversation is for". A channel and a group would have no reason to
+// disagree about how long that may be, and two numbers would only be a chance
+// to drift.
+//
+// 500 sits where the existing text caps put it: above a title (120) and a
+// display name (MaxChannelDisplayNameCodePoints, 100), because this is prose
+// rather than a label, and well below a scraped link-preview description
+// (1000), because a person types this one.
+//
+// Counted in Unicode code points, matching utf8.RuneCountInString and
+// PostgreSQL char_length, so the service and the database agree on what 500
+// means for non-ASCII text. There is no write path in this release; the
+// constant exists so the database constraint has a named counterpart rather
+// than a literal repeated in SQL and Go.
+const MaxConversationDescriptionCodePoints = 500
+
 // NormalizeChannelDisplayName trims a channel name and enforces the cap.
 //
 // The single rule behind every path that persists chat.channels.display_name —
@@ -574,26 +595,23 @@ var ErrGeneralChannelImmutable = errors.New("general channel is immutable")
 // panel's selector produces in one human confirmation.
 const MaxAddMembersPerRequest = 25
 
-// CanManageChannelMembers reports whether a user may add participants to a
-// channel (issue #398).
+// CanAddChannelMembers reports whether a workspace membership may add channel
+// participants (issue #705). Operation-specific channel scope is checked by
+// the service and storage.
+func CanAddChannelMembers(wm *WorkspaceMember) bool { return CanReachPublicChannels(wm) }
+
+// CanManageChannelMembers reports whether a user may administratively remove
+// participants from a channel (issue #398).
 //
 // It is the workspace moderation gate — active owner, admin or moderator —
 // reusing CanModerateWorkspace rather than restating it, exactly as channel
-// categories do. The choice is not a new policy: removing a member from a
-// channel is the same authority (MemberService.RemoveMemberFromChannel), and
-// docs/runbooks/task-chat-channel-join-leave.md names the addition its
-// "manager-add flow". Adding and removing the same row are the same authority.
+// categories do. MemberService.RemoveMemberFromChannel uses this predicate.
+// Issue #705 split addition into CanAddChannelMembers so a plain member can add
+// without gaining this removal authority.
 //
-// RF-74 is what widened this from owner/admin to include the moderator: this
-// predicate was written as the named seam for exactly that, and the seam is now
-// spent. The widening reaches the store as well — PGXMemberStore.AddChannelMembers
-// re-derives the same role list inside its transaction.
-//
-// Deliberately *not* "any member of the channel": that would let anyone with
-// read access to a private channel widen its audience, which is precisely the
-// property a private channel has. Deliberately not the per-channel 'moderator'
-// role either — that role is per channel and is never read as workspace
-// authority.
+// RF-74 widened this removal authority from owner/admin to include the workspace
+// moderator. Deliberately not the per-channel 'moderator' role: that role is a
+// different scope and is never read as workspace authority.
 //
 // Group DM participation is a different question with a different answer and is
 // deliberately not routed through here: chat.dm_members.role is closed by CHECK

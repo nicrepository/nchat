@@ -11,8 +11,6 @@ require (
 	github.com/prometheus/client_golang v1.22.0
 	github.com/tetratelabs/wazero v1.12.0
 	github.com/valkey-io/valkey-go v1.0.75
-	github.com/xuri/excelize/v2 v2.11.0
-	golang.org/x/net v0.58.0
 )
 
 require (
@@ -30,11 +28,6 @@ require (
 	github.com/prometheus/client_model v0.6.1 // indirect
 	github.com/prometheus/common v0.62.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
-	github.com/richardlehane/mscfb v1.0.7 // indirect
-	github.com/richardlehane/msoleps v1.0.6 // indirect
-	github.com/tiendc/go-deepcopy v1.7.2 // indirect
-	github.com/xuri/efp v0.0.1 // indirect
-	github.com/xuri/nfp v0.0.2-0.20250530014748-2ddeb826f9a9 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.43.0 // indirect
@@ -43,7 +36,7 @@ require (
 	go.opentelemetry.io/otel/sdk v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.10.0 // indirect
-	golang.org/x/crypto v0.55.0 // indirect
+	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect

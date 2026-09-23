@@ -69,6 +69,9 @@ func (f *sidebarFakeMemberStore) SearchDMConversationMembers(_ context.Context, 
 func (f *sidebarFakeMemberStore) ListOnlineChannelMemberProfiles(_ context.Context, _, _ string, _ []string, _ int) (storage.ChannelMemberPage, error) {
 	return storage.ChannelMemberPage{}, nil
 }
+func (f *sidebarFakeMemberStore) ListChannelMemberRoster(_ context.Context, _, _, _ string, _ int) (storage.ChannelRosterPage, error) {
+	return storage.ChannelRosterPage{}, nil
+}
 func (f *sidebarFakeMemberStore) ListChannelMemberProfilesByIDs(_ context.Context, _, _ string, _ []string) ([]domain.CallParticipantProfile, error) {
 	return nil, nil
 }
@@ -128,6 +131,10 @@ func (f *sidebarFakeChannelStore) GetChannelByID(_ context.Context, _ string) (d
 func (f *sidebarFakeChannelStore) GetChannelByIDInWorkspace(_ context.Context, _, _ string) (domain.Channel, error) {
 	return domain.Channel{}, nil
 }
+func (f *sidebarFakeChannelStore) GetChannelAbout(_ context.Context, _, _ string) (storage.ConversationAbout, error) {
+	return storage.ConversationAbout{}, nil
+}
+
 func (f *sidebarFakeChannelStore) GetVisibleChannelByID(_ context.Context, _, _, _ string) (domain.Channel, error) {
 	return domain.Channel{}, nil
 }
@@ -223,6 +230,10 @@ func (f *sidebarFakeDMStore) ListVisibleConversationsWithParticipantIDs(_ contex
 func (f *sidebarFakeDMStore) GetDirectCounterpartProfile(_ context.Context, _, _, _ string) (domain.DMDirectProfile, error) {
 	return domain.DMDirectProfile{}, nil
 }
+func (f *sidebarFakeDMStore) GetConversationAbout(_ context.Context, _, _ string) (storage.ConversationAbout, error) {
+	return storage.ConversationAbout{}, nil
+}
+
 func (f *sidebarFakeDMStore) GetVisibleConversationByID(_ context.Context, _, _, _ string) (domain.DMConversation, error) {
 	return domain.DMConversation{}, nil
 }
@@ -605,6 +616,10 @@ func (c *capturingChannelStore) GetChannelByID(_ context.Context, _ string) (dom
 func (c *capturingChannelStore) GetChannelByIDInWorkspace(_ context.Context, _, _ string) (domain.Channel, error) {
 	return domain.Channel{}, nil
 }
+func (c *capturingChannelStore) GetChannelAbout(_ context.Context, _, _ string) (storage.ConversationAbout, error) {
+	return storage.ConversationAbout{}, nil
+}
+
 func (c *capturingChannelStore) GetVisibleChannelByID(_ context.Context, _, _, _ string) (domain.Channel, error) {
 	return domain.Channel{}, nil
 }

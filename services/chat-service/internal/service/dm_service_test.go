@@ -838,6 +838,10 @@ type fakeDMStore struct {
 	listVisibleCalls  int
 	getVisibleCalls   int
 
+	about      storage.ConversationAbout
+	aboutErr   error
+	aboutCalls []aboutCall
+
 	groupCandidates       []domain.DMCandidate
 	groupCandidatesErr    error
 	candidateCalls        []groupCandidateCall
@@ -1027,6 +1031,14 @@ func (f *fakeDMStore) GetVisibleConversationByID(_ context.Context, _, _, _ stri
 		return domain.DMConversation{}, f.getVisibleErr
 	}
 	return f.visibleConversation, nil
+}
+
+func (f *fakeDMStore) GetConversationAbout(_ context.Context, workspaceID, conversationID string) (storage.ConversationAbout, error) {
+	f.aboutCalls = append(f.aboutCalls, aboutCall{workspaceID: workspaceID, targetID: conversationID})
+	if f.aboutErr != nil {
+		return storage.ConversationAbout{}, f.aboutErr
+	}
+	return f.about, nil
 }
 
 func (f *fakeDMStore) ListVisibleConversationsWithParticipantIDs(_ context.Context, _, _ string) ([]domain.DMConversationWithParticipantIDs, error) {

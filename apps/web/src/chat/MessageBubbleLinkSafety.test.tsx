@@ -25,6 +25,8 @@ import MessageBubble from "./MessageBubble";
 import type { MessageBubbleProps } from "./MessageBubble";
 import { linkSafetyAllowsAnchors, normalizeLinkSafety } from "./chatTypes";
 import type { LinkSafetyRecheck, Message } from "./chatTypes";
+import { parseMessageLink, type LinkPreview, type MessageLink } from "./messageLinks";
+import { withheldBodyNotice as withheldBodyText } from "./MessageContent";
 
 const linkURL = "https://example.test/some/page";
 
@@ -264,164 +266,266 @@ describe("every other state", () => {
  * `preload` or `prefetch` to decide whether to draw one — `expectNoClientSideFetch`
  * is asserted alongside every one of them.
  */
+/**
+ * Per-link entities (issue #807).
+ *
+ * The server describes every link; the client draws what it is told and
+ * decides nothing. These assert each state's shape — anchor, interstitial
+ * button, pending note, blocked chip — that the states are independent within
+ * one message, and that a message the server did not describe never grows an
+ * anchor from its text alone.
+ */
+function linkEntity(overrides: Partial<MessageLink> = {}): MessageLink {
+  return {
+    ordinal: 0,
+    targetKey: "key-artigo",
+    text: linkURL,
+    url: linkURL,
+    hostname: "example.test",
+    safety: "safe",
+    click: "direct",
+    href: linkURL,
+    updatedAt: "2026-08-17T12:00:00Z",
+    ...overrides,
+  };
+}
+
+const unknownLink = (overrides: Partial<MessageLink> = {}) =>
+  linkEntity({ safety: "unknown", click: "interstitial", href: "", ...overrides });
+const pendingLink = (overrides: Partial<MessageLink> = {}) =>
+  linkEntity({ safety: "pending", click: "none", href: "", ...overrides });
+const blockedLink = (ordinal = 0) =>
+  linkEntity({
+    ordinal,
+    text: "",
+    url: "",
+    hostname: "",
+    safety: "malicious",
+    click: "none",
+    href: "",
+  });
+
+function rerenderBubble(rerender: ReturnType<typeof render>["rerender"], message: Message) {
+  rerender(
+    <MessageBubble
+      message={message}
+      onToggleReaction={vi.fn()}
+      onReplyMessage={vi.fn()}
+      onReferenceMessage={vi.fn()}
+      onToggleFavorite={vi.fn()}
+      onEditMessage={vi.fn()}
+      onEditForbidden={vi.fn()}
+      onDeleteMessage={vi.fn()}
+      emojiUsage={emptyEmojiUsage}
+      onEmojiToneChange={vi.fn()}
+      currentUserId="me"
+      recentReactionEmojis={[]}
+      reactionMenuVisible={false}
+      onReactionMenuVisibleChange={vi.fn()}
+      pickerOpen={false}
+      onPickerOpenChange={vi.fn()}
+    />,
+  );
+}
+
 describe("anchors", () => {
   const anchors = (container: HTMLElement) =>
     Array.from(container.querySelectorAll("a")) as HTMLAnchorElement[];
 
-  it("renders a safe message's URL as a real anchor", () => {
-    const { container } = renderBubble({ message: messageWith({ linkSafetyState: "safe" }) });
+  it("renders a safe link as a real anchor to the server's href", () => {
+    const { container } = renderBubble({
+      message: messageWith({ linkSafetyState: "safe", links: [linkEntity()] }),
+    });
 
     const found = anchors(container);
     expect(found).toHaveLength(1);
     expect(found[0].getAttribute("href")).toBe(linkURL);
     expect(found[0]).toHaveTextContent(linkURL);
-    expectNoClientSideFetch(container);
-  });
-
-  // The proof the whole issue turns on: unverified is *published and clickable*,
-  // with the notice above it — not blocked, and not stripped of its link.
-  it("renders an unverified message's URL as a real anchor, under the notice", () => {
-    const { container } = renderBubble({
-      message: messageWith({ linkSafetyState: "inconclusive" }),
-    });
-
-    const found = anchors(container);
-    expect(found).toHaveLength(1);
-    expect(found[0].getAttribute("href")).toBe(linkURL);
-
-    const notice = screen.getByTestId("chat-message-link-unverified");
-    expect(
-      notice.compareDocumentPosition(found[0]) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-    expectNoClientSideFetch(container);
-  });
-
-  it("gives every anchor a permitted protocol and safe rel/target", () => {
-    for (const state of ["safe", "inconclusive"] as const) {
-      cleanup();
-      const { container } = renderBubble({ message: messageWith({ linkSafetyState: state }) });
-
-      for (const anchor of anchors(container)) {
-        const href = anchor.getAttribute("href") ?? "";
-        expect(href).toMatch(/^https?:\/\//i);
-        expect(new URL(href).protocol).toMatch(/^https?:$/);
-        // A new tab must not hand the opened page a handle back to this one, nor
-        // leak the workspace URL — which names a channel or a conversation — as a
-        // referrer.
-        expect(anchor.getAttribute("target")).toBe("_blank");
-        const rel = (anchor.getAttribute("rel") ?? "").split(/\s+/);
-        expect(rel).toContain("noopener");
-        expect(rel).toContain("noreferrer");
-      }
-    }
-  });
-
-  // The other half of the proof.
-  it("renders no anchor at all for a condemned message", () => {
-    const { container } = renderBubble({ message: messageWith({ linkSafetyState: "malicious" }) });
-
-    expect(anchors(container)).toHaveLength(0);
-    expect(container.textContent).not.toContain(linkURL);
-    expectNoClientSideFetch(container);
-  });
-
-  // A message still being checked was never published, so there is no public link
-  // to offer — even to its own author, who is the only person who can see it.
-  it("renders no anchor while the message is still being checked", () => {
-    const { container } = renderBubble({
-      message: messageWith({ status: "pending_link_scan", linkSafetyState: "" }),
-    });
-
-    expect(anchors(container)).toHaveLength(0);
-  });
-
-  // The realtime transition, as the DOM sees it: the same component, re-rendered
-  // with the corrected state, loses its anchor.
-  it("drops the anchor when a published message is later condemned", () => {
-    const { container, rerender } = renderBubble({
-      message: messageWith({ linkSafetyState: "inconclusive" }),
-    });
-    expect(anchors(container)).toHaveLength(1);
-
-    rerender(
-      <MessageBubble
-        message={messageWith({ linkSafetyState: "malicious" })}
-        onToggleReaction={vi.fn()}
-        onReplyMessage={vi.fn()}
-        onReferenceMessage={vi.fn()}
-        onToggleFavorite={vi.fn()}
-        onEditMessage={vi.fn()}
-        onEditForbidden={vi.fn()}
-        onDeleteMessage={vi.fn()}
-        emojiUsage={emptyEmojiUsage}
-        onEmojiToneChange={vi.fn()}
-        currentUserId="me"
-        recentReactionEmojis={[]}
-        reactionMenuVisible={false}
-        onReactionMenuVisibleChange={vi.fn()}
-        pickerOpen={false}
-        onPickerOpenChange={vi.fn()}
-      />,
-    );
-
-    expect(anchors(container)).toHaveLength(0);
-    expect(screen.getByTestId("chat-message-link-blocked")).toBeInTheDocument();
+    expect(found[0].getAttribute("target")).toBe("_blank");
+    const rel = (found[0].getAttribute("rel") ?? "").split(/\s+/);
+    expect(rel).toContain("noopener");
+    expect(rel).toContain("noreferrer");
+    // Per-link state on the entity: no message-level banner.
     expect(screen.queryByTestId("chat-message-link-unverified")).not.toBeInTheDocument();
+    expectNoClientSideFetch(container);
   });
 
-  // And the benign direction: the notice goes, the anchor stays.
-  it("keeps the anchor and drops the notice when a verdict finally clears it", () => {
-    const { container, rerender } = renderBubble({
-      message: messageWith({ linkSafetyState: "inconclusive" }),
-    });
-    expect(screen.getByTestId("chat-message-link-unverified")).toBeInTheDocument();
-
-    rerender(
-      <MessageBubble
-        message={messageWith({ linkSafetyState: "safe" })}
-        onToggleReaction={vi.fn()}
-        onReplyMessage={vi.fn()}
-        onReferenceMessage={vi.fn()}
-        onToggleFavorite={vi.fn()}
-        onEditMessage={vi.fn()}
-        onEditForbidden={vi.fn()}
-        onDeleteMessage={vi.fn()}
-        emojiUsage={emptyEmojiUsage}
-        onEmojiToneChange={vi.fn()}
-        currentUserId="me"
-        recentReactionEmojis={[]}
-        reactionMenuVisible={false}
-        onReactionMenuVisibleChange={vi.fn()}
-        pickerOpen={false}
-        onPickerOpenChange={vi.fn()}
-      />,
-    );
-
-    expect(screen.queryByTestId("chat-message-link-unverified")).not.toBeInTheDocument();
-    const found = anchors(container);
-    expect(found).toHaveLength(1);
-    expect(found[0].getAttribute("href")).toBe(linkURL);
-    // One message, not two: a correction is not a creation.
-    expect(container.querySelectorAll("[data-testid='chat-msg-bubble']")).toHaveLength(1);
-  });
-
-  // A message aggregated as malicious because *one* of its links was condemned
-  // must not leave the others clickable. With the aggregate model that is
-  // structural — nothing is rendered as an anchor at all.
-  it("leaves no anchor clickable when one of several links is condemned", () => {
+  it("uses the canonical href the server sent, never a client-derived one", () => {
+    const canonical = "https://xn--exmple-cua.test/p";
+    const written = "https://exämple.test/p";
     const { container } = renderBubble({
       message: messageWith({
-        bodyText: `bom https://good.test/a e ruim ${linkURL}`,
+        bodyText: `veja ${written}`,
+        linkSafetyState: "safe",
+        links: [
+          linkEntity({
+            text: written,
+            url: canonical,
+            href: canonical,
+            hostname: "xn--exmple-cua.test",
+          }),
+        ],
+      }),
+    });
+    const found = anchors(container);
+    expect(found).toHaveLength(1);
+    expect(found[0].getAttribute("href")).toBe(canonical);
+    expect(found[0]).toHaveTextContent(written);
+    // The real destination is available on hover for an IDN spelling.
+    expect(found[0].getAttribute("title")).toBe(canonical);
+  });
+
+  it("renders a pending link as text with a status note, not focusable", () => {
+    const { container } = renderBubble({
+      message: messageWith({ links: [pendingLink()] }),
+    });
+
+    expect(anchors(container)).toHaveLength(0);
+    expect(container.querySelectorAll("button").length).toBe(0);
+    const pending = container.querySelector("[data-link-safety='pending']");
+    expect(pending).not.toBeNull();
+    expect(pending).toHaveTextContent(linkURL);
+    expect(screen.getByRole("status")).toHaveTextContent("Verificando segurança do link…");
+    expectNoClientSideFetch(container);
+  });
+
+  it("renders an unverified link as a button that opens the interstitial", () => {
+    const { container } = renderBubble({
+      message: messageWith({ linkSafetyState: "inconclusive", links: [unknownLink()] }),
+    });
+
+    expect(anchors(container)).toHaveLength(0);
+    const button = screen.getByRole("button", { name: `${linkURL} — Link não verificado` });
+    expect(button.getAttribute("href")).toBeNull();
+
+    fireEvent.click(button);
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toHaveTextContent("Não foi possível verificar este link");
+    // The real host, and the full destination, so nothing is hidden.
+    expect(screen.getByTestId("chat-link-interstitial-host")).toHaveTextContent("example.test");
+    expect(dialog).toHaveTextContent(linkURL);
+    expect(dialog.textContent).not.toMatch(/seguro/i);
+    // Initial focus on the safe action; the open action is a real anchor with
+    // the hardened attributes; nothing was fetched.
+    expect(document.activeElement).toHaveTextContent("Cancelar");
+    const open = screen.getByRole("link", { name: "Abrir mesmo assim" });
+    expect(open.getAttribute("href")).toBe(linkURL);
+    expect(open.getAttribute("rel")).toContain("noopener");
+    expect(open.getAttribute("target")).toBe("_blank");
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Escape closes and focus returns to the link that opened it.
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(button);
+  });
+
+  it("offers the re-check inside the interstitial when a handler is wired", async () => {
+    const onReconcile = vi.fn(
+      async (): Promise<LinkSafetyRecheck> => ({
+        state: "inconclusive",
+        updatedAt: "2026-08-17T12:01:00Z",
+        retryAfterSeconds: 60,
+      }),
+    );
+    renderBubble({
+      message: messageWith({ linkSafetyState: "inconclusive", links: [unknownLink()] }),
+      onReconcileLinkSafety: onReconcile,
+    });
+    fireEvent.click(screen.getByRole("button", { name: `${linkURL} — Link não verificado` }));
+    fireEvent.click(screen.getByRole("button", { name: "Verificar novamente" }));
+    await waitFor(() => expect(onReconcile).toHaveBeenCalledWith("msg-1"));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Verificar novamente" })).not.toBeInTheDocument(),
+    );
+  });
+
+  it("renders a blocked link as the chip, with the URL absent from the page", () => {
+    const { container } = renderBubble({
+      message: messageWith({
+        bodyText: "clique em \uFFFC agora",
         linkSafetyState: "malicious",
+        links: [blockedLink()],
       }),
     });
 
     expect(anchors(container)).toHaveLength(0);
-    expect(container.textContent).not.toContain("https://good.test/a");
+    expect(container.textContent).not.toContain(linkURL);
+    expect(container.textContent).toContain("clique em");
+    expect(container.textContent).toContain("agora");
+    const chip = container.querySelector("[data-link-safety='malicious']");
+    expect(chip).toHaveTextContent("Link bloqueado por segurança");
+    expect(chip?.getAttribute("tabindex")).toBeNull();
+    expectNoClientSideFetch(container);
   });
 
-  // Dangerous schemes, end to end through the real renderer rather than only
-  // through the scanner's unit tests.
+  it("keeps every link independent within one message", () => {
+    const good = "https://good.test/a";
+    const { container } = renderBubble({
+      message: messageWith({
+        bodyText: `bom ${good} incerto ${linkURL} ruim \uFFFC fim`,
+        linkSafetyState: "malicious",
+        links: [
+          linkEntity({ ordinal: 0, text: good, url: good, href: good, hostname: "good.test" }),
+          unknownLink({ ordinal: 1 }),
+          blockedLink(2),
+        ],
+      }),
+    });
+
+    const found = anchors(container);
+    expect(found).toHaveLength(1);
+    expect(found[0].getAttribute("href")).toBe(good);
+    expect(
+      screen.getByRole("button", { name: `${linkURL} — Link não verificado` }),
+    ).toBeInTheDocument();
+    expect(container.querySelector("[data-link-safety='malicious']")).not.toBeNull();
+    expect(container.textContent).toContain("fim");
+    // No whole-message tombstone: the rest of the text is preserved.
+    expect(container.textContent).not.toContain(withheldBodyText);
+  });
+
+  it("drops the anchor when a later render describes the link as unverified or blocked", () => {
+    const { container, rerender } = renderBubble({
+      message: messageWith({ linkSafetyState: "safe", links: [linkEntity()] }),
+    });
+    expect(anchors(container)).toHaveLength(1);
+
+    rerenderBubble(
+      rerender,
+      messageWith({ linkSafetyState: "inconclusive", links: [unknownLink()] }),
+    );
+    expect(anchors(container)).toHaveLength(0);
+    expect(
+      screen.getByRole("button", { name: `${linkURL} — Link não verificado` }),
+    ).toBeInTheDocument();
+
+    rerenderBubble(
+      rerender,
+      messageWith({
+        bodyText: "veja \uFFFC",
+        linkSafetyState: "malicious",
+        links: [blockedLink()],
+      }),
+    );
+    expect(anchors(container)).toHaveLength(0);
+    expect(container.textContent).not.toContain(linkURL);
+  });
+
+  it("renders no anchor for a URL the server did not describe", () => {
+    // A body with two URLs and an entity for one: the other is literal text,
+    // whatever the message-level marker says.
+    const { container } = renderBubble({
+      message: messageWith({
+        bodyText: `${linkURL} e https://other.test/x`,
+        linkSafetyState: "safe",
+        links: [linkEntity()],
+      }),
+    });
+    expect(anchors(container)).toHaveLength(1);
+    expect(container.textContent).toContain("https://other.test/x");
+  });
+
   it("never renders a dangerous scheme as an anchor", () => {
     for (const body of [
       "javascript:alert(1)",
@@ -432,137 +536,426 @@ describe("anchors", () => {
     ]) {
       cleanup();
       const { container } = renderBubble({
-        message: messageWith({ bodyText: body, linkSafetyState: "safe" }),
+        message: messageWith({
+          bodyText: body,
+          linkSafetyState: "safe",
+          links: [linkEntity({ text: body, url: body, href: body })],
+        }),
       });
 
       expect(anchors(container)).toHaveLength(0);
-      // The text is still shown — it is what the sender wrote — it is simply not
-      // a destination.
       expect(container.textContent).toContain(body.slice(0, 12));
     }
   });
 
-  it("leaves text that merely resembles a URL as text", () => {
+  it("renders no anchor while the message is still withheld by a legacy server", () => {
     const { container } = renderBubble({
-      message: messageWith({
-        bodyText: "example.test/a e www.example.test e hxxps://example.test/a",
-        linkSafetyState: "safe",
-      }),
+      message: messageWith({ status: "pending_link_scan", linkSafetyState: "" }),
     });
-
     expect(anchors(container)).toHaveLength(0);
   });
 });
 
 /**
- * The clickability allowlist (CQ-004).
- *
- * Migration 000027 gave every pre-existing message `link_safety_state = ''`, and
- * a deployment with link scanning switched off produces nothing else. Those
- * messages have never been checked by anything, so "not known bad" must not be
- * read as "good enough to link" — otherwise turning the feature on retroactively
- * linkifies the entire message history on no evidence.
+ * The clickability allowlist, restated for issue #807: an anchor exists only
+ * where the server sent an href on a direct link. No message-level state, no
+ * text pattern and no client-side parser can produce one.
  */
 describe("clickability is an allowlist", () => {
   const anchors = (container: HTMLElement) => Array.from(container.querySelectorAll("a"));
 
-  it("renders no anchor for a legacy message with no link-safety state", () => {
-    const { container } = renderBubble({
-      message: messageWith({ status: "active", linkSafetyState: "" }),
-    });
-
-    expect(anchors(container)).toHaveLength(0);
-    // The text is still shown in full — nothing is withheld, it is simply not a
-    // destination.
-    expect(container.textContent).toContain(linkURL);
-    expect(screen.queryByTestId("chat-message-link-unverified")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("chat-message-link-blocked")).not.toBeInTheDocument();
-  });
-
-  it("renders no anchor when the field is absent altogether", () => {
-    // A pre-#135 server sends no field at all; the mapper leaves it undefined.
-    const message = messageWith();
-    delete (message as { linkSafetyState?: unknown }).linkSafetyState;
-    const { container } = renderBubble({ message });
-
-    expect(anchors(container)).toHaveLength(0);
-    expect(container.textContent).toContain(linkURL);
-  });
-
-  // CQ-004: "the provider produced no usable verdict" and "this build does not
-  // recognise what the server said" are different facts. The decoder maps the
-  // second to `unknown`, which authorises nothing — mapping it to `inconclusive`
-  // would have granted anchors on a state nobody here has reasoned about.
-  it("renders no anchor for a state this client does not understand", () => {
-    for (const raw of ["future_state_v2", "probably_fine", "SAFE", "unknown"]) {
+  it("renders no anchor for a message the server described no links for", () => {
+    for (const state of ["", "safe", "inconclusive", "malicious", "unknown"] as const) {
       cleanup();
-      const { container } = renderBubble({
-        message: messageWith({ linkSafetyState: normalizeLinkSafety(raw) }),
-      });
-
-      expect(anchors(container), `state ${raw} produced an anchor`).toHaveLength(0);
-      // The content is still shown in full — nothing is withheld, it is simply not
-      // a destination.
-      expect(container.textContent).toContain(linkURL);
+      const { container } = renderBubble({ message: messageWith({ linkSafetyState: state }) });
+      expect(anchors(container)).toHaveLength(0);
+      // The text is still there — except for the legacy tombstone, which
+      // withholds a condemned body wholesale.
+      if (state !== "malicious") expect(container.textContent).toContain(linkURL);
     }
   });
 
   it("decodes an unrecognised server state as unknown, never as inconclusive", () => {
     expect(normalizeLinkSafety("future_state_v2")).toBe("unknown");
-    expect(normalizeLinkSafety("inconclusive")).toBe("inconclusive");
-    expect(normalizeLinkSafety("")).toBe("");
-    expect(normalizeLinkSafety(undefined)).toBe("");
     expect(linkSafetyAllowsAnchors("unknown")).toBe(false);
-    expect(linkSafetyAllowsAnchors("")).toBe(false);
-    expect(linkSafetyAllowsAnchors("malicious")).toBe(false);
-    expect(linkSafetyAllowsAnchors("safe")).toBe(true);
-    expect(linkSafetyAllowsAnchors("inconclusive")).toBe(true);
   });
 
-  // A message that was clickable must stop being clickable when a realtime
-  // correction names a state this build does not understand.
-  it("drops the anchor when a correction names an unknown state", () => {
-    const { container, rerender } = renderBubble({
-      message: messageWith({ linkSafetyState: "inconclusive" }),
-    });
-    expect(anchors(container)).toHaveLength(1);
-
-    rerender(
-      <MessageBubble
-        message={messageWith({ linkSafetyState: normalizeLinkSafety("future_state_v2") })}
-        onToggleReaction={vi.fn()}
-        onReplyMessage={vi.fn()}
-        onReferenceMessage={vi.fn()}
-        onToggleFavorite={vi.fn()}
-        onEditMessage={vi.fn()}
-        onEditForbidden={vi.fn()}
-        onDeleteMessage={vi.fn()}
-        emojiUsage={emptyEmojiUsage}
-        onEmojiToneChange={vi.fn()}
-        currentUserId="me"
-        recentReactionEmojis={[]}
-        reactionMenuVisible={false}
-        onReactionMenuVisibleChange={vi.fn()}
-        pickerOpen={false}
-        onPickerOpenChange={vi.fn()}
-      />,
-    );
-
-    expect(anchors(container)).toHaveLength(0);
-    expect(screen.queryByTestId("chat-message-link-unverified")).not.toBeInTheDocument();
+  it("refuses an entity whose href contradicts its click policy", () => {
+    // Decoded through the same parser the API uses, so a server bug cannot
+    // become an anchor.
+    expect(
+      parseMessageLink({ safety: "unknown", click: "interstitial", href: linkURL, url: linkURL }),
+    ).toBeUndefined();
+    expect(
+      parseMessageLink({ safety: "safe", click: "direct", href: "javascript:x" }),
+    ).toBeUndefined();
+    expect(parseMessageLink({ safety: "trusted", click: "direct", href: linkURL })).toBeUndefined();
+    expect(
+      parseMessageLink({ target_key: "key", safety: "safe", click: "direct", href: linkURL })?.href,
+    ).toBe(linkURL);
   });
 
-  it("renders an anchor only for the two checked states", () => {
-    for (const state of ["safe", "inconclusive"] as const) {
+  it("renders an anchor only for a direct link with an href", () => {
+    const cases: Array<[MessageLink, number]> = [
+      [linkEntity(), 1],
+      [linkEntity({ href: "" }), 0],
+      [unknownLink(), 0],
+      [pendingLink(), 0],
+    ];
+    for (const [link, want] of cases) {
       cleanup();
-      const { container } = renderBubble({ message: messageWith({ linkSafetyState: state }) });
-      expect(anchors(container)).toHaveLength(1);
+      const { container } = renderBubble({ message: messageWith({ links: [link] }) });
+      expect(anchors(container)).toHaveLength(want);
     }
-    for (const state of ["", "malicious", "unknown"] as const) {
-      cleanup();
-      const { container } = renderBubble({ message: messageWith({ linkSafetyState: state }) });
+  });
+});
+
+/**
+ * Rich preview cards (issue #807 §24-28).
+ */
+/**
+ * Emphasised links (issue #807 CQ follow-up). Plain and rich text share one
+ * link pipeline: a URL inside bold, italic or bold-italic is the same span —
+ * same entity, same anchor or interstitial, same chip — as a plain one, only
+ * wrapped, and the wrapper never mints a second href of its own.
+ */
+describe("links inside emphasis", () => {
+  const anchors = (container: HTMLElement) => Array.from(container.querySelectorAll("a"));
+  const wrappers: Array<[string, string, string]> = [
+    ["bold", `**${linkURL}**`, "strong"],
+    ["italic", `*${linkURL}*`, "em"],
+    ["bold-italic", `***${linkURL}***`, "strong em"],
+  ];
+
+  it.each(wrappers)(
+    "draws a safe %s link as one anchor inside its wrapper",
+    (_name, body, wrapper) => {
+      const { container } = renderBubble({
+        message: messageWith({ bodyText: body, linkSafetyState: "safe", links: [linkEntity()] }),
+      });
+      const found = anchors(container);
+      expect(found).toHaveLength(1);
+      expect(found[0].getAttribute("href")).toBe(linkURL);
+      expect(found[0].getAttribute("rel")).toContain("noopener");
+      expect(container.querySelector(`${wrapper} a`)).toBe(found[0]);
+    },
+  );
+
+  it.each(wrappers)(
+    "draws a pending %s link as text with the pending note and no anchor",
+    (_name, body, wrapper) => {
+      const { container } = renderBubble({
+        message: messageWith({ bodyText: body, linkSafetyState: "", links: [pendingLink()] }),
+      });
       expect(anchors(container)).toHaveLength(0);
-    }
+      expect(container.querySelector(`${wrapper} [data-link-safety='pending']`)).not.toBeNull();
+      expect(container.textContent).toContain(linkURL);
+    },
+  );
+
+  it.each(wrappers)(
+    "draws an unverified %s link as the interstitial button, not an anchor",
+    (_name, body, wrapper) => {
+      const { container } = renderBubble({
+        message: messageWith({
+          bodyText: body,
+          linkSafetyState: "inconclusive",
+          links: [unknownLink()],
+        }),
+      });
+      expect(anchors(container)).toHaveLength(0);
+      const button = screen.getByRole("button", { name: `${linkURL} — Link não verificado` });
+      expect(container.querySelector(`${wrapper} button`)).toBe(button);
+      fireEvent.click(button);
+      expect(screen.getByRole("dialog")).toHaveTextContent(linkURL);
+      fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    },
+  );
+
+  it.each(wrappers)(
+    "draws a blocked %s link as the chip inside its wrapper",
+    (_name, body, wrapper) => {
+      const { container } = renderBubble({
+        message: messageWith({
+          bodyText: body.replace(linkURL, "\uFFFC"),
+          linkSafetyState: "malicious",
+          links: [blockedLink()],
+        }),
+      });
+      expect(anchors(container)).toHaveLength(0);
+      expect(container.querySelector(`${wrapper} [data-link-safety='malicious']`)).not.toBeNull();
+      expect(container.textContent).not.toContain(linkURL);
+    },
+  );
+
+  it("still never linkifies inline code", () => {
+    const { container } = renderBubble({
+      message: messageWith({
+        bodyText: `\`${linkURL}\``,
+        linkSafetyState: "safe",
+        links: [linkEntity()],
+      }),
+    });
+    expect(anchors(container)).toHaveLength(0);
+    expect(container.querySelector("code")).toHaveTextContent(linkURL);
+  });
+});
+
+/**
+ * The interstitial derives what it shows from the message's current links
+ * (issue #807 CQ follow-up): a verdict that arrives while it is open, or an
+ * edit that changes the occurrence, is reflected at once — the "Abrir mesmo
+ * assim" action is never offered on a snapshot the server has since replaced.
+ */
+describe("the interstitial follows the occurrence", () => {
+  const anchors = (container: HTMLElement) => Array.from(container.querySelectorAll("a"));
+  const openInterstitial = () => {
+    fireEvent.click(screen.getByRole("button", { name: `${linkURL} — Link não verificado` }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  };
+
+  it("closes when the link is cleared, and the body offers the anchor instead", () => {
+    const { container, rerender } = renderBubble({
+      message: messageWith({ linkSafetyState: "inconclusive", links: [unknownLink()] }),
+    });
+    openInterstitial();
+    rerenderBubble(
+      rerender,
+      messageWith({
+        linkSafetyState: "safe",
+        links: [linkEntity({ updatedAt: "2026-08-17T12:05:00Z" })],
+      }),
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(anchors(container)).toHaveLength(1);
+  });
+
+  it("closes when the link is condemned, and nothing of the URL remains", () => {
+    const { container, rerender } = renderBubble({
+      message: messageWith({ linkSafetyState: "inconclusive", links: [unknownLink()] }),
+    });
+    openInterstitial();
+    rerenderBubble(
+      rerender,
+      messageWith({
+        bodyText: "veja \uFFFC por favor",
+        linkSafetyState: "malicious",
+        links: [blockedLink()],
+      }),
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(container.textContent).not.toContain(linkURL);
+  });
+
+  it("closes when an edit removes the occurrence", () => {
+    const { rerender } = renderBubble({
+      message: messageWith({ linkSafetyState: "inconclusive", links: [unknownLink()] }),
+    });
+    openInterstitial();
+    rerenderBubble(
+      rerender,
+      messageWith({ bodyText: "sem link", linkSafetyState: "", links: undefined }),
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("closes when an edit replaces the occurrence with another target at the same position", () => {
+    const other = "https://other.test/b";
+    const { rerender } = renderBubble({
+      message: messageWith({ linkSafetyState: "inconclusive", links: [unknownLink()] }),
+    });
+    openInterstitial();
+    expect(screen.getByRole("link", { name: "Abrir mesmo assim" }).getAttribute("href")).toBe(
+      linkURL,
+    );
+    rerenderBubble(
+      rerender,
+      messageWith({
+        bodyText: `veja ${other} por favor`,
+        linkSafetyState: "inconclusive",
+        links: [
+          unknownLink({ targetKey: "key-other", text: other, url: other, hostname: "other.test" }),
+        ],
+      }),
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    // Opening the new occurrence shows the new destination, never the old one.
+    fireEvent.click(screen.getByRole("button", { name: `${other} — Link não verificado` }));
+    expect(screen.getByRole("link", { name: "Abrir mesmo assim" }).getAttribute("href")).toBe(
+      other,
+    );
+  });
+
+  it("stays open, on the current state, while the occurrence is still unverified", () => {
+    const { rerender } = renderBubble({
+      message: messageWith({ linkSafetyState: "inconclusive", links: [unknownLink()] }),
+    });
+    openInterstitial();
+    rerenderBubble(
+      rerender,
+      messageWith({
+        linkSafetyState: "inconclusive",
+        links: [unknownLink({ hostname: "xn--example.test", updatedAt: "2026-08-17T12:05:00Z" })],
+      }),
+    );
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByTestId("chat-link-interstitial-host")).toHaveTextContent("xn--example.test");
+  });
+});
+
+describe("preview cards", () => {
+  const readyPreview = (overrides: Partial<LinkPreview> = {}): LinkPreview => ({
+    state: "ready",
+    hostname: "example.test",
+    siteName: "Example",
+    title: "A page title",
+    description: "A short description of the page.",
+    imageId: "",
+    imageWidth: 0,
+    imageHeight: 0,
+    ...overrides,
+  });
+
+  it("draws the card under the message with the real hostname, as one anchor", () => {
+    const { container } = renderBubble({
+      message: messageWith({
+        linkSafetyState: "safe",
+        links: [linkEntity({ preview: readyPreview() })],
+      }),
+    });
+
+    const card = screen.getByTestId("chat-link-card");
+    const cardAnchor = card.querySelector("a.link-card__body") as HTMLAnchorElement;
+    expect(cardAnchor.getAttribute("href")).toBe(linkURL);
+    expect(cardAnchor.getAttribute("rel")).toContain("noopener");
+    expect(cardAnchor.getAttribute("aria-label")).toBe("A page title — example.test");
+    expect(card).toHaveTextContent("example.test");
+    expect(card).toHaveTextContent("A page title");
+    expect(card).toHaveTextContent("A short description");
+    // The site's own name does not replace the host.
+    expect(card.querySelector(".link-card__host")).toHaveTextContent("example.test");
+    // Nothing remote is loaded by the browser.
+    expectNoClientSideFetch(container);
+  });
+
+  it("renders remote metadata as text, never as markup", () => {
+    renderBubble({
+      message: messageWith({
+        linkSafetyState: "safe",
+        links: [linkEntity({ preview: readyPreview({ title: "<img src=x onerror=alert(1)>" }) })],
+      }),
+    });
+    const card = screen.getByTestId("chat-link-card");
+    expect(card.querySelectorAll("img")).toHaveLength(0);
+    expect(card).toHaveTextContent("<img src=x onerror=alert(1)>");
+  });
+
+  it("shows a placeholder while the preview is fetching and nothing when it failed", () => {
+    const { rerender } = renderBubble({
+      message: messageWith({
+        linkSafetyState: "safe",
+        links: [linkEntity({ preview: readyPreview({ state: "fetching", title: "" }) })],
+      }),
+    });
+    expect(screen.getByTestId("chat-link-card-placeholder")).toHaveTextContent(
+      "Preparando visualização…",
+    );
+    // The link is already clickable while the card is on its way.
+    expect(screen.getByRole("link", { name: linkURL })).toBeInTheDocument();
+
+    rerenderBubble(
+      rerender,
+      messageWith({
+        linkSafetyState: "safe",
+        links: [linkEntity({ preview: readyPreview({ state: "failed", title: "" }) })],
+      }),
+    );
+    expect(screen.queryByTestId("chat-link-card-placeholder")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-link-card")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    // Failure changes nothing about the anchor.
+    expect(screen.getByRole("link", { name: linkURL })).toBeInTheDocument();
+  });
+
+  it("draws at most two cards, one per distinct target, in order", () => {
+    const urls = ["https://a.test/1", "https://b.test/2", "https://c.test/3"];
+    const links = [
+      ...urls.map((url, ordinal) =>
+        linkEntity({
+          ordinal,
+          targetKey: `key-${ordinal}`,
+          text: url,
+          url,
+          href: url,
+          hostname: new URL(url).host,
+          preview: readyPreview({ hostname: new URL(url).host, title: `T${ordinal}` }),
+        }),
+      ),
+      // The first target again: no second card.
+      linkEntity({
+        ordinal: 3,
+        targetKey: "key-0",
+        text: urls[0],
+        url: urls[0],
+        href: urls[0],
+        hostname: "a.test",
+        preview: readyPreview({ hostname: "a.test", title: "T0" }),
+      }),
+    ];
+    const { container } = renderBubble({
+      message: messageWith({
+        bodyText: `${urls.join(" ")} ${urls[0]}`,
+        linkSafetyState: "safe",
+        links,
+      }),
+    });
+
+    const cards = screen.getAllByTestId("chat-link-card");
+    expect(cards).toHaveLength(2);
+    expect(cards[0]).toHaveTextContent("a.test");
+    expect(cards[1]).toHaveTextContent("b.test");
+    // Every link is still an anchor, cards or not.
+    expect(container.querySelectorAll("a.rtr-link")).toHaveLength(4);
+  });
+
+  it("never draws a card for a link that is not safe, whatever the preview says", () => {
+    renderBubble({
+      message: messageWith({
+        linkSafetyState: "inconclusive",
+        links: [unknownLink({ preview: readyPreview() })],
+      }),
+    });
+    expect(screen.queryByTestId("chat-link-card")).not.toBeInTheDocument();
+  });
+
+  it("hides the card from its menu and keeps the link", () => {
+    localStorage.clear();
+    const { container } = renderBubble({
+      message: messageWith({
+        linkSafetyState: "safe",
+        links: [linkEntity({ preview: readyPreview() })],
+      }),
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Opções da visualização de example.test" }));
+    const menu = screen.getByRole("menu");
+    expect(screen.getByRole("menuitem", { name: "Abrir link" }).getAttribute("href")).toBe(linkURL);
+    expect(screen.getByRole("menuitem", { name: "Copiar link" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /reportar/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Ocultar visualização" }));
+
+    expect(menu).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-link-card")).not.toBeInTheDocument();
+    expect(container.querySelectorAll("a.rtr-link")).toHaveLength(1);
+    // Remembered for this reader.
+    cleanup();
+    renderBubble({
+      message: messageWith({
+        linkSafetyState: "safe",
+        links: [linkEntity({ preview: readyPreview() })],
+      }),
+    });
+    expect(screen.queryByTestId("chat-link-card")).not.toBeInTheDocument();
+    localStorage.clear();
   });
 });
 

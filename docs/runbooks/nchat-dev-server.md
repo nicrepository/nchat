@@ -91,15 +91,14 @@ SealedSecrets (seções 9–10).
 O workflow de deploy usa runner self-hosted com label `nchat-dev-deploy`. Como
 `deploy-nchat-dev.yml` só aceita `workflow_call`, ele não gera execução
 independente: o job self-hosted pertence à execução do workflow chamador,
-`images.yml`, que dispara em push para `develop`. É `images.yml` que deve ser
-consultado. Antes de instalar ou iniciar o runner, verifique se já existe uma
-execução em andamento que possa disparar um deploy prematuro assim que o runner
-ficar disponível:
+`cd-develop.yml`. É `cd-develop.yml` que deve ser consultado. Antes de instalar
+ou iniciar o runner, verifique se já existe uma execução em andamento que possa
+disparar um deploy prematuro assim que o runner ficar disponível:
 
 ```bash
 # [notebook]
 gh run list \
-  --workflow images.yml \
+  --workflow cd-develop.yml \
   --branch develop \
   --limit 10 \
   --json databaseId,status,conclusion,headSha,displayTitle,url \
@@ -117,12 +116,18 @@ gh run cancel <RUN_ID>
 
 Esta checagem é repetida na seção 15, imediatamente antes de habilitar o runner.
 
-Atenção: `images.yml` executa em **qualquer** push para `develop`, sem filtro por
-caminho. O merge de uma alteração exclusivamente documental — inclusive o merge
-deste próprio runbook — também constrói todas as imagens e chama o deploy; o job
-reutilizável ficará aguardando o runner com label `nchat-dev-deploy`. Portanto,
-execute esta checagem (e o eventual cancelamento) imediatamente após o merge deste
-runbook.
+Atenção: `cd-develop.yml` executa para **qualquer** push em `develop` cuja CI
+tenha passado, sem filtro por caminho. O merge de uma alteração exclusivamente
+documental — inclusive o merge deste próprio runbook — também constrói todas as
+imagens e chama o deploy; o job reutilizável ficará aguardando o runner com
+label `nchat-dev-deploy`. Portanto, execute esta checagem (e o eventual
+cancelamento) imediatamente após o merge deste runbook.
+
+O gatilho mudou com a issue #933: antes o build começava no mesmo instante do
+push e corria em paralelo com a CI, o que permitia implantar um commit que a CI
+depois reprovava. Agora `cd-develop.yml` só começa quando o run de `CI` termina,
+e a primeira coisa que faz é ler o job `CI / Required` daquele run. O deploy
+leva mais tempo para começar, e é isso que se pretende.
 
 ## 2. Pré-checagens somente leitura
 
@@ -910,7 +915,7 @@ que nenhuma execução ficou pendente durante o bootstrap:
 ```bash
 # [notebook]
 gh run list \
-  --workflow images.yml \
+  --workflow cd-develop.yml \
   --branch develop \
   --limit 10 \
   --json databaseId,status,conclusion,headSha,displayTitle,url \
@@ -929,15 +934,34 @@ sudo ./svc.sh status
 
 ## 16. Build e deploy
 
-Como o pipeline é disparado:
+Como o pipeline é disparado (issue #933):
+
+```text
+push em develop
+    |
+    v
+CI  (ci.yml)                     todos os gates, incluindo CI / Required
+    |
+    v
+CD / Develop  (cd-develop.yml)   workflow_run, só depois que a CI terminou
+    |
+    +-- eligibility   lê o job `CI / Required` daquele run, pelo nome
+    +-- build         images.yml -> onze imagens por digest + manifest selado
+    +-- deploy        deploy-nchat-dev.yml no runner self-hosted
+          deploy.sh   data, migrations, apply, rollout
+          smoke.sh    prova operacional
+          summary     $GITHUB_STEP_SUMMARY
+```
 
 - `deploy-nchat-dev.yml` usa `workflow_call` — ele não roda sozinho e **não possui**
   `workflow_dispatch`; não é possível dispará-lo manualmente pela interface.
-- `images.yml` dispara em push para `develop`. Ele primeiro constrói e publica as
-  imagens em runners GitHub-hosted e, ao final, chama o deploy passando os digests
-  `@sha256:` das imagens publicadas.
+- `cd-develop.yml` é o gatilho, e só age sobre um commit cujo job `CI / Required`
+  concluiu com `success`. A conclusão do run de CI **não** é o veredito: um
+  `Quality / SonarQube` reprovado deixa o run inteiro vermelho e continua sendo
+  advisory, portanto não bloqueia o deploy.
 - O job de deploy roda no runner self-hosted `srv-apps-01-nchat-dev`, agora
   habilitado.
+- Dev é **single-slot**: não há Blue/Green, não há cutover e não há aprovação.
 - **Não crie commit vazio** em `develop` apenas para disparar o pipeline sem
   autorização explícita. O caminho normal é o próximo merge em `develop`.
 
@@ -945,6 +969,43 @@ Acompanhe a execução pela interface do GitHub Actions. Confirme que o build te
 antes do deploy, que o runner foi `srv-apps-01-nchat-dev` e que as imagens
 renderizadas usam `@sha256:`. O timeout do workflow para migrations é 330s,
 ligeiramente superior ao deadline de 300s do Job.
+
+### Smoke e summary
+
+`deploy.sh` aplica e espera os rollouts; `scripts/deploy/nchat-dev/smoke.sh` é
+que prova que o ambiente está servindo a release. São dois passos porque são
+duas perguntas diferentes: a primeira falha quando o Kubernetes recusou a
+mudança, a segunda quando a mudança está ruim. Nenhuma das duas pode ser
+reportada como sucesso.
+
+O smoke verifica, sem credencial nenhuma:
+
+- todos os rollouts concluídos;
+- nenhum container em `CrashLoopBackOff`, `ImagePullBackOff`, `ErrImagePull` ou
+  `CreateContainerConfigError` — um container em back-off parece saudável entre
+  dois probes, e é exatamente o que um gate baseado só em readiness ignora;
+- `job/nchat-migrations` com a condition `Complete` — um Job apagado não é um
+  Job concluído;
+- `/healthz` e `/readyz` de cada serviço Go, pelo proxy de Service;
+- `https://$NCHAT_DEV_HOST/` respondendo 200;
+- `/api/chat/sidebar` respondendo **401** a uma requisição anônima;
+- `/api/chat/ws` respondendo **401** a um upgrade anônimo.
+
+Os dois últimos provam autenticação por recusa, não por login: um 200 ali é um
+middleware que não foi ligado, e um 404 é uma rota quebrada ou um gateway que
+não sabe carregar um upgrade. Não é a suíte E2E — o Playwright já rodou contra
+esse commit em `E2E / Web` e `E2E / Admin`, e repeti-lo aqui responderia de novo
+uma pergunta que a CI já respondeu.
+
+Executável isoladamente contra um ambiente que se está depurando:
+
+```bash
+# [srv-apps-01]
+NCHAT_DEV_HOST=<host> scripts/deploy/nchat-dev/smoke.sh
+```
+
+O summary do run traz SHA, número de imagens fixadas por digest, resultado do
+apply/migrations/rollout e resultado do smoke.
 
 ## 17. Validação pós-deploy
 

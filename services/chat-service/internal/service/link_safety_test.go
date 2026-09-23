@@ -15,14 +15,13 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
-// RF-21, as it behaves after the move to Cloudflare URL Scanner.
+// RF-21, as it behaves after issue #807.
 //
-// Two things changed and both are asserted throughout: the unit is a canonical
-// URL rather than a hostname, so a verdict about a domain no longer clears every
-// path on it; and the check is asynchronous, so a URL nobody has scanned makes
-// the message *withheld* rather than refused — the provider cannot answer inside
-// an interactive request, and the alternatives were publishing it unchecked or
-// refusing every message carrying a link nobody had sent before.
+// Two things are asserted throughout: the unit is a canonical URL rather than a
+// hostname, so a verdict about a domain never clears another path on it; and
+// the message is never held or refused for its links — every message publishes,
+// each URL is recorded as an entity with its own state, and a URL nobody has
+// scanned is queued for the worker while its link stays non-navigable.
 //
 // The verdict source is the store itself, which is what production wires: one
 // indexed read, no network. Nothing in this file can reach Cloudflare.
@@ -116,26 +115,33 @@ func TestCachedSafeURLPublishesImmediately(t *testing.T) {
 	}
 }
 
-// The property RF-21 exists for: a condemned link means no row and no broadcast.
-func TestMaliciousURLIsNotPersisted(t *testing.T) {
+// Issue #807: a condemned link blocks itself, not the message. The row is
+// written with the malicious marker — the read path withholds that one span —
+// and the message is published like any other.
+func TestMaliciousURLPublishesWithTheLinkBlocked(t *testing.T) {
 	store := safetyStore(map[string]urlsafety.Verdict{
 		"https://evil.example/login": urlsafety.VerdictMalicious,
 	})
 	svc, publisher := messageServiceWith(store)
 
-	_, err := createChannelMessage(svc, "clique em https://evil.example/login")
-
-	if !errors.Is(err, domain.ErrMaliciousURL) {
-		t.Fatalf("want ErrMaliciousURL, got %v", err)
+	if _, err := createChannelMessage(svc, "clique em https://evil.example/login"); err != nil {
+		t.Fatalf("a condemned link must not refuse the send: %v", err)
 	}
-	if store.createCalls != 0 || publisher.count() != 0 {
-		t.Fatalf("a refused message was persisted or published: createCalls=%d published=%d",
-			store.createCalls, publisher.count())
+	waitForPublishCalls(t, publisher, 1)
+	if store.createCalls != 1 || store.lastCreateInput.Status != "" {
+		t.Fatalf("createCalls=%d status=%q", store.createCalls, store.lastCreateInput.Status)
+	}
+	if store.lastCreateInput.LinkSafetyState != domain.MessageLinkSafetyMalicious {
+		t.Fatalf("link_safety_state=%q, want malicious", store.lastCreateInput.LinkSafetyState)
+	}
+	if len(store.ensuredURLs) != 0 {
+		t.Fatalf("a scan was queued for a decided URL: %v", store.ensuredURLs)
 	}
 }
 
-// The new outcome: no verdict yet means accepted, withheld, and scanned.
-func TestUnknownURLWithholdsTheMessage(t *testing.T) {
+// No verdict yet means accepted, published, and scanned. The link itself waits;
+// the message does not.
+func TestUnknownURLPublishesAndQueuesTheScan(t *testing.T) {
 	store := safetyStore(nil)
 	svc, publisher := messageServiceWith(store)
 
@@ -146,13 +152,12 @@ func TestUnknownURLWithholdsTheMessage(t *testing.T) {
 	if store.createCalls != 1 {
 		t.Fatalf("createCalls=%d", store.createCalls)
 	}
-	// Withheld: the status every read path already excludes.
-	if store.lastCreateInput.Status != domain.MessageStatusPendingLinkScan {
-		t.Fatalf("status=%q", store.lastCreateInput.Status)
+	// Published: the provider is not on the publication path.
+	if store.lastCreateInput.Status != "" || store.lastCreateInput.LinkSafetyState != domain.MessageLinkSafetyNone {
+		t.Fatalf("status=%q state=%q", store.lastCreateInput.Status, store.lastCreateInput.LinkSafetyState)
 	}
-	// Nobody else is told about it.
-	assertNothingPublished(t, publisher)
-	// And the scan that will decide it is queued.
+	waitForPublishCalls(t, publisher, 1)
+	// And the scan that will decide the link is queued.
 	if len(store.ensuredURLs) != 1 || store.ensuredURLs[0] != "https://novo.example/post" {
 		t.Fatalf("scan queue: %v", store.ensuredURLs)
 	}
@@ -180,11 +185,13 @@ func TestSafeURLDoesNotClearAnotherPathOnTheSameHost(t *testing.T) {
 			if _, err := createChannelMessage(svc, body); err != nil {
 				t.Fatalf("CreateChannelMessage: %v", err)
 			}
-			if store.lastCreateInput.Status != domain.MessageStatusPendingLinkScan {
-				t.Fatalf("%q inherited the root's clearance: status=%q",
-					body, store.lastCreateInput.Status)
+			if store.lastCreateInput.LinkSafetyState == domain.MessageLinkSafetySafe {
+				t.Fatalf("%q inherited the root's clearance", body)
 			}
-			assertNothingPublished(t, publisher)
+			if len(store.ensuredURLs) != 1 {
+				t.Fatalf("%q was not queued for its own scan: %v", body, store.ensuredURLs)
+			}
+			waitForPublishCalls(t, publisher, 1)
 		})
 	}
 }
@@ -213,8 +220,8 @@ func TestFragmentDoesNotCreateASeparateVerdict(t *testing.T) {
 	if _, err := createChannelMessage(svc, "veja https://example.com/file#secao-2"); err != nil {
 		t.Fatalf("CreateChannelMessage: %v", err)
 	}
-	if store.lastCreateInput.Status != "" {
-		t.Fatalf("a fragment forced a new scan: status=%q", store.lastCreateInput.Status)
+	if len(store.ensuredURLs) != 0 || store.lastCreateInput.LinkSafetyState != domain.MessageLinkSafetySafe {
+		t.Fatalf("a fragment forced a new scan: %v", store.ensuredURLs)
 	}
 	waitForPublishCalls(t, publisher, 1)
 }
@@ -238,9 +245,8 @@ func TestUnicodePrefixDoesNotShiftTheURLOffset(t *testing.T) {
 			if _, err := createChannelMessage(svc, body); err != nil {
 				t.Fatalf("CreateChannelMessage: %v", err)
 			}
-			if store.lastCreateInput.Status != "" {
-				t.Fatalf("the link was not found where it actually is: status=%q asked=%v",
-					store.lastCreateInput.Status, store.lastVerdictURLs)
+			if store.lastCreateInput.LinkSafetyState != domain.MessageLinkSafetySafe {
+				t.Fatalf("the link was not found where it actually is: asked=%v", store.lastVerdictURLs)
 			}
 			waitForPublishCalls(t, publisher, 1)
 		})
@@ -249,61 +255,40 @@ func TestUnicodePrefixDoesNotShiftTheURLOffset(t *testing.T) {
 
 // --- several links in one message ------------------------------------------
 
-func TestAllURLsMustBeDecidedBeforePublishing(t *testing.T) {
+func TestEveryLinkKeepsItsOwnStateInOneMessage(t *testing.T) {
 	for name, testCase := range map[string]struct {
 		verdicts   map[string]urlsafety.Verdict
-		wantErr    error
-		wantStatus domain.MessageStatus
+		wantState  domain.MessageLinkSafety
+		wantQueued int
 	}{
-		"one safe one pending": {
-			verdicts:   safe("https://a.example/x"),
-			wantStatus: domain.MessageStatusPendingLinkScan,
-		},
-		"one safe one malicious": {
-			verdicts: map[string]urlsafety.Verdict{
-				"https://a.example/x": urlsafety.VerdictSafe,
-				"https://b.example/y": urlsafety.VerdictMalicious,
-			},
-			wantErr: domain.ErrMaliciousURL,
-		},
-		"both pending": {wantStatus: domain.MessageStatusPendingLinkScan},
-		"both safe": {
-			verdicts:   safe("https://a.example/x", "https://b.example/y"),
-			wantStatus: "",
-		},
-		// A pending URL beside a malicious one is still a refusal: one condemned
-		// link is enough, and waiting for the other would be waiting to say no.
-		"one pending one malicious": {
-			verdicts: map[string]urlsafety.Verdict{"https://b.example/y": urlsafety.VerdictMalicious},
-			wantErr:  domain.ErrMaliciousURL,
-		},
+		"one safe one pending":      {verdicts: safe("https://a.example/x"), wantQueued: 1},
+		"both pending":              {wantQueued: 2},
+		"both safe":                 {verdicts: safe("https://a.example/x", "https://b.example/y"), wantState: domain.MessageLinkSafetySafe},
+		"one safe one malicious":    {verdicts: map[string]urlsafety.Verdict{"https://a.example/x": urlsafety.VerdictSafe, "https://b.example/y": urlsafety.VerdictMalicious}, wantState: domain.MessageLinkSafetyMalicious},
+		"one pending one malicious": {verdicts: map[string]urlsafety.Verdict{"https://b.example/y": urlsafety.VerdictMalicious}, wantState: domain.MessageLinkSafetyMalicious, wantQueued: 1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			store := safetyStore(testCase.verdicts)
 			svc, publisher := messageServiceWith(store)
 
-			_, err := createChannelMessage(svc, "https://a.example/x e https://b.example/y")
-
-			if testCase.wantErr != nil {
-				if !errors.Is(err, testCase.wantErr) {
-					t.Fatalf("want %v, got %v", testCase.wantErr, err)
-				}
-				if store.createCalls != 0 || publisher.count() != 0 {
-					t.Fatal("a refused message left a trace")
-				}
-				return
-			}
-			if err != nil {
+			if _, err := createChannelMessage(svc, "https://a.example/x e https://b.example/y"); err != nil {
 				t.Fatalf("CreateChannelMessage: %v", err)
 			}
-			if store.lastCreateInput.Status != testCase.wantStatus {
-				t.Fatalf("status=%q want %q", store.lastCreateInput.Status, testCase.wantStatus)
+			// Always published, whatever the links say.
+			waitForPublishCalls(t, publisher, 1)
+			if store.lastCreateInput.Status != "" {
+				t.Fatalf("status=%q, a link must never withhold a message", store.lastCreateInput.Status)
 			}
-			if testCase.wantStatus == "" {
-				waitForPublishCalls(t, publisher, 1)
-				return
+			if store.lastCreateInput.LinkSafetyState != testCase.wantState {
+				t.Fatalf("aggregate=%q want %q", store.lastCreateInput.LinkSafetyState, testCase.wantState)
 			}
-			assertNothingPublished(t, publisher)
+			if len(store.ensuredURLs) != testCase.wantQueued {
+				t.Fatalf("queued %v, want %d", store.ensuredURLs, testCase.wantQueued)
+			}
+			// Both URLs are recorded against the message regardless of state.
+			if len(store.lastCreateInput.LinkScanURLs) != 2 {
+				t.Fatalf("link edges: %v", store.lastCreateInput.LinkScanURLs)
+			}
 		})
 	}
 }
@@ -347,13 +332,15 @@ func TestRepeatedURLIsOneScan(t *testing.T) {
 
 // --- URLs that cannot be scanned at all ------------------------------------
 
-// An IP literal has no reputation to consult, and refusing it is what stops
-// "host the phishing page on a bare address" from being the obvious bypass.
-func TestUncheckableURLIsBlocked(t *testing.T) {
+// An IP literal or a credential-bearing authority has no reputation to consult.
+// Since issue #807 it is not a link at all: the message publishes, no entity is
+// recorded, no scan is queued, and the client draws the text literally — which
+// is what it already did for these spellings.
+func TestUncheckableURLIsNotALink(t *testing.T) {
 	// gosec reads the "credentials" case as a hardcoded secret. It is the
 	// opposite: a URL carrying a user:password@ userinfo component is one of the
-	// things this refuses, so the component has to be present for the case to
-	// test anything. Nothing here is a real credential.
+	// things this refuses to link, so the component has to be present for the
+	// case to test anything. Nothing here is a real credential.
 	for name, body := range map[string]string{ //nolint:gosec // G101: refusal fixture, not a secret
 		"ipv4":        "veja http://192.0.2.10/login",
 		"ipv6":        "veja http://[2001:db8::1]/login",
@@ -363,13 +350,13 @@ func TestUncheckableURLIsBlocked(t *testing.T) {
 			store := safetyStore(nil)
 			svc, publisher := messageServiceWith(store)
 
-			_, err := createChannelMessage(svc, body)
-
-			if !errors.Is(err, domain.ErrMaliciousURL) {
-				t.Fatalf("want ErrMaliciousURL, got %v", err)
+			if _, err := createChannelMessage(svc, body); err != nil {
+				t.Fatalf("an uncheckable spelling must not refuse the send: %v", err)
 			}
-			if store.createCalls != 0 || publisher.count() != 0 {
-				t.Fatal("an uncheckable link was persisted or published")
+			waitForPublishCalls(t, publisher, 1)
+			if len(store.ensuredURLs) != 0 || len(store.lastCreateInput.LinkScanURLs) != 0 {
+				t.Fatalf("an uncheckable spelling became a link entity: %v %v",
+					store.ensuredURLs, store.lastCreateInput.LinkScanURLs)
 			}
 		})
 	}
@@ -403,8 +390,9 @@ func TestVerdictTableFailureRefusesTheSend(t *testing.T) {
 	}
 }
 
-// Failing to queue the scan is also not a clearance: a withheld message nobody
-// scheduled a scan for would wait forever.
+// Failing to queue the scan is also not a clearance: a link nobody scheduled a
+// scan for would never converge, so the send is refused rather than accepted
+// with an entity nothing will decide.
 func TestFailureToQueueAScanRefusesTheSend(t *testing.T) {
 	store := safetyStore(nil)
 	store.ensureScansErr = errors.New("database unavailable")
@@ -416,33 +404,37 @@ func TestFailureToQueueAScanRefusesTheSend(t *testing.T) {
 		t.Fatalf("want ErrURLCheckUnavailable, got %v", err)
 	}
 	if store.createCalls != 0 {
-		t.Fatal("a message was withheld with no scan to release it")
+		t.Fatal("a message was created with no scan to decide its link")
 	}
 }
 
 // --- the other write paths --------------------------------------------------
 
-// A DM is the likelier phishing vector of the two, not the lesser one.
+// A DM is the likelier phishing vector of the two, not the lesser one: the same
+// entities are recorded, the same marker is written, the same scan is queued.
 func TestDMIsGatedToo(t *testing.T) {
 	store := safetyStore(map[string]urlsafety.Verdict{
 		"https://evil.example/x": urlsafety.VerdictMalicious,
 	})
 	svc, publisher := messageServiceWith(store)
 
-	if _, err := createDMMessage(svc, "veja https://evil.example/x"); !errors.Is(err, domain.ErrMaliciousURL) {
-		t.Fatalf("want ErrMaliciousURL, got %v", err)
+	if _, err := createDMMessage(svc, "veja https://evil.example/x"); err != nil {
+		t.Fatalf("CreateDMMessage: %v", err)
 	}
-	assertNothingPublished(t, publisher)
+	waitForPublishCalls(t, publisher, 1)
+	if store.lastCreateInput.LinkSafetyState != domain.MessageLinkSafetyMalicious {
+		t.Fatalf("link_safety_state=%q", store.lastCreateInput.LinkSafetyState)
+	}
 
 	pendingStore := safetyStore(nil)
 	pendingSvc, pendingPublisher := messageServiceWith(pendingStore)
 	if _, err := createDMMessage(pendingSvc, "veja https://novo.example/x"); err != nil {
 		t.Fatalf("CreateDMMessage: %v", err)
 	}
-	if pendingStore.lastCreateInput.Status != domain.MessageStatusPendingLinkScan {
-		t.Fatalf("status=%q", pendingStore.lastCreateInput.Status)
+	waitForPublishCalls(t, pendingPublisher, 1)
+	if len(pendingStore.ensuredURLs) != 1 {
+		t.Fatalf("scan queue: %v", pendingStore.ensuredURLs)
 	}
-	assertNothingPublished(t, pendingPublisher)
 }
 
 func editableMessageStore(verdicts map[string]urlsafety.Verdict) *fakeMessageStore {
@@ -461,35 +453,37 @@ func editMessage(svc *service.MessageService, body string) (domain.Message, erro
 	})
 }
 
-// Editing cannot be bypassed by sending a clean message and editing the link in.
+// Editing cannot be bypassed by sending a clean message and editing the link
+// in: the edit goes through the same classification, and the condemned link
+// arrives blocked.
 func TestEditIsGated(t *testing.T) {
 	store := editableMessageStore(map[string]urlsafety.Verdict{
 		"https://evil.example/x": urlsafety.VerdictMalicious,
 	})
 	svc, _ := messageServiceWith(store)
 
-	_, err := editMessage(svc, "agora com https://evil.example/x")
-
-	if !errors.Is(err, domain.ErrMaliciousURL) {
-		t.Fatalf("want ErrMaliciousURL, got %v", err)
+	if _, err := editMessage(svc, "agora com https://evil.example/x"); err != nil {
+		t.Fatalf("EditMessage: %v", err)
+	}
+	if store.lastEditInput.LinkSafetyState != domain.MessageLinkSafetyMalicious {
+		t.Fatalf("link_safety_state=%q", store.lastEditInput.LinkSafetyState)
 	}
 }
 
-// An edit is the one path that cannot go pending: showing everyone an unscanned
-// body, or silently keeping the old one while reporting success, are both worse
-// than telling the author to retry. The already-published version is untouched.
-func TestEditWithAnUnscannedURLIsDeferredNotApplied(t *testing.T) {
+// An edit with an unscanned URL applies at once (issue #807): the new link is
+// recorded pending and queued, and waits without holding the edit.
+func TestEditWithAnUnscannedURLAppliesAndQueuesTheScan(t *testing.T) {
 	store := editableMessageStore(nil)
 	svc, _ := messageServiceWith(store)
 
-	_, err := editMessage(svc, "agora com https://novo.example/x")
-
-	if !errors.Is(err, domain.ErrURLCheckPending) {
-		t.Fatalf("want ErrURLCheckPending, got %v", err)
+	if _, err := editMessage(svc, "agora com https://novo.example/x"); err != nil {
+		t.Fatalf("EditMessage: %v", err)
 	}
-	// The scan was queued anyway, so the author's retry succeeds shortly.
 	if len(store.ensuredURLs) != 1 {
-		t.Fatalf("the deferred edit queued no scan: %v", store.ensuredURLs)
+		t.Fatalf("the edit queued no scan: %v", store.ensuredURLs)
+	}
+	if store.lastEditInput.LinkSafetyState != domain.MessageLinkSafetyNone {
+		t.Fatalf("link_safety_state=%q, a pending link has no opinion yet", store.lastEditInput.LinkSafetyState)
 	}
 }
 
@@ -525,26 +519,20 @@ func forwardWith(svc *service.MessageService, key string) (service.ForwardChanne
 }
 
 // A forward creates a *new* message, so it is a way to publish content written
-// before the check existed. It goes through the same gate, with the same three
-// outcomes.
+// before the check existed. It goes through the same gate: the links are
+// recorded and classified, and the message publishes whatever they say.
 func TestForwardIsGated(t *testing.T) {
 	for name, testCase := range map[string]struct {
 		verdicts   map[string]urlsafety.Verdict
-		wantErr    error
-		wantStatus domain.MessageStatus
 		wantState  domain.MessageLinkSafety
-		wantPub    int
+		wantQueued int
 	}{
 		"malicious": {
-			verdicts: map[string]urlsafety.Verdict{"https://evil.example/x": urlsafety.VerdictMalicious},
-			wantErr:  domain.ErrMaliciousURL,
+			verdicts:  map[string]urlsafety.Verdict{"https://evil.example/x": urlsafety.VerdictMalicious},
+			wantState: domain.MessageLinkSafetyMalicious,
 		},
-		"unscanned": {wantStatus: domain.MessageStatusPendingLinkScan},
-		"safe": {
-			verdicts:  safe("https://evil.example/x"),
-			wantState: domain.MessageLinkSafetySafe,
-			wantPub:   1,
-		},
+		"unscanned": {wantQueued: 1},
+		"safe":      {verdicts: safe("https://evil.example/x"), wantState: domain.MessageLinkSafetySafe},
 	} {
 		t.Run(name, func(t *testing.T) {
 			store := safetyStore(testCase.verdicts)
@@ -555,33 +543,22 @@ func TestForwardIsGated(t *testing.T) {
 			svc, publisher := forwardServiceWith(store)
 
 			out, err := forwardWith(svc, "")
-
-			if testCase.wantErr != nil {
-				if !errors.Is(err, testCase.wantErr) {
-					t.Fatalf("want %v, got %v", testCase.wantErr, err)
-				}
-				if store.forwardCalls != 0 {
-					t.Fatal("a condemned forward was persisted")
-				}
-				return
-			}
 			if err != nil {
 				t.Fatalf("ForwardChannelMessage: %v", err)
 			}
-			if store.lastForwardInput.Status != testCase.wantStatus {
-				t.Fatalf("status=%q want %q", store.lastForwardInput.Status, testCase.wantStatus)
+			if store.lastForwardInput.Status != "" {
+				t.Fatalf("status=%q, a forward is never withheld", store.lastForwardInput.Status)
 			}
 			if store.lastForwardInput.LinkSafetyState != testCase.wantState {
 				t.Fatalf("link_safety_state=%q want %q",
 					store.lastForwardInput.LinkSafetyState, testCase.wantState)
 			}
-			if testCase.wantPub > 0 {
-				waitForPublishCalls(t, publisher, testCase.wantPub)
-			} else {
-				assertNothingPublished(t, publisher)
+			if len(store.ensuredURLs) != testCase.wantQueued {
+				t.Fatalf("queued %v, want %d", store.ensuredURLs, testCase.wantQueued)
 			}
-			if out.Pending != (testCase.wantStatus == domain.MessageStatusPendingLinkScan) {
-				t.Fatalf("Pending=%v", out.Pending)
+			waitForPublishCalls(t, publisher, 1)
+			if out.Replayed {
+				t.Fatal("a first forward was reported as a replay")
 			}
 		})
 	}
@@ -1270,6 +1247,9 @@ func TestFreshVerdictsCostNothing(t *testing.T) {
 	}
 	if message.Status == domain.MessageStatusPendingLinkScan {
 		t.Fatal("a message of cleared links was withheld")
+	}
+	if store.lastCreateInput.LinkSafetyState != domain.MessageLinkSafetySafe {
+		t.Fatalf("link_safety_state=%q", store.lastCreateInput.LinkSafetyState)
 	}
 	if store.admittedWorkspace != "" {
 		t.Fatal("the admission was consulted for a message that needs no provider work")

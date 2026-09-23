@@ -7,6 +7,7 @@ import {
   OTHER_USER_ID,
   OTHER_USER_NAME,
   createScenario,
+  expectComposerConsumedTheSend,
   fillComposer,
   installMessagingMocks,
   makeMessage,
@@ -170,11 +171,16 @@ test.describe("mensagens em canal", () => {
       replyBubble.getByRole("button", { name: `Ir para mensagem original de ${OTHER_USER_NAME}` }),
     ).toBeVisible();
 
+    // Issue #875: the reply is on the timeline, so it is no longer a draft —
+    // neither the text that was sent nor the quote it answered.
+    await expectComposerConsumedTheSend(page);
+
     await page.reload();
     await expect(messageBubble(page, reply!.id)).toContainText(replyText);
     await expect(messageBubble(page, reply!.id).getByTestId("chat-message-quote")).toContainText(
       originalText,
     );
+    await expectComposerConsumedTheSend(page);
   });
 
   test("edita uma mensagem dentro da janela e mostra histórico", async ({ page }, testInfo) => {

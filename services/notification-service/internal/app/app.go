@@ -415,7 +415,7 @@ func (a *App) startNotificationWorker(
 	// its protected pass context may use, so shutdown waits for as long as a
 	// pass is entitled to run and not a second less.
 	a.notification = a.launchWorker("notification",
-		newNotificationWorker(cfg, storage.NewPGXNotificationOutboxStore(pool),
+		newNotificationWorker(cfg, storage.NewPGXNotificationOutboxStore(pool, cfg.WebPush.PushPreviewEnabled),
 			deliverer, metrics, logger),
 		startNotificationWorker, cfg.NotificationWorker.ProcessingBudget())
 	// No policy version here, deliberately. It belongs to a decision, not to a

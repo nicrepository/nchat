@@ -23,6 +23,7 @@ import {
 } from "../../chatViewportState";
 import type { ViewportAnchor } from "../../chatViewportPersistence";
 import type { Message } from "../../chatTypes";
+import type { NavigationTarget } from "./navigation";
 
 export type OpenPosition =
   /** A deep link owns positioning; resolution only records that it did. */
@@ -94,7 +95,11 @@ function fromFirstUnread(input: OpenPositionInput): OpenPosition | null {
   return { kind: "first-unread", messageId: input.messages[0].id };
 }
 
-/** The one decision, in priority order. */
+/**
+ * The one decision, in priority order — NAVIGATION_PRIORITY's order, and the
+ * only place it is applied (#880 item 14). Each answer below is one of those
+ * destinations; targetFor names which.
+ */
 export function resolveOpenPosition(input: OpenPositionInput): OpenPosition {
   if (input.focusMessageId) return { kind: "deep-link" };
   return fromSavedAnchor(input) ?? fromFirstUnread(input) ?? { kind: "bottom" };
@@ -123,6 +128,8 @@ export type OpenPositionResolution =
       kind: "settle";
       /** Null unless the conversation opens on an unread boundary. */
       firstUnreadMessageId: string | null;
+      /** Which destination won, so the positioning never re-derives it. */
+      target: NavigationTarget;
       scrollTarget: ScrollTarget;
       phase: ViewportPhase;
     };
@@ -140,6 +147,14 @@ export interface ResolutionInput extends OpenPositionInput {
   searchedForLength: number;
 }
 
+/** Which logical destination this answer is, in the shared vocabulary (#880). */
+export function targetFor(position: SettledPosition): NavigationTarget {
+  if (position.kind === "deep-link") return "MESSAGE_TARGET";
+  if (position.kind === "anchor") return "RESTORED_ANCHOR";
+  if (position.kind === "first-unread") return "FIRST_UNREAD";
+  return "TAIL";
+}
+
 /** A deep link positions itself; every other answer names where to land. */
 function scrollTargetFor(position: SettledPosition): ScrollTarget {
   if (position.kind === "deep-link") return undefined;
@@ -149,7 +164,11 @@ function scrollTargetFor(position: SettledPosition): ScrollTarget {
 
 function phaseFor(position: SettledPosition): ViewportPhase {
   if (position.kind === "first-unread") return "AT_FIRST_UNREAD";
-  if (position.kind === "bottom") return "AT_BOTTOM";
+  // #880: the tail is a destination like any other, reached by the navigator
+  // and confirmed by the sentinel — AT_BOTTOM is what that confirmation sets,
+  // not something opening may assume. Until then the position is still being
+  // established, which is exactly what RESTORING_POSITION says.
+  if (position.kind === "bottom") return "RESTORING_POSITION";
   return "READING_HISTORY";
 }
 
@@ -163,6 +182,7 @@ export function decideOpenPositionResolution(input: ResolutionInput): OpenPositi
     return {
       kind: "settle",
       firstUnreadMessageId: position.kind === "first-unread" ? position.messageId : null,
+      target: targetFor(position),
       scrollTarget: scrollTargetFor(position),
       phase: phaseFor(position),
     };

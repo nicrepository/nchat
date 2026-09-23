@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
 )
 
@@ -250,4 +252,30 @@ func scrapeRaw(t *testing.T, metrics *observability.Metrics) string {
 		t.Fatalf("scrape returned %d", response.Code)
 	}
 	return response.Body.String()
+}
+
+// The issue #807 observers publish under closed label sets and tolerate a nil
+// receiver, so a service without metrics wired runs the same code path.
+func TestPreviewAndCircuitObserversAcceptNilAndKnownLabels(t *testing.T) {
+	var none *PipelineMetrics
+	none.ObserveCircuitState(string(BreakerOpen))
+	none.ObservePreview(PreviewReady)
+	none.ObservePreviewBacklog(3)
+
+	metrics := NewPipelineMetrics(testMetrics(t), "chat-service")
+	metrics.ObserveCircuitState(string(BreakerHalfOpen))
+	metrics.ObservePreview(PreviewFailed)
+	metrics.ObservePreviewBacklog(3)
+	if got := testutil.ToFloat64(metrics.circuit.WithLabelValues("chat-service", string(BreakerHalfOpen))); got != 1 {
+		t.Fatalf("half-open gauge = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.circuit.WithLabelValues("chat-service", string(BreakerClosed))); got != 0 {
+		t.Fatalf("closed gauge = %v, want 0", got)
+	}
+	if got := testutil.ToFloat64(metrics.previews.WithLabelValues("chat-service", PreviewFailed)); got != 1 {
+		t.Fatalf("previews counter = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.previewPending.WithLabelValues("chat-service")); got != 3 {
+		t.Fatalf("pending gauge = %v, want 3", got)
+	}
 }

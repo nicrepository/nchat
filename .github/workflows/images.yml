@@ -1,32 +1,46 @@
-name: Build and push images
+name: Build and seal a release
 
-# Callers of the single builder. A push to develop builds the commit that was
-# pushed; a manual dispatch builds an approved production SHA, which the builder
-# refuses unless main can reach it.
+# The release build, as one reusable unit (CICD-04, CICD-05, issue #933).
 #
-# The builder only builds. Sealing the release and deploying to nchat-dev are
-# two independent consumers of that build, so a manifest that cannot be written
-# does not hold back a development deploy whose images already exist.
+# It builds the eleven images of a commit once and writes the sealed manifest
+# that identifies them. Both continuous delivery flows call it -- develop and
+# production -- so a development deploy and a production candidate are produced
+# by exactly the same builder and can never drift apart.
+#
+# It has no trigger of its own any more. Until #933 this workflow was started
+# by a push to develop, which meant it built in parallel with the CI of the
+# same commit and could deploy one that CI then failed. Eligibility is now the
+# caller's question, and the caller answers it before calling: see
+# cd-develop.yml and cd-prepare-production.yml.
+#
+# `require_main` is what separates a production build from a development one.
+# When it is set the requested commit must be provably reachable from main
+# before anything is built.
+#
+# The images are identified by their OCI digests, written to `digest-*`
+# artifacts by the builder, and distilled into one sealed manifest here. The
+# `:<sha>` tag on the registry is an auxiliary convenience and is never the
+# identity of a release.
 
 on:
-  push:
-    branches: [develop]
-  workflow_dispatch:
+  workflow_call:
     inputs:
       sha:
-        description: Full 40-character lowercase commit SHA on main to build.
+        description: Full 40-character lowercase commit SHA to build.
         required: true
         type: string
+      require_main:
+        description: Prove the SHA is reachable from main before building.
+        required: false
+        default: false
+        type: boolean
+    outputs:
+      sha:
+        description: The commit the eleven images were actually built from.
+        value: ${{ jobs.build.outputs.sha }}
 
 permissions:
-  actions: read
   contents: read
-
-# A production release is keyed by the commit it builds, and is never cancelled
-# by a later dispatch: the digests of a run are the identity of that release.
-concurrency:
-  group: nchat-images-${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   build:
@@ -36,8 +50,8 @@ jobs:
       packages: write
     uses: ./.github/workflows/build-nchat-images.yml
     with:
-      sha: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
-      require_main: ${{ github.event_name == 'workflow_dispatch' }}
+      sha: ${{ inputs.sha }}
+      require_main: ${{ inputs.require_main }}
 
   # CICD-04: the identity of a release, written once from the digests this run
   # produced and sealed with a SHA-256. It needs no registry write and no token
@@ -52,7 +66,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           # The commit the builder reported building, never a ref of the
-          # caller's own: a dispatch builds a SHA that is not this run's HEAD.
+          # caller's own: a production build builds a SHA that is not the
+          # default branch's HEAD.
           ref: ${{ needs.build.outputs.sha }}
           persist-credentials: false
       # Without run-id/github-token this reads only the current run's artifacts,
@@ -69,7 +84,9 @@ jobs:
           NCHAT_RELEASE_RUN_ID: ${{ github.run_id }}
         run: scripts/deploy/nchat-prod/release-manifest.sh release-digests release-manifest
       # 90 days: the longest retention every GitHub plan honours, and an order
-      # of magnitude past the 7-day digest artifacts this is distilled from.
+      # of magnitude past the 7-day digest artifacts this is distilled from. A
+      # cutover downloads this artifact from the preparation run, which may
+      # have been days earlier, so the two retentions are not interchangeable.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-manifest
@@ -78,13 +95,3 @@ jobs:
             release-manifest/release-manifest.sha256
           retention-days: 90
           if-no-files-found: error
-
-  deploy:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
-    needs: build
-    permissions:
-      actions: read
-      contents: read
-    uses: ./.github/workflows/deploy-nchat-dev.yml
-    with:
-      sha: ${{ github.sha }}

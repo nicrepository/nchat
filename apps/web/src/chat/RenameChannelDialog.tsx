@@ -22,7 +22,11 @@ import { type FormEvent, type KeyboardEvent, useEffect, useRef, useState } from 
 import { createPortal } from "react-dom";
 
 import "./RenameChannelDialog.css";
-import { ApiRequestError } from "../lib/api";
+import {
+  conversationRenameCopy,
+  renameErrorMessage,
+  renameNameRefusal,
+} from "./conversationRename";
 
 interface RenameChannelDialogProps {
   /**
@@ -44,40 +48,12 @@ const inputId = "chat-rename-channel-name";
 const errorId = "chat-rename-channel-error";
 
 /**
- * The server's own limits, restated here only as input bounds.
- *
- * They are not a second validation rule: the backend counts the same Unicode
- * code points — 100 for a channel (domain.MaxChannelDisplayNameCodePoints), 120
- * for a group (maxDMTitleRunes) — and refuses anything longer whatever this
- * attribute says. Their whole job is to stop a user typing past the limit before
- * being told.
+ * The wording that is this dialog's alone. The field label, the input bound and
+ * the sentence a refusal becomes are shared with the details panel's inline
+ * editor (issue #893) and live in conversationRename — one operation, one set
+ * of rules, two affordances.
  */
-const maxNameLength = { channel: 100, group: 120 } as const;
-
-/**
- * Maps a failure to copy, by status code only. The server's message is never
- * surfaced: a rejected name can be tens of kilobytes of caller-controlled text,
- * and the endpoint deliberately declines to say whether a refused channel exists.
- */
-function renameErrorMessage(error: unknown): string {
-  if (error instanceof ApiRequestError) {
-    if (error.status === 400) return "Escolha um nome válido para esta conversa.";
-    if (error.status === 403) return "Você não tem permissão para renomear este canal.";
-    if (error.status === 404) return "Este canal não está mais disponível.";
-    if (error.status === 409)
-      return "O canal mudou enquanto você editava. Recarregue e tente de novo.";
-    if (error.status === 429) {
-      return "Muitas solicitações em sequência. Aguarde um momento e tente novamente.";
-    }
-    if (error.status === 0) return "Sem conexão. Verifique sua rede e tente novamente.";
-  }
-  return "Não foi possível renomear o canal. Tente novamente.";
-}
-
-const dialogCopy = {
-  channel: { title: "Renomear canal", field: "Nome do canal" },
-  group: { title: "Renomear grupo", field: "Nome do grupo" },
-} as const;
+const dialogTitle = { channel: "Renomear canal", group: "Renomear grupo" } as const;
 
 export default function RenameChannelDialog({
   kind = "channel",
@@ -86,7 +62,7 @@ export default function RenameChannelDialog({
   onClose,
   onRename,
 }: RenameChannelDialogProps) {
-  const copy = dialogCopy[kind];
+  const copy = conversationRenameCopy[kind];
   // Seeded with the current name and owned from here on: the field is what the
   // user is editing, so a refetch landing mid-edit must not overwrite it.
   const [name, setName] = useState(currentName);
@@ -140,11 +116,14 @@ export default function RenameChannelDialog({
   async function submit(event: FormEvent) {
     event.preventDefault();
     const trimmed = name.trim();
-    // A fast local answer for the one case the user can see for themselves. The
-    // backend enforces the same rule and remains the authority — this only saves
-    // a round trip, and every other verdict comes from the server.
-    if (!trimmed) {
-      setError("Escolha um nome para esta conversa.");
+    // A fast local answer for the cases the user can see for themselves, in
+    // the same shared rule the inline editor uses (issue #893): nothing typed,
+    // or past the domain's cap in code points. The backend enforces both and
+    // remains the authority — this only saves a round trip, and every other
+    // verdict comes from the server.
+    const refusal = renameNameRefusal(kind, trimmed);
+    if (refusal) {
+      setError(refusal);
       inputRef.current?.focus();
       return;
     }
@@ -160,7 +139,7 @@ export default function RenameChannelDialog({
       // dropped connection is recoverable, and the UI must never be left showing
       // a name that was not persisted.
       if (mountedRef.current) {
-        setError(renameErrorMessage(failure));
+        setError(renameErrorMessage(kind, failure));
         inputRef.current?.focus();
       }
     } finally {
@@ -181,7 +160,7 @@ export default function RenameChannelDialog({
         onMouseDown={(event) => event.stopPropagation()}
       >
         <h2 id={titleId} className="rename-channel__title">
-          {copy.title}
+          {dialogTitle[kind]}
         </h2>
         <form onSubmit={submit}>
           <label className="rename-channel__label" htmlFor={inputId}>
@@ -193,7 +172,11 @@ export default function RenameChannelDialog({
             className="rename-channel__input"
             type="text"
             autoComplete="off"
-            maxLength={maxNameLength[kind]}
+            /*
+              No `maxLength`: it counts UTF-16 code units while the domain
+              counts code points, so it refused valid names made of astral
+              characters. The cap is checked on submit instead (issue #893).
+            */
             value={name}
             disabled={pending}
             aria-invalid={error ? true : undefined}

@@ -13,13 +13,15 @@ import {
 
 /**
  * Objetivo: autorização negativa — abrir uma DM/canal do qual o usuário não é
- * participante deve falhar como qualquer outra falha de carregamento (mesmo
- * testid/rótulo genérico "Não foi possível carregar as mensagens."), sem
- * vazar conteúdo da conversa nem distinguir "não existe" de "sem permissão"
- * (o backend já responde 404 para ambos — ver permission_service.go).
+ * participante deve mostrar o estado dedicado de acesso negado (issue #475),
+ * sem vazar conteúdo da conversa nem distinguir "não existe" de "sem
+ * permissão" (o backend responde 404 não-enumerável para ambos — ver
+ * mapServiceError em chat-service). Antes da #475 isso caía no mesmo estado
+ * genérico de falha de carregamento; agora converge para um estado próprio
+ * que também remove o composer da árvore em vez de só desabilitá-lo.
  */
 test.describe("controle de acesso — DM/canal sem participação", () => {
-  test("DM sem participação: mostra erro genérico e nenhum conteúdo é exposto", async ({
+  test("DM sem participação: mostra acesso negado, nenhum conteúdo é exposto, e volta para minhas conversas", async ({
     page,
   }, testInfo) => {
     const targetId = uniqueId(testInfo, "dm");
@@ -41,20 +43,26 @@ test.describe("controle de acesso — DM/canal sem participação", () => {
 
     await page.goto(`/chat/dm/${forbiddenId}`);
 
-    const error = page.getByTestId("chat-msg-error");
-    await expect(error).toBeVisible();
-    await expect(error).toContainText("Não foi possível carregar as mensagens.");
+    const denied = page.getByTestId("chat-msg-access-denied");
+    await expect(denied).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "Você não tem acesso a esta conversa" }),
+    ).toBeVisible();
     await expect(page.getByText(secretText)).toHaveCount(0);
     await expect(page.getByTestId("chat-msg-bubble")).toHaveCount(0);
+    await expect(page.getByTestId("chat-composer-box")).toHaveCount(0);
+    await expect(page.getByTestId("chat-msg-header")).toHaveCount(0);
+    await expect(page.getByText(forbiddenId)).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Tentar novamente" })).toHaveCount(0);
 
-    // Retentativa continua bloqueada: a autorização é reavaliada a cada
-    // requisição, não é um estado que "destrava" no cliente.
-    await error.getByRole("button", { name: "Tentar novamente" }).click();
-    await expect(page.getByTestId("chat-msg-error")).toBeVisible();
-    await expect(page.getByText(secretText)).toHaveCount(0);
+    // "Voltar para minhas conversas" navega via SPA para o estado neutro do
+    // chat, sem reload — nunca de volta para a URL proibida.
+    await denied.getByRole("button", { name: "Voltar para minhas conversas" }).click();
+    await expect(page).toHaveURL(/\/chat\/?$/);
+    await expect(page.getByTestId("chat-placeholder")).toBeVisible();
   });
 
-  test("canal sem participação: mostra erro genérico e nenhum conteúdo é exposto", async ({
+  test("canal sem participação: mostra acesso negado e nenhum conteúdo é exposto", async ({
     page,
   }, testInfo) => {
     const targetId = uniqueId(testInfo, "channel");
@@ -72,11 +80,15 @@ test.describe("controle de acesso — DM/canal sem participação", () => {
 
     await page.goto(`/chat/channel/${OTHER_CHANNEL_ID}`);
 
-    const error = page.getByTestId("chat-msg-error");
-    await expect(error).toBeVisible();
-    await expect(error).toContainText("Não foi possível carregar as mensagens.");
+    const denied = page.getByTestId("chat-msg-access-denied");
+    await expect(denied).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "Você não tem acesso a esta conversa" }),
+    ).toBeVisible();
     await expect(page.getByText(secretText)).toHaveCount(0);
     await expect(page.getByTestId("chat-msg-bubble")).toHaveCount(0);
+    await expect(page.getByTestId("chat-composer-box")).toHaveCount(0);
+    await expect(page.getByText(OTHER_CHANNEL_ID)).toHaveCount(0);
   });
 
   test("não permite editar nem excluir mensagem de outro usuário", async ({ page }, testInfo) => {

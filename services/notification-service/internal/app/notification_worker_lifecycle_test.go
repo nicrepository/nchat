@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/nicrepository/nchat/libs/go/platform/notificationevent"
 	"github.com/nicrepository/nchat/libs/go/platform/notificationpolicy"
 	"github.com/nicrepository/nchat/services/notification-service/internal/config"
@@ -606,5 +608,93 @@ func TestAnUnusableChannelKeepsTheWorkerFromReportingReady(t *testing.T) {
 	cfg.WebPush = testWebPushConfig()
 	if ready, reason := cfg.NotificationWorkerReady(); !ready {
 		t.Fatalf("a usable channel was refused: %s", reason)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Issue #870: one flag, two consumers
+// ---------------------------------------------------------------------------
+
+// recordingPool captures the arguments of the last Query and answers with an
+// error, so the caller returns before it tries to scan a result set that does
+// not exist. It is the smallest thing that can observe a bind parameter.
+type recordingPool struct {
+	fakePool
+	args []any
+}
+
+func (p *recordingPool) Query(_ context.Context, _ string, args ...any) (pgx.Rows, error) {
+	p.args = args
+	return nil, errors.New("recorded")
+}
+
+// cfg.WebPush.PushPreviewEnabled reaches both of the things it decides.
+//
+// It decides two independent behaviours — whether ClaimDue materialises the
+// presentation, and whether the payload is version 1 or version 2 — and
+// startNotificationWorker wires them at two separate call sites: the store gets
+// the field explicitly, the deliverer reads it from the config it is handed.
+//
+// Neither direction of a divergence discloses anything. A store without a
+// deliverer runs the expensive projection on every claim and then emits v1; a
+// deliverer without a store emits v2 with nothing in it, which the browser
+// renders as the generic banner. Both are silent, which is the problem: one
+// pays for a feature that is off and the other turns a feature off that an
+// operator switched on, and nothing else in the process would notice either.
+//
+// The store's copy of the flag is unexported, so it is observed where it is
+// actually used — the fourth bind of the claim — rather than through an
+// accessor added for a test.
+func TestPreviewFlagReachesTheStoreAndTheDeliverer(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		name := "disabled"
+		if enabled {
+			name = "enabled"
+		}
+		t.Run(name, func(t *testing.T) {
+			restoreFactories(t)
+			restoreNotificationFactories(t)
+
+			pool := &recordingPool{}
+			openDB = func(context.Context, string, int) (storage.Pool, error) { return pool, nil }
+
+			delivererSaw := !enabled
+			newNotificationDeliverer = func(cfg config.Config, _ storage.Pool,
+				_ *worker.NotificationMetrics, _ *slog.Logger) worker.Deliverer {
+				delivererSaw = cfg.WebPush.PushPreviewEnabled
+				return noopDeliverer{}
+			}
+
+			var claimed storage.NotificationOutboxStore
+			buildWorker := newNotificationWorker
+			newNotificationWorker = func(cfg config.Config, store storage.NotificationOutboxStore,
+				deliverer worker.Deliverer, metrics *worker.NotificationMetrics,
+				logger *slog.Logger) backgroundWorker {
+				claimed = store
+				return buildWorker(cfg, store, deliverer, metrics, logger)
+			}
+			startNotificationWorker = func(context.Context, backgroundWorker) {}
+
+			cfg := notificationWorkerConfig()
+			cfg.WebPush.PushPreviewEnabled = enabled
+			New(cfg)
+
+			if claimed == nil {
+				t.Fatal("the notification worker was never built")
+			}
+			//nolint:errcheck // the pool answers with an error on purpose; the
+			// assertion is about the arguments it recorded.
+			_, _ = claimed.ClaimDue(context.Background(), 1, 1, time.Minute)
+
+			if len(pool.args) != 4 {
+				t.Fatalf("the claim took %d arguments, want the four ClaimDue binds", len(pool.args))
+			}
+			if pool.args[3] != enabled {
+				t.Fatalf("the claim asked for preview=%v, want %v", pool.args[3], enabled)
+			}
+			if delivererSaw != enabled {
+				t.Fatalf("the deliverer was built with preview=%v, want %v", delivererSaw, enabled)
+			}
+		})
 	}
 }

@@ -107,6 +107,11 @@ type DMStore interface {
 	// body, author or message id travels with it.
 	ListVisibleConversationsWithParticipantIDs(ctx context.Context, workspaceID, userID string) ([]domain.DMConversationWithParticipantIDs, error)
 	GetVisibleConversationByID(ctx context.Context, workspaceID, conversationID, userID string) (domain.DMConversation, error)
+	// GetConversationAbout returns the conversation's description and its
+	// creator's resolved display name (issue #894), in one query. The caller's
+	// access must already have been settled — this is isolation in depth, not
+	// the permission.
+	GetConversationAbout(ctx context.Context, workspaceID, conversationID string) (ConversationAbout, error)
 	// GetDirectCounterpartProfile authorises callerID for conversationID and
 	// returns the one active participant who is not them, in a single query.
 	// It is the authority for both: any earlier visibility check is a

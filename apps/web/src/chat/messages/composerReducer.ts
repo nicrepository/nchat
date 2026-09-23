@@ -26,6 +26,7 @@ import type { Action, ActionOf, MessagesState } from "./types";
  * verdict the backend already made and enforced.
  */
 const sendErrorMessages: Record<string, string> = {
+  mention_not_eligible: "Essa pessoa não pode ser mencionada ou adicionada a esta conversa.",
   malicious_url: "Este link foi bloqueado por segurança.",
   link_check_unavailable:
     "Não foi possível verificar a segurança do link. Tente novamente em instantes.",
@@ -80,7 +81,9 @@ function applySent(state: MessagesState, action: ActionOf<"sent">): MessagesStat
     sendError: null,
     lastMutation: alreadyPresent ? "none" : "append",
     realtimeError: null,
-    replyTo: null,
+    // The reply this message answered is consumed; one chosen since the
+    // submit is the next message's and survives the acknowledgement (#929).
+    replyTo: state.replyTo?.id === action.parentMessageId ? null : state.replyTo,
     linkSafetyCorrections,
   };
 }

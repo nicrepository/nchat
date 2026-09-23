@@ -13,6 +13,7 @@ import { EditorContent } from "@tiptap/react";
 import type { Editor } from "@tiptap/core";
 import {
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type ChangeEvent,
@@ -42,7 +43,12 @@ import {
   type MessagePriorityIntent,
 } from "./messagePriority";
 import { useChatEditor } from "./useChatEditor";
-import { noopConversationDrafts, type ConversationDraftsApi } from "./useConversationDrafts";
+import { useDraftMirrors } from "./useDraftMirrors";
+import {
+  noopConversationDrafts,
+  type ConversationDraftsApi,
+  type SendSnapshot,
+} from "./useConversationDrafts";
 import type { CodecFormat } from "./tiptapSerializer";
 import type { MentionTarget, Message, MessageBodyFormat } from "./chatTypes";
 import { formatFileSize } from "./conversationDetailsDisplay";
@@ -757,6 +763,14 @@ function ComposerBar({
   );
 }
 
+/** A queued file whose upload finished: it has a server id a send can reference. */
+type PublishedUploadItem = AttachmentUploadItem & {
+  attachment: NonNullable<AttachmentUploadItem["attachment"]>;
+};
+
+const isPublished = (item: AttachmentUploadItem): item is PublishedUploadItem =>
+  item.attachment !== null;
+
 /**
  * An attachment is content, so a composer holding one may send an empty
  * document — but not while its own upload is still running.
@@ -802,6 +816,44 @@ function voiceOptions(
     disabled: !attachEnabled || uploading || hasComposerAttachments,
     title: hasComposerAttachments ? "Remova os anexos para gravar uma mensagem de voz." : undefined,
     onStart,
+  };
+}
+
+/**
+ * What the draft's own state locks in this composer (issue #929 review).
+ *
+ * A composer remounted while its draft's send is still open — in the
+ * instance it replaced — has no `sending` of its own, so `sendPending`
+ * stands in for it and holds the editor, the bar and the recorder exactly
+ * as this instance's own send would. Attachments may still be dropped, as
+ * they may during any send (#875).
+ *
+ * `blocked` is wider: it also covers the single commit between an
+ * acknowledgement and this instance's mirrors catching up with it. That
+ * window must never be *sendable* — but it must stay typable, because it
+ * is a sub-frame condition and disabling the editor there would take focus
+ * away, and swallow a keystroke, for no reason a reader could perceive.
+ */
+function sendLocks(
+  disabled: boolean | undefined,
+  sending: boolean,
+  mirrors: { sendPending: boolean; blocked: boolean },
+  uploading: boolean,
+) {
+  return {
+    /** The editor's `disabled`: its own `sending` still locks it separately. */
+    editor: Boolean(disabled) || mirrors.sendPending,
+    bar: Boolean(disabled) || sending || mirrors.sendPending,
+    /** Recording is refused while a send is open, as it is while a file is going up. */
+    recording: sending || mirrors.sendPending || uploading,
+    /**
+     * Unavailable while a file is going up, whatever else the composer
+     * holds — the attachment is part of the message being written, and
+     * sending now would post a message without it — and for as long as
+     * this draft is blocked. `canSend` folds this instance's own `sending`
+     * in already.
+     */
+    sendable: !uploading && !mirrors.blocked,
   };
 }
 
@@ -905,14 +957,42 @@ export default function ChatComposer({
    */
   const sendStatingPriority = async (
     body: string,
-    attachmentIds?: string[],
+    attachmentIds: string[] | undefined,
+    // Issue #929: what this send is taking out of the draft, captured by
+    // the caller *before* the request leaves. The confirmed `sent` consumes
+    // exactly that from the store — by identity, in one transition — and
+    // nothing the reader composed while the request was in flight. Keyed by
+    // the snapshot's own draftKey, so the acknowledgement of a send the
+    // reader has since navigated away from still reconciles the right draft
+    // and never the one now on screen.
+    snapshot: SendSnapshot,
   ): Promise<SendResult> => {
-    const result = await onSend(body, attachmentIds, priority);
-    // The priority belongs to the message that carried it, not to the
-    // composer: leaving it applied would silently escalate everything composed
-    // afterwards (issues #822, #824).
-    if (result.status === "sent") setPriority(standardPriorityIntent);
-    return result;
+    // The invariant, not the button: one send of a draft at a time, and
+    // never one issued from mirrors that have not caught up with the
+    // draft. A composer remounted while its draft's send is still open —
+    // or still showing, for this one commit, what an acknowledgement has
+    // just consumed — must not post that content again, whatever path
+    // asked (#929 review).
+    if (!mirrors.canIssueSend()) return { status: "stale" };
+    const attempt = drafts.beginSend(snapshot);
+    try {
+      const result = await onSend(body, attachmentIds, priority);
+      if (result.status === "sent") {
+        // Consumes the snapshot and releases the attempt in one lifecycle
+        // step, so whoever is showing this draft — this instance, or the
+        // one mounted in its place — reconciles against the consumed draft.
+        drafts.settleSend(attempt, "sent");
+        // The priority belongs to the message that carried it, not to the
+        // composer: leaving it applied would silently escalate everything
+        // composed afterwards (issues #822, #824).
+        setPriority(standardPriorityIntent);
+      }
+      return result;
+    } finally {
+      // A failure, a stale result or a throw leaves the draft whole for the
+      // retry and only releases the attempt; a no-op once settled as sent.
+      drafts.settleSend(attempt, "unsent");
+    }
   };
 
   // A voice recording is sent through the same path as any other message:
@@ -926,16 +1006,24 @@ export default function ChatComposer({
     target: uploadTarget ?? null,
     maxUploadBytes: attachmentLimits?.maxUploadBytes ?? null,
     onUploaded: async (attachmentId) => {
-      const result = await sendStatingPriority("", [attachmentId]);
+      // A voice note carries the recording and the reply it answers — never
+      // the text under it, which stays for the next message (issue #929).
+      const snapshot = drafts.createSendSnapshot(draftKey ?? "", {
+        text: false,
+        attachmentLocalIds: [],
+        voice: true,
+      });
+      const result = await sendStatingPriority("", [attachmentId], snapshot);
       return result.status === "sent";
     },
     drafts: draftsProp,
     draftKey,
   });
   const recording = recorder.phase !== "idle";
-  const pendingAttachments = upload.items
-    .map((item) => item.attachment)
-    .filter((attachment): attachment is NonNullable<typeof attachment> => attachment !== null);
+  // The attachments a send can carry right now: uploaded, so they have a
+  // server id to reference (RF-32) — and a localId, which is the identity
+  // the draft consumes them by once the send is confirmed (issue #929).
+  const publishableAttachments = upload.items.filter(isPublished);
 
   /**
    * The one place a send is assembled (RF-32).
@@ -950,40 +1038,43 @@ export default function ChatComposer({
    *    result or a thrown error leaves it exactly where it was, so the same
    *    already-uploaded file can be sent again without re-uploading it.
    */
-  // Issue #769, "ACK ATRASADO": whether the text editor should actually
-  // clear once this send resolves. Decided the instant the send resolves —
-  // by comparing the draft's revision then against its revision when this
-  // send *started* — and deliberately before upload.resetAfterPublish()
-  // runs below, which bumps the revision itself (attachments consumed by
-  // this very send, not a new edit) and would otherwise read as "the reader
-  // moved on" every single time.
-  const shouldClearTextRef = useRef(true);
-  // -1 (never a real revision, which starts at 1 on a draft's first
-  // mutation) rather than null/undefined: with the no-op store every
-  // caller that does not opt into #769 gets — including most of this
-  // file's own tests — getDraft always reports undefined, and comparing
-  // two undefineds by strict equality is exactly as valid a "unchanged"
-  // signal as comparing two real revisions.
-  const noRevision = -1;
+  // Whether the editor should clear once this send resolves is the editor's
+  // own question, answered by useChatEditor against its document (issue
+  // #875); the draft answers the same question for itself against the text
+  // revision the snapshot captured (issue #929). Both count the same TipTap
+  // onUpdate, so they cannot disagree.
   const handleComposerSend = async (body: string): Promise<SendResult> => {
     if (uploading) return { status: "stale" };
-    const revisionAtSubmit = drafts.getDraft(draftKey ?? "")?.revision ?? noRevision;
+    const publishedLocalIds = publishableAttachments.map((item) => item.localId);
+    const snapshot = drafts.createSendSnapshot(draftKey ?? "", {
+      text: true,
+      attachmentLocalIds: publishedLocalIds,
+      voice: false,
+    });
+    const publishedAttachmentIds = publishableAttachments.map((item) => item.attachment.id);
     const result = await sendStatingPriority(
       body,
-      pendingAttachments.length ? pendingAttachments.map((attachment) => attachment.id) : undefined,
+      publishedAttachmentIds.length ? publishedAttachmentIds : undefined,
+      snapshot,
     );
     if (result.status === "sent") {
-      shouldClearTextRef.current =
-        (drafts.getDraft(draftKey ?? "")?.revision ?? noRevision) === revisionAtSubmit;
-      upload.resetAfterPublish();
+      // The queue's own bookkeeping for what the draft just consumed — by
+      // identity, never wholesale: a file dropped while this request was
+      // still open belongs to the next message, not to this one (issue
+      // #875).
+      upload.forgetPublished(publishedLocalIds);
       setEmojiPickerOpen(false);
     }
     return result;
   };
 
-  const { editor, canSend, sending, handleSend } = useChatEditor({
+  // Issue #929 (review): whether a send of this draft is still open — in
+  // this instance, or in the one this composer replaced — and whether an
+  // authoritative change to the draft is still to be mirrored here.
+  const mirrors = useDraftMirrors(drafts, draftKey);
+  const { editor, canSend, sending, handleSend, reconcileContent } = useChatEditor({
     placeholder,
-    disabled,
+    disabled: sendLocks(disabled, false, mirrors, false).editor,
     mentionTarget,
     bodyFormat,
     // An attachment is content, so a composer holding one may send an empty
@@ -997,8 +1088,35 @@ export default function ChatComposer({
     onSend: handleComposerSend,
     onActivity,
     onTextChange: draftKey ? (doc) => drafts.setText(draftKey, doc) : undefined,
-    shouldClearOnSent: () => shouldClearTextRef.current,
   });
+
+  // Issue #929 (review): the authoritative draft moved behind this
+  // instance's back — an acknowledgement of a send issued by the composer
+  // this one replaced, an upload that finished meanwhile, a recording
+  // finalized meanwhile. Each mirror converges with the draft; none writes
+  // it back. In the layout phase, so nothing can interact with the commit
+  // that announced the change while the mirrors still show what it
+  // replaced; `mirrors.canIssueSend()` is what makes that a guarantee
+  // rather than a race.
+  useLayoutEffect(() => {
+    mirrors.reconcile((store, key, reason) => {
+      if (reason === "cleared") {
+        // The session these mirrors were filled in is over (#929, fifth
+        // review): nothing they hold may start, send or be sent anything
+        // in the one that replaced it. Each gives up what it owns.
+        reconcileContent(null);
+        upload.resetForSessionEnd();
+        recorder.resetForSessionEnd();
+        return;
+      }
+      const draft = store.getDraft(key);
+      reconcileContent(draft?.text ?? null);
+      upload.reconcileWithDraft(draft?.attachments ?? []);
+      recorder.reconcileWithDraft(draft?.voiceMessage ?? null);
+    });
+  });
+
+  const locks = sendLocks(disabled, sending, mirrors, uploading);
 
   // Whether a new attachment may be taken at all right now. A voice
   // recording is deliberately never combined with an attachment (issue
@@ -1087,7 +1205,7 @@ export default function ChatComposer({
           onCancel={onCancelReference}
         />
         {recording ? (
-          <VoiceRecorderPanel recorder={recorder} />
+          <VoiceRecorderPanel recorder={recorder} sendPending={mirrors.sendPending} />
         ) : (
           <>
             <ComposerPrioritySummary
@@ -1099,7 +1217,7 @@ export default function ChatComposer({
             <ComposerUploadPanel upload={upload} dragActive={drop.active} />
             <ComposerBar
               editor={activeEditor}
-              disabled={disabled || sending}
+              disabled={locks.bar}
               emoji={emoji}
               pickerOpen={emojiPickerOpen}
               onPickerOpenChange={setEmojiPickerOpen}
@@ -1108,14 +1226,11 @@ export default function ChatComposer({
                 Boolean(uploadTarget),
                 recorder.supported,
                 attachEnabled,
-                uploading,
+                locks.recording,
                 hasComposerAttachments,
                 startRecording,
               )}
-              // Unavailable while a file is going up, whatever else the composer
-              // holds: the attachment is part of the message being written, and
-              // sending now would post a message without it.
-              canSend={canSend && !uploading}
+              canSend={canSend && locks.sendable}
               onSend={handleSend}
               priority={priority}
               onPriorityChange={setPriority}

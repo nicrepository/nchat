@@ -54,6 +54,6 @@ for service in "${services[@]}"; do
   fi
 done
 
-bash "$ROOT/scripts/ci/go-test.sh"
-
+# The Go suites are not run from here: `Tests / Go Unit` owns `go-test.sh`, and
+# calling it again would execute every Go test a second time for one gate.
 echo "Health contract check passed."
