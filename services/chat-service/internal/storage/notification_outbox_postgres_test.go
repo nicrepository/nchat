@@ -28,8 +28,9 @@ import (
 // database carrying the real migrations.
 
 const (
-	// The workspace every chat migration seeds.
-	notifyWorkspace    = "00000000-0000-0000-0000-000000000001"
+	// Dedicated workspaces keep public-channel membership deterministic now
+	// that every eligible workspace member is materialized automatically.
+	notifyWorkspace    = "74100000-0000-4000-8000-000000000000"
 	notifySecondWS     = "74100000-0000-4000-8000-000000000001"
 	notifyChannel      = "74100000-0000-4000-8000-000000000002"
 	notifyConversation = "74100000-0000-4000-8000-000000000003"
@@ -43,6 +44,7 @@ const (
 	notifyOrphanDM = "74100000-0000-4000-8000-000000000009"
 	// Every workspace must carry exactly one active public general channel.
 	notifySecondGeneral = "74100000-0000-4000-8000-000000000010"
+	notifyGeneral       = "74100000-0000-4000-8000-000000000013"
 	// An active workspace member who is NOT an explicit member of notifyChannel.
 	// A public channel is visible to them all the same, which is the whole point
 	// of chat.channel_visible_to_user being the authority.
@@ -74,18 +76,19 @@ func seedNotificationFixture(t *testing.T) *pgxpool.Pool {
 		($3, 'notify-741-third@e.test',    'Third'),
 		($4, 'notify-741-outsider@e.test', 'Outsider')
 		ON CONFLICT (id) DO NOTHING`, notifyAuthor, notifyPeer, notifyThird, notifyOutsider)
-	// The workspace and its general channel are written together: the invariant
-	// that every workspace has one is enforced by a deferred constraint trigger,
-	// so a workspace committed on its own is refused.
+	// Each workspace and its general channel are written together: the invariant
+	// that every workspace has one is enforced by a deferred constraint trigger.
 	exec(`WITH created AS (
-			INSERT INTO chat.workspaces (id, slug, name, status)
-			VALUES ($1, 'notify-741', 'Notify 741', 'active')
+			INSERT INTO chat.workspaces (id, slug, name, status) VALUES
+				($1, 'notify-741-primary', 'Notify 741 Primary', 'active'),
+				($2, 'notify-741-secondary', 'Notify 741 Secondary', 'active')
 			ON CONFLICT (id) DO NOTHING
 			RETURNING id
 		)
 		INSERT INTO chat.channels (id, workspace_id, slug, display_name, type, is_general, status)
-		VALUES ($2, $1, 'geral', 'Geral', 'public', true, 'active')
-		ON CONFLICT (id) DO NOTHING`, notifySecondWS, notifySecondGeneral)
+		VALUES ($3, $1, 'geral', 'Geral', 'public', true, 'active'),
+		       ($4, $2, 'geral', 'Geral', 'public', true, 'active')
+		ON CONFLICT (id) DO NOTHING`, notifyWorkspace, notifySecondWS, notifyGeneral, notifySecondGeneral)
 	exec(`INSERT INTO chat.workspace_members (workspace_id, user_id, status) VALUES
 		($1, $3, 'active'), ($1, $4, 'active'), ($1, $5, 'active'), ($1, $6, 'active'),
 		($2, $3, 'active'), ($2, $4, 'active')
@@ -97,6 +100,11 @@ func seedNotificationFixture(t *testing.T) *pgxpool.Pool {
 	exec(`INSERT INTO chat.channel_members (channel_id, user_id) VALUES
 		($1, $2), ($1, $3), ($1, $4)
 		ON CONFLICT DO NOTHING`, notifyChannel, notifyAuthor, notifyPeer, notifyThird)
+	// A few notification tests deliberately exercise the visibility fallback for
+	// a legacy/drifted public reader. Remove only that row after the trigger has
+	// proved the normal public-channel population path above.
+	exec(`DELETE FROM chat.channel_members WHERE channel_id = $1 AND user_id = $2`,
+		notifyChannel, notifyOutsider)
 	exec(`INSERT INTO chat.dm_conversations
 			(id, workspace_id, type, status, created_by, title, direct_pair_key)
 		VALUES ($2, $1, 'group',  'active', $3, 'Notify 741', NULL),
@@ -136,7 +144,7 @@ func cleanupNotificationFixture(t *testing.T, pool *pgxpool.Pool) {
 		`DELETE FROM chat.workspace_members WHERE workspace_id = '` + notifyWorkspace + `'
 		   AND user_id IN ('` + notifyAuthor + `', '` + notifyPeer + `', '` + notifyThird +
 			`', '` + notifyOutsider + `')`,
-		`DELETE FROM chat.workspaces WHERE id = '` + notifySecondWS + `'`,
+		`DELETE FROM chat.workspaces WHERE id IN ('` + notifyWorkspace + `', '` + notifySecondWS + `')`,
 		`DELETE FROM auth.users WHERE id IN ('` + notifyAuthor + `', '` + notifyPeer + `', '` +
 			notifyThird + `', '` + notifyOutsider + `')`,
 	} {

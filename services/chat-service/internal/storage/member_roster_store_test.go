@@ -20,22 +20,22 @@ import (
 // membership rather than the page.
 
 func rosterCols() []string {
-	return []string{"user_id", "display_name", "avatar_url", "role", "total_count"}
+	return []string{"total_count", "user_id", "display_name", "avatar_url", "role"}
 }
 
 func TestListChannelMemberRoster_SelectsMembershipWithoutPresence(t *testing.T) {
 	mock := newMock(t)
 	rows := pgxmock.NewRows(rosterCols()).
-		AddRow("user-1", "Ana", "/media/a.png", "moderator", 12).
-		AddRow("user-2", "Bruno", "", "member", 12)
+		AddRow(12, "user-1", "Ana", "/media/a.png", "moderator").
+		AddRow(12, "user-2", "Bruno", "", "member")
 	mock.ExpectQuery(`(?s)WITH active_members AS`).
-		WithArgs("ws-1", "ch-1", domain.MaxChannelDetailsMembers).
+		WithArgs("ws-1", "ch-1", false, "", nil, domain.MaxChannelDetailsMembers+1).
 		WillReturnRows(rows)
 
 	var capturedSQL string
 	pool := &sqlCapturingPool{Pool: mock, captured: &capturedSQL}
 	page, err := storage.NewPGXMemberStore(pool).ListChannelMemberRoster(
-		context.Background(), "ws-1", "ch-1", domain.MaxChannelDetailsMembers,
+		context.Background(), "ws-1", "ch-1", "", domain.MaxChannelDetailsMembers,
 	)
 	if err != nil {
 		t.Fatalf("ListChannelMemberRoster: %v", err)
@@ -57,7 +57,7 @@ func TestListChannelMemberRoster_SelectsMembershipWithoutPresence(t *testing.T) 
 			t.Fatalf("the roster query must not mention %q:\n%s", forbidden, capturedSQL)
 		}
 	}
-	if !strings.Contains(capturedSQL, "COUNT(*) OVER ()") {
+	if !strings.Contains(capturedSQL, "count(*) AS total_count") {
 		t.Fatalf("the total must come from the same statement:\n%s", capturedSQL)
 	}
 	checkExpectations(t, mock)
@@ -68,13 +68,13 @@ func TestListChannelMemberRoster_SelectsMembershipWithoutPresence(t *testing.T) 
 func TestListChannelMemberRoster_KeepsTheActiveMembershipPredicate(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectQuery(`(?s)WITH active_members AS`).
-		WithArgs("ws-1", "ch-1", 10).
+		WithArgs("ws-1", "ch-1", false, "", nil, 11).
 		WillReturnRows(pgxmock.NewRows(rosterCols()))
 
 	var capturedSQL string
 	pool := &sqlCapturingPool{Pool: mock, captured: &capturedSQL}
 	if _, err := storage.NewPGXMemberStore(pool).ListChannelMemberRoster(
-		context.Background(), "ws-1", "ch-1", 10,
+		context.Background(), "ws-1", "ch-1", "", 10,
 	); err != nil {
 		t.Fatalf("ListChannelMemberRoster: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestListChannelMemberRoster_KeepsTheActiveMembershipPredicate(t *testing.T)
 		"u.status = 'active'",
 		"u.deleted_at IS NULL",
 		"ORDER BY lower(display_name), user_id",
-		"LIMIT $3",
+		"LIMIT $6",
 	} {
 		if !strings.Contains(capturedSQL, fragment) {
 			t.Fatalf("query lost the %q predicate:\n%s", fragment, capturedSQL)
@@ -108,11 +108,11 @@ func TestListChannelMemberRoster_ClampsTheLimit(t *testing.T) {
 	for _, limit := range []int{0, -5, domain.MaxChannelDetailsMembers + 1} {
 		mock := newMock(t)
 		mock.ExpectQuery(`(?s)WITH active_members AS`).
-			WithArgs("ws-1", "ch-1", domain.MaxChannelDetailsMembers).
+			WithArgs("ws-1", "ch-1", false, "", nil, domain.MaxChannelDetailsMembers+1).
 			WillReturnRows(pgxmock.NewRows(rosterCols()))
 
 		if _, err := storage.NewPGXMemberStore(mock).ListChannelMemberRoster(
-			context.Background(), "ws-1", "ch-1", limit,
+			context.Background(), "ws-1", "ch-1", "", limit,
 		); err != nil {
 			t.Fatalf("limit %d: %v", limit, err)
 		}
@@ -125,11 +125,11 @@ func TestListChannelMemberRoster_ClampsTheLimit(t *testing.T) {
 func TestListChannelMemberRoster_PropagatesTheQueryFailure(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectQuery(`(?s)WITH active_members AS`).
-		WithArgs("ws-1", "ch-1", 10).
+		WithArgs("ws-1", "ch-1", false, "", nil, 11).
 		WillReturnError(errors.New("boom"))
 
 	if _, err := storage.NewPGXMemberStore(mock).ListChannelMemberRoster(
-		context.Background(), "ws-1", "ch-1", 10,
+		context.Background(), "ws-1", "ch-1", "", 10,
 	); err == nil {
 		t.Fatal("a query failure was reported as an empty roster")
 	}

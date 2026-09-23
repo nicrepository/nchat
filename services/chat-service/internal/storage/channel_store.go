@@ -30,11 +30,15 @@ type CreateChannelInput struct {
 	IsGeneral   bool
 	Position    int
 	CreatedBy   string
+	// EnsurePublicWorkspaceMembers adds every active, non-guest workspace
+	// member to a newly-created public channel in the creation transaction.
+	EnsurePublicWorkspaceMembers bool
 	// EnsureCreatorMemberRole, when non-empty, adds CreatedBy to
 	// chat.channel_members in the same transaction as the channel insert, the
 	// way UpdateChannelInput.EnsureMemberUserID does for a public→private
-	// switch. Private channels need it so the creator can see what they made;
-	// public ones do not. Honoured by CreateChannelForActiveMember only.
+	// switch. ChannelService sets it for private channels so their creator is
+	// represented in the authoritative roster. Honoured by
+	// CreateChannelForActiveMember only.
 	EnsureCreatorMemberRole domain.ChannelRole
 }
 
@@ -303,12 +307,37 @@ func (s *PGXChannelStore) CreateChannelForActiveMember(ctx context.Context, inpu
 			return domain.Channel{}, err
 		}
 	}
+	if input.EnsurePublicWorkspaceMembers {
+		if err := addPublicWorkspaceMembers(ctx, tx, ch.ID, ch.WorkspaceID); err != nil {
+			return domain.Channel{}, err
+		}
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return domain.Channel{}, fmt.Errorf("commit create channel for active member: %w", err)
 	}
 	committed = true
 	return ch, nil
+}
+
+// addPublicWorkspaceMembers materializes the same population automatically
+// joined to #geral: active owners, admins, moderators and members. Guests keep
+// their restricted-channel boundary and must still be explicitly invited.
+func addPublicWorkspaceMembers(ctx context.Context, q channelQuerier, channelID, workspaceID string) error {
+	_, err := q.Exec(ctx, `
+		INSERT INTO chat.channel_members (channel_id, user_id, role)
+		SELECT $1::uuid, wm.user_id, $3
+		FROM chat.workspace_members wm
+		WHERE wm.workspace_id = $2::uuid
+		  AND wm.status = 'active'
+		  AND wm.role IN ('owner', 'admin', 'moderator', 'member')
+		ON CONFLICT (channel_id, user_id) DO NOTHING`,
+		channelID, workspaceID, string(domain.ChannelRoleMember),
+	)
+	if err != nil {
+		return fmt.Errorf("add public channel workspace members: %w", err)
+	}
+	return nil
 }
 
 func createChannel(ctx context.Context, q channelQuerier, input CreateChannelInput) (domain.Channel, error) {

@@ -49,8 +49,8 @@ func TestChannelHandler_Members_ReturnsMembershipAndTheServerTotal(t *testing.T)
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
 	data := detailsData(t, rec)
-	if data["member_count"] != float64(12) {
-		t.Fatalf("member_count = %v, want 12", data["member_count"])
+	if data["total"] != float64(12) {
+		t.Fatalf("total = %v, want 12", data["total"])
 	}
 	members, ok := data["members"].([]any)
 	if !ok || len(members) != 2 {

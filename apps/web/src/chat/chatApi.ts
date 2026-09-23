@@ -2390,7 +2390,8 @@ interface ChannelRosterMemberResponse {
 
 interface ChannelRosterEnvelope {
   data: {
-    member_count?: unknown;
+    total?: unknown;
+    next_cursor?: unknown;
     members?: unknown;
   };
 }
@@ -2421,9 +2422,11 @@ function mapChannelRosterMember(raw: unknown): ChannelRosterMember | undefined {
 export async function fetchChannelMembers(
   channelId: string,
   signal?: AbortSignal,
+  cursor?: string,
 ): Promise<ChannelRoster> {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
   const res = await authenticatedFetch<ChannelRosterEnvelope>(
-    `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}/members`,
+    `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}/members${query}`,
     { method: "GET", signal },
   );
   const data = res.data;
@@ -2432,7 +2435,13 @@ export async function fetchChannelMembers(
         .map(mapChannelRosterMember)
         .filter((member): member is ChannelRosterMember => member !== undefined)
     : [];
-  return { memberCount: nonNegativeCount(data.member_count), members };
+  const nextCursor =
+    typeof data.next_cursor === "string" && data.next_cursor ? data.next_cursor : undefined;
+  return {
+    memberCount: nonNegativeCount(data.total),
+    members,
+    ...(nextCursor ? { nextCursor } : {}),
+  };
 }
 
 /**

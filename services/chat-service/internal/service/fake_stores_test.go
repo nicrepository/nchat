@@ -385,7 +385,7 @@ type rosterCall struct {
 // membership the online preview is drawn from, with no presence predicate, so
 // a test can tell the two populations apart.
 func (f *fakeMemberStore) ListChannelMemberRoster(
-	_ context.Context, workspaceID, channelID string, limit int,
+	_ context.Context, workspaceID, channelID, _ string, limit int,
 ) (storage.ChannelRosterPage, error) {
 	f.rosterCalls = append(f.rosterCalls, rosterCall{workspaceID: workspaceID, channelID: channelID, limit: limit})
 	if f.rosterErr != nil {

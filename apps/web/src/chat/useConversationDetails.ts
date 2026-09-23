@@ -282,13 +282,9 @@ function reconcileReducer(state: ReconcileWindow, action: ReconcileAction): Reco
 }
 
 /**
- * Issues the roster request for a channel whose payload says this caller may
- * administer it, and does nothing otherwise (issue #469).
- *
- * The capability decides whether the request happens at all. That is not an
- * authorization check — the server refuses the route on its own terms — it is
- * what keeps every ordinary reader from spending a guaranteed 403 each time
- * they open a channel panel.
+ * Issues the authoritative roster request for every visible channel. The
+ * server applies the same visibility check as channel details, while action
+ * capabilities only decide which controls each row receives.
  *
  * It shares the details request's AbortController, so a target switch or an
  * unmount cancels an in-flight roster exactly like everything else here, and a
@@ -300,7 +296,7 @@ function loadChannelRoster(
   controller: AbortController,
   dispatch: (action: Action) => void,
 ) {
-  if (details.kind !== "channel" || !details.canRemoveMembers) return;
+  if (details.kind !== "channel") return;
   fetchChannelMembers(details.id, controller.signal).then(
     (roster) => {
       if (controller.signal.aborted) return;

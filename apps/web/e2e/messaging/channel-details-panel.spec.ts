@@ -8,6 +8,7 @@ import {
   OTHER_USER_ID,
   OTHER_USER_NAME,
   channelDetailsFixture,
+  channelRosterFixture,
   createScenario,
   emitConversationUpdated,
   installMessagingMocks,
@@ -28,6 +29,15 @@ test.describe("painel de detalhes do canal", () => {
       messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
     });
     for (const channel of scenario.sidebarChannels) {
+      const roster = [
+        {
+          user_id: CURRENT_USER_ID,
+          display_name: CURRENT_USER_NAME,
+          role: "moderator" as const,
+        },
+        { user_id: OTHER_USER_ID, display_name: OTHER_USER_NAME, role: "member" as const },
+        ...offlineRoster(10),
+      ];
       scenario.channelDetails.set(
         channel.id,
         channelDetailsFixture(
@@ -51,6 +61,7 @@ test.describe("painel de detalhes do canal", () => {
           12,
         ),
       );
+      scenario.channelRosters.set(channel.id, channelRosterFixture(roster, 12));
     }
     // Distinct About metadata per channel (issue #894), so switching channels
     // with the panel open has something to actually change. The details for the
@@ -115,21 +126,20 @@ test.describe("painel de detalhes do canal", () => {
     // one standing in for the creator's name.
     await expect(panel.getByText(OTHER_USER_ID)).toHaveCount(0);
     await expect(panel.getByText(OTHER_USER_ID.slice(0, 8))).toHaveCount(0);
-    await expect(panel.getByRole("heading", { name: "Membros online (2)" })).toBeVisible();
-    const members = panel.getByRole("list", { name: "Membros online do canal" });
+    await expect(panel.getByRole("heading", { name: "Membros (12)" })).toBeVisible();
+    const members = panel.getByRole("list", { name: "Membros do canal" });
     await expect(members.getByText(CURRENT_USER_NAME)).toBeVisible();
     await expect(members.getByText("Você")).toBeVisible();
     await expect(members.getByText(OTHER_USER_NAME)).toBeVisible();
+    await expect(members.getByText("Pessoa Offline 01")).toBeVisible();
     await expect(panel.getByRole("heading", { name: "Mensagem fixada" })).toBeVisible();
     await expect(
       panel.getByRole("list", { name: "Arquivos recentes" }).getByText("relatorio-backup.pdf"),
     ).toBeVisible();
 
-    // Com dois membros online e um arquivo, nenhuma seção tem conteúdo além do
-    // compacto — então não existe controle algum (issue #892), em vez de um
-    // "Ver todos" visível que não revelaria nada. A frase que explicava essa
-    // indisponibilidade saiu junto.
-    await expect(panel.getByRole("button", { name: /Ver todos/ })).toHaveCount(0);
+    // O roster completo tem conteúdo além do compacto, mesmo que somente duas
+    // pessoas estejam online. A expansão pertence à lista de membros.
+    await expect(panel.getByRole("button", { name: "Ver todos Membros" })).toBeVisible();
     await expect(panel.getByText(/ainda não está disponível nesta versão/)).toHaveCount(0);
 
     // "Adicionar membros" deixou de ser um placeholder (issue #398): virou fluxo
@@ -323,7 +333,7 @@ test.describe("painel de detalhes do canal", () => {
     await expect(composer).toContainText("rascunho que atravessa o toggle");
   });
 
-  test("distingue 'ninguém online' de 'canal sem membros'", async ({ page }, testInfo) => {
+  test("mostra membros offline quando ninguém está online", async ({ page }, testInfo) => {
     const targetId = uniqueId(testInfo, "channel-details-empty");
     const scenario = createScenario({
       kind: "channel",
@@ -335,6 +345,7 @@ test.describe("painel de detalhes do canal", () => {
       // 31 membros no canal, nenhum conectado — exatamente o cenário em que o
       // painel não pode dizer que o canal está vazio.
       scenario.channelDetails.set(channel.id, channelDetailsFixture(channel, [], 31));
+      scenario.channelRosters.set(channel.id, channelRosterFixture(offlineRoster(31), 31));
     }
 
     await installMessagingMocks(page, scenario);
@@ -343,19 +354,20 @@ test.describe("painel de detalhes do canal", () => {
     await page.getByRole("button", { name: "Detalhes do canal", exact: true }).click();
 
     const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
-    await expect(panel.getByText("Nenhum membro online no momento.")).toBeVisible();
+    await expect(panel.getByText("Nenhum membro online no momento.")).toHaveCount(0);
     // O tamanho do canal continua reportado e não vira zero.
     await expect(panel.getByText("Canal público")).toBeVisible();
     await expect(panel.getByText("31 membros")).toBeVisible();
-    await expect(panel.getByRole("heading", { name: "Membros online (0)" })).toBeVisible();
+    await expect(panel.getByRole("heading", { name: "Membros (31)" })).toBeVisible();
+    const members = panel.getByRole("list", { name: "Membros do canal" });
+    await expect(members.getByRole("listitem")).toHaveCount(5);
+    await expect(members.getByText("Pessoa Offline 01")).toBeVisible();
     await expect(panel.getByText("Nenhuma mensagem fixada neste canal.")).toBeVisible();
     await expect(panel.getByText("Nenhum arquivo enviado neste canal.")).toBeVisible();
     await expect(panel.getByText("Este canal ainda não tem descrição.")).toBeVisible();
   });
 
-  test("mostra o membro online que fica fora dos primeiros 30 nomes", async ({
-    page,
-  }, testInfo) => {
+  test("ordena primeiro o membro online dentro do roster completo", async ({ page }, testInfo) => {
     const targetId = uniqueId(testInfo, "channel-details-online-cut");
     const scenario = createScenario({
       kind: "channel",
@@ -381,6 +393,16 @@ test.describe("painel de detalhes do canal", () => {
           31,
         ),
       );
+      scenario.channelRosters.set(
+        channel.id,
+        channelRosterFixture(
+          [
+            ...offlineRoster(30),
+            { user_id: "e2e-ultimo-alfabetico", display_name: "Zulmira Última", role: "member" },
+          ],
+          31,
+        ),
+      );
     }
 
     await installMessagingMocks(page, scenario);
@@ -389,10 +411,10 @@ test.describe("painel de detalhes do canal", () => {
     await page.getByRole("button", { name: "Detalhes do canal", exact: true }).click();
 
     const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
-    const members = panel.getByRole("list", { name: "Membros online do canal" });
+    const members = panel.getByRole("list", { name: "Membros do canal" });
     await expect(members.getByText("Zulmira Última")).toBeVisible();
-    await expect(members.getByRole("listitem")).toHaveCount(1);
-    await expect(panel.getByRole("heading", { name: "Membros online (1)" })).toBeVisible();
+    await expect(members.getByRole("listitem")).toHaveCount(5);
+    await expect(panel.getByRole("heading", { name: "Membros (31)" })).toBeVisible();
     await expect(panel.getByText("Canal público")).toBeVisible();
     await expect(panel.getByText("31 membros")).toBeVisible();
   });
@@ -411,6 +433,18 @@ function onlineRoster(count: number) {
   }));
 }
 
+function offlineRoster(count: number) {
+  return Array.from({ length: count }, (_, index) => ({
+    user_id: `e2e-offline-${index}`,
+    display_name: `Pessoa Offline ${String(index + 1).padStart(2, "0")}`,
+    role: "member" as const,
+  }));
+}
+
+function rosterMembers(members: ReturnType<typeof onlineRoster>) {
+  return members.map(({ user_id, display_name, role }) => ({ user_id, display_name, role }));
+}
+
 test.describe("seção expansível de membros", () => {
   test("mostra 5, expande com scroll interno e volta ao compacto sem mover a conversa", async ({
     page,
@@ -423,7 +457,9 @@ test.describe("seção expansível de membros", () => {
       messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
     });
     for (const channel of scenario.sidebarChannels) {
-      scenario.channelDetails.set(channel.id, channelDetailsFixture(channel, onlineRoster(12), 30));
+      const members = onlineRoster(12);
+      scenario.channelDetails.set(channel.id, channelDetailsFixture(channel, members, 12));
+      scenario.channelRosters.set(channel.id, channelRosterFixture(rosterMembers(members), 12));
     }
 
     await installMessagingMocks(page, scenario);
@@ -431,19 +467,19 @@ test.describe("seção expansível de membros", () => {
     await page.getByRole("button", { name: "Detalhes do canal", exact: true }).click();
 
     const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
-    const members = panel.getByRole("list", { name: "Membros online do canal" });
+    const members = panel.getByRole("list", { name: "Membros do canal" });
     const messageArea = page.getByTestId("chat-message-area");
 
     // ── 1. compacto ──────────────────────────────────────────────────────
     await expect(members.getByRole("listitem")).toHaveCount(5);
-    await expect(panel.getByRole("heading", { name: "Membros online (12)" })).toBeVisible();
+    await expect(panel.getByRole("heading", { name: "Membros (12)" })).toBeVisible();
     await expect(members.getByText("Pessoa Online 06")).toHaveCount(0);
 
     // One locator for both states: the control is the same element throughout —
     // only its label and its aria-expanded change — and a locator that matched
     // just one of the two labels would be asserting that it is replaced.
     const toggle = panel.getByRole("button", {
-      name: /(Ver todos|Mostrar menos) Membros online/,
+      name: /(Ver todos|Mostrar menos) Membros/,
     });
     await expect(toggle).toHaveAttribute("aria-expanded", "false");
     // Alvo de toque utilizável: o controle é pequeno em texto, não em área.
@@ -515,7 +551,9 @@ test.describe("seção expansível de membros", () => {
       messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
     });
     for (const channel of scenario.sidebarChannels) {
-      scenario.channelDetails.set(channel.id, channelDetailsFixture(channel, onlineRoster(12), 30));
+      const members = onlineRoster(12);
+      scenario.channelDetails.set(channel.id, channelDetailsFixture(channel, members, 12));
+      scenario.channelRosters.set(channel.id, channelRosterFixture(rosterMembers(members), 12));
     }
 
     await installMessagingMocks(page, scenario);
@@ -524,7 +562,7 @@ test.describe("seção expansível de membros", () => {
 
     const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
     const toggle = panel.getByRole("button", {
-      name: /(Ver todos|Mostrar menos) Membros online/,
+      name: /(Ver todos|Mostrar menos) Membros/,
     });
     await toggle.click();
 
@@ -533,7 +571,7 @@ test.describe("seção expansível de membros", () => {
     await expect(toggle).toBeVisible();
     await expect(toggle).toHaveAttribute("aria-expanded", "true");
     await expect(
-      panel.getByRole("list", { name: "Membros online do canal" }).getByRole("listitem"),
+      panel.getByRole("list", { name: "Membros do canal" }).getByRole("listitem"),
     ).toHaveCount(12);
 
     const horizontal = await page.evaluate(
@@ -543,7 +581,7 @@ test.describe("seção expansível de membros", () => {
 
     await toggle.click();
     await expect(
-      panel.getByRole("list", { name: "Membros online do canal" }).getByRole("listitem"),
+      panel.getByRole("list", { name: "Membros do canal" }).getByRole("listitem"),
     ).toHaveCount(5);
   });
 });

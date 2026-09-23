@@ -201,23 +201,20 @@ describe("channel removal controls", () => {
     );
   });
 
-  // Until the roster answers, the preview is still correct — just narrower —
-  // and its rows are members too, so they stay actionable.
-  it("falls back to the presence preview while the roster is loading", () => {
+  it("waits for the complete roster instead of showing an online-only preview", () => {
     renderChannel(channelDetails(), { status: "loading" });
 
-    expect(screen.getByRole("heading", { name: /Membros online/ })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Remover Bruno Dias do canal" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Membros" })).toBeInTheDocument();
+    expect(screen.getByText("Carregando membros…")).toBeInTheDocument();
+    expect(screen.queryByText("Bruno Dias")).not.toBeInTheDocument();
   });
 
-  it("keeps the preview when the roster request fails", () => {
+  it("does not replace a failed roster with an online-only preview", () => {
     renderChannel(channelDetails(), { status: "error" });
 
-    expect(screen.getByRole("heading", { name: /Membros online/ })).toBeInTheDocument();
-    expect(screen.getByText("Bruno Dias")).toBeInTheDocument();
-    // A preview row is a membership row too, so the action it offers is one
-    // the server will honour.
-    expect(screen.getByRole("button", { name: "Remover Bruno Dias do canal" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Membros" })).toBeInTheDocument();
+    expect(screen.getByText("Não foi possível carregar os membros.")).toBeInTheDocument();
+    expect(screen.queryByText("Bruno Dias")).not.toBeInTheDocument();
   });
 
   it("says how much of a large membership it is holding", () => {

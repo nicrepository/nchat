@@ -425,7 +425,8 @@ export interface ChannelRosterMemberFixture {
 
 /** GET /api/chat/channels/{id}/members (issue #469). */
 export interface ChannelRosterFixture {
-  member_count: number;
+  total: number;
+  next_cursor?: string;
   members: ChannelRosterMemberFixture[];
 }
 
@@ -653,7 +654,7 @@ export function channelRosterFixture(
   members: ChannelRosterMemberFixture[],
   memberCount = members.length,
 ): ChannelRosterFixture {
-  return { member_count: memberCount, members };
+  return { total: memberCount, members };
 }
 
 /**
@@ -717,7 +718,7 @@ function removeChannelMemberFromFixture(
   if (roster) {
     const before = roster.members.length;
     roster.members = roster.members.filter((member) => member.user_id !== userId);
-    if (roster.members.length !== before) roster.member_count -= 1;
+    if (roster.members.length !== before) roster.total -= 1;
   }
   scenario.channelMemberships.get(channelId)?.delete(userId);
   const details = scenario.channelDetails.get(channelId);

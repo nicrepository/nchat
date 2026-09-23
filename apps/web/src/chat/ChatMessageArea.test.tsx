@@ -88,6 +88,7 @@ const {
   mockDeleteMessage,
   mockGetMessageHistory,
   mockFetchChannelDetails,
+  mockFetchChannelMembers,
   mockFetchGroupDetails,
   mockFetchDirectProfile,
   mockFetchChannelAttachments,
@@ -153,6 +154,7 @@ const {
   mockDeleteMessage: vi.fn<(messageId: string) => Promise<Message>>(),
   mockGetMessageHistory: vi.fn(),
   mockFetchChannelDetails: vi.fn(),
+  mockFetchChannelMembers: vi.fn(),
   mockFetchGroupDetails: vi.fn(),
   mockFetchDirectProfile: vi.fn(),
   mockFetchChannelAttachments: vi.fn(),
@@ -235,6 +237,8 @@ vi.mock("./chatApi", () => ({
   getMessageHistory: (...args: unknown[]) => mockGetMessageHistory(...args),
   fetchChannelDetails: (channelId: string, signal?: AbortSignal) =>
     mockFetchChannelDetails(channelId, signal),
+  fetchChannelMembers: (channelId: string, signal?: AbortSignal, cursor?: string) =>
+    mockFetchChannelMembers(channelId, signal, cursor),
   fetchGroupDetails: (conversationId: string, signal?: AbortSignal) =>
     mockFetchGroupDetails(conversationId, signal),
   fetchDirectProfile: (conversationId: string, signal?: AbortSignal) =>
@@ -624,6 +628,18 @@ beforeEach(() => {
   mockGetMessageHistory.mockResolvedValue({ entries: [], nextCursor: undefined });
   mockFetchChannelDetails.mockImplementation((channelId: string) =>
     Promise.resolve(channelDetailsFor(channelId)),
+  );
+  mockFetchChannelMembers.mockImplementation((channelId: string) =>
+    Promise.resolve({
+      memberCount: 1,
+      members: [
+        {
+          userId: "me-123",
+          displayName: `Membro de ${channelId}`,
+          role: "member" as const,
+        },
+      ],
+    }),
   );
   mockFetchGroupDetails.mockRejectedValue(new Error("group details not stubbed for this test"));
   mockFetchChannelAttachments.mockResolvedValue([]);

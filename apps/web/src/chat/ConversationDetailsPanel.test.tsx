@@ -86,12 +86,27 @@ function channelDetails(
 }
 
 function state(overrides: Partial<ConversationDetailsState> = {}): ConversationDetailsState {
+  const details = overrides.details ?? { status: "ready", data: channelDetails() };
+  const roster =
+    overrides.roster ??
+    (details.status === "ready" && details.data.kind === "channel"
+      ? {
+          status: "ready" as const,
+          data: {
+            memberCount: details.data.memberCount,
+            members: details.data.onlineMembers.map((member) => ({
+              userId: member.userId,
+              displayName: member.displayName,
+              avatarUrl: member.avatarUrl,
+              role: member.role,
+            })),
+          },
+        }
+      : { status: "loading" as const });
   return {
-    details: { status: "ready", data: channelDetails() },
+    details,
     files: { status: "ready", data: [] },
-    // The roster is only ever requested for a caller who may administer the
-    // channel, so "still loading" is what every other case sees.
-    roster: { status: "loading" },
+    roster,
     reload: vi.fn(),
     ...overrides,
   };
@@ -273,12 +288,10 @@ describe("ConversationDetailsPanel — canal: seção Sobre", () => {
 
     // The channel's size and how many of its members are online are three
     // different numbers, and none is the length of the rendered list.
-    expect(screen.getByText(/40 membros/)).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Membros online (6)" })).toBeInTheDocument();
+    expect(screen.getByTestId("chat-details-people-count")).toHaveTextContent("40 membros");
+    expect(screen.getByRole("heading", { name: "Membros (40)" })).toBeInTheDocument();
     expect(
-      within(screen.getByRole("list", { name: "Membros online do canal" })).getAllByRole(
-        "listitem",
-      ),
+      within(screen.getByRole("list", { name: "Membros do canal" })).getAllByRole("listitem"),
     ).toHaveLength(1);
   });
 
@@ -354,7 +367,7 @@ describe("ConversationDetailsPanel — canal: membros", () => {
       }),
     });
 
-    const list = screen.getByRole("list", { name: "Membros online do canal" });
+    const list = screen.getByRole("list", { name: "Membros do canal" });
     const rows = within(list).getAllByRole("listitem");
     expect(within(rows[0]).getByText("Você")).toBeInTheDocument();
     expect(within(rows[1]).queryByText("Você")).not.toBeInTheDocument();
@@ -410,22 +423,26 @@ describe("ConversationDetailsPanel — canal: membros", () => {
     expect(screen.getByText("Moderador")).toBeInTheDocument();
   });
 
-  it("says nobody is online — not that the channel is empty — and keeps the total", () => {
+  it("shows an offline member even when the presence preview is empty", () => {
     const { unmount } = renderPanel({
       state: state({
         details: {
           status: "ready",
-          // A populated channel where nobody happens to be connected.
           data: channelDetails({ onlineMembers: [], onlineCount: 0, memberCount: 31 }),
+        },
+        roster: {
+          status: "ready",
+          data: {
+            memberCount: 31,
+            members: [{ userId: "offline-1", displayName: "Membro offline", role: "member" }],
+          },
         },
       }),
     });
 
-    expect(screen.getByText("Nenhum membro online no momento.")).toBeInTheDocument();
-    expect(screen.queryByText(/não tem membros/i)).not.toBeInTheDocument();
-    // The channel's size is reported independently of who is connected.
-    expect(screen.getByText(/31 membros/)).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Membros online (0)" })).toBeInTheDocument();
+    expect(screen.getByText("Membro offline")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Membros (31)" })).toBeInTheDocument();
+    expect(screen.queryByTestId("presence-dot")).not.toBeInTheDocument();
     unmount();
 
     render(
@@ -498,17 +515,17 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
       state: state({
         details: {
           status: "ready",
-          data: channelDetails({ onlineMembers: onlineRoster(7), onlineCount: 7 }),
+          data: channelDetails({ onlineMembers: onlineRoster(7), onlineCount: 7, memberCount: 7 }),
         },
       }),
     });
 
-    const list = () => screen.getByRole("list", { name: "Membros online do canal" });
+    const list = () => screen.getByRole("list", { name: "Membros do canal" });
     expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
-    expect(screen.getByRole("heading", { name: "Membros online (7)" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Membros (7)" })).toBeInTheDocument();
     expect(screen.queryByText("Pessoa 7")).not.toBeInTheDocument();
 
-    const toggle = screen.getByRole("button", { name: /Ver todos Membros online/ });
+    const toggle = screen.getByRole("button", { name: /Ver todos Membros/ });
     // Reachable from the close button the panel focuses on open.
     expect(screen.getByRole("button", { name: "Fechar detalhes do canal" })).toHaveFocus();
     await tabUntilFocused(toggle);
@@ -519,7 +536,7 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
     expect(within(list()).getAllByTestId("chat-details-member-avatar")).toHaveLength(7);
     expect(screen.getByText("Pessoa 7")).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: /Mostrar menos Membros online/ }));
+    await userEvent.click(screen.getByRole("button", { name: /Mostrar menos Membros/ }));
     expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
   });
 
@@ -533,16 +550,18 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
       state: state({
         details: {
           status: "ready",
-          data: channelDetails({ onlineMembers: onlineRoster(3), onlineCount: 40 }),
+          data: channelDetails({
+            onlineMembers: onlineRoster(3),
+            onlineCount: 40,
+            memberCount: 40,
+          }),
         },
       }),
     });
 
-    expect(screen.getByRole("heading", { name: "Membros online (40)" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Membros (40)" })).toBeInTheDocument();
     expect(
-      within(screen.getByRole("list", { name: "Membros online do canal" })).getAllByRole(
-        "listitem",
-      ),
+      within(screen.getByRole("list", { name: "Membros do canal" })).getAllByRole("listitem"),
     ).toHaveLength(3);
     expect(screen.queryByRole("button", { name: /Ver todos/ })).not.toBeInTheDocument();
   });
@@ -556,28 +575,30 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
       state: state({
         details: {
           status: "ready",
-          data: channelDetails({ onlineMembers: onlineRoster(30), onlineCount: 40 }),
+          data: channelDetails({
+            onlineMembers: onlineRoster(30),
+            onlineCount: 40,
+            memberCount: 40,
+          }),
         },
       }),
     });
 
-    const list = () => screen.getByRole("list", { name: "Membros online do canal" });
+    const list = () => screen.getByRole("list", { name: "Membros do canal" });
     expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
     expect(screen.queryByRole("button", { name: /Ver todos/ })).not.toBeInTheDocument();
     // And the shortfall is named rather than left for the reader to infer from
     // a heading that says forty above a list that stops at thirty.
     expect(screen.getByTestId("chat-details-roster-shortfall")).toHaveTextContent(
-      "30 de 40 membros online carregados.",
+      "30 de 40 membros carregados.",
     );
 
-    await userEvent.click(screen.getByRole("button", { name: /Mostrar mais Membros online/ }));
+    await userEvent.click(screen.getByRole("button", { name: /Mostrar mais Membros/ }));
 
     expect(within(list()).getAllByRole("listitem")).toHaveLength(30);
-    expect(screen.getByRole("heading", { name: "Membros online (40)" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Membros (40)" })).toBeInTheDocument();
     // The way back is unchanged: only the promise of "all" was wrong.
-    expect(
-      screen.getByRole("button", { name: /Mostrar menos Membros online/ }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Mostrar menos Membros/ })).toBeInTheDocument();
   });
 
   it("offers no control when exactly five members are online", () => {
@@ -585,15 +606,13 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
       state: state({
         details: {
           status: "ready",
-          data: channelDetails({ onlineMembers: onlineRoster(5), onlineCount: 5 }),
+          data: channelDetails({ onlineMembers: onlineRoster(5), onlineCount: 5, memberCount: 5 }),
         },
       }),
     });
 
     expect(
-      within(screen.getByRole("list", { name: "Membros online do canal" })).getAllByRole(
-        "listitem",
-      ),
+      within(screen.getByRole("list", { name: "Membros do canal" })).getAllByRole("listitem"),
     ).toHaveLength(5);
     expect(screen.queryByRole("button", { name: /Ver todos/ })).not.toBeInTheDocument();
   });
@@ -602,7 +621,7 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
     const expanded = state({
       details: {
         status: "ready",
-        data: channelDetails({ onlineMembers: onlineRoster(7), onlineCount: 7 }),
+        data: channelDetails({ onlineMembers: onlineRoster(7), onlineCount: 7, memberCount: 7 }),
       },
     });
     const { rerender } = render(
@@ -614,11 +633,9 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
         onClose={vi.fn()}
       />,
     );
-    await userEvent.click(screen.getByRole("button", { name: /Ver todos Membros online/ }));
+    await userEvent.click(screen.getByRole("button", { name: /Ver todos Membros/ }));
     expect(
-      within(screen.getByRole("list", { name: "Membros online do canal" })).getAllByRole(
-        "listitem",
-      ),
+      within(screen.getByRole("list", { name: "Membros do canal" })).getAllByRole("listitem"),
     ).toHaveLength(7);
 
     // The panel is deliberately not remounted on a target switch; the section
@@ -629,7 +646,12 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
         state={state({
           details: {
             status: "ready",
-            data: channelDetails({ id: "ch-2", onlineMembers: onlineRoster(7), onlineCount: 7 }),
+            data: channelDetails({
+              id: "ch-2",
+              onlineMembers: onlineRoster(7),
+              onlineCount: 7,
+              memberCount: 7,
+            }),
           },
         })}
         currentUserId={currentUserId}
@@ -639,11 +661,9 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
     );
 
     expect(
-      within(screen.getByRole("list", { name: "Membros online do canal" })).getAllByRole(
-        "listitem",
-      ),
+      within(screen.getByRole("list", { name: "Membros do canal" })).getAllByRole("listitem"),
     ).toHaveLength(5);
-    expect(screen.getByRole("button", { name: /Ver todos Membros online/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Ver todos Membros/ })).toBeInTheDocument();
   });
 
   it("keeps the two sections' expansions independent of each other", async () => {
@@ -651,7 +671,7 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
       state: state({
         details: {
           status: "ready",
-          data: channelDetails({ onlineMembers: onlineRoster(7), onlineCount: 7 }),
+          data: channelDetails({ onlineMembers: onlineRoster(7), onlineCount: 7, memberCount: 7 }),
         },
         files: {
           status: "ready",
@@ -662,12 +682,10 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
       }),
     });
 
-    await userEvent.click(screen.getByRole("button", { name: /Ver todos Membros online/ }));
+    await userEvent.click(screen.getByRole("button", { name: /Ver todos Membros/ }));
 
     expect(
-      within(screen.getByRole("list", { name: "Membros online do canal" })).getAllByRole(
-        "listitem",
-      ),
+      within(screen.getByRole("list", { name: "Membros do canal" })).getAllByRole("listitem"),
     ).toHaveLength(7);
     // The files section is the second consumer of the same primitive and is
     // untouched by what the people section did.

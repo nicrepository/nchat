@@ -200,7 +200,7 @@ func TestPGXChannelStoreCreateForActiveMemberPostgreSQL(t *testing.T) {
 }
 
 // A private channel gets its creator's membership in the same transaction, and
-// a public one gets none.
+// a public one gets every active non-guest workspace member.
 func TestPGXChannelStoreCreateForActiveMemberSeedsPrivateMembershipPostgreSQL(t *testing.T) {
 	pool := newChannelAuthzPool(t)
 	store := storage.NewPGXChannelStore(pool)
@@ -224,18 +224,59 @@ func TestPGXChannelStoreCreateForActiveMemberSeedsPrivateMembershipPostgreSQL(t 
 	}
 
 	public, err := store.CreateChannelForActiveMember(ctx, storage.CreateChannelInput{
-		WorkspaceID: chanWorkspace,
-		Slug:        "public-room",
-		DisplayName: "Public Room",
-		Type:        domain.ChannelTypePublic,
-		CreatedBy:   chanMember,
+		WorkspaceID:                  chanWorkspace,
+		Slug:                         "public-room",
+		DisplayName:                  "Public Room",
+		Type:                         domain.ChannelTypePublic,
+		CreatedBy:                    chanMember,
+		EnsurePublicWorkspaceMembers: true,
 	})
 	if err != nil {
 		t.Fatalf("create public channel: %v", err)
 	}
 	if n := countChannelRows(t, pool,
-		`SELECT count(*) FROM chat.channel_members WHERE channel_id = $1`, public.ID); n != 0 {
-		t.Fatalf("public channel got %d channel_members row(s), want 0", n)
+		`SELECT count(*) FROM chat.channel_members WHERE channel_id = $1`, public.ID); n != 4 {
+		t.Fatalf("public channel got %d channel_members row(s), want 4 active non-guests", n)
+	}
+	if n := countChannelRows(t, pool,
+		`SELECT count(*) FROM chat.channel_members WHERE channel_id = $1 AND user_id = $2`, public.ID, chanGuest); n != 0 {
+		t.Fatalf("public channel auto-added guest membership")
+	}
+}
+
+// The database trigger keeps an old application slot correct during a
+// blue/green rollout, even when that slot does not send the new population
+// flag. It also adds a member activated after the channel was created.
+func TestPublicChannelMembershipTriggerCoversOldSlotAndLaterActivationPostgreSQL(t *testing.T) {
+	pool := newChannelAuthzPool(t)
+	store := storage.NewPGXChannelStore(pool)
+	ctx := t.Context()
+
+	public, err := store.CreateChannelForActiveMember(ctx, storage.CreateChannelInput{
+		WorkspaceID: chanWorkspace,
+		Slug:        "public-from-old-slot",
+		DisplayName: "Public From Old Slot",
+		Type:        domain.ChannelTypePublic,
+		CreatedBy:   chanMember,
+	})
+	if err != nil {
+		t.Fatalf("create public channel through old-slot shape: %v", err)
+	}
+	if n := countChannelRows(t, pool,
+		`SELECT count(*) FROM chat.channel_members WHERE channel_id = $1`, public.ID); n != 4 {
+		t.Fatalf("old-slot public channel got %d memberships, want 4", n)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		UPDATE chat.workspace_members
+		SET status = 'active'
+		WHERE workspace_id = $1 AND user_id = $2`, chanWorkspace, chanSuspended); err != nil {
+		t.Fatalf("activate later workspace member: %v", err)
+	}
+	if n := countChannelRows(t, pool,
+		`SELECT count(*) FROM chat.channel_members WHERE channel_id = $1 AND user_id = $2`,
+		public.ID, chanSuspended); n != 1 {
+		t.Fatalf("later active workspace member got %d public memberships, want 1", n)
 	}
 }
 

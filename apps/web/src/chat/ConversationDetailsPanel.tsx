@@ -48,6 +48,7 @@ import {
 
 import "./ConversationDetailsPanel.css";
 import AddMembersDialog from "./AddMembersDialog";
+import { fetchChannelMembers } from "./chatApi";
 import AttachmentThumbnail from "./AttachmentThumbnail";
 import AttachmentVideo from "./AttachmentVideo";
 import ConversationNameField from "./ConversationNameField";
@@ -449,34 +450,6 @@ function rosterItems(
  * contract, and a member the server already vouched for is someone this user
  * may open a conversation with. So the rows behave exactly like a group's.
  */
-function channelMembersContent(
-  details: ChannelDetails,
-  context: RosterContext,
-  removal?: ParticipantRemoval,
-): ExpandableSectionContent {
-  return {
-    status: "ready",
-    count: details.onlineCount,
-    items: rosterItems(
-      details.onlineMembers.map((member) => ({
-        userId: member.userId,
-        displayName: member.displayName,
-        avatarUrl: member.avatarUrl,
-        subtitle: member.role === "moderator" ? "Moderador" : "Membro",
-      })),
-      context,
-      // Everyone here is a chat.channel_members row — the presence filter
-      // narrows that population, it does not come from another one — so the
-      // removal is as valid on a preview row as on a roster row. It matters
-      // while the roster request is in flight, and if it failed.
-      removal,
-    ),
-    // "ninguem online agora", never "este canal nao tem membros" — the
-    // channel's size is reported separately and is unaffected.
-    empty: <SectionMessage>Nenhum membro online no momento.</SectionMessage>,
-  };
-}
-
 /**
  * The channel's administrable membership (issue #469), when the server has
  * answered one.
@@ -502,11 +475,12 @@ function channelMembersContent(
 function channelRosterContent(
   roster: ChannelRoster,
   context: RosterContext,
-  removal: ParticipantRemoval,
+  removal?: ParticipantRemoval,
 ): ExpandableSectionContent {
   return {
     status: "ready",
     count: roster.memberCount,
+    hasMore: Boolean(roster.nextCursor),
     items: rosterItems(
       roster.members.map((member) => ({
         userId: member.userId,
@@ -812,15 +786,9 @@ function FileRow({ file }: { file: ChannelAttachment }) {
 interface PeopleView {
   kind: "channel" | "group";
   details: ConversationDetailsState["details"];
-  /**
-   * The channel's administrable membership, or null (issue #469).
-   *
-   * Null covers every case in which the preview stays: a group, a caller
-   * without the capability, and the moment before the roster request answers.
-   * A failed roster request is also null — the preview is still correct, just
-   * narrower, and blanking the section would be the worse outcome.
-   */
+  /** The full channel roster; presence never selects the rows shown here. */
   roster: ChannelRoster | null;
+  rosterState: ConversationDetailsState["roster"];
   context: RosterContext;
   removal?: ParticipantRemoval;
 }
@@ -849,7 +817,7 @@ const peopleSectionMessages = {
  * — a cast would assert the same thing without the type system checking it.
  */
 function peopleContent(view: PeopleView): ExpandableSectionContent {
-  const { kind, details, roster, context, removal } = view;
+  const { kind, details, roster, rosterState, context, removal } = view;
   const words = peopleSectionMessages[kind];
   if (details.status === "error") return { status: "error", message: words.error };
   if (details.status !== "ready") return { status: "loading", message: words.loading };
@@ -857,9 +825,9 @@ function peopleContent(view: PeopleView): ExpandableSectionContent {
     return groupParticipantsContent(details.data, context, removal);
   }
   if (details.data.kind === "direct") return { status: "loading", message: words.loading };
-  return roster && removal
-    ? channelRosterContent(roster, context, removal)
-    : channelMembersContent(details.data, context, removal);
+  if (rosterState.status === "loading") return { status: "loading", message: words.loading };
+  if (rosterState.status === "error" || !roster) return { status: "error", message: words.error };
+  return channelRosterContent(roster, context, removal);
 }
 
 /**
@@ -1159,9 +1127,9 @@ function rosterShortfall(
  */
 function peopleSectionWords(
   copy: ConversationCopy,
-  roster: ChannelRoster | null,
+  kind: "channel" | "group",
 ): { heading: string; label: string } {
-  if (roster) return { heading: copy.membersHeading, label: copy.membersLabel };
+  if (kind === "channel") return { heading: copy.membersHeading, label: copy.membersLabel };
   return { heading: copy.peopleHeading, label: copy.peopleLabel };
 }
 
@@ -1176,10 +1144,10 @@ function peopleSectionWords(
  */
 function administrableRoster(
   kind: "channel" | "group",
-  canRemove: boolean,
+  _canRemove: boolean,
   roster: ConversationDetailsState["roster"],
 ): ChannelRoster | null {
-  if (kind !== "channel" || !canRemove || roster.status !== "ready") return null;
+  if (kind !== "channel" || roster.status !== "ready") return null;
   return roster.data;
 }
 
@@ -1298,10 +1266,16 @@ function PeopleSection({
     reload,
     fallbackFocusRef: addMembersButtonRef,
   });
-  const channelRoster = administrableRoster(kind, canRemove, roster);
+  const requestedRoster = administrableRoster(kind, canRemove, roster);
+  const [loadedRoster, setLoadedRoster] = useState<{
+    base: ChannelRoster | null;
+    value: ChannelRoster;
+  } | null>(null);
+  const channelRoster =
+    loadedRoster?.base === requestedRoster ? loadedRoster.value : requestedRoster;
   const rowRemoval = rowRemovalFor(kind, canRemove, removal.request);
   const shortfall = rosterShortfall(details, channelRoster);
-  const sectionWords = peopleSectionWords(copy, channelRoster);
+  const sectionWords = peopleSectionWords(copy, kind);
 
   // Open only while the conversation it was opened for is still on screen. The
   // comparison closes it during render — the dialog unmounts, its
@@ -1334,6 +1308,16 @@ function PeopleSection({
     reload();
   }
 
+  function loadMoreMembers() {
+    if (!channelRoster?.nextCursor || kind !== "channel") return;
+    fetchChannelMembers(targetId, undefined, channelRoster.nextCursor).then((next) => {
+      setLoadedRoster({
+        base: requestedRoster,
+        value: { ...next, members: [...channelRoster.members, ...next.members] },
+      });
+    });
+  }
+
   return (
     <>
       {/*
@@ -1352,11 +1336,13 @@ function PeopleSection({
           what keeps "Ver todos" as the default wording for every section that
           can genuinely show everything.
         */
-        expandLabel={shortfall.expandLabel}
+        expandLabel={channelRoster?.nextCursor ? "Carregar mais" : shortfall.expandLabel}
+        onExpand={channelRoster?.nextCursor ? loadMoreMembers : undefined}
         content={peopleContent({
           kind,
           details,
           roster: channelRoster,
+          rosterState: roster,
           context: { presence, currentUserId, openDM },
           removal: rowRemoval,
         })}

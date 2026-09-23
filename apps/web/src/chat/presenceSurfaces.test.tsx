@@ -270,7 +270,13 @@ function detailsStateFor(userId: string): ConversationDetailsState {
   return {
     details: { status: "ready", data: { kind: "channel", ...data } },
     files: { status: "ready", data: [] },
-    roster: { status: "loading" },
+    roster: {
+      status: "ready",
+      data: {
+        memberCount: 1,
+        members: [{ userId, displayName: "Juliane Lino", role: "member" }],
+      },
+    },
     reload: () => {},
   };
 }

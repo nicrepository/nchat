@@ -39,6 +39,7 @@ const { mockFetchChannelDetails, mockFetchConversationAttachments, mockFetchAtta
 
 vi.mock("./chatApi", () => ({
   fetchChannelDetails: (id: string, signal?: AbortSignal) => mockFetchChannelDetails(id, signal),
+  fetchChannelMembers: vi.fn(() => Promise.resolve({ memberCount: 0, members: [] })),
   fetchGroupDetails: vi.fn(),
   fetchDirectProfile: vi.fn(),
 }));

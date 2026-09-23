@@ -4029,7 +4029,7 @@ describe("fetchChannelMembers", () => {
   it("reads the administrable membership and encodes the channel in the path", async () => {
     mockAuthFetch.mockResolvedValueOnce({
       data: {
-        member_count: 12,
+        total: 12,
         members: [
           { user_id: "u-1", display_name: "Álvaro", avatar_url: "/media/a.png", role: "moderator" },
           { user_id: "u-2", display_name: "Juliane", role: "member" },

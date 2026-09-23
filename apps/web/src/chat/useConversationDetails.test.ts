@@ -1467,12 +1467,13 @@ describe("useConversationDetails — metadata não vaza entre conversas", () => 
 // remove anybody would otherwise spend a guaranteed 403 on every channel they
 // open.
 describe("useConversationDetails channel roster", () => {
-  it("does not ask for a roster the caller may not have", async () => {
+  it("loads the roster for every visible channel member", async () => {
+    mockFetchChannelMembers.mockResolvedValue({ memberCount: 1, members: [] });
     const { result } = renderHook(() => useConversationDetails({ kind: "channel", id: "ch-1" }));
 
     await waitFor(() => expect(result.current.details.status).toBe("ready"));
-    expect(mockFetchChannelMembers).not.toHaveBeenCalled();
-    expect(result.current.roster.status).toBe("loading");
+    await waitFor(() => expect(result.current.roster.status).toBe("ready"));
+    expect(mockFetchChannelMembers).toHaveBeenCalledWith("ch-1", expect.any(AbortSignal));
   });
 
   it("loads the roster for a caller the server says may remove members", async () => {

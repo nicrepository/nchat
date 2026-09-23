@@ -739,8 +739,11 @@ func seedBoundChannel(t *testing.T, pool *pgxpool.Pool, members int) {
 			t.Fatalf("seed bound channel: %v", err)
 		}
 	}
+	// Private on purpose: this suite controls the exact membership cardinality.
+	// Public channels now materialize the workspace roster automatically, which
+	// would add unrelated fixture users before the bound members below.
 	exec(`INSERT INTO chat.channels (id, workspace_id, slug, display_name, type, status)
-		VALUES ($1, $2, 'ack-824-bound', 'Ack 824 bound', 'public', 'active')
+		VALUES ($1, $2, 'ack-824-bound', 'Ack 824 bound', 'private', 'active')
 		ON CONFLICT (id) DO NOTHING`, boundChannel, notifyWorkspace)
 	exec(`INSERT INTO chat.channel_members (channel_id, user_id) VALUES ($1, $2)
 		ON CONFLICT DO NOTHING`, boundChannel, notifyAuthor)
@@ -889,10 +892,16 @@ func TestAcknowledgementBoundHoldsWhileMembershipGrowsPostgreSQL(t *testing.T) {
 	// channel across it while sends are in flight.
 	seedBoundChannel(t, pool, domain.MaxAcknowledgementRecipients-4)
 	store := storage.NewPGXMessageStore(pool)
+	// Prove the below-bound side deterministically before racing the remaining
+	// sends with the joins. A fast local database may otherwise commit every
+	// join first, making all raced sends correctly refuse and the test claim the
+	// race proved nothing even though the invariant held.
+	baseline := mustCreate(t, store, boundChannelMessage("824-bound-race-baseline"))
 
 	const sends = 8
 	var wg sync.WaitGroup
-	created := make([]string, sends)
+	created := make([]string, sends+1)
+	created[0] = baseline.ID
 	start := make(chan struct{})
 	for i := range sends {
 		wg.Add(1)
@@ -902,7 +911,7 @@ func TestAcknowledgementBoundHoldsWhileMembershipGrowsPostgreSQL(t *testing.T) {
 			msg, err := store.CreateMessage(context.Background(),
 				boundChannelMessage(fmt.Sprintf("824-bound-race-%d", i)))
 			if err == nil {
-				created[i] = msg.ID
+				created[i+1] = msg.ID
 			}
 		}()
 	}

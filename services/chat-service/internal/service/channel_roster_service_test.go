@@ -73,7 +73,7 @@ func TestChannelService_ListChannelMembers_ReturnsMembershipAndTheServerTotal(t 
 
 // The gate is the removal policy, not read access: a roster answered to someone
 // who could not remove anybody would publish the membership list for nothing.
-func TestChannelService_ListChannelMembers_FollowsCanManageChannelMembers(t *testing.T) {
+func TestChannelService_ListChannelMembers_AllowsEveryActiveVisibleMember(t *testing.T) {
 	for _, role := range []domain.WorkspaceRole{
 		domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin, domain.WorkspaceRoleModerator,
 		domain.WorkspaceRoleMember, domain.WorkspaceRoleGuest, domain.WorkspaceRole("wizard"),
@@ -83,18 +83,11 @@ func TestChannelService_ListChannelMembers_FollowsCanManageChannelMembers(t *tes
 			svc := service.NewChannelService(activeWorkspaceStore("ws-1"), rosterChannelStore(false), ms)
 
 			_, err := svc.ListChannelMembers(context.Background(), rosterInput())
-			allowed := domain.CanManageChannelMembers(&domain.WorkspaceMember{Role: role, Status: domain.MemberStatusActive})
-
-			if allowed && err != nil {
-				t.Fatalf("predicate allows %s but the service refused: %v", role, err)
+			if err != nil {
+				t.Fatalf("active %s was refused: %v", role, err)
 			}
-			if !allowed {
-				if !errors.Is(err, domain.ErrForbidden) {
-					t.Fatalf("predicate denies %s but the service returned %v", role, err)
-				}
-				if len(ms.rosterCalls) != 0 {
-					t.Fatal("a refused caller reached the roster query")
-				}
+			if len(ms.rosterCalls) != 1 {
+				t.Fatal("visible member did not reach roster query")
 			}
 		})
 	}
@@ -102,30 +95,30 @@ func TestChannelService_ListChannelMembers_FollowsCanManageChannelMembers(t *tes
 
 // Authority is settled before the channel is looked up, so this route cannot be
 // used to probe which channel UUIDs exist.
-func TestChannelService_ListChannelMembers_RefusesBeforeResolvingTheChannel(t *testing.T) {
+func TestChannelService_ListChannelMembers_ResolvesVisibleChannelForMembers(t *testing.T) {
 	ms := rosterMemberStore(domain.WorkspaceRoleMember)
 	channels := rosterChannelStore(false)
 	svc := service.NewChannelService(activeWorkspaceStore("ws-1"), channels, ms)
 
-	if _, err := svc.ListChannelMembers(context.Background(), rosterInput()); !errors.Is(err, domain.ErrForbidden) {
-		t.Fatalf("err = %v, want ErrForbidden", err)
+	if _, err := svc.ListChannelMembers(context.Background(), rosterInput()); err != nil {
+		t.Fatalf("err = %v", err)
 	}
-	if channels.getVisibleByIDCalls != 0 {
-		t.Fatalf("channel lookups = %d, want none before the authority check", channels.getVisibleByIDCalls)
+	if channels.getVisibleByIDCalls != 1 {
+		t.Fatalf("channel lookups = %d, want one", channels.getVisibleByIDCalls)
 	}
 }
 
 // #geral's membership belongs to the workspace sync, and the removal refuses
 // it — so there is nothing here to administer and no roster to hand over.
-func TestChannelService_ListChannelMembers_RefusesTheGeneralChannel(t *testing.T) {
+func TestChannelService_ListChannelMembers_IncludesTheGeneralChannel(t *testing.T) {
 	ms := rosterMemberStore(domain.WorkspaceRoleOwner)
 	svc := service.NewChannelService(activeWorkspaceStore("ws-1"), rosterChannelStore(true), ms)
 
-	if _, err := svc.ListChannelMembers(context.Background(), rosterInput()); !errors.Is(err, domain.ErrForbidden) {
-		t.Fatalf("err = %v, want ErrForbidden", err)
+	if _, err := svc.ListChannelMembers(context.Background(), rosterInput()); err != nil {
+		t.Fatalf("err = %v", err)
 	}
-	if len(ms.rosterCalls) != 0 {
-		t.Fatal("#geral reached the roster query")
+	if len(ms.rosterCalls) != 1 {
+		t.Fatal("#geral did not reach roster query")
 	}
 }
 

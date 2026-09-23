@@ -2,10 +2,13 @@ package storage
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -44,13 +47,9 @@ type MemberStore interface {
 	ListOnlineChannelMemberProfiles(
 		ctx context.Context, workspaceID, channelID string, onlineUserIDs []string, limit int,
 	) (ChannelMemberPage, error)
-	// ListChannelMemberRoster returns the channel's explicit members —
-	// chat.channel_members, the population the admin removal deletes from —
-	// as a capped, ordered page plus the full total (issue #469). Unlike
-	// ListOnlineChannelMemberProfiles it applies no presence predicate, so an
-	// offline member stays administrable instead of disappearing. The caller's
-	// authority to administer the channel must already have been settled.
-	ListChannelMemberRoster(ctx context.Context, workspaceID, channelID string, limit int) (ChannelRosterPage, error)
+	// ListChannelMemberRoster returns an authorized caller's complete effective
+	// membership as an opaque-cursor page. Presence is never part of this query.
+	ListChannelMemberRoster(ctx context.Context, workspaceID, channelID, cursor string, limit int) (ChannelRosterPage, error)
 	// ListChannelMemberProfilesByIDs resolves the subset of userIDs that are
 	// active members of channelID, for the call-participant avatar/name
 	// lookup (issue #612). Unlike ListOnlineChannelMemberProfiles this is not
@@ -82,6 +81,34 @@ type MemberStore interface {
 	RemoveChannelMemberByAdmin(ctx context.Context, workspaceID, channelID, actorID, targetUserID string) (domain.Message, error)
 	EnsureGeneralMembership(ctx context.Context, workspaceID, userID string) error
 	SyncGeneralMemberships(ctx context.Context, workspaceID string) (int64, error)
+}
+
+type rosterCursor struct {
+	Name   string `json:"n"`
+	UserID string `json:"u"`
+}
+
+func decodeRosterCursor(raw string) (rosterCursor, error) {
+	if raw == "" {
+		return rosterCursor{}, nil
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return rosterCursor{}, domain.ErrInvalidInput
+	}
+	var cursor rosterCursor
+	if json.Unmarshal(decoded, &cursor) != nil || cursor.UserID == "" {
+		return rosterCursor{}, domain.ErrInvalidInput
+	}
+	if _, err := uuid.Parse(cursor.UserID); err != nil {
+		return rosterCursor{}, domain.ErrInvalidInput
+	}
+	return cursor, nil
+}
+
+func encodeRosterCursor(profile domain.ChannelMemberProfile) string {
+	encoded, _ := json.Marshal(rosterCursor{Name: strings.ToLower(profile.DisplayName), UserID: profile.UserID})
+	return base64.RawURLEncoding.EncodeToString(encoded)
 }
 
 // PGXMemberStore implements MemberStore using a pgx connection pool.
@@ -901,6 +928,7 @@ func (s *PGXMemberStore) ListOnlineChannelMemberProfiles(
 type ChannelRosterPage struct {
 	Members    []domain.ChannelMemberProfile
 	TotalCount int
+	NextCursor string
 }
 
 // ListChannelMemberRoster returns a capped page of a channel's explicit
@@ -928,10 +956,19 @@ type ChannelRosterPage struct {
 // ListParticipantProfiles uses for a group, and for the same reason: a second
 // COUNT statement is a second chance to drift from this one's predicate.
 func (s *PGXMemberStore) ListChannelMemberRoster(
-	ctx context.Context, workspaceID, channelID string, limit int,
+	ctx context.Context, workspaceID, channelID, rawCursor string, limit int,
 ) (ChannelRosterPage, error) {
 	if limit <= 0 || limit > domain.MaxChannelDetailsMembers {
 		limit = domain.MaxChannelDetailsMembers
+	}
+	cursor, err := decodeRosterCursor(rawCursor)
+	if err != nil {
+		return ChannelRosterPage{}, err
+	}
+	hasCursor := rawCursor != ""
+	var cursorUserID any
+	if hasCursor {
+		cursorUserID = cursor.UserID
 	}
 	rows, err := s.pool.Query(ctx, `
 		WITH active_members AS (
@@ -955,14 +992,18 @@ func (s *PGXMemberStore) ListChannelMemberRoster(
 			JOIN auth.users u ON u.id = cm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
 			WHERE cm.channel_id = $2::uuid
 		)
-		SELECT user_id::text,
-		       display_name,
-		       avatar_url,
-		       role,
-		       COUNT(*) OVER () AS total_count
-		FROM active_members
-		ORDER BY lower(display_name), user_id
-		LIMIT $3`, workspaceID, channelID, limit)
+		SELECT total.total_count,
+		       page.user_id::text,
+		       page.display_name,
+		       page.avatar_url,
+		       page.role
+		FROM (SELECT count(*) AS total_count FROM active_members) total
+		LEFT JOIN LATERAL (
+			SELECT * FROM active_members
+			WHERE NOT $3::boolean OR (lower(display_name), user_id) > ($4, $5::uuid)
+			ORDER BY lower(display_name), user_id
+			LIMIT $6
+		) page ON true`, workspaceID, channelID, hasCursor, cursor.Name, cursorUserID, limit+1)
 	if err != nil {
 		return ChannelRosterPage{}, fmt.Errorf("list channel member roster: %w", err)
 	}
@@ -971,15 +1012,26 @@ func (s *PGXMemberStore) ListChannelMemberRoster(
 	page := ChannelRosterPage{Members: make([]domain.ChannelMemberProfile, 0, limit)}
 	for rows.Next() {
 		var (
-			profile domain.ChannelMemberProfile
-			role    string
-			total   int
+			profile     domain.ChannelMemberProfile
+			role        pgtype.Text
+			total       int
+			userID      pgtype.Text
+			displayName pgtype.Text
+			avatarURL   pgtype.Text
 		)
-		if err := rows.Scan(&profile.UserID, &profile.DisplayName, &profile.AvatarURL, &role, &total); err != nil {
+		if err := rows.Scan(&total, &userID, &displayName, &avatarURL, &role); err != nil {
 			return ChannelRosterPage{}, fmt.Errorf("scan channel roster member: %w", err)
 		}
-		profile.Role = domain.ChannelRole(role)
+		if !userID.Valid {
+			continue
+		}
+		profile.UserID, profile.DisplayName, profile.AvatarURL = userID.String, displayName.String, avatarURL.String
+		profile.Role = domain.ChannelRole(role.String)
 		page.TotalCount = total
+		if len(page.Members) == limit {
+			page.NextCursor = encodeRosterCursor(page.Members[len(page.Members)-1])
+			continue
+		}
 		page.Members = append(page.Members, profile)
 	}
 	if err := rows.Err(); err != nil {

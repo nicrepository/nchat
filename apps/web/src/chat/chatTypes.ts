@@ -860,8 +860,8 @@ export interface ChannelRosterMember {
 }
 
 /**
- * A channel's administrable membership: `chat.channel_members`, which is the
- * population the removal acts on (issue #469).
+ * A channel's authoritative membership: `chat.channel_members`, which is both
+ * the population shown to readers and the population member actions act on.
  *
  * It is not `ChannelDetails.onlineMembers` and cannot be derived from it: that
  * array is filtered by presence inside the query, so it never contains an
@@ -869,14 +869,13 @@ export interface ChannelRosterMember {
  * to act on. `memberCount` is the whole membership and `members` the capped
  * page of it, the same relationship every other paged surface here has.
  *
- * One page, and the route offers no cursor: in a channel larger than the cap
- * the removal reaches the rows in hand, and the section says how many those
- * are. Navigating the whole collection is issue #895's, which owns the
- * roster's presentation and consumes this payload.
+ * `nextCursor` continues the stable name/user-id ordering without deriving the
+ * total from the current page.
  */
 export interface ChannelRoster {
   memberCount: number;
   members: ChannelRosterMember[];
+  nextCursor?: string;
 }
 
 // ── Add members (issue #398) ─────────────────────────────────────────────────

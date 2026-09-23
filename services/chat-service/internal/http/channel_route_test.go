@@ -71,7 +71,7 @@ func (s *routeMemberStore) GetWorkspaceMember(_ context.Context, workspaceID, us
 // membership, with no presence predicate and no reordering by connection
 // state, so a route test can tell a roster response from a presence preview.
 func (s *routeMemberStore) ListChannelMemberRoster(
-	_ context.Context, _, channelID string, limit int,
+	_ context.Context, _, channelID, _ string, limit int,
 ) (storage.ChannelRosterPage, error) {
 	s.rosterLimit = limit
 	roster := s.memberPages[channelID]

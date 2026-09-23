@@ -56,8 +56,9 @@ func NewChannelService(workspaces storage.WorkspaceStore, channels storage.Chann
 	return &ChannelService{workspaces: workspaces, channels: channels, members: members}
 }
 
-// CreateChannel creates a public or private channel in an active workspace.
-// Private channels add the creator as a channel member in the storage transaction.
+// CreateChannel creates a channel in an active workspace. Public channels add
+// every eligible workspace member; private channels add their creator, in the
+// same storage transaction as the channel itself.
 //
 // Creating a channel takes no management role (BUG #393): a plain member and an
 // owner take the same path. The one role it excludes is guest, via
@@ -97,18 +98,18 @@ func (s *ChannelService) CreateChannel(ctx context.Context, input CreateChannelI
 	}
 
 	createInput := storage.CreateChannelInput{
-		WorkspaceID: input.WorkspaceID,
-		CategoryID:  categoryID,
-		Slug:        slug,
-		DisplayName: displayName,
-		Type:        input.Type,
-		IsGeneral:   false,
-		Position:    input.Position,
-		CreatedBy:   input.CallerID,
+		WorkspaceID:                  input.WorkspaceID,
+		CategoryID:                   categoryID,
+		Slug:                         slug,
+		DisplayName:                  displayName,
+		Type:                         input.Type,
+		IsGeneral:                    false,
+		Position:                     input.Position,
+		CreatedBy:                    input.CallerID,
+		EnsurePublicWorkspaceMembers: input.Type == domain.ChannelTypePublic,
 	}
-	// A private channel nobody belongs to is invisible to its own creator, so
-	// the membership is part of the same transaction rather than a follow-up
-	// write that could fail on its own.
+	// A private channel starts with its creator. Public channels take the whole
+	// eligible workspace population above, which necessarily includes them.
 	if input.Type == domain.ChannelTypePrivate {
 		createInput.EnsureCreatorMemberRole = domain.ChannelRoleMember
 	}
@@ -240,6 +241,7 @@ type ChannelRosterInput struct {
 	WorkspaceID string
 	CallerID    string
 	ChannelID   string
+	Cursor      string
 	// MemberLimit caps the page. Values outside
 	// (0, domain.MaxChannelDetailsMembers] are clamped by the store.
 	MemberLimit int
@@ -255,6 +257,7 @@ type ChannelRosterInput struct {
 type ChannelRoster struct {
 	Members     []domain.ChannelMemberProfile
 	MemberCount int
+	NextCursor  string
 }
 
 // ListChannelMembers returns the channel's explicit membership for a caller who
@@ -274,25 +277,18 @@ type ChannelRoster struct {
 // cannot see the channel still gets the uniform ErrNotFound the visibility
 // predicate produces.
 func (s *ChannelService) ListChannelMembers(ctx context.Context, input ChannelRosterInput) (ChannelRoster, error) {
-	member, err := s.requireActiveWorkspaceMember(ctx, input.WorkspaceID, input.CallerID)
-	if err != nil {
+	if _, err := s.requireActiveWorkspaceMember(ctx, input.WorkspaceID, input.CallerID); err != nil {
 		return ChannelRoster{}, err
-	}
-	if !domain.CanManageChannelMembers(&member) {
-		return ChannelRoster{}, domain.ErrForbidden
 	}
 	channel, err := s.channels.GetVisibleChannelByID(ctx, input.WorkspaceID, input.ChannelID, input.CallerID)
 	if err != nil {
 		return ChannelRoster{}, err
 	}
-	if channel.IsGeneral {
-		return ChannelRoster{}, domain.ErrForbidden
-	}
-	page, err := s.members.ListChannelMemberRoster(ctx, input.WorkspaceID, channel.ID, input.MemberLimit)
+	page, err := s.members.ListChannelMemberRoster(ctx, input.WorkspaceID, channel.ID, input.Cursor, input.MemberLimit)
 	if err != nil {
 		return ChannelRoster{}, fmt.Errorf("list channel member roster: %w", err)
 	}
-	return ChannelRoster{Members: page.Members, MemberCount: page.TotalCount}, nil
+	return ChannelRoster{Members: page.Members, MemberCount: page.TotalCount, NextCursor: page.NextCursor}, nil
 }
 
 // ChannelCallParticipantProfilesInput asks for presentation identities of a

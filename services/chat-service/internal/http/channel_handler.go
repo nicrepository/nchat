@@ -440,8 +440,9 @@ type channelRosterMemberJSON struct {
 // manager, and folding the two would either hand a roster to readers who may
 // not administer it or make one payload mean different things per caller.
 type channelRosterResponse struct {
-	MemberCount int                       `json:"member_count"`
-	Members     []channelRosterMemberJSON `json:"members"`
+	Total      int                       `json:"total"`
+	NextCursor string                    `json:"next_cursor,omitempty"`
+	Members    []channelRosterMemberJSON `json:"members"`
 }
 
 // Members handles GET /api/chat/channels/{channelID}/members (issue #469).
@@ -473,11 +474,21 @@ func (h *ChannelHandler) Members(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	limit := domain.MaxChannelDetailsMembers
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, parseErr := strconv.Atoi(raw)
+		if parseErr != nil || parsed < 1 || parsed > domain.MaxChannelDetailsMembers {
+			httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "limit must be between 1 and 30")
+			return
+		}
+		limit = parsed
+	}
 	roster, err := h.channels.ListChannelMembers(r.Context(), service.ChannelRosterInput{
 		WorkspaceID: workspaceID,
 		CallerID:    callerID,
 		ChannelID:   channelID,
-		MemberLimit: domain.MaxChannelDetailsMembers,
+		Cursor:      r.URL.Query().Get("cursor"),
+		MemberLimit: limit,
 	})
 	if err != nil {
 		writeChannelRosterError(w, err)
@@ -493,6 +504,8 @@ func (h *ChannelHandler) Members(w http.ResponseWriter, r *http.Request) {
 // indistinguishable from one that does not exist.
 func writeChannelRosterError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, domain.ErrInvalidInput):
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid cursor")
 	case errors.Is(err, domain.ErrForbidden):
 		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "forbidden")
 	case errors.Is(err, domain.ErrNotFound):
@@ -512,7 +525,7 @@ func channelRosterBody(roster service.ChannelRoster) channelRosterResponse {
 			Role:        string(member.Role),
 		})
 	}
-	return channelRosterResponse{MemberCount: roster.MemberCount, Members: members}
+	return channelRosterResponse{Total: roster.MemberCount, NextCursor: roster.NextCursor, Members: members}
 }
 
 // ── Call-participant profiles (issue #612) ───────────────────────────────────
