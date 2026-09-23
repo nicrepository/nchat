@@ -33,6 +33,7 @@ import { flushResizeObservers } from "../setupTests";
 import ChatMessageArea from "./ChatMessageArea";
 import { saveViewportAnchor } from "./chatViewportPersistence";
 import { PREPEND_ANCHOR_TOLERANCE_PX, VIRTUALIZE_MIN_ROWS } from "./timelineVirtualization";
+import { UNREAD_ANCHOR_TOLERANCE_PX } from "./message-area/viewport/navigation";
 import type { ChatOutletContext } from "./ChatShell";
 import type { Message, MessagePage } from "./chatTypes";
 import type { WSMessageCreatedEvent } from "./useChatWebSocket";
@@ -1202,5 +1203,140 @@ describe("a virtualized timeline", { timeout: 30_000 }, () => {
     expect(host.querySelectorAll(".chat-msg-area__day-divider").length).toBeGreaterThan(0);
     expect(screen.getByRole("separator", { name: "Novas mensagens" })).toBeInTheDocument();
     expect(screen.getByTestId("chat-system-message")).toBeInTheDocument();
+  });
+
+  // ── #880: one owner for a programmatic navigation ──────────────────────────
+
+  it("reaches the real tail after a prepended page, with nothing putting the old position back", async () => {
+    mockFetchChannelMessages
+      .mockResolvedValueOnce({ messages: history(), nextCursor: "older" })
+      .mockResolvedValueOnce({ messages: history(20, -20), nextCursor: "" });
+    await openVirtualizedChannel();
+
+    scrollport.scrollTo(0);
+    await waitFor(() => expect(mockFetchChannelMessages).toHaveBeenCalledTimes(2));
+    await settleUntil(() => expect(scrollport.top()).toBeGreaterThan(0));
+    await settleLayout();
+
+    // Up in the history, with "prepend" still the last mutation this timeline
+    // saw — the state the #880 DEV capture was taken in. The restoration that
+    // mutation armed used to be re-armed by the very phase change that ended
+    // the trip to the end, and would then write a stale anchor back: measured
+    // at 238px short of the tail, with the control already hidden.
+    scrollport.scrollTo(400);
+    await settleLayout();
+
+    await act(async () => {
+      screen.getByRole("button", { name: /Ir para o final/i }).click();
+    });
+    // An attachment in the last screenful finishing its layout mid-trip: the
+    // destination moves while the navigation is still travelling to it.
+    scrollport.grow(`m-${HISTORY_SIZE - 2}`, 520);
+    await settleUntil(() =>
+      expect(scrollport.top()).toBe(Math.max(0, scrollport.height() - VIEWPORT_PX)),
+    );
+
+    expect(scrollport.top()).toBe(Math.max(0, scrollport.height() - VIEWPORT_PX));
+    expect(screen.getByText(`Mensagem ${HISTORY_SIZE - 1}`)).toBeInTheDocument();
+    // And the control agrees with the geometry, which is the half of the
+    // defect a reader actually sees: it used to hide while stranded.
+    expect(screen.queryByRole("button", { name: /Ir para o final/i })).toBeNull();
+  });
+
+  it("opens on the unread boundary with read context above it, never flush against the top", async () => {
+    mockFetchChannelMessages.mockResolvedValue({ messages: history(), nextCursor: "" });
+
+    await openVirtualizedChannel({ unreadCount: 12 });
+
+    const divider = await screen.findByRole("separator", { name: "Novas mensagens" });
+    const offsetOfDivider = () =>
+      divider.getBoundingClientRect().top - listElement().getBoundingClientRect().top;
+    // The contract, not the exact pixel: a strip of already-read context above
+    // the boundary, and not half the viewport of it. The offset itself is
+    // unreadContextOffsetPx's own test — rows above the fold keep being
+    // measured after the arrival, and each of those legitimately moves the
+    // separator a little without changing what the reader sees.
+    await settleUntil(() => {
+      expect(offsetOfDivider()).toBeGreaterThanOrEqual(UNREAD_ANCHOR_TOLERANCE_PX);
+      expect(offsetOfDivider()).toBeLessThan(VIEWPORT_PX / 2);
+    });
+
+    // The row above the boundary is mounted and on screen: what "context"
+    // means here is the last thing this reader had already read.
+    const dividerIndex = Number(divider.closest<HTMLElement>("[data-index]")!.dataset.index);
+    const above = mountedRows().find((row) => row.index === dividerIndex - 1);
+    expect(above).toBeDefined();
+    expect(above!.start + above!.element.offsetHeight).toBeGreaterThan(scrollport.top());
+  });
+
+  it("offers the unread boundary first and the end afterwards, from the one control", async () => {
+    mockFetchChannelMessages.mockResolvedValue({ messages: history(), nextCursor: "" });
+    await openVirtualizedChannel({ unreadCount: 12 });
+    await settleLayout();
+
+    // Reading history, well above the boundary: what the control offers is the
+    // nearest thing not yet seen, which is the boundary and not the end.
+    scrollport.scrollTo(0);
+    await settleLayout();
+    const toBoundary = await screen.findByRole("button", {
+      name: "Começar pelas 12 novas mensagens",
+    });
+
+    await act(async () => {
+      toBoundary.click();
+    });
+    await settleUntil(() => {
+      const divider = screen.getByRole("separator", { name: "Novas mensagens" });
+      const offset =
+        divider.getBoundingClientRect().top - listElement().getBoundingClientRect().top;
+      expect(offset).toBeGreaterThanOrEqual(UNREAD_ANCHOR_TOLERANCE_PX);
+      expect(offset).toBeLessThan(VIEWPORT_PX / 2);
+    });
+    // It stopped at the boundary rather than carrying on to the end — the
+    // first unread messages are exactly what the reader came back for.
+    expect(scrollport.top()).toBeLessThan(scrollport.height() - VIEWPORT_PX);
+
+    // Same control, now meaning the end, and it takes the reader there.
+    const toTail = await screen.findByRole("button", { name: /^Ir para o final da conversa/ });
+    await act(async () => {
+      toTail.click();
+    });
+    // Waited on the arrival itself, the same way the neighbouring tail test
+    // does — not through settleUntil's reflows, whose scroll events at an
+    // unchanged position are a harness artefact the #788 gate reads as a
+    // reader (a browser never fires a scroll event for a scrollport that did
+    // not move), and which would be testing that gate rather than the trip.
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /Ir para o final|Começar pelas/ })).toBeNull(),
+    );
+    expect(scrollport.top()).toBeGreaterThanOrEqual(scrollport.height() - VIEWPORT_PX - 1);
+  });
+
+  it("counts real unread on the control, not the messages below the fold", async () => {
+    mockFetchChannelMessages.mockResolvedValue({ messages: history(), nextCursor: "" });
+    await openVirtualizedChannel();
+    await scrollToTail();
+
+    // Read to the end, then back up the whole conversation: dozens of messages
+    // are below the reader and every one of them has been read.
+    scrollport.scrollTo(0);
+    await settleLayout();
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    ).toBeVisible();
+
+    // Three arrive behind them, and only those three are unread.
+    for (const id of ["m-a", "m-b", "m-c"]) {
+      act(() => {
+        wsState.onMessageCreated?.(messageCreated(id, `Chegou ${id}`));
+      });
+    }
+    await settleLayout();
+
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa, 3 novas mensagens" }),
+    ).toBeVisible();
+    // And the viewport was never hijacked to show them.
+    expect(scrollport.top()).toBe(0);
   });
 });

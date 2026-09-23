@@ -156,7 +156,7 @@ describe("shouldShiftReadingPositionForResize", () => {
       readingOffsetPx: reading,
       isFirstMeasurement: false,
       restoring: false,
-      scrollingToEnd: false,
+      navigating: false,
       ...over,
     });
 
@@ -174,8 +174,8 @@ describe("shouldShiftReadingPositionForResize", () => {
       // The browser is animating that scroll, and any programmatic write to
       // scrollTop cancels it — leaving the reader stranded wherever the write
       // landed, with nothing left to finish the trip.
-      expect(resize({ scrollingToEnd: true, rowStartPx: 0, rowSizePx: 100 })).toBe(false);
-      expect(resize({ scrollingToEnd: true, isFirstMeasurement: true, rowStartPx: 0 })).toBe(false);
+      expect(resize({ navigating: true, rowStartPx: 0, rowSizePx: 100 })).toBe(false);
+      expect(resize({ navigating: true, isFirstMeasurement: true, rowStartPx: 0 })).toBe(false);
     });
   });
 

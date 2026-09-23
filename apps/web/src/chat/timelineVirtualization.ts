@@ -197,9 +197,10 @@ export interface RowResize {
   /** Whether a prepend restoration currently owns the scroll position. */
   restoring: boolean;
   /**
-   * Whether an explicit "take me to the end" is in flight and owns it instead.
+   * Whether a programmatic navigation (#880) owns it instead — a trip to the
+   * end, or to the unread boundary.
    */
-  scrollingToEnd: boolean;
+  navigating: boolean;
 }
 
 /**
@@ -215,11 +216,12 @@ export interface RowResize {
  * PREPEND_RESTORE measures the anchor's real box and corrects to it, so an
  * adjustment landing in the same cycle is either redundant or a fight.
  *
- * SCROLLING_TO_BOTTOM is an animation the browser is running: any programmatic
- * write to scrollTop cancels it, and a cancelled animation has nobody left to
- * finish it — the reader is simply stranded wherever the write landed, which is
- * how "Ir para o final" could stop thirty thousand pixels short. The tail-lock
- * is what follows the growing content in that state, and it does not need this.
+ * A navigation (#880) is travelling to a logical destination and re-deriving
+ * where that destination is on every measurement. An adjustment landing in the
+ * middle of that is a second writer moving the scrollport underneath it — and
+ * an animated trip it cancels outright, leaving the reader stranded wherever
+ * the write landed, which is how "Ir para o final" could stop thirty thousand
+ * pixels short.
  *
  * Both hand the authority back the moment they end.
  *
@@ -242,7 +244,7 @@ export interface RowResize {
  * scrolled past.
  */
 export function shouldShiftReadingPositionForResize(resize: RowResize): boolean {
-  if (resize.restoring || resize.scrollingToEnd) return false;
+  if (resize.restoring || resize.navigating) return false;
   if (resize.isFirstMeasurement) return resize.rowStartPx < resize.readingOffsetPx;
   return resize.rowStartPx + resize.rowSizePx <= resize.readingOffsetPx;
 }

@@ -104,9 +104,8 @@ export default function MessageList(props: MessageListProps) {
     virtualizer,
     highlightedMessageId,
     jumpToMessage,
-    pendingCount,
-    scrollButtonVisible,
-    scrollToBottomNow,
+    scrollButton,
+    onScrollButtonClick,
     focusList,
   } = useConversationViewport({
     messages,
@@ -208,11 +207,7 @@ export default function MessageList(props: MessageListProps) {
           <div ref={bottomRef} data-testid="chat-bottom-sentinel" />
         </div>
       </div>
-      <ScrollToBottomButton
-        visible={scrollButtonVisible}
-        pendingCount={pendingCount}
-        onClick={scrollToBottomNow}
-      />
+      <ScrollToBottomButton state={scrollButton} onClick={onScrollButtonClick} />
     </div>
   );
 

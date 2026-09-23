@@ -10,7 +10,10 @@
 import type { RefObject } from "react";
 import type { Virtualizer } from "@tanstack/react-virtual";
 
+import { isNearBottom, TAIL_EPSILON_PX } from "../../chatViewportState";
+import { animationIsInterruptible } from "./navigation";
 import { scrollToEndBehavior } from "../../timelineVirtualization";
+import type { ReadingPosition } from "./useViewportCore";
 
 /**
  * Scrolls the timeline to its newest message with an explicit behavior —
@@ -31,6 +34,14 @@ export function scrollToBottom(
   }
 }
 
+/** The reader's position, read off a scrollport whose geometry is trustworthy. */
+export function readingPositionOf(el: HTMLDivElement): ReadingPosition {
+  return {
+    nearBottom: isNearBottom(el.scrollHeight, el.scrollTop, el.clientHeight),
+    followTail: isNearBottom(el.scrollHeight, el.scrollTop, el.clientHeight, TAIL_EPSILON_PX),
+  };
+}
+
 /** #492: reduced motion always wins over an explicit animated scroll. */
 export function prefersReducedMotion(): boolean {
   return (
@@ -42,14 +53,17 @@ export function prefersReducedMotion(): boolean {
 /**
  * The behavior an explicit user-triggered scroll (button, own-send) should use.
  *
- * Animated when the trip is short enough for the animation to survive it — see
- * MAX_SMOOTH_SCROLL_DISTANCE_PX for why distance is the deciding factor and not
- * taste.
+ * Animated when the trip is short enough for the animation to survive it (see
+ * MAX_SMOOTH_SCROLL_DISTANCE_PX) *and* when the reader could still take the
+ * scrollport back from it mid-flight (see animationIsInterruptible). Neither
+ * is a matter of taste.
  */
 export function explicitScrollBehavior(container: HTMLDivElement | null): ScrollBehavior {
-  const remaining = container
-    ? container.scrollHeight - container.scrollTop - container.clientHeight
-    : 0;
+  if (!container) return "auto";
+  // #880: an animation the reader cannot interrupt is worse than no animation,
+  // and whether they can depends on the scrollbar being part of the page.
+  if (!animationIsInterruptible(container.offsetWidth, container.clientWidth)) return "auto";
+  const remaining = container.scrollHeight - container.scrollTop - container.clientHeight;
   return scrollToEndBehavior(remaining, prefersReducedMotion());
 }
 

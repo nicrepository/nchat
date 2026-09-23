@@ -347,6 +347,22 @@ function settleListLayout(list: HTMLElement, scrollHeight: number, clientHeight:
   fireEvent.scroll(list);
 }
 
+/**
+ * A scrollport whose scrollbar is part of the page (#880).
+ *
+ * The border box is wider than the content box by the bar's width, which is
+ * what lets a drag on it reach the page as a pointer — and therefore what
+ * makes an animated trip interruptible. jsdom lays out neither, so a test that
+ * wants an animation has to say so.
+ */
+function withClassicScrollbar(list: HTMLElement, clientWidth = 400, scrollbarWidth = 15) {
+  Object.defineProperty(list, "clientWidth", { configurable: true, value: clientWidth });
+  Object.defineProperty(list, "offsetWidth", {
+    configurable: true,
+    value: clientWidth + scrollbarWidth,
+  });
+}
+
 /** The reader's own scroll: only scrollTop moves, exactly as in a browser. */
 function userScrollTo(list: HTMLElement, scrollTop: number) {
   Object.defineProperty(list, "scrollTop", {
@@ -5411,7 +5427,7 @@ describe("ChatMessageArea — infinite scroll", () => {
     expect(scrollMock).not.toHaveBeenCalled();
   });
 
-  it("calls scrollIntoView when a new message is sent (append)", async () => {
+  it("returns the viewport to the end when a message is sent (append)", async () => {
     mockFetchChannelMessages.mockResolvedValue({
       messages: [makeMessage({ id: "m1" })],
       nextCursor: "",
@@ -5421,10 +5437,10 @@ describe("ChatMessageArea — infinite scroll", () => {
     renderChannelArea();
     await waitFor(() => expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(1));
 
-    // beforeEach sets window.Element.prototype.scrollIntoView = vi.fn().
-    // Clear its call history here to only count calls triggered by the send.
-    const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
-    scrollMock.mockClear();
+    // A reader up in the history, with the geometry jsdom lays out for nobody.
+    const list = screen.getByRole("log");
+    settleListLayout(list, 1000, 400);
+    userScrollTo(list, 0);
 
     const input = screen.getByTestId("chat-composer-input");
     await fillEditor(input, "Enviada");
@@ -5432,8 +5448,11 @@ describe("ChatMessageArea — infinite scroll", () => {
 
     await waitFor(() => expect(screen.getByText("Enviada")).toBeInTheDocument());
 
-    // Append (sent) must scroll to bottom.
-    expect(scrollMock).toHaveBeenCalledTimes(1);
+    // #880: sending is an explicit intent to come back to the present, and it
+    // gets there through the same navigator the button uses — a scroll
+    // position derived from the layout, rather than a scrollIntoView aimed at
+    // a sentinel whose own position trails that layout by a commit.
+    await waitFor(() => expect(list.scrollTop).toBe(600));
   });
 });
 
@@ -6954,9 +6973,12 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
 
     await waitFor(() => expect(screen.getByText("Última mensagem")).toBeInTheDocument());
 
+    // #880: opening at the end is a navigation like any other, driven to the
+    // tail by the navigator — and, like #492 always required, never animated
+    // and never flashing the control on the way there.
     const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
-    expect(scrollMock).toHaveBeenCalledWith({ behavior: "auto" });
     expect(scrollMock).not.toHaveBeenCalledWith(expect.objectContaining({ behavior: "smooth" }));
+    expect(screen.queryByRole("button", { name: /Ir para o final/ })).not.toBeInTheDocument();
   });
 
   it("opens directly at the first unread message with a 'Novas mensagens' separator when unreadCount > 0", async () => {
@@ -7138,13 +7160,354 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
 
     scrollAwayFromBottom(list);
     const button = await screen.findByRole("button", { name: "Ir para o final da conversa" });
+    const animated = vi.fn();
+    list.scrollTo = animated as unknown as typeof list.scrollTo;
 
-    const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
-    scrollMock.mockClear();
     await userEvent.click(button);
 
-    expect(scrollMock).toHaveBeenCalledWith({ behavior: "auto" });
-    expect(scrollMock).not.toHaveBeenCalledWith(expect.objectContaining({ behavior: "smooth" }));
+    // Same destination, same retargeting, no animation: the reader arrives
+    // at the end (scrollHeight 1000 − clientHeight 400) in one step.
+    expect(list.scrollTop).toBe(600);
+    expect(animated).not.toHaveBeenCalled();
+  });
+
+  it("animates a short trip to the end when motion is allowed", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+    );
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+
+    withClassicScrollbar(list);
+    scrollAwayFromBottom(list);
+    const button = await screen.findByRole("button", { name: "Ir para o final da conversa" });
+    const animated = vi.fn();
+    list.scrollTo = animated as unknown as typeof list.scrollTo;
+
+    await userEvent.click(button);
+
+    expect(animated).toHaveBeenCalledWith({ top: 600, behavior: "smooth" });
+  });
+
+  it("never animates across a whole conversation of loaded history", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+    );
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+
+    // #675: past MAX_SMOOTH_SCROLL_DISTANCE_PX an animation is a teleport
+    // with extra steps, and one nothing can correct while it runs.
+    settleListLayout(list, 40_000, 400);
+    userScrollTo(list, 0);
+    const button = await screen.findByRole("button", { name: "Ir para o final da conversa" });
+    const animated = vi.fn();
+    list.scrollTo = animated as unknown as typeof list.scrollTo;
+
+    await userEvent.click(button);
+
+    expect(list.scrollTop).toBe(39_600);
+    expect(animated).not.toHaveBeenCalled();
+  });
+
+  it("hands the viewport back to a reader who scrolls during a trip to the end", async () => {
+    const initialMsg = makeMessage({ id: "m1", bodyText: "Msg" });
+    const wsMsg = makeMessage({ id: "m2", senderId: "other-1", bodyText: "Chegou depois" });
+    mockFetchChannelMessages.mockResolvedValue(messagePage([initialMsg]));
+    vi.mocked(chatApi.fetchChannelMessage).mockResolvedValue(wsMsg);
+    vi.mocked(useChatWebSocket).mockImplementation(
+      ({ onMessageCreated }: { onMessageCreated: (evt: WSMessageCreatedEvent) => void }) => {
+        capturedOnMessageCreatedForBadge = onMessageCreated;
+        return {
+          toggleReaction: wsMockState.toggleReaction,
+          sendTyping: wsMockState.sendTyping,
+          connectionStatus: "connected",
+        };
+      },
+    );
+
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+    withClassicScrollbar(list);
+    scrollAwayFromBottom(list);
+
+    // A short trip, so it animates — and the animation never moves here, which
+    // is a trip still in flight when the reader reaches for the wheel.
+    const animated = vi.fn();
+    list.scrollTo = animated as unknown as typeof list.scrollTo;
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    );
+    expect(animated).toHaveBeenCalledTimes(1);
+
+    fireEvent.wheel(list);
+
+    // The trip is over and the reader is where they are: up in the history. A
+    // message arriving now is unread for them, and nothing moves to show it.
+    await act(async () => {
+      capturedOnMessageCreatedForBadge?.({
+        type: "message.created",
+        event_id: "evt-cancel",
+        created_at: new Date().toISOString(),
+        workspace_id: "ws-1",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m2",
+      });
+    });
+    await waitFor(() => expect(screen.getByText("Chegou depois")).toBeInTheDocument());
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa, 1 novas mensagens" }),
+    ).toBeInTheDocument();
+
+    // And a later reflow is not mistaken for the old trip still being alive.
+    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1400 });
+    act(() => flushResizeObservers());
+    expect(list.scrollTop).toBe(0);
+    expect(animated).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a reader who dragged the scrollbar out of a trip to the end", async () => {
+    const initialMsg = makeMessage({ id: "m1", bodyText: "Msg" });
+    const wsMsg = makeMessage({ id: "m2", senderId: "other-1", bodyText: "Chegou depois" });
+    mockFetchChannelMessages.mockResolvedValue(messagePage([initialMsg]));
+    vi.mocked(chatApi.fetchChannelMessage).mockResolvedValue(wsMsg);
+    vi.mocked(useChatWebSocket).mockImplementation(
+      ({ onMessageCreated }: { onMessageCreated: (evt: WSMessageCreatedEvent) => void }) => {
+        capturedOnMessageCreatedForBadge = onMessageCreated;
+        return {
+          toggleReaction: wsMockState.toggleReaction,
+          sendTyping: wsMockState.sendTyping,
+          connectionStatus: "connected",
+        };
+      },
+    );
+
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+    withClassicScrollbar(list);
+    scrollAwayFromBottom(list);
+
+    const animated = vi.fn();
+    list.scrollTo = animated as unknown as typeof list.scrollTo;
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    );
+    expect(animated).toHaveBeenCalledTimes(1);
+
+    // The reader grabs the scrollbar while the trip is still travelling: the
+    // pointer lands past the content box, where nothing else can be.
+    const drag = new Event("pointerdown", { bubbles: true });
+    Object.defineProperty(drag, "offsetX", { value: 406 });
+    act(() => {
+      list.dispatchEvent(drag);
+    });
+    userScrollTo(list, 100);
+
+    // A message arriving now is unread, and the viewport is theirs.
+    await act(async () => {
+      capturedOnMessageCreatedForBadge?.({
+        type: "message.created",
+        event_id: "evt-drag",
+        created_at: new Date().toISOString(),
+        workspace_id: "ws-1",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m2",
+      });
+    });
+    await waitFor(() => expect(screen.getByText("Chegou depois")).toBeInTheDocument());
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa, 1 novas mensagens" }),
+    ).toBeInTheDocument();
+    expect(list.scrollTop).toBe(100);
+
+    // And a reflow afterwards belongs to nobody: the trip is over.
+    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1400 });
+    act(() => flushResizeObservers());
+    expect(list.scrollTop).toBe(100);
+    expect(animated).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a reader who dragged an overlay scrollbar, which reaches the page only as a scroll", async () => {
+    const initialMsg = makeMessage({ id: "m1", bodyText: "Msg" });
+    const wsMsg = makeMessage({ id: "m2", senderId: "other-1", bodyText: "Chegou depois" });
+    mockFetchChannelMessages.mockResolvedValue(messagePage([initialMsg]));
+    vi.mocked(chatApi.fetchChannelMessage).mockResolvedValue(wsMsg);
+    vi.mocked(useChatWebSocket).mockImplementation(
+      ({ onMessageCreated }: { onMessageCreated: (evt: WSMessageCreatedEvent) => void }) => {
+        capturedOnMessageCreatedForBadge = onMessageCreated;
+        return {
+          toggleReaction: wsMockState.toggleReaction,
+          sendTyping: wsMockState.sendTyping,
+          connectionStatus: "connected",
+        };
+      },
+    );
+
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+
+    // A whole conversation of history below them: the trip there is instant
+    // (#675), so nothing is animating and the scrollport's position is the
+    // navigation's own until somebody else moves it.
+    settleListLayout(list, 40_000, 400);
+    userScrollTo(list, 0);
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    );
+    expect(list.scrollTop).toBe(39_600);
+
+    // The drag: no pointer event reaches the page, only the scroll it caused.
+    userScrollTo(list, 5_000);
+
+    await act(async () => {
+      capturedOnMessageCreatedForBadge?.({
+        type: "message.created",
+        event_id: "evt-overlay",
+        created_at: new Date().toISOString(),
+        workspace_id: "ws-1",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m2",
+      });
+    });
+    await waitFor(() => expect(screen.getByText("Chegou depois")).toBeInTheDocument());
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa, 1 novas mensagens" }),
+    ).toBeInTheDocument();
+    expect(list.scrollTop).toBe(5_000);
+
+    // And the reflow that follows has no trip left to retarget.
+    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 41_000 });
+    act(() => flushResizeObservers());
+    expect(list.scrollTop).toBe(5_000);
+  });
+
+  it("never leaves an animation running where a drag would reach the page as nothing", async () => {
+    const initialMsg = makeMessage({ id: "m1", bodyText: "Msg" });
+    const wsMsg = makeMessage({ id: "m2", senderId: "other-1", bodyText: "Chegou depois" });
+    mockFetchChannelMessages.mockResolvedValue(messagePage([initialMsg]));
+    vi.mocked(chatApi.fetchChannelMessage).mockResolvedValue(wsMsg);
+    vi.mocked(useChatWebSocket).mockImplementation(
+      ({ onMessageCreated }: { onMessageCreated: (evt: WSMessageCreatedEvent) => void }) => {
+        capturedOnMessageCreatedForBadge = onMessageCreated;
+        return {
+          toggleReaction: wsMockState.toggleReaction,
+          sendTyping: wsMockState.sendTyping,
+          connectionStatus: "connected",
+        };
+      },
+    );
+
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+
+    // An overlay scrollbar: the border box has no room for one, so a drag on
+    // it is browser chrome and the page is told nothing but the scroll.
+    Object.defineProperty(list, "clientWidth", { configurable: true, value: 400 });
+    Object.defineProperty(list, "offsetWidth", { configurable: true, value: 400 });
+    scrollAwayFromBottom(list);
+
+    const animated = vi.fn();
+    list.scrollTo = animated as unknown as typeof list.scrollTo;
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    );
+
+    // Short enough to animate (#675) and instant anyway: an animation nobody
+    // could interrupt here is worse than none.
+    expect(animated).not.toHaveBeenCalled();
+    expect(list.scrollTop).toBe(600);
+
+    // And so the drag — a scroll event and nothing else — is recognised.
+    userScrollTo(list, 120);
+    await act(async () => {
+      capturedOnMessageCreatedForBadge?.({
+        type: "message.created",
+        event_id: "evt-overlay-smooth",
+        created_at: new Date().toISOString(),
+        workspace_id: "ws-1",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m2",
+      });
+    });
+    await waitFor(() => expect(screen.getByText("Chegou depois")).toBeInTheDocument());
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa, 1 novas mensagens" }),
+    ).toBeInTheDocument();
+    expect(list.scrollTop).toBe(120);
+
+    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1400 });
+    act(() => flushResizeObservers());
+    expect(list.scrollTop).toBe(120);
+  });
+
+  it("does not mistake the frames of its own animation for the reader", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+    );
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+    withClassicScrollbar(list);
+    scrollAwayFromBottom(list);
+
+    const animated = vi.fn();
+    list.scrollTo = animated as unknown as typeof list.scrollTo;
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    );
+    expect(animated).toHaveBeenCalledWith({ top: 600, behavior: "smooth" });
+
+    // The animation travelling: every one of these positions is one the trip
+    // put the scrollport in, and none of them ends it.
+    for (const top of [180, 360, 540]) {
+      userScrollTo(list, top);
+      expect(
+        screen.getByRole("button", { name: "Ir para o final da conversa" }),
+      ).toBeInTheDocument();
+    }
+
+    // A reflow mid-animation retargets rather than cancels: the trip is still
+    // the owner, and it is the one that writes.
+    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1600 });
+    act(() => flushResizeObservers());
+    expect(list.scrollTop).toBe(1200);
+  });
+
+  it("settles on the end when the reader takes over a trip that has already arrived there", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+    );
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+    withClassicScrollbar(list);
+    scrollAwayFromBottom(list);
+
+    const animated = vi.fn();
+    list.scrollTo = animated as unknown as typeof list.scrollTo;
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    );
+    // The animation reached the end, but the sentinel has not reported yet.
+    list.scrollTop = 600;
+
+    fireEvent.keyDown(list, { key: "ArrowDown" });
+
+    // At the end by the geometry, so that is the phase — not a trip that
+    // nobody owns any more, which would leave the control on screen for good.
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /Ir para o final/ })).not.toBeInTheDocument(),
+    );
   });
 
   it("names the button with the pending count once new messages arrive while reading history", async () => {
