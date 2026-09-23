@@ -3,6 +3,7 @@ package urlsafety
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 )
@@ -109,22 +110,61 @@ func (c *CloudflareScanner) findReusableEvidenceAt(
 	if err != nil {
 		return ReusableEvidence{}, err
 	}
-	candidate, ok := selectReusableCandidate(decoded, canonicalURL, now.Add(-maxAge))
-	if !ok {
-		return ReusableEvidence{}, ErrNoReusableEvidence
+	candidates := selectReusableCandidates(decoded, canonicalURL, now.Add(-maxAge))
+	for _, candidate := range candidates {
+		evidence, err := c.readCandidate(ctx, candidate, canonicalURL, now, maxAge)
+		if err == nil {
+			return evidence, nil
+		}
+		if !errors.Is(err, ErrNoReusableEvidence) {
+			// A failure of the exchange itself, not of this candidate: the
+			// caller went away, the provider is refusing everyone, the account
+			// is throttled. Reading the next candidate would ask the same
+			// question of the same provider and get the same answer, so the
+			// whole operation stops and reports what happened.
+			return ReusableEvidence{}, err
+		}
+		// This candidate cannot answer — still running, no verdict, a report
+		// about something else, too old. The next one might, and each is an
+		// independent scan.
 	}
+	return ReusableEvidence{}, ErrNoReusableEvidence
+}
+
+// readCandidate reads one candidate's full report and decides whether it is
+// usable evidence.
+//
+// The split between the two error kinds is the whole contract of the loop
+// above, and it is decided by what the failure is a fact *about*:
+//
+//   - about this one scan — still running, a body this client cannot read, a
+//     report describing something else, no usable verdict, too old — is
+//     ErrNoReusableEvidence. Each candidate is an independent scan, so none of
+//     these says anything about the one before it;
+//   - about the provider or the account — a refused credential, an exhausted
+//     quota, an outage, a transport failure, the caller going away — is
+//     returned as itself. Reading the next candidate would ask the same
+//     provider the same question and get the same answer, so the walk stops
+//     and the caller learns it could not ask rather than that there was
+//     nothing to find.
+func (c *CloudflareScanner) readCandidate(
+	ctx context.Context, candidate ScanRecord, canonicalURL string,
+	now time.Time, maxAge time.Duration,
+) (ReusableEvidence, error) {
 	report, err := c.fetchScanReport(ctx, candidate.UUID)
-	switch {
-	case errors.Is(err, ErrScanPending):
-		// Found, but not finished. Not evidence yet and not a failure either:
-		// the caller submits, and a scan already running for this URL is exactly
-		// what the hostname budget will refuse anyway — which converges to
-		// UNKNOWN rather than to anything permissive.
-		return ReusableEvidence{}, ErrNoReusableEvidence
-	case err != nil:
+	if err != nil {
+		if candidateUnusable(err) {
+			return ReusableEvidence{}, ErrNoReusableEvidence
+		}
 		return ReusableEvidence{}, err
 	}
 	return usableEvidence(report, candidate, canonicalURL, now, maxAge)
+}
+
+// candidateUnusable reports whether a failed report read is a fact about this
+// one scan rather than about the provider.
+func candidateUnusable(err error) bool {
+	return errors.Is(err, ErrScanPending) || FailureReason(err) == ReasonMalformed
 }
 
 // usableEvidence applies the report-level checks to a candidate's full report.
@@ -168,28 +208,56 @@ func usableEvidence(
 	return ReusableEvidence{Verdict: verdict, ObservedAt: observedAt, UUID: candidate.UUID}, nil
 }
 
-// selectReusableCandidate picks the newest scan of exactly this URL that is
-// inside the freshness window.
+// maxReusableCandidates bounds how many reports one reuse attempt reads.
+//
+// The search already returns at most searchLookbackLimit results, so this is a
+// second, tighter bound on the expensive half: each candidate costs a request.
+// Small on purpose. The question is "does a usable answer already exist", and
+// if the three newest scans of this exact URL cannot answer it, a fourth is not
+// going to — submitting is the right next step. This is evidence reuse, not a
+// crawler.
+const maxReusableCandidates = 3
+
+// selectReusableCandidates returns the eligible scans of exactly this URL that
+// are inside the freshness window, newest first.
+//
+// Newest first because a more recent scan describes a more recent page, so the
+// first usable report is also the best one. Older candidates are kept rather
+// than discarded because "newest" and "usable" are different properties: the
+// newest scan may still be running, may have finished without a verdict, or may
+// be a report this client cannot read — none of which says anything about the
+// scan before it, and stopping there threw away an answer the provider already
+// had.
 //
 // It reuses eligibleScan, so identity, visibility and uuid presence are decided
 // by the same code reconciliation uses — the rules that say what "one of our
 // scans of this URL" means do not get a second implementation. What differs is
 // only the age bound handed in: an evidence window rather than the start of an
 // outstanding attempt.
-func selectReusableCandidate(
+//
+// The order is total and deterministic: submission time descending, with the
+// uuid breaking ties, so two replicas reading the same search answer read the
+// same reports in the same order.
+func selectReusableCandidates(
 	response searchResponse, canonicalURL string, earliest time.Time,
-) (ScanRecord, bool) {
-	var best ScanRecord
+) []ScanRecord {
+	eligible := make([]ScanRecord, 0, len(response.Results))
 	for _, result := range response.Results {
 		task := result.Task
 		record, ok := eligibleScan(
 			task.UUID, task.URL, task.Time, task.Visibility, canonicalURL, earliest)
-		if !ok {
-			continue
-		}
-		if best.UUID == "" || record.SubmittedAt.After(best.SubmittedAt) {
-			best = record
+		if ok {
+			eligible = append(eligible, record)
 		}
 	}
-	return best, best.UUID != ""
+	sort.Slice(eligible, func(i, j int) bool {
+		if !eligible[i].SubmittedAt.Equal(eligible[j].SubmittedAt) {
+			return eligible[i].SubmittedAt.After(eligible[j].SubmittedAt)
+		}
+		return eligible[i].UUID < eligible[j].UUID
+	})
+	if len(eligible) > maxReusableCandidates {
+		eligible = eligible[:maxReusableCandidates]
+	}
+	return eligible
 }

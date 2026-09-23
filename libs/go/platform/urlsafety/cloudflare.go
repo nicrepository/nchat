@@ -390,7 +390,11 @@ func (c *CloudflareScanner) fetchScanReport(
 	}
 	var decoded resultResponse
 	if err := decodeExactlyOne(response.Body, &decoded); err != nil {
-		return resultResponse{}, ErrUnavailable
+		// Labelled, and the label is load-bearing beyond the metric: a body
+		// this client cannot read is a fact about *this report*, whereas the
+		// statuses above are facts about the provider or the account. Evidence
+		// reuse walks past the first and stops at the second.
+		return resultResponse{}, unavailable(reasonMalformed)
 	}
 	return decoded, nil
 }
