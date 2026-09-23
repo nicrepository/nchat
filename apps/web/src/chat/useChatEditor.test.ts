@@ -463,3 +463,56 @@ describe("useChatEditor — clearing exactly what was sent (issue #875)", () => 
     expect(result.current.editor?.getText()).toContain("B");
   });
 });
+
+describe("useChatEditor — reconciling with the draft (issue #929, review)", () => {
+  const textDoc = (text: string) => ({
+    type: "doc",
+    content: [{ type: "paragraph", content: [{ type: "text", text }] }],
+  });
+
+  it("empties the document without reporting an edit or activity, and canSend follows", async () => {
+    const onTextChange = vi.fn();
+    const onActivity = vi.fn();
+    const { result } = renderHook(() => useChatEditor({ ...defaults, onTextChange, onActivity }));
+    await waitForEditor(result);
+    await fill(result, "T1");
+    onTextChange.mockClear();
+    onActivity.mockClear();
+
+    act(() => result.current.reconcileContent(null));
+
+    await waitFor(() => expect(result.current.canSend).toBe(false));
+    expect(result.current.editor?.getText()).toBe("");
+    expect(onTextChange).not.toHaveBeenCalled();
+    expect(onActivity).not.toHaveBeenCalled();
+  });
+
+  it("shows the draft's text when it differs, and leaves a document that already matches alone", async () => {
+    const onTextChange = vi.fn();
+    const { result } = renderHook(() => useChatEditor({ ...defaults, onTextChange }));
+    await waitForEditor(result);
+    await fill(result, "T1");
+    onTextChange.mockClear();
+
+    act(() => result.current.reconcileContent(textDoc("T2")));
+    expect(result.current.editor?.getText()).toBe("T2");
+    expect(onTextChange).not.toHaveBeenCalled();
+
+    // Same document again: no transaction, so an undo history and a cursor
+    // the reader is in the middle of are not disturbed.
+    const before = result.current.editor!.state;
+    act(() => result.current.reconcileContent(result.current.editor!.getJSON()));
+    expect(result.current.editor!.state).toBe(before);
+  });
+
+  it("is a no-op on an empty document asked to become empty", async () => {
+    const { result } = renderHook(() => useChatEditor(defaults));
+    await waitForEditor(result);
+    const before = result.current.editor!.state;
+
+    act(() => result.current.reconcileContent(null));
+
+    expect(result.current.editor!.state).toBe(before);
+    expect(result.current.canSend).toBe(false);
+  });
+});

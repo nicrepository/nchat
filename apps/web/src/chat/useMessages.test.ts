@@ -2731,6 +2731,131 @@ describe("useMessages — reply state", () => {
   });
 });
 
+// ── Issue #929: a send's acknowledgement consumes only what it carried ───────
+
+describe("useMessages — the acknowledgement of a send (issue #929)", () => {
+  it("consumes the reply the send carried, but keeps one picked while it was in flight", async () => {
+    const first = makeMessage({ id: "msg-first" });
+    const second = makeMessage({ id: "msg-second" });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [first, second], nextCursor: "" });
+    let resolveSend!: (message: ReturnType<typeof makeMessage>) => void;
+    mockPostChannelMessage.mockReturnValueOnce(
+      new Promise<ReturnType<typeof makeMessage>>((resolve) => (resolveSend = resolve)),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.selectReply(first));
+    let send!: Promise<unknown>;
+    act(() => {
+      send = result.current.sendMessage("resposta");
+    });
+    await waitFor(() => expect(mockPostChannelMessage).toHaveBeenCalledOnce());
+    expect(mockPostChannelMessage.mock.calls[0]?.[2]).toMatchObject({
+      parentMessageId: "msg-first",
+    });
+
+    // Before the acknowledgement, the reader answers the other message.
+    act(() => result.current.selectReply(second));
+    await act(async () => {
+      resolveSend(makeMessage({ id: "msg-sent", bodyText: "resposta" }));
+      await send;
+    });
+
+    expect(result.current.state.replyTo).toEqual(second);
+  });
+
+  it("consumes the reply when it is still the one the send carried", async () => {
+    const first = makeMessage({ id: "msg-first" });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [first], nextCursor: "" });
+    mockPostChannelMessage.mockResolvedValue(makeMessage({ id: "msg-sent" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    act(() => result.current.selectReply(first));
+
+    await act(() => result.current.sendMessage("resposta"));
+
+    expect(result.current.state.replyTo).toBeNull();
+  });
+
+  it("reports a send the server accepted as sent even after a target change, without touching the new target", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    let resolveSend!: (message: ReturnType<typeof makeMessage>) => void;
+    mockPostChannelMessage.mockReturnValueOnce(
+      new Promise<ReturnType<typeof makeMessage>>((resolve) => (resolveSend = resolve)),
+    );
+    const { result, rerender } = renderHook(
+      ({ targetId }: { targetId: string }) =>
+        useMessages({ kind: "channel", targetId, currentUserId: "user-me" }),
+      { initialProps: { targetId: "ch-1" } },
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let send!: Promise<{ status: string }>;
+    act(() => {
+      send = result.current.sendMessage("de A");
+    });
+    await waitFor(() => expect(mockPostChannelMessage).toHaveBeenCalledOnce());
+
+    rerender({ targetId: "ch-2" });
+    await waitFor(() =>
+      expect(mockFetchChannelMessages).toHaveBeenCalledWith(
+        "ch-2",
+        undefined,
+        expect.any(AbortSignal),
+      ),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let outcome!: { status: string };
+    await act(async () => {
+      resolveSend(makeMessage({ id: "msg-sent", bodyText: "de A" }));
+      outcome = await send;
+    });
+
+    // Authoritative for A's draft, which the caller reconciles by the key it
+    // captured at submit; B's timeline shows none of it.
+    expect(outcome).toEqual({ status: "sent" });
+    expect(result.current.state.messages).toEqual([]);
+    expect(result.current.state.sendError).toBeNull();
+  });
+
+  it("reports stale when the request fails after a target change", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    let rejectSend!: (error: Error) => void;
+    const pending = new Promise<never>((_, reject) => (rejectSend = reject));
+    pending.catch(() => undefined);
+    mockPostChannelMessage.mockReturnValueOnce(pending);
+    const { result, rerender } = renderHook(
+      ({ targetId }: { targetId: string }) =>
+        useMessages({ kind: "channel", targetId, currentUserId: "user-me" }),
+      { initialProps: { targetId: "ch-1" } },
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let send!: Promise<{ status: string }>;
+    act(() => {
+      send = result.current.sendMessage("de A");
+    });
+    await waitFor(() => expect(mockPostChannelMessage).toHaveBeenCalledOnce());
+    rerender({ targetId: "ch-2" });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let outcome!: { status: string };
+    await act(async () => {
+      rejectSend(new Error("rede"));
+      outcome = await send;
+    });
+
+    expect(outcome).toEqual({ status: "stale" });
+    expect(result.current.state.sendError).toBeNull();
+  });
+});
+
 // ── Favorites (RF-06) ─────────────────────────────────────────────────────────
 
 describe("useMessages — toggleFavorite", () => {

@@ -18,6 +18,8 @@ function recorder(overrides: Partial<VoiceRecorderControls> = {}): VoiceRecorder
     stop: vi.fn(),
     discard: vi.fn(),
     send: vi.fn(),
+    reconcileWithDraft: vi.fn(),
+    resetForSessionEnd: vi.fn(),
     ...overrides,
   };
 }
@@ -156,5 +158,20 @@ describe("VoiceRecorderPanel", () => {
     expect(screen.getByTestId("chat-voice-error")).toHaveTextContent(
       "Não foi possível gravar a mensagem de voz.",
     );
+  });
+
+  // Issue #929 (review): a composer remounted while the recording's send is
+  // still open shows the recording the way the instance that sent it does.
+  it("shows a recording under review as going out while its send is still pending", () => {
+    render(
+      <VoiceRecorderPanel
+        recorder={recorder({ phase: "reviewing", previewUrl: "blob:voice-1" })}
+        sendPending
+      />,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("Enviando mensagem de voz…");
+    expect(screen.queryByTestId("chat-voice-send")).toBeNull();
+    expect(screen.queryByTestId("chat-voice-discard")).toBeNull();
   });
 });

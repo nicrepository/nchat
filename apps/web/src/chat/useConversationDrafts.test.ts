@@ -6,7 +6,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { useConversationDrafts } from "./useConversationDrafts";
+import { useConversationDrafts, type DraftVoiceMessage } from "./useConversationDrafts";
 import { loadDraftPersistence } from "./chatDraftPersistence";
 import type { AttachmentUploadItem } from "./useAttachmentUpload";
 import type { TTNode } from "./tiptapSerializer";
@@ -26,6 +26,16 @@ function fakeAttachment(localId: string): AttachmentUploadItem {
     progress: null,
     error: null,
     attachment: null,
+  };
+}
+
+function fakeVoice(id: string): DraftVoiceMessage {
+  return {
+    id,
+    blob: new Blob(["x"]),
+    previewUrl: `blob:${id}`,
+    durationMs: 100,
+    mimeType: "audio/webm",
   };
 }
 
@@ -64,6 +74,7 @@ describe("useConversationDrafts", () => {
 
     act(() => {
       result.current.setVoiceMessage("dm:juliane", {
+        id: "v-juliane",
         blob: new Blob(["x"]),
         previewUrl: "blob:voice",
         durationMs: 1200,
@@ -102,6 +113,7 @@ describe("useConversationDrafts", () => {
     const { result } = renderHook(() => useConversationDrafts("u1"));
     act(() => {
       result.current.setVoiceMessage("dm:caio", {
+        id: "v-1",
         blob: new Blob(["x"]),
         previewUrl: "blob:voice-1",
         durationMs: 500,
@@ -119,6 +131,7 @@ describe("useConversationDrafts", () => {
     act(() => {
       result.current.setText("dm:caio", textDoc("oi"));
       result.current.setVoiceMessage("dm:juliane", {
+        id: "v-2",
         blob: new Blob(["x"]),
         previewUrl: "blob:voice-2",
         durationMs: 500,
@@ -189,6 +202,7 @@ describe("useConversationDrafts", () => {
     act(() => {
       result.current.setAttachments("dm:caio", [fakeAttachment("a1")]);
       result.current.setVoiceMessage("dm:caio", {
+        id: "v-3",
         blob: new Blob(["x"]),
         previewUrl: "blob:voice-3",
         durationMs: 500,
@@ -262,6 +276,7 @@ describe("useConversationDrafts", () => {
     const revokeSpy = vi.spyOn(URL, "revokeObjectURL");
     const { result } = renderHook(() => useConversationDrafts("u1"));
     const voice = {
+      id: "v-same",
       blob: new Blob(["x"]),
       previewUrl: "blob:same",
       durationMs: 100,
@@ -303,5 +318,278 @@ describe("useConversationDrafts", () => {
     const { result } = renderHook(() => useConversationDrafts("u1"));
     expect(result.current.getDraft("dm:stale")).toBeUndefined();
     expect(result.current.summaries.has("dm:stale")).toBe(false);
+  });
+
+  // ── Issue #929: the draft is the complete unsent state ──────────────────
+
+  it("keeps a reply isolated per draftKey, next to the text it belongs with", () => {
+    const { result } = renderHook(() => useConversationDrafts("u1"));
+    act(() => {
+      result.current.setReply("dm:caio", "R1");
+      result.current.setText("dm:caio", textDoc("Vou verificar"));
+      result.current.setText("dm:juliane", textDoc("outra"));
+    });
+    expect(result.current.getDraft("dm:caio")).toMatchObject({
+      replyToMessageId: "R1",
+      text: textDoc("Vou verificar"),
+    });
+    expect(result.current.getDraft("dm:juliane")?.replyToMessageId).toBeNull();
+  });
+
+  it("keeps a finished voice message isolated per draftKey", () => {
+    const { result } = renderHook(() => useConversationDrafts("u1"));
+    act(() => result.current.setVoiceMessage("dm:caio", fakeVoice("V1")));
+    expect(result.current.getDraft("dm:caio")?.voiceMessage?.id).toBe("V1");
+    expect(result.current.getDraft("dm:juliane")?.voiceMessage ?? null).toBeNull();
+  });
+
+  it("holds text, reply, attachment and voice together in one draft, and nothing in the store forgets any of them", () => {
+    const { result } = renderHook(() => useConversationDrafts("u1"));
+    act(() => {
+      result.current.setText("dm:caio", textDoc("T1"));
+      result.current.setReply("dm:caio", "R1");
+      result.current.setAttachments("dm:caio", [fakeAttachment("X")]);
+      result.current.setVoiceMessage("dm:caio", fakeVoice("V1"));
+    });
+    // A conversation switch never touches the store — the composer merely
+    // remounts and reads this back — so "navigation preserves" is the
+    // draft simply still being here, whole.
+    expect(result.current.getDraft("dm:caio")).toMatchObject({
+      text: textDoc("T1"),
+      replyToMessageId: "R1",
+      voiceMessage: { id: "V1" },
+    });
+    expect(result.current.getDraft("dm:caio")?.attachments.map((a) => a.localId)).toEqual(["X"]);
+  });
+
+  it("textRevision counts text changes only, never the other fields", () => {
+    const { result } = renderHook(() => useConversationDrafts("u1"));
+    act(() => result.current.setText("dm:caio", textDoc("a")));
+    const after = result.current.getDraft("dm:caio")?.textRevision;
+    act(() => {
+      result.current.setReply("dm:caio", "R1");
+      result.current.setAttachments("dm:caio", [fakeAttachment("X")]);
+      result.current.setVoiceMessage("dm:caio", fakeVoice("V1"));
+    });
+    expect(result.current.getDraft("dm:caio")?.textRevision).toBe(after);
+    act(() => result.current.setText("dm:caio", textDoc("ab")));
+    expect(result.current.getDraft("dm:caio")?.textRevision).toBe((after as number) + 1);
+  });
+
+  describe("consumeSentSnapshot (issue #929)", () => {
+    const everything = { text: true, attachmentLocalIds: ["X"], voice: true };
+
+    function composite(result: { current: ReturnType<typeof useConversationDrafts> }) {
+      act(() => {
+        result.current.setText("dm:caio", textDoc("T1"));
+        result.current.setReply("dm:caio", "R1");
+        result.current.setAttachments("dm:caio", [fakeAttachment("X")]);
+        result.current.setVoiceMessage("dm:caio", fakeVoice("V1"));
+      });
+    }
+
+    it("a snapshot identical to the draft leaves no draft, no summary and no persistence", () => {
+      const revokeSpy = vi.spyOn(URL, "revokeObjectURL");
+      const { result } = renderHook(() => useConversationDrafts("u1"));
+      composite(result);
+      expect(result.current.summaries.has("dm:caio")).toBe(true);
+      const snapshot = result.current.createSendSnapshot("dm:caio", everything);
+
+      act(() => result.current.consumeSentSnapshot(snapshot));
+
+      expect(result.current.getDraft("dm:caio")).toBeUndefined();
+      expect(result.current.summaries.has("dm:caio")).toBe(false);
+      act(() => vi.advanceTimersByTime(500));
+      expect(loadDraftPersistence("u1", "dm:caio")).toBeNull();
+      expect(revokeSpy).toHaveBeenCalledWith("blob:V1");
+    });
+
+    it("an old snapshot consumes only what it sent and preserves T2/R2/Z/V2 composed since", () => {
+      const revokeSpy = vi.spyOn(URL, "revokeObjectURL");
+      const { result } = renderHook(() => useConversationDrafts("u1"));
+      composite(result);
+      const snapshot = result.current.createSendSnapshot("dm:caio", everything);
+      act(() => {
+        result.current.setText("dm:caio", textDoc("T2"));
+        result.current.setReply("dm:caio", "R2");
+        result.current.setAttachments("dm:caio", [fakeAttachment("X"), fakeAttachment("Z")]);
+        result.current.setVoiceMessage("dm:caio", fakeVoice("V2"));
+      });
+      revokeSpy.mockClear();
+
+      act(() => result.current.consumeSentSnapshot(snapshot));
+
+      const after = result.current.getDraft("dm:caio");
+      expect(after?.text).toEqual(textDoc("T2"));
+      expect(after?.replyToMessageId).toBe("R2");
+      expect(after?.attachments.map((a) => a.localId)).toEqual(["Z"]);
+      expect(after?.voiceMessage?.id).toBe("V2");
+      // V1's URL was released when V2 replaced it; V2's is still in use.
+      expect(revokeSpy).not.toHaveBeenCalledWith("blob:V2");
+      expect(result.current.summaries.has("dm:caio")).toBe(true);
+    });
+
+    it("is one transition: a single revision bump and a single summary update", () => {
+      const { result } = renderHook(() => useConversationDrafts("u1"));
+      composite(result);
+      const snapshot = result.current.createSendSnapshot("dm:caio", {
+        text: false,
+        attachmentLocalIds: ["X"],
+        voice: true,
+      });
+      const before = result.current.getDraft("dm:caio")?.revision as number;
+      const summariesBefore = result.current.summaries;
+
+      act(() => result.current.consumeSentSnapshot(snapshot));
+
+      expect(result.current.getDraft("dm:caio")?.revision).toBe(before + 1);
+      // Still non-empty (T1 and R1 were not carried), so the summary value
+      // is the very same Map — no re-render of the sidebar for a draft that
+      // did not cross the EMPTY<->HAS_DRAFT boundary (issue #845).
+      expect(result.current.summaries).toBe(summariesBefore);
+    });
+
+    it("never touches another conversation's draft", () => {
+      const { result } = renderHook(() => useConversationDrafts("u1"));
+      composite(result);
+      act(() => {
+        result.current.setText("dm:juliane", textDoc("B"));
+        result.current.setReply("dm:juliane", "RB");
+      });
+      const draftB = result.current.getDraft("dm:juliane");
+      const snapshot = result.current.createSendSnapshot("dm:caio", everything);
+
+      act(() => result.current.consumeSentSnapshot(snapshot));
+
+      expect(result.current.getDraft("dm:caio")).toBeUndefined();
+      expect(result.current.getDraft("dm:juliane")).toEqual(draftB);
+    });
+
+    it("cancels a persist debounce armed before the ACK, so it cannot write the sent text back", () => {
+      const { result } = renderHook(() => useConversationDrafts("u1"));
+      act(() => {
+        result.current.setReply("dm:caio", "R1");
+        result.current.setText("dm:caio", textDoc("enviado"));
+      });
+      const snapshot = result.current.createSendSnapshot("dm:caio", {
+        text: true,
+        attachmentLocalIds: [],
+        voice: false,
+      });
+      // The 400ms write for "enviado" is still pending here.
+      act(() => result.current.consumeSentSnapshot(snapshot));
+      act(() => vi.advanceTimersByTime(500));
+      expect(loadDraftPersistence("u1", "dm:caio")).toBeNull();
+      expect(result.current.getDraft("dm:caio")).toBeUndefined();
+    });
+
+    it("persists only what legitimately remains after a partial consumption", () => {
+      const { result } = renderHook(() => useConversationDrafts("u1"));
+      act(() => {
+        result.current.setReply("dm:caio", "R1");
+        result.current.setText("dm:caio", textDoc("T1"));
+      });
+      const snapshot = result.current.createSendSnapshot("dm:caio", {
+        text: true,
+        attachmentLocalIds: [],
+        voice: false,
+      });
+      act(() => result.current.setReply("dm:caio", "R2"));
+
+      act(() => result.current.consumeSentSnapshot(snapshot));
+      act(() => vi.advanceTimersByTime(500));
+
+      expect(loadDraftPersistence("u1", "dm:caio")).toMatchObject({
+        text: null,
+        replyToMessageId: "R2",
+      });
+    });
+
+    it("is a no-op on a conversation that has no draft", () => {
+      const { result } = renderHook(() => useConversationDrafts("u1"));
+      const summaries = result.current.summaries;
+      act(() =>
+        result.current.consumeSentSnapshot(
+          result.current.createSendSnapshot("dm:none", everything),
+        ),
+      );
+      expect(result.current.getDraft("dm:none")).toBeUndefined();
+      expect(result.current.summaries).toBe(summaries);
+    });
+  });
+
+  // ── Issue #929 (third review): the session an async operation belongs to ──
+
+  describe("generations", () => {
+    it("hands out the current generation, and only that one is current", () => {
+      const { result } = renderHook(() => useConversationDrafts("u1"));
+      const first = result.current.captureGeneration();
+
+      expect(result.current.isGenerationCurrent(first)).toBe(true);
+
+      act(() => result.current.clearAllDrafts());
+
+      expect(result.current.isGenerationCurrent(first)).toBe(false);
+      const second = result.current.captureGeneration();
+      expect(second).not.toBe(first);
+      expect(result.current.isGenerationCurrent(second)).toBe(true);
+    });
+
+    it("never brings an earlier generation back, however often the drafts are cleared", () => {
+      const { result } = renderHook(() => useConversationDrafts("u1"));
+      const first = result.current.captureGeneration();
+      act(() => result.current.clearAllDrafts());
+      const second = result.current.captureGeneration();
+      act(() => result.current.clearAllDrafts());
+
+      expect(result.current.isGenerationCurrent(first)).toBe(false);
+      expect(result.current.isGenerationCurrent(second)).toBe(false);
+      expect(result.current.isGenerationCurrent(result.current.captureGeneration())).toBe(true);
+    });
+
+    it("is untouched by everything a conversation does — only a clear ends a session", () => {
+      const { result } = renderHook(() => useConversationDrafts("u1"));
+      const generation = result.current.captureGeneration();
+
+      act(() => {
+        result.current.setText("dm:caio", textDoc("T1"));
+        result.current.setReply("dm:caio", "R1");
+        result.current.setAttachments("dm:caio", [fakeAttachment("X")]);
+        result.current.updateAttachment("dm:caio", "X", { status: "success" });
+        result.current.setVoiceMessage("dm:caio", fakeVoice("V1"));
+        result.current.clearDraft("dm:caio");
+      });
+
+      expect(result.current.isGenerationCurrent(generation)).toBe(true);
+      expect(result.current.captureGeneration()).toBe(generation);
+    });
+
+    it("announces the end of the session to mounted mirrors, once per clear", () => {
+      const { result } = renderHook(() => useConversationDrafts("u1"));
+      const first = result.current.resetRevision;
+
+      act(() => result.current.setText("dm:caio", textDoc("T1")));
+      expect(result.current.resetRevision).toBe(first);
+
+      act(() => result.current.clearAllDrafts());
+      const second = result.current.resetRevision;
+      expect(second).not.toBe(first);
+
+      act(() => result.current.clearAllDrafts());
+      expect(result.current.resetRevision).not.toBe(second);
+    });
+
+    it("two stores keep their own generations", () => {
+      const { result: a } = renderHook(() => useConversationDrafts("u1"));
+      const { result: b } = renderHook(() => useConversationDrafts("u2"));
+      const fromB = b.current.captureGeneration();
+
+      const resetB = b.current.resetRevision;
+
+      act(() => a.current.clearAllDrafts());
+
+      expect(b.current.isGenerationCurrent(fromB)).toBe(true);
+      expect(b.current.resetRevision).toBe(resetB);
+    });
   });
 });

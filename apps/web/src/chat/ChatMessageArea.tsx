@@ -42,6 +42,7 @@ import { usePendingReference } from "./usePendingReference";
 import { useConversationTarget } from "./useConversationTarget";
 import { useEmojiUsage } from "./emoji/useEmojiUsage";
 import { useMessages, type SendResult } from "./useMessages";
+import { useLatestRef } from "./messages/useLatestRef";
 import { useTypingIndicator } from "./useTypingIndicator";
 import type { WSTypingUpdatedEvent } from "./useChatWebSocket";
 import { usePins } from "./usePins";
@@ -277,30 +278,42 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
 
   // Issue #769: historyReducer.applyLoaded unconditionally resets replyTo on
   // every initial load, i.e. on every conversation switch (#492 review) —
-  // correct for a composer that used to lose its own draft the same way,
-  // wrong now that the reply is supposed to survive one. Restoring it here,
-  // once the messages a reply target could be found in have actually
-  // loaded, keeps that reset (nothing else here needs to know this ever
-  // happened) while still bringing the reply back for the reader.
+  // correct for the reducer's own operational state, but the reply is draft
+  // state and the draft store is its owner (issue #929). Once the page a
+  // reply target could be found in has loaded, the live reply — the Message
+  // the preview draws and sendMessage takes the parent id from — is derived
+  // back from the store's id.
   //
-  // A reply whose message is not in the loaded page — deleted, or simply
-  // outside it — is dropped rather than guessed at: RF says "não apagar
-  // texto", not "restore at any cost", and a dangling replyTo the server
-  // would reject on send is worse than none.
+  // Keyed on the *loaded state*, never on the conversation key. On the
+  // render where the route has already moved to A, `state` is still B's:
+  // the reducer only leaves "ready" from an effect. An effect reacting to
+  // the key change looked for A's reply in B's messages and dropped it —
+  // the reported bug of #929. `lastMutation === "initial"` is what says
+  // "this is the page that just loaded", so an append (a send, a realtime
+  // message) can never re-run this against a reply a send just consumed.
+  //
+  // A reply whose message is not in the loaded page — outside it, or
+  // removed — is dropped rather than guessed at, and only the reply: RF
+  // says "não apagar texto", not "restore at any cost", and a dangling
+  // replyTo the server would reject on send is worse than none.
+  const conversationKeyRef = useLatestRef(anchors.conversationKey);
   useEffect(() => {
-    if (state.status !== "ready" || state.replyTo || !anchors.conversationKey) return;
-    const draftReplyId = drafts.getDraft(anchors.conversationKey)?.replyToMessageId;
+    if (state.status !== "ready" || state.lastMutation !== "initial" || state.replyTo) return;
+    const draftKey = conversationKeyRef.current;
+    const draftReplyId = draftKey ? drafts.getDraft(draftKey)?.replyToMessageId : undefined;
     if (!draftReplyId) return;
     const message = state.messages.find((m) => m.id === draftReplyId);
-    if (message) {
-      selectReplyBase(message);
-    } else {
-      drafts.setReply(anchors.conversationKey, null);
-    }
-    // Runs once per conversation becoming ready, not on every message-list
-    // change (e.g. a realtime append must not re-trigger this).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.status, anchors.conversationKey]);
+    if (message && !message.isRemoved) selectReplyBase(message);
+    else drafts.setReply(draftKey, null);
+  }, [
+    conversationKeyRef,
+    drafts,
+    selectReplyBase,
+    state.lastMutation,
+    state.messages,
+    state.replyTo,
+    state.status,
+  ]);
 
   const typing = useTypingIndicator({
     kind,
@@ -357,34 +370,30 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       attachmentIds?: string[],
       priority?: MessagePriorityIntent,
     ): Promise<SendResult> => {
+      const sentFrom = anchors.conversationKey;
       const result = await sendMessage(
         body,
         pendingReference.messageId || undefined,
         attachmentIds,
         priority,
       );
-      if (result.status === "sent") {
+      // What the draft keeps or loses is the composer's, decided against the
+      // snapshot it captured at submit (issue #929). What is left here is
+      // this screen's: the typing session and the pending reference in the
+      // location state — both of the conversation the send left from, so
+      // neither is touched once the reader has moved to another one.
+      if (result.status === "sent" && conversationKeyRef.current === sentFrom) {
         // Sending is itself the clearest possible "stopped typing" signal — do
         // not wait for the composer-cleared activity event or the inactivity
         // timeout to catch up.
         typingStop();
-        // Mirrors applySent's own replyTo: null (issue #769) — the reply
-        // this message answered is consumed, in the draft as much as in
-        // the live reducer state. Guarded so a plain send with no reply
-        // does not mutate (and re-persist) a draft it has nothing to say
-        // about. It no longer has any bearing on whether the editor clears
-        // itself: that is decided against the editor's own document, not
-        // against this draft's revision (issue #875).
-        if (anchors.conversationKey && drafts.getDraft(anchors.conversationKey)?.replyToMessageId) {
-          drafts.setReply(anchors.conversationKey, null);
-        }
         navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
       }
       return result;
     },
     [
       anchors.conversationKey,
-      drafts,
+      conversationKeyRef,
       location.pathname,
       location.search,
       navigate,

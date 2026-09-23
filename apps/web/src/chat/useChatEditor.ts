@@ -13,9 +13,9 @@
  * for user-submitted content.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useEditor } from "@tiptap/react";
-import { Extension } from "@tiptap/core";
+import { Extension, type Editor } from "@tiptap/core";
 import Bold from "@tiptap/extension-bold";
 import BulletList from "@tiptap/extension-bullet-list";
 import Code from "@tiptap/extension-code";
@@ -294,8 +294,13 @@ export function useChatEditor({
       // changed one means the reader has moved on to the next message, and
       // this acknowledgement has no claim on it (issue #769 "ACK ATRASADO",
       // issue #875).
+      //
+      // A destroyed editor is one the reader navigated away from while the
+      // send was in flight (issue #929): the acknowledgement is still real
+      // and the draft store reconciles it by its own snapshot, but there is
+      // no document left here to clear.
       const stillHoldsWhatWasSent = textRevisionRef.current === textRevisionAtSubmit;
-      if (result.status === "sent" && clearOnSend && stillHoldsWhatWasSent) {
+      if (result.status === "sent" && clearOnSend && stillHoldsWhatWasSent && !editor.isDestroyed) {
         // emitUpdate=true fires the onUpdate above, which is what mirrors
         // the now-empty document back into the draft (issue #769).
         editor.commands.clearContent(true);
@@ -313,5 +318,34 @@ export function useChatEditor({
     handleSendRef.current = handleSend;
   });
 
-  return { editor, canSend, sending, handleSend };
+  /**
+   * Makes the document reflect the conversation draft's authoritative text
+   * (issue #929): a send acknowledged by a previous instance of this
+   * composer consumed the draft this editor was seeded from, and the store
+   * — not the reader — is the one changing the text here.
+   *
+   * Deliberately not a user edit: nothing is emitted, so neither the draft
+   * (already authoritative) nor the typing indicator hears of it, and
+   * textRevisionRef — which counts the reader's own edits during a send —
+   * is left alone. A document already equal to `doc` is not touched, so a
+   * cursor and an undo history the reader is in the middle of survive a
+   * reconciliation that had nothing to change.
+   */
+  const reconcileContent = useCallback(
+    (doc: TTNode | null) => {
+      if (!editor || editor.isDestroyed || isSameDocument(editor, doc)) return;
+      if (doc) editor.commands.setContent(doc, false);
+      else editor.commands.clearContent(false);
+      setHasContent(!editor.isEmpty);
+    },
+    [editor],
+  );
+
+  return { editor, canSend, sending, handleSend, reconcileContent };
+}
+
+/** Whether the editor already shows `doc` (null: an empty document). */
+function isSameDocument(editor: Editor, doc: TTNode | null): boolean {
+  if (!doc) return editor.isEmpty;
+  return JSON.stringify(editor.getJSON()) === JSON.stringify(doc);
 }

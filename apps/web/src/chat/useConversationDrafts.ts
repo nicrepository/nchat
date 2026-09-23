@@ -29,6 +29,24 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AttachmentUploadItem } from "./useAttachmentUpload";
 import type { TTNode } from "./tiptapSerializer";
 import {
+  emptyDraft,
+  hydratedDraft,
+  isDraftEmpty,
+  isTextMeaningful,
+  releaseVoice,
+  type ConversationDraft,
+  type DraftVoiceMessage,
+} from "./conversationDraft";
+import {
+  consumeSnapshot,
+  sendSnapshotOf,
+  type SendParts,
+  type SendSnapshot,
+} from "./draftSendSnapshot";
+import { useDraftBoundary, type DraftBoundaryApi } from "./useDraftBoundary";
+import { useDraftMirrorSync, type DraftMirrorSyncApi } from "./useDraftMirrorSync";
+import { useDraftSendLifecycle, type DraftSendLifecycleApi } from "./useDraftSendLifecycle";
+import {
   clearDraftPersistence,
   clearUserDraftPersistence,
   loadAllDraftPersistence,
@@ -36,22 +54,11 @@ import {
   saveDraftPersistence,
 } from "./chatDraftPersistence";
 
-export interface DraftVoiceMessage {
-  blob: Blob;
-  previewUrl: string;
-  durationMs: number;
-  mimeType: string;
-}
-
-export interface ConversationDraft {
-  text: TTNode | null;
-  attachments: AttachmentUploadItem[];
-  voiceMessage: DraftVoiceMessage | null;
-  replyToMessageId: string | null;
-  /** Monotonic; bumped by every mutation. The ACK-race guard for #769 ("REVISION"). */
-  revision: number;
-  updatedAt: number;
-}
+export type { DraftGeneration } from "./useDraftBoundary";
+export type { ConversationDraft, DraftVoiceMessage } from "./conversationDraft";
+export type { SendParts, SendSnapshot } from "./draftSendSnapshot";
+export type { DraftSendLifecycle, SendAttempt, SendOutcome } from "./useDraftSendLifecycle";
+export type { DraftMirrorSyncApi } from "./useDraftMirrorSync";
 
 /**
  * Sidebar-relevant summary — issue #845: presence only, never content.
@@ -67,7 +74,17 @@ export interface DraftSummary {
   hasDraft: true;
 }
 
-export interface ConversationDraftsApi {
+/**
+ * The draft store, plus the two lifecycles a composer needs to read above
+ * its own mount (issue #929): whether a send of this draft is still in
+ * flight (useDraftSendLifecycle) and whether the authoritative draft has
+ * changed in a way its mirrors must re-read (useDraftMirrorSync).
+ */
+export interface ConversationDraftsApi
+  extends
+    Omit<DraftSendLifecycleApi, "clearSendLifecycle">,
+    Omit<DraftMirrorSyncApi, "clearMirrorSync">,
+    Omit<DraftBoundaryApi, "endSession"> {
   getDraft: (draftKey: string) => ConversationDraft | undefined;
   setText: (draftKey: string, text: TTNode | null) => void;
   setAttachments: (draftKey: string, attachments: AttachmentUploadItem[]) => void;
@@ -87,39 +104,27 @@ export interface ConversationDraftsApi {
   ) => void;
   setVoiceMessage: (draftKey: string, voice: DraftVoiceMessage | null) => void;
   setReply: (draftKey: string, replyToMessageId: string | null) => void;
+  /**
+   * Captures, at submit, the identity of everything a send is taking out of
+   * `draftKey` (issue #929). Cheap and side-effect free; the value is handed
+   * back to consumeSentSnapshot once the server acknowledges the send.
+   */
+  createSendSnapshot: (draftKey: string, parts: SendParts) => SendSnapshot;
+  /**
+   * The one transition a confirmed send performs on its draft (issue #929):
+   * consumes each field still matching the snapshot, preserves everything
+   * composed since, and — as a single mutation — persists, updates the
+   * summary and removes the entry only if what remains is empty.
+   */
+  consumeSentSnapshot: (snapshot: SendSnapshot) => void;
   /** Removes the draft entirely — a confirmed send, or GC of an emptied draft. */
   clearDraft: (draftKey: string) => void;
   /** Logout / account switch (issue #769, "FASE 14 — LOGOUT"): every draft, every object URL. */
   clearAllDrafts: () => void;
   /** Sidebar-relevant summaries only, keyed by draftKey. Coarse — see module doc. */
   summaries: ReadonlyMap<string, DraftSummary>;
-}
-
-const emptyDraft = (): ConversationDraft => ({
-  text: null,
-  attachments: [],
-  voiceMessage: null,
-  replyToMessageId: null,
-  revision: 0,
-  updatedAt: Date.now(),
-});
-
-/** No mention, no non-blank text anywhere in the document. */
-function isTextMeaningful(node: TTNode | null): boolean {
-  if (!node) return false;
-  if (node.type === "mention") return true;
-  if (node.text && node.text.trim().length > 0) return true;
-  return (node.content ?? []).some(isTextMeaningful);
-}
-
-/** Draft #769 "REGRA DE DRAFT VAZIO": empty only when none of these hold. */
-function isDraftEmpty(draft: ConversationDraft): boolean {
-  return (
-    !isTextMeaningful(draft.text) &&
-    draft.attachments.length === 0 &&
-    draft.voiceMessage === null &&
-    !draft.replyToMessageId
-  );
+  /* The session boundary — see useDraftBoundary: `captureGeneration`,
+     `isGenerationCurrent` and `resetRevision` come from there. */
 }
 
 function summaryOf(): DraftSummary {
@@ -139,9 +144,24 @@ export const noopConversationDrafts: ConversationDraftsApi = {
   updateAttachment: () => undefined,
   setVoiceMessage: () => undefined,
   setReply: () => undefined,
+  createSendSnapshot: (draftKey, parts) => sendSnapshotOf(draftKey, undefined, parts),
+  consumeSentSnapshot: () => undefined,
   clearDraft: () => undefined,
   clearAllDrafts: () => undefined,
   summaries: new Map(),
+  captureGeneration: () => 0,
+  isGenerationCurrent: () => true,
+  resetRevision: 0,
+  getResetRevision: () => 0,
+  hasUnobservedReset: () => false,
+  sendLifecycle: new Map(),
+  hasPendingSend: () => false,
+  beginSend: (snapshot) => ({ id: 0, snapshot }),
+  settleSend: () => undefined,
+  mirrorRevisions: new Map(),
+  getMirrorRevision: () => 0,
+  hasUnreconciledMirror: () => false,
+  notifyMirrors: () => undefined,
 };
 
 export function useConversationDrafts(userId: string): ConversationDraftsApi {
@@ -182,14 +202,7 @@ export function useConversationDrafts(userId: string): ConversationDraftsApi {
     let changed = false;
     for (const [draftKey, payload] of persisted) {
       if (draftsRef.current.has(draftKey)) continue;
-      const hydrated: ConversationDraft = {
-        text: payload.text,
-        attachments: [],
-        voiceMessage: null,
-        replyToMessageId: payload.replyToMessageId,
-        revision: 0,
-        updatedAt: payload.updatedAt,
-      };
+      const hydrated = hydratedDraft(payload);
       if (isDraftEmpty(hydrated)) continue;
       draftsRef.current.set(draftKey, hydrated);
       changed = true;
@@ -238,6 +251,14 @@ export function useConversationDrafts(userId: string): ConversationDraftsApi {
       }, 400),
     );
   }, []);
+
+  const mirrors = useDraftMirrorSync();
+  const { notifyMirrors, clearMirrorSync } = mirrors;
+  // Per store instance, never module-global: two stores (two tests, two
+  // roots) must not be able to invalidate each other's work.
+  const boundary = useDraftBoundary();
+  const { captureGeneration, isGenerationCurrent, resetRevision, endSession } = boundary;
+  const { getResetRevision, hasUnobservedReset } = boundary;
 
   const applyMutation = useCallback(
     (draftKey: string, mutate: (current: ConversationDraft) => ConversationDraft) => {
@@ -290,14 +311,7 @@ export function useConversationDrafts(userId: string): ConversationDraftsApi {
     if (!uid) return undefined;
     const persisted = loadDraftPersistence(uid, draftKey);
     if (!persisted) return undefined;
-    const hydrated: ConversationDraft = {
-      text: persisted.text,
-      attachments: [],
-      voiceMessage: null,
-      replyToMessageId: persisted.replyToMessageId,
-      revision: 0,
-      updatedAt: persisted.updatedAt,
-    };
+    const hydrated = hydratedDraft(persisted);
     if (isDraftEmpty(hydrated)) return undefined;
     draftsRef.current.set(draftKey, hydrated);
     return hydrated;
@@ -305,7 +319,11 @@ export function useConversationDrafts(userId: string): ConversationDraftsApi {
 
   const setText = useCallback(
     (draftKey: string, text: TTNode | null) => {
-      applyMutation(draftKey, (current) => ({ ...current, text }));
+      applyMutation(draftKey, (current) => ({
+        ...current,
+        text,
+        textRevision: current.textRevision + 1,
+      }));
     },
     [applyMutation],
   );
@@ -325,20 +343,28 @@ export function useConversationDrafts(userId: string): ConversationDraftsApi {
           item.localId === localId ? { ...item, ...patch } : item,
         ),
       }));
+      // Only where the upload ended (issue #929, second review): a queue
+      // mounted for this conversation — very possibly not the one that
+      // started the upload — has to show the result. Progress reports stay
+      // between an upload and its own component, so a file going up does
+      // not re-render anything above the composer.
+      if (patch.status === "success" || patch.status === "failed") notifyMirrors(draftKey);
     },
-    [applyMutation],
+    [applyMutation, notifyMirrors],
   );
 
   const setVoiceMessage = useCallback(
     (draftKey: string, voiceMessage: DraftVoiceMessage | null) => {
       applyMutation(draftKey, (current) => {
-        if (current.voiceMessage && current.voiceMessage.previewUrl !== voiceMessage?.previewUrl) {
-          URL.revokeObjectURL(current.voiceMessage.previewUrl);
-        }
+        releaseVoice(current.voiceMessage, voiceMessage);
         return { ...current, voiceMessage };
       });
+      // A recording is finalized, or leaves the draft, exactly once —
+      // sparse by nature, and possibly produced by a recorder whose
+      // composer is already gone (issue #929, second review).
+      notifyMirrors(draftKey);
     },
-    [applyMutation],
+    [applyMutation, notifyMirrors],
   );
 
   const setReply = useCallback(
@@ -346,6 +372,31 @@ export function useConversationDrafts(userId: string): ConversationDraftsApi {
       applyMutation(draftKey, (current) => ({ ...current, replyToMessageId }));
     },
     [applyMutation],
+  );
+
+  const createSendSnapshot = useCallback(
+    (draftKey: string, parts: SendParts): SendSnapshot =>
+      sendSnapshotOf(draftKey, getDraft(draftKey), parts),
+    [getDraft],
+  );
+
+  // One applyMutation, so the draft goes from "before the ACK" to "after
+  // the ACK" in a single step: one revision bump, one persist decision, one
+  // summary check, and no intermediate state another callback could observe
+  // (issue #929, "ATOMICIDADE").
+  const consumeSentSnapshot = useCallback(
+    (snapshot: SendSnapshot) => {
+      applyMutation(snapshot.draftKey, (current) => {
+        const next = consumeSnapshot(current, snapshot);
+        releaseVoice(current.voiceMessage, next.voiceMessage);
+        return next;
+      });
+      // Announced as part of the same acknowledgement: from here on a
+      // composer still showing what this send carried knows it is behind,
+      // and its send path stays closed until it has caught up.
+      notifyMirrors(snapshot.draftKey);
+    },
+    [applyMutation, notifyMirrors],
   );
 
   const clearDraft = useCallback(
@@ -365,7 +416,16 @@ export function useConversationDrafts(userId: string): ConversationDraftsApi {
     [cancelPersist],
   );
 
+  const lifecycle = useDraftSendLifecycle(consumeSentSnapshot);
+  const { clearSendLifecycle } = lifecycle;
+
   const clearAllDrafts = useCallback(() => {
+    // First: the session being cleared ends here — for the operations
+    // already under way (the generation) and for the composers still on
+    // screen holding its content (the reset revision). See useDraftBoundary.
+    endSession();
+    clearSendLifecycle();
+    clearMirrorSync();
     for (const timer of persistTimersRef.current.values()) clearTimeout(timer);
     persistTimersRef.current.clear();
     for (const draft of draftsRef.current.values()) {
@@ -380,8 +440,10 @@ export function useConversationDrafts(userId: string): ConversationDraftsApi {
     // DraftSummariesContext: any identity change re-renders every row in
     // the sidebar, which a popup menu mid-interaction does not appreciate.
     setSummaries((prev) => (prev.size === 0 ? prev : new Map()));
-  }, []);
+  }, [clearMirrorSync, clearSendLifecycle, endSession]);
 
+  const { sendLifecycle, hasPendingSend, beginSend, settleSend } = lifecycle;
+  const { mirrorRevisions, getMirrorRevision, hasUnreconciledMirror } = mirrors;
   return useMemo(
     () => ({
       getDraft,
@@ -390,9 +452,24 @@ export function useConversationDrafts(userId: string): ConversationDraftsApi {
       updateAttachment,
       setVoiceMessage,
       setReply,
+      createSendSnapshot,
+      consumeSentSnapshot,
       clearDraft,
       clearAllDrafts,
       summaries,
+      captureGeneration,
+      isGenerationCurrent,
+      resetRevision,
+      getResetRevision,
+      hasUnobservedReset,
+      sendLifecycle,
+      hasPendingSend,
+      beginSend,
+      settleSend,
+      mirrorRevisions,
+      getMirrorRevision,
+      hasUnreconciledMirror,
+      notifyMirrors,
     }),
     [
       getDraft,
@@ -401,9 +478,24 @@ export function useConversationDrafts(userId: string): ConversationDraftsApi {
       updateAttachment,
       setVoiceMessage,
       setReply,
+      createSendSnapshot,
+      consumeSentSnapshot,
       clearDraft,
       clearAllDrafts,
       summaries,
+      captureGeneration,
+      isGenerationCurrent,
+      resetRevision,
+      getResetRevision,
+      hasUnobservedReset,
+      sendLifecycle,
+      hasPendingSend,
+      beginSend,
+      settleSend,
+      mirrorRevisions,
+      getMirrorRevision,
+      hasUnreconciledMirror,
+      notifyMirrors,
     ],
   );
 }
