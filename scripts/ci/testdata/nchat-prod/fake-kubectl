@@ -43,6 +43,9 @@
 #                        from "ConfigMap with empty data"
 #   release-state-write-fails "1" makes `apply -f -` of that ConfigMap fail, as
 #                        a refused write
+#   observed/<component>-<slot>  one "<sha>:<id>" per Ready pod of a workload
+#   pods/<component>-<slot>.json the PodList answered verbatim instead
+#   pods-list-fails      "1" refuses every namespaced `get pods -o json`
 #   scale-log            every `scale` target, and the rollout record of the
 #                        scaled Deployment is rewritten to the new replica
 #                        count
@@ -251,32 +254,29 @@ if [[ "${1:-}" == "get" && "${2:-}" == "deployment" ]]; then
   exit 0
 fi
 
-# Ready pod NAMES of a workload, which is what an operation needing to exec into
-# one asks for. One synthetic name per Ready pod recorded in
-# observed/<component>-<slot>, so a slot with no Ready pods answers nothing and
-# a caller cannot mistake a listing for a pod.
-if [[ "${1:-}" == "get" && "${2:-}" == "pods" && "$*" == *"metadata.name"* ]]; then
-  selector=""
-  for arg in "$@"; do
-    [[ "$prev" == "-l" ]] && selector="$arg"
-    prev="$arg"
-  done
-  component="${selector#*component=}"
-  component="${component%%,*}"
-  slot="${selector##*release-slot=}"
-  slot="${slot%%,*}"
-  index=0
-  while IFS= read -r release; do
-    [[ -n "$release" ]] || continue
-    printf '%s-%s-%s\n' "$component" "$slot" "$index"
-    index=$((index + 1))
-  done < <(read_state "observed/$component-$slot")
-  exit 0
+# The nested jsonpath filter production once used to find Ready pods, refused
+# exactly as the real kubectl parser refuses it. Answering it by topic is what
+# let the smoke pass here while it failed on every production run.
+if [[ "${1:-}" == "get" && "${2:-}" == "pods" && "$*" == *'[?(@.status.conditions[?('* ]]; then
+  echo "error: error parsing jsonpath {range .items[?(@.status.conditions[?(@.type==\"Ready\")].status==\"True\")]}, unterminated filter" >&2
+  exit 1
 fi
 
-# Ready pods of a workload, each carrying the release it is actually running.
-# observed/<component>-<slot> holds one release per line.
-if [[ "${1:-}" == "get" && "${2:-}" == "pods" && "$*" == *"release-sha"* ]]; then
+# The pods of one workload in one slot, as the PodList `-o json` returns.
+#
+# pods/<component>-<slot>.json, when present, is answered verbatim: that is how
+# a case states Ready=False, a missing Ready condition or a missing annotation
+# in the shape the API really uses. Otherwise observed/<component>-<slot> holds
+# one "<sha>:<id>" per Ready pod, rendered into that same shape; an empty half
+# is an annotation the pod does not carry, not an empty one.
+#
+# pods-list-fails=1 refuses the listing the way an RBAC denial does, so a case
+# can show that "the pods could not be read" is never taken for "no pod".
+if [[ "${1:-}" == "get" && "${2:-}" == "pods" && "$*" == *"-o json"* && "$*" != *"--all-namespaces"* ]]; then
+  if [[ "$(read_state pods-list-fails)" == "1" ]]; then
+    echo 'Error from server (Forbidden): pods is forbidden: User cannot list resource "pods" in API group "" in the namespace "nchat-prod"' >&2
+    exit 1
+  fi
   selector=""
   for arg in "$@"; do
     [[ "$prev" == "-l" ]] && selector="$arg"
@@ -286,7 +286,21 @@ if [[ "${1:-}" == "get" && "${2:-}" == "pods" && "$*" == *"release-sha"* ]]; the
   component="${component%%,*}"
   slot="${selector##*release-slot=}"
   slot="${slot%%,*}"
-  read_state "observed/$component-$slot"
+  if [[ -f "$STATE/pods/$component-$slot.json" ]]; then
+    cat "$STATE/pods/$component-$slot.json"
+    exit 0
+  fi
+  read_state "observed/$component-$slot" | jq -R -s --arg component "$component" --arg slot "$slot" '
+    def present($key; $value): if $value == "" then {} else {($key): $value} end;
+    split("\n") | map(select(length > 0)) | to_entries
+    | { apiVersion: "v1", kind: "List", items: map(
+        (.value | index(":")) as $colon
+        | { metadata: {
+              name: "\($component)-\($slot)-\(.key)",
+              labels: { "app.kubernetes.io/component": $component, "nchat.io/release-slot": $slot },
+              annotations: (present("nchat.io/release-sha"; .value[:$colon])
+                + present("nchat.io/release-id"; .value[$colon + 1:])) },
+            status: { conditions: [{ type: "Ready", status: "True" }] } }) }'
   exit 0
 fi
 
