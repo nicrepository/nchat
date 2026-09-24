@@ -46,6 +46,11 @@
 #   observed/<component>-<slot>  one "<sha>:<id>" per Ready pod of a workload
 #   pods/<component>-<slot>.json the PodList answered verbatim instead
 #   pods-list-fails      "1" refuses every namespaced `get pods -o json`
+#   pods-list-log        one "<component>-<slot>" line per such listing
+#   observed-next/<component>-<slot>  the pods that workload has once it has
+#                        been listed: moved over observed/ after the listing,
+#                        which is how old pods leaving mid-observation look
+#   deployment-read-fails "1" refuses every `get deployment <name>`
 #   scale-log            every `scale` target, and the rollout record of the
 #                        scaled Deployment is rewritten to the new replica
 #                        count
@@ -234,9 +239,22 @@ fi
 #
 # Modelling only "desired ready" is what let the tests agree with the bug: there
 # was no way to express a stuck rollout whose previous pods are still Ready.
+#
+# An absent record is a Deployment that does not exist: NotFound and exit 1, or
+# nothing and exit 0 under `--ignore-not-found`, exactly as kubectl answers.
+# deployment-read-fails is the other answer -- the read itself refused -- which
+# must never look like either.
 if [[ "${1:-}" == "get" && "${2:-}" == "deployment" ]]; then
   deployment="$3"
-  [[ -f "$STATE/ready/$deployment" ]] || exit 1
+  if [[ "$(read_state deployment-read-fails)" == "1" ]]; then
+    echo "Error from server (Forbidden): deployments.apps \"$deployment\" is forbidden" >&2
+    exit 1
+  fi
+  if [[ ! -f "$STATE/ready/$deployment" ]]; then
+    [[ "$*" == *"--ignore-not-found"* ]] && exit 0
+    echo "Error from server (NotFound): deployments.apps \"$deployment\" not found" >&2
+    exit 1
+  fi
   read -r generation observed desired updated ready available unavailable <"$STATE/ready/$deployment"
   case "$*" in
     # The rollout record, in the order lib.sh asks for it.
@@ -273,10 +291,6 @@ fi
 # pods-list-fails=1 refuses the listing the way an RBAC denial does, so a case
 # can show that "the pods could not be read" is never taken for "no pod".
 if [[ "${1:-}" == "get" && "${2:-}" == "pods" && "$*" == *"-o json"* && "$*" != *"--all-namespaces"* ]]; then
-  if [[ "$(read_state pods-list-fails)" == "1" ]]; then
-    echo 'Error from server (Forbidden): pods is forbidden: User cannot list resource "pods" in API group "" in the namespace "nchat-prod"' >&2
-    exit 1
-  fi
   selector=""
   for arg in "$@"; do
     [[ "$prev" == "-l" ]] && selector="$arg"
@@ -286,6 +300,12 @@ if [[ "${1:-}" == "get" && "${2:-}" == "pods" && "$*" == *"-o json"* && "$*" != 
   component="${component%%,*}"
   slot="${selector##*release-slot=}"
   slot="${slot%%,*}"
+  # Logged before it is answered, so a refused listing is counted as a request.
+  printf '%s-%s\n' "$component" "$slot" >>"$STATE/pods-list-log"
+  if [[ "$(read_state pods-list-fails)" == "1" ]]; then
+    echo 'Error from server (Forbidden): pods is forbidden: User cannot list resource "pods" in API group "" in the namespace "nchat-prod"' >&2
+    exit 1
+  fi
   if [[ -f "$STATE/pods/$component-$slot.json" ]]; then
     cat "$STATE/pods/$component-$slot.json"
     exit 0
@@ -301,6 +321,11 @@ if [[ "${1:-}" == "get" && "${2:-}" == "pods" && "$*" == *"-o json"* && "$*" != 
               annotations: (present("nchat.io/release-sha"; .value[:$colon])
                 + present("nchat.io/release-id"; .value[$colon + 1:])) },
             status: { conditions: [{ type: "Ready", status: "True" }] } }) }'
+  # The cluster moves on after this read, not before it: the listing above is
+  # what the caller saw, and only a later one can see the change.
+  if [[ -f "$STATE/observed-next/$component-$slot" ]]; then
+    mv "$STATE/observed-next/$component-$slot" "$STATE/observed/$component-$slot"
+  fi
   exit 0
 fi
 

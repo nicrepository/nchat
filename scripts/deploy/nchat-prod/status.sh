@@ -34,13 +34,17 @@ report_services() {
   done <<<"$mapping"
 }
 
+# One observation for the state and the lines under it, so the report cannot
+# pair a verdict with a later snapshot of the slot. The slot as it is now: a
+# status never waits for a MIXED to settle.
 report_release() {
-  local slot="$1" state
-  state="$(slot_release_state "$slot")" || {
+  local slot="$1" observation state
+  observation="$(observe_slot_release "$slot")" || {
     printf '  release   UNKNOWN (could not be read)\n'
     note_problem
     return
   }
+  state="$(release_observation_state "$observation")"
   case "$state" in
     CONSISTENT\ *) printf '  release   %s\n  state     CONSISTENT\n' "${state#CONSISTENT }" ;;
     NOT_DEPLOYED) printf '  release   -\n  state     NOT DEPLOYED\n' ;;
@@ -48,12 +52,12 @@ report_release() {
       # Distinct from MIXED: the slot is not broken, it has simply not finished.
       # The per-workload lines show which releases its Ready pods are on.
       printf '  release   ROLLING OUT\n  state     INCOMPLETE\n'
-      slot_workload_releases "$slot" | awk '{ printf "    %-22s observed=%s  %s\n", $1, $2, $3 }'
+      print_release_observation "$observation" '    '
       note_problem
       ;;
     *)
       printf '  release   MIXED\n  state     INVALID\n'
-      slot_workload_releases "$slot" | awk '{ printf "    %-22s %s  %s\n", $1, $2, $3 }'
+      print_release_observation "$observation" '    '
       note_problem
       ;;
   esac

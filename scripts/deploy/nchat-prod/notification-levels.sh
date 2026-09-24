@@ -106,7 +106,9 @@ slot_is_deployed() {
 ready_pod_of() {
   local slot="$1" deployment component names name
   deployment="$NCHAT_PROD_NOTIFICATION_LEVELS_SERVICE-$slot"
-  component="$(deployment_component "$deployment")" || return 0
+  # An unreadable Deployment fails like an unreadable pod list; only an absent
+  # one is "no pod".
+  component="$(deployment_component "$deployment")" || return 1
   [[ -n "$component" ]] || return 0
   names="$(ready_pods "$component" "$slot" '.metadata.name')" || return 1
   # The first non-blank name, read in the shell rather than through

@@ -23,6 +23,15 @@ NCHAT_PROD_RELEASE_SHA_ANNOTATION='nchat.io/release-sha'
 NCHAT_PROD_RELEASE_ID_ANNOTATION='nchat.io/release-id'
 # Written beside the digests by release-digests.sh, read by the deploy.
 NCHAT_PROD_RELEASE_ID_FILE=release-id.txt
+# How long the candidate smoke may wait, right after a deploy, for the finished
+# rollout's old pods to leave: up to ATTEMPTS observations, INTERVAL seconds
+# apart. `rollout status` returns once the new pods are Ready, while the
+# replaced ones may stay Ready through their 60s terminationGracePeriodSeconds,
+# so the default window (90s) outlasts that. Only observe_settled_slot_release
+# reads these; every other gate takes one observation and answers at once.
+# Bounded in release_settle_bounds_valid; the tests set 0s.
+NCHAT_PROD_RELEASE_SETTLE_ATTEMPTS="${NCHAT_PROD_RELEASE_SETTLE_ATTEMPTS:-19}"
+NCHAT_PROD_RELEASE_SETTLE_INTERVAL="${NCHAT_PROD_RELEASE_SETTLE_INTERVAL:-5}"
 NCHAT_PROD_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 NCHAT_PROD_SLOTS=(blue green)
 # The slot the first production release is established in. Blue is the baseline
@@ -285,19 +294,24 @@ slot_ready() {
   [[ "$failures" -eq 0 ]]
 }
 
-# "<workload> <release-sha> <image>" for every workload of a slot.
-#
-# Every workload, not one of them: reading the slot's version from
-# chat-service alone would report a clean release while file-service and
-# media-service were still on the previous one, which is exactly the state a
-# half-applied deploy leaves behind and exactly the state an operator must not
-# promote.
 # The component label a Deployment selects on, read from the object rather than
 # mapped from its name: it is the relation Kubernetes itself uses to find the
 # workload's pods, so it cannot drift from what is actually deployed.
+#
+# Empty for a Deployment that does not exist, a failure when it cannot be read.
+# `--ignore-not-found` is what separates the two by exit status alone: without
+# it, NotFound and a refused or unreachable API both exit 1, and an unreadable
+# slot read as an undeployed one.
 deployment_component() {
-  kubectl get deployment "$1" -n "$NCHAT_PROD_NAMESPACE" \
-    -o "jsonpath={.spec.selector.matchLabels['app\\.kubernetes\\.io/component']}" 2>/dev/null
+  kubectl get deployment "$1" -n "$NCHAT_PROD_NAMESPACE" --ignore-not-found \
+    -o "jsonpath={.spec.selector.matchLabels['app\\.kubernetes\\.io/component']}"
+}
+
+# The image a Deployment asks for: empty when it does not exist, a failure when
+# it cannot be read, exactly as deployment_component.
+deployment_image() {
+  kubectl get deployment "$1" -n "$NCHAT_PROD_NAMESPACE" --ignore-not-found \
+    -o jsonpath='{.spec.template.spec.containers[0].image}'
 }
 
 # One line per Ready pod of a workload in a slot, rendered by the jq expression
@@ -338,7 +352,7 @@ ready_pods() {
 # listing that fails is a failure, so the caller cannot mistake it for "none".
 deployment_observed_releases() {
   local deployment="$1" slot="$2" component
-  component="$(deployment_component "$deployment")" || return 0
+  component="$(deployment_component "$deployment")" || return 1
   [[ -n "$component" ]] || return 0
   # Both halves of the identity, joined, so every gate downstream compares the
   # code AND the bytes. A pod missing either annotation yields a value that
@@ -372,30 +386,38 @@ observed_release_of() {
 
 # "<workload> <observed-release> <image>" for every workload of a slot.
 #
+# Every workload, not one of them: reading the slot's version from
+# chat-service alone would report a clean release while file-service and
+# media-service were still on the previous one, which is exactly the state a
+# half-applied deploy leaves behind and exactly the state an operator must not
+# promote.
+#
 # Observed, not desired. A workload whose rollout has not completed reports the
 # release its Ready pods are on, so a slot mid-rollout can never be mistaken for
-# one that finished.
+# one that finished. A workload that does not exist is "none absent"; one that
+# cannot be read fails the whole listing.
 slot_workload_releases() {
   local slot="$1" service observed image
   is_valid_slot "$slot" || return 1
   for service in "${NCHAT_PROD_STABLE_SERVICES[@]}"; do
+    image="$(deployment_image "$service-$slot")" || return 1
     observed="$(observed_release_of "$service-$slot" "$slot")" || return 1
-    image="$(kubectl get deployment "$service-$slot" -n "$NCHAT_PROD_NAMESPACE" \
-      -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)"
     printf '%s %s %s\n' "$service" "${observed:-none}" "${image:-absent}"
   done
 }
 
-# What state a slot's release is in, as one token:
-#
-#   CONSISTENT <sha>   every workload carries the same release
-#   NOT_DEPLOYED       no workload of this slot exists
-#   MIXED              the workloads disagree, or only some of them exist, or
-#                      one carries no release annotation at all
-#
-# NOT_DEPLOYED is deliberately separate from MIXED. After bootstrap the second
-# slot legitimately does not exist, and reporting that as a fault would train
-# operators to ignore the one message that means a deploy landed half-way.
+# How many workloads of a slot exist. A Deployment that cannot be read is a
+# failure here, never an absent one: counted as absent, an unreadable slot
+# became NOT_DEPLOYED, which the baseline smoke accepts as "no rival slot".
+slot_deployed_workloads() {
+  local slot="$1" service image count=0
+  for service in "${NCHAT_PROD_STABLE_SERVICES[@]}"; do
+    image="$(deployment_image "$service-$slot")" || return 1
+    [[ -z "$image" ]] || count=$((count + 1))
+  done
+  printf '%s' "$count"
+}
+
 # Every workload of the slot has finished rolling out its current generation.
 slot_rollout_complete() {
   local slot="$1" service
@@ -404,36 +426,165 @@ slot_rollout_complete() {
   done
 }
 
-slot_release_state() {
-  local slot="$1" releases shas images distinct absent total
-  releases="$(slot_workload_releases "$slot")" || return 1
-  images="$(awk '{ print $3 }' <<<"$releases")"
-  total="$(printf '%s\n' "$images" | grep -c .)"
-  absent="$(printf '%s\n' "$images" | grep -c '^absent$' || true)"
-  if [[ "$absent" -eq "$total" ]]; then
-    printf 'NOT_DEPLOYED'
-    return 0
-  fi
-  # Before asking which release is running, establish that one has finished
-  # rolling out. A slot whose new pods are still Pending is serving the previous
-  # release from pods that remain Ready, and calling that CONSISTENT is what let
-  # a stuck deploy be smoked and promoted.
-  if ! slot_rollout_complete "$slot"; then
-    printf 'ROLLING_OUT'
-    return 0
-  fi
-  shas="$(awk '{ print $2 }' <<<"$releases" | LC_ALL=C sort -u)"
-  distinct="$(printf '%s\n' "$shas" | grep -c .)"
-  if [[ "$absent" -ne 0 || "$distinct" -ne 1 ]]; then
+# The state a set of workload lines describes, for a slot whose workloads all
+# exist and have finished rolling out. Pure: it reads nothing, so the verdict and the lines printed to
+# explain it cannot come from two different moments.
+#
+#   CONSISTENT <sha>:<id>   every workload carries the same complete release
+#   MIXED                   anything else
+classify_slot_releases() {
+  local releases="$1" identities distinct
+  # A workload that vanished between the count and this read.
+  if awk '$3 == "absent" { found = 1 } END { exit !found }' <<<"$releases"; then
     printf 'MIXED'
     return 0
   fi
-  # "none" (no Ready pod carries a release) and "mixed" (they disagree) are
-  # answers about the observed state, never a release to promote.
-  case "$shas" in
+  identities="$(awk '{ print $2 }' <<<"$releases" | LC_ALL=C sort -u)"
+  distinct="$(printf '%s\n' "$identities" | grep -c . || true)"
+  if [[ "$distinct" -ne 1 ]]; then
+    printf 'MIXED'
+    return 0
+  fi
+  # "none" (no Ready pod carries a release), "mixed" (they disagree) and
+  # "unset" (no complete identity) are answers about the observed state, never
+  # a release to promote.
+  case "$identities" in
     none | mixed | unset) printf 'MIXED'; return 0 ;;
   esac
-  printf 'CONSISTENT %s' "$shas"
+  printf 'CONSISTENT %s' "$identities"
+}
+
+# What a slot's Deployments alone decide, before any pod is classified: MIXED
+# when only some of them exist -- a deploy that landed half-way, whatever the
+# rest are doing -- ROLLING_OUT when all exist but one has not finished, and
+# nothing when the pods have to decide.
+slot_deployment_state() {
+  local slot="$1" deployed="$2"
+  if ((deployed < ${#NCHAT_PROD_STABLE_SERVICES[@]})); then
+    printf 'MIXED'
+    return 0
+  fi
+  slot_rollout_complete "$slot" || printf 'ROLLING_OUT'
+}
+
+# One observation of a slot: its state on the first line, then the
+# "<workload> <observed-release> <image>" lines that state was decided from.
+#
+#   CONSISTENT <sha>:<id>  every workload carries the same release
+#   NOT_DEPLOYED           no workload of this slot exists
+#   ROLLING_OUT            every workload exists, one has not finished rolling out
+#   MIXED                  only some workloads exist, or they disagree,
+#                          or one carries no complete release identity
+#
+# NOT_DEPLOYED is deliberately separate from MIXED. After bootstrap the second
+# slot legitimately does not exist, and reporting that as a fault would train
+# operators to ignore the one message that means a deploy landed half-way.
+#
+# Rollout first, pods second. A slot whose new pods are still Pending is
+# serving the previous release from pods that remain Ready, and classifying
+# those is what let a stuck deploy be smoked and promoted. Reading the pods
+# before the rollout check also let a rollout finish between the two reads, so
+# a snapshot from before completion was judged as the final one. For
+# ROLLING_OUT the lines are only evidence: they are never classified.
+#
+# Exactly one observation: no wait and no retry. Every gate answers from the
+# present state; only the candidate smoke opts into observe_settled_slot_release.
+observe_slot_release() {
+  local slot="$1" deployed state="" releases
+  is_valid_slot "$slot" || return 1
+  deployed="$(slot_deployed_workloads "$slot")" || return 1
+  if [[ "$deployed" -eq 0 ]]; then
+    printf 'NOT_DEPLOYED\n'
+    return 0
+  fi
+  state="$(slot_deployment_state "$slot" "$deployed")"
+  releases="$(slot_workload_releases "$slot")" || return 1
+  [[ -n "$state" ]] || state="$(classify_slot_releases "$releases")"
+  printf '%s\n%s\n' "$state" "$releases"
+}
+
+# The two halves of an observation.
+release_observation_state() { printf '%s' "${1%%$'\n'*}"; }
+
+release_observation_workloads() {
+  [[ "$1" == *$'\n'* ]] || return 0
+  printf '%s\n' "${1#*$'\n'}"
+}
+
+# Whether a MIXED observation can still settle on its own.
+#
+# Only one shape can. After a rollout has completed, a workload whose Ready pods
+# disagree with each other is a replaced pod that has not left yet: `rollout
+# status` does not wait for it, and it may stay Ready through its grace period.
+# It leaves, or the observation stays MIXED.
+#
+# Nothing else is waited for, because nothing else goes away by waiting. A
+# missing annotation ("unset") stays missing; a workload with no Ready pod after
+# its rollout reported them Ready ("none") is not a lag, since the pods are
+# written before the controller counts them; and workloads that each agree with
+# themselves but not with each other are a deploy that landed half-way.
+slot_release_settling() {
+  local observation="$1"
+  [[ "$(release_observation_state "$observation")" == MIXED ]] || return 1
+  release_observation_workloads "$observation" | awk '
+    $2 == "mixed" { mixed = 1 }
+    $2 == "none" || $2 == "unset" { settled = 1 }
+    END { exit !(mixed && !settled) }'
+}
+
+# The settle window is configuration an operator can set, so it is bounded
+# rather than trusted: at least one observation, never more than 300s of wait.
+release_settle_bounds_valid() {
+  local attempts="$NCHAT_PROD_RELEASE_SETTLE_ATTEMPTS" interval="$NCHAT_PROD_RELEASE_SETTLE_INTERVAL"
+  [[ "$attempts" =~ ^[0-9]{1,3}$ && "$interval" =~ ^[0-9]{1,3}$ ]] || return 1
+  ((10#$attempts >= 1 && (10#$attempts - 1) * 10#$interval <= 300))
+}
+
+# An observation of the slot that is no longer settling, or the last one taken
+# when the window runs out -- which then stays MIXED and blocks as it always
+# did.
+#
+# For the candidate smoke that runs right after `rollout status`, and nothing
+# else. status, cutover and rollback describe the slot as it is now: a MIXED
+# there is either a real fault or a deploy still settling, and in both cases the
+# answer is to refuse now, not to wait up to 90s for it to change.
+#
+# Each attempt is a whole new observation, rollout check included, so a rollout
+# that restarts meanwhile ends the wait as ROLLING_OUT. A read that fails ends
+# it at once: an API, RBAC or context failure is not a release settling, and
+# retrying it would only turn a hard refusal into a slow one.
+observe_settled_slot_release() {
+  local slot="$1" observation attempt=1
+  release_settle_bounds_valid || {
+    echo "error: NCHAT_PROD_RELEASE_SETTLE_ATTEMPTS must be 1-999 and NCHAT_PROD_RELEASE_SETTLE_INTERVAL 0-999, waiting at most 300s" >&2
+    return 1
+  }
+  observation="$(observe_slot_release "$slot")" || return 1
+  while slot_release_settling "$observation" && ((attempt < 10#$NCHAT_PROD_RELEASE_SETTLE_ATTEMPTS)); do
+    echo "slot $slot: replaced pods are still Ready beside the new ones; observing again in ${NCHAT_PROD_RELEASE_SETTLE_INTERVAL}s ($attempt/$NCHAT_PROD_RELEASE_SETTLE_ATTEMPTS)" >&2
+    sleep "$NCHAT_PROD_RELEASE_SETTLE_INTERVAL"
+    observation="$(observe_slot_release "$slot")" || return 1
+    attempt=$((attempt + 1))
+  done
+  printf '%s\n' "$observation"
+}
+
+# The workload lines of an observation, for an operator. While rolling out, the
+# releases are labelled as observed: the Deployment is still asking for another.
+print_release_observation() {
+  local observation="$1" indent="$2" label=""
+  [[ "$(release_observation_state "$observation")" != ROLLING_OUT ]] || label="observed="
+  release_observation_workloads "$observation" |
+    awk -v indent="$indent" -v label="$label" \
+      '{ printf "%s%-22s %s%s  %s\n", indent, $1, label, $2, $3 }'
+}
+
+# What state a slot's release is in now, as one token (see
+# observe_slot_release). One observation, never a wait.
+slot_release_state() {
+  local observation
+  observation="$(observe_slot_release "$1")" || return 1
+  release_observation_state "$observation"
 }
 
 # The single release SHA a slot carries, or failure when it is not consistent.
@@ -453,9 +604,10 @@ slot_release() {
 # nobody built and nobody tested, so the release identity is checked as well and
 # anything short of CONSISTENT blocks.
 require_consistent_release() {
-  local slot="$1" state
-  state="$(slot_release_state "$slot")" ||
+  local slot="$1" observation state
+  observation="$(observe_slot_release "$slot")" ||
     prod_fail "cannot read the release identity of slot $slot"
+  state="$(release_observation_state "$observation")"
   case "$state" in
     CONSISTENT\ *)
       printf '%s' "${state#CONSISTENT }"
@@ -466,12 +618,12 @@ require_consistent_release() {
       ;;
     ROLLING_OUT)
       echo "slot $slot has not finished rolling out:" >&2
-      slot_workload_releases "$slot" | awk '{ printf "  %-22s observed=%s  %s\n", $1, $2, $3 }' >&2
+      print_release_observation "$observation" '  ' >&2
       prod_fail "slot $slot is still rolling out; its Ready pods are not all on the release it declares"
       ;;
   esac
   echo "slot $slot does not carry one release:" >&2
-  slot_workload_releases "$slot" | awk '{ printf "  %-22s %s  %s\n", $1, $2, $3 }' >&2
+  print_release_observation "$observation" '  ' >&2
   prod_fail "slot $slot is $state; deploy the release again before promoting it"
 }
 

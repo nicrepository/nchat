@@ -773,6 +773,24 @@ reports each slot as `CONSISTENT <sha>:<release id>`, `NOT DEPLOYED`, or
 CONSISTENT, and workloads that agree on the commit but not on the release id are
 MIXED — that is a slot half-replaced by a rebuild.
 
+A slot is judged from its Deployments first: none of them is `NOT DEPLOYED`,
+only some of them is `MIXED`, all of them with one still rolling out is
+`ROLLING OUT` whatever its pods carry, and only then are the Ready pods read and
+compared. The per-workload lines printed under a verdict are the observation
+that produced it, never a second read. The identity compared is still
+`<sha>:<release id>`.
+
+`status`, `cutover` and `rollback` report the slot as it is now, from one
+observation, and refuse anything short of CONSISTENT without waiting for it to
+change. Only the **candidate smoke**, which runs right after `rollout status`,
+may wait briefly: the replaced pods can stay Ready through their 60s grace
+period, so when a workload's Ready pods disagree with each other it observes
+again, every 5s for up to 90s. Nothing else is waited for there either. A
+disagreement that outlasts the window stays MIXED; a missing annotation, a
+workload with no Ready pod, or workloads that each agree internally but differ
+from one another are MIXED at once; and a read that fails (API, RBAC, context,
+a Deployment or pod list) stops every command on the spot, without retrying.
+
 ---
 
 ## 6. Migrations
