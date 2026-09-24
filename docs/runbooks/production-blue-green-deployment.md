@@ -84,6 +84,9 @@ stops with the exact missing name.
 - **kube context** `nchat-prod-deployer` (override with `NCHAT_PROD_CONTEXT`).
   Every script refuses an unexpected context.
 - **Namespace** `nchat-prod` must exist.
+- **`jq`** wherever the scripts run, the production runner and an operator's
+  machine alike. The release gates decide pod readiness with it and stop when it
+  is missing; `release-digests.sh` already needed it on the runner.
 - **Secrets**, provisioned via `docs/runbooks/sealed-secrets-rotation.md`:
   `nchat-secrets`, `nchat-postgres-runtime`, `nchat-postgres-migrator`,
   `nchat-file-encryption`, `ghcr-pull`.

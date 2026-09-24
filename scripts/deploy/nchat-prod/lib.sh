@@ -300,6 +300,31 @@ deployment_component() {
     -o "jsonpath={.spec.selector.matchLabels['app\\.kubernetes\\.io/component']}" 2>/dev/null
 }
 
+# One line per Ready pod of a workload in a slot, rendered by the jq expression
+# in $3.
+#
+# Ready is decided in jq over `-o json`, not in a jsonpath filter. A filter on
+# the Ready condition nested inside a filter on .items is refused by kubectl's
+# parser ("unterminated filter"), and with its stderr discarded that read as a
+# workload with no Ready pod: production smokes of a healthy, uniformly
+# annotated slot failed as "carries more than one release".
+#
+# The listing and the filter run as two steps so a kubectl failure (RBAC, API,
+# context) is a failure of this function, never an empty list that a caller
+# would read as "no Ready pod". $3 is always a constant from this directory,
+# never data.
+ready_pods() {
+  local component="$1" slot="$2" render="$3" pods
+  command -v jq >/dev/null || prod_fail "jq is required"
+  pods="$(kubectl get pods -n "$NCHAT_PROD_NAMESPACE"     -l "app.kubernetes.io/component=$component,$NCHAT_PROD_SLOT_LABEL=$slot"     -o json)" || {
+    echo "error: could not list the pods of $component in slot $slot" >&2
+    return 1
+  }
+  jq -r '.items[]
+    | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))
+    | '"$render" <<<"$pods"
+}
+
 # The release each READY pod of a workload is running, one per line.
 #
 # The pods, not the Deployment. The Deployment's annotation is the release we
@@ -308,19 +333,18 @@ deployment_component() {
 #
 # The annotation reaches pods because the slot Kustomization sets it as a common
 # annotation, which kustomize applies to spec.template.metadata as well.
+#
+# A Deployment that does not exist has no pods: nothing, successfully. A pod
+# listing that fails is a failure, so the caller cannot mistake it for "none".
 deployment_observed_releases() {
-  local deployment="$1" slot="$2" component template
-  component="$(deployment_component "$deployment")" || return 1
-  [[ -n "$component" ]] || return 1
-  template='{range .items[?(@.status.conditions[?(@.type=="Ready")].status=="True")]}'
+  local deployment="$1" slot="$2" component
+  component="$(deployment_component "$deployment")" || return 0
+  [[ -n "$component" ]] || return 0
   # Both halves of the identity, joined, so every gate downstream compares the
   # code AND the bytes. A pod missing either annotation yields a value that
   # matches no valid release and is refused rather than defaulted.
-  template+="{.metadata.annotations['nchat\\.io/release-sha']}{':'}"
-  template+="{.metadata.annotations['nchat\\.io/release-id']}{'\n'}{end}"
-  kubectl get pods -n "$NCHAT_PROD_NAMESPACE" \
-    -l "app.kubernetes.io/component=$component,$NCHAT_PROD_SLOT_LABEL=$slot" \
-    -o "jsonpath=$template" 2>/dev/null
+  ready_pods "$component" "$slot" \
+    '"\(.metadata.annotations["nchat.io/release-sha"] // ""):\(.metadata.annotations["nchat.io/release-id"] // "")"'
 }
 
 # The single release every Ready pod of a workload carries, or a state token.
@@ -329,9 +353,11 @@ deployment_observed_releases() {
 #   none           the workload has no Ready pod
 #   mixed          Ready pods disagree — a rollout caught in the middle
 #   unset          the pods carry no complete release identity
+#
+# Fails, rather than answering, when the pods could not be read.
 observed_release_of() {
   local deployment="$1" slot="$2" releases distinct count
-  releases="$(deployment_observed_releases "$deployment" "$slot")" || { printf 'none'; return 0; }
+  releases="$(deployment_observed_releases "$deployment" "$slot")" || return 1
   distinct="$(grep -v '^[[:space:]]*$' <<<"$releases" | LC_ALL=C sort -u)"
   count="$(printf '%s\n' "$distinct" | grep -c .)"
   [[ "$count" -ne 0 ]] || { printf 'none'; return 0; }
@@ -353,7 +379,7 @@ slot_workload_releases() {
   local slot="$1" service observed image
   is_valid_slot "$slot" || return 1
   for service in "${NCHAT_PROD_STABLE_SERVICES[@]}"; do
-    observed="$(observed_release_of "$service-$slot" "$slot")"
+    observed="$(observed_release_of "$service-$slot" "$slot")" || return 1
     image="$(kubectl get deployment "$service-$slot" -n "$NCHAT_PROD_NAMESPACE" \
       -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)"
     printf '%s %s %s\n' "$service" "${observed:-none}" "${image:-absent}"

@@ -2359,6 +2359,148 @@ pass
 
 
 echo
+echo "--- ready pod detection ---"
+
+# Production answered the smoke's pod query with a jsonpath parse error, and the
+# release gates read that as "no Ready pod": a healthy, uniformly annotated slot
+# failed as "carries more than one release". These cases pin the replacement --
+# Ready decided in jq over `-o json` -- against a PodList in the API's own shape,
+# and pin that a listing that fails is a failure, never "none".
+PROD_SHA=d414056dfbddef12ed12c51b78bc9d625d79f7cc
+PROD_ID=7bd6d450b3a9453a2d8c186d9f677430c49fe4acdf9972e49fbd3db2daec74f4
+PODS_FIXTURE="$ROOT_DIR/scripts/ci/testdata/nchat-prod/pods-ready-mixed.json"
+
+# Runs one lib.sh function against the fake cluster the way every script
+# consumes it: through a command substitution, keeping its exit status.
+lib_run() {
+  local state="$1"
+  shift
+  FAKE_STATE_DIR="$state" bash -c '
+    set -Eeuo pipefail
+    source "$1/lib.sh"
+    shift
+    answer="$("$@")" || exit $?
+    printf "%s" "$answer"
+  ' _ "$SCRIPTS" "$@" >"$WORK/out.txt" 2>"$WORK/err.txt"
+}
+
+# One workload's pods answered as a literal PodList, in place of the rendered one.
+set_pods_json() {
+  mkdir -p "$1/pods"
+  cp "$3" "$1/pods/$2.json"
+}
+
+begin "the fake refuses the nested Ready jsonpath exactly as kubectl does"
+state="$(new_state blue blue)"
+status=0
+FAKE_STATE_DIR="$state" kubectl get pods -n nchat-prod -l 'app.kubernetes.io/component=web' \
+  -o 'jsonpath={range .items[?(@.status.conditions[?(@.type=="Ready")].status=="True")]}{end}' \
+  >"$WORK/out.txt" 2>"$WORK/err.txt" || status=$?
+expect_exit 1 "$status"
+grep -q 'unterminated filter' "$WORK/err.txt" || fail "the fake answered a query production cannot parse"
+nested="$(grep -rlF '[?(@.status.conditions[?(' "$SCRIPTS" || true)"
+[[ -z "$nested" ]] || fail "a script still depends on the nested Ready jsonpath: $nested"
+pass
+
+begin "only Ready=True pods contribute an identity, in the production pod shape"
+state="$(new_state blue blue)"
+set_pods_json "$state" web-blue "$PODS_FIXTURE"
+status=0; lib_run "$state" deployment_observed_releases nchat-web-blue blue || status=$?
+expect_exit 0 "$status"
+# Ready=False, no Ready condition and a terminating pod each carry a different
+# release: counted, any one of them would make the slot mixed.
+assert_equals "Ready identities" "$PROD_SHA:$PROD_ID
+$PROD_SHA:$PROD_ID" "$(cat "$WORK/out.txt")"
+status=0; lib_run "$state" observed_release_of nchat-web-blue blue || status=$?
+expect_exit 0 "$status"
+assert_equals "observed release" "$PROD_SHA:$PROD_ID" "$(cat "$WORK/out.txt")"
+pass
+
+begin "a slot whose Ready pods all carry one identity is CONSISTENT"
+state="$(new_state blue blue)"
+printf '%s\n%s\n' "$(identity "$RELEASE_A" "$RELEASE_ID_A")" "$(identity "$RELEASE_A" "$RELEASE_ID_A")" \
+  >"$state/observed/web-blue"
+status=0; lib_run "$state" slot_release_state blue || status=$?
+expect_exit 0 "$status"
+assert_equals "slot state" "CONSISTENT $(identity "$RELEASE_A" "$RELEASE_ID_A")" "$(cat "$WORK/out.txt")"
+pass
+
+begin "Ready pods that disagree make the slot MIXED"
+state="$(new_state blue blue)"
+# Same commit, different sealed build: the identity is both halves, never the SHA.
+printf '%s\n%s\n' "$(identity "$RELEASE_B" "$RELEASE_ID_B")" "$(identity "$RELEASE_B" "$RELEASE_ID_B_REBUILT")" \
+  >"$state/observed/web-blue"
+status=0; lib_run "$state" observed_release_of nchat-web-blue blue || status=$?
+assert_equals "observed release" mixed "$(cat "$WORK/out.txt")"
+status=0; lib_run "$state" slot_release_state blue || status=$?
+assert_equals "slot state" MIXED "$(cat "$WORK/out.txt")"
+pass
+
+begin "a Ready pod missing either half of its identity is unset, never CONSISTENT"
+for half in "$RELEASE_A:" ":$RELEASE_ID_A"; do
+  state="$(new_state blue blue)"
+  printf '%s\n' "$half" >"$state/observed/web-blue"
+  status=0; lib_run "$state" observed_release_of nchat-web-blue blue || status=$?
+  assert_equals "observed release of '$half'" unset "$(cat "$WORK/out.txt")"
+  status=0; lib_run "$state" slot_release_state blue || status=$?
+  assert_equals "slot state of '$half'" MIXED "$(cat "$WORK/out.txt")"
+done
+pass
+
+begin "a workload with no Ready pod is none, and the slot is not promotable"
+state="$(new_state blue blue)"
+jq '.items |= map(select(all(.status.conditions[]?; .type != "Ready" or .status != "True")))' \
+  "$PODS_FIXTURE" >"$WORK/no-ready.json"
+set_pods_json "$state" web-blue "$WORK/no-ready.json"
+status=0; lib_run "$state" observed_release_of nchat-web-blue blue || status=$?
+expect_exit 0 "$status"
+assert_equals "observed release" none "$(cat "$WORK/out.txt")"
+status=0; lib_run "$state" slot_release_state blue || status=$?
+assert_equals "slot state" MIXED "$(cat "$WORK/out.txt")"
+pass
+
+begin "a pod listing that fails is an error, never none"
+state="$(new_state blue "blue green")"
+printf '1' >"$state/pods-list-fails"
+status=0; lib_run "$state" observed_release_of nchat-web-green green || status=$?
+[[ "$status" -ne 0 ]] || fail "a refused pod listing was answered"
+[[ "$(cat "$WORK/out.txt")" != none ]] || fail "a refused pod listing read as no Ready pod"
+grep -q 'could not list the pods of web in slot green' "$WORK/err.txt" ||
+  fail "the failure does not say the pods could not be listed"
+status=0; lib_run "$state" slot_release_state green || status=$?
+[[ "$status" -ne 0 ]] || fail "slot_release_state answered '$(cat "$WORK/out.txt")' without its pods"
+status=0; run "$state" "$SCRIPTS/smoke.sh" --target green || status=$?
+expect_exit 1 "$status"
+grep -q "cannot read the release identity of slot green" "$WORK/err.txt" ||
+  fail "the smoke did not fail closed on an unreadable slot"
+grep -q "Release validated          : NONE" "$WORK/out.txt" || fail "claimed to have validated a release"
+pass
+
+begin "notification-levels execs into a Ready pod, never a Ready=False one"
+state="$(new_state blue blue)"
+set_levels_state "$state" false true unset
+set_pods_json "$state" chat-blue "$PODS_FIXTURE"
+status=0; run "$state" "$SCRIPTS/notification-levels.sh" --status || status=$?
+expect_exit 0 "$status"
+grep -q 'nchat-web-blue-5f4d7b9c8-x2k7q' "$state/exec-log" || fail "did not exec into the first Ready pod"
+grep -Eq 'notready|pending|terminating' "$state/exec-log" && fail "exec'd into a pod that is not Ready"
+grep -q 'slot blue pods: true' "$WORK/out.txt" || fail "the Ready pod's value was not reported"
+pass
+
+begin "notification-levels does not read an unlistable slot as an empty one"
+state="$(new_state blue "blue green")"
+set_levels_state "$state" false true true
+printf '1' >"$state/pods-list-fails"
+status=0; run "$state" "$SCRIPTS/notification-levels.sh" --status || status=$?
+expect_exit 0 "$status"
+grep -q 'slot blue pods: UNKNOWN' "$WORK/out.txt" || fail "--status did not flag the unreadable slot"
+status=0; run "$state" "$SCRIPTS/notification-levels.sh" --set true || status=$?
+[[ "$status" -ne 0 ]] || fail "--set succeeded without reading the pods it had to verify"
+grep -q 'could not list the pods of slot' "$WORK/err.txt" || fail "the failure does not name the unreadable slot"
+grep -q 'no Ready pod' "$WORK/out.txt" && fail "an unreadable slot was reported as having no Ready pod"
+pass
+
+echo
 if [ "$FAILURES" -gt 0 ]; then
   echo "production blue/green script tests failed with $FAILURES failure(s)." >&2
   exit 1
