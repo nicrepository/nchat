@@ -181,7 +181,7 @@ candidate_slot_disposition() {
 # and "the record could not be read" are the same empty string and opposite
 # answers. Only the first is a bootstrap.
 require_consistent_record() {
-  local record="$1" status="$2" active="$3" problem
+  local record="$1" status="$2" active="$3"
   case "$status" in
     0) ;;
     "$NCHAT_PROD_RELEASE_STATE_ABSENT")
@@ -194,16 +194,7 @@ require_consistent_record() {
       return 1
       ;;
   esac
-  # Emptiest condition first, then the schema that decides which keys apply,
-  # then the keys themselves. An existing ConfigMap with empty `data` renders
-  # exactly like an absent one, so it has to be named as its own fault rather
-  # than reported as eight missing keys.
-  [[ -n "$record" ]] ||
-    { echo "the lifecycle record exists but carries no data at all; refusing to act on it" >&2; return 1; }
-  problem="$(release_state_schema_problem "$record")"
-  [[ -z "$problem" ]] || { echo "$problem; refusing to act on it" >&2; return 1; }
-  problem="$(release_state_shape_problem "$record")"
-  [[ -z "$problem" ]] || { echo "$problem; refusing to act on it" >&2; return 1; }
+  require_release_state_contract "$record" || return 1
   require_record_agrees_with_cluster "$record" "$active" || return 1
   require_record_candidate_complete "$record"
 }
@@ -219,22 +210,6 @@ require_record_agrees_with_cluster() {
   reserved="$(release_state_field "$record" rollback_reserved_slot)"
   [[ -z "$reserved" || "$reserved" == "$(opposite_slot "$active")" ]] ||
     { echo "the lifecycle record reserves slot '$reserved' for rollback while '$active' is serving; a reservation can only be on the idle slot" >&2; return 1; }
-}
-
-# The four candidate fields are written together and cleared together, so any
-# mixture of set and empty is a preparation or a cutover that did not finish.
-require_record_candidate_complete() {
-  local record="$1" key value set_count=0 empty_count=0
-  for key in candidate_slot candidate_release candidate_ready_at prepare_run_id; do
-    value="$(release_state_field "$record" "$key")"
-    if [[ -n "$value" ]]; then
-      set_count=$((set_count + 1))
-    else
-      empty_count=$((empty_count + 1))
-    fi
-  done
-  ((set_count == 0 || empty_count == 0)) ||
-    { echo "the lifecycle record holds a half-written candidate ($set_count of 4 fields set); a preparation or a cutover did not finish" >&2; return 1; }
 }
 
 # --- promotion -------------------------------------------------------------

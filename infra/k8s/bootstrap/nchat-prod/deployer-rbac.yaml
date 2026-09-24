@@ -1,0 +1,94 @@
+# The production deploy identity: its ServiceAccount, Role and RoleBinding.
+#
+# Applied by a cluster administrator (`kubectl apply -k`), never by CD and never
+# by a release overlay: the identity cannot be allowed to rewrite its own grants.
+# Until issue #1000 this existed only in the cluster; the rules below are that
+# production Role unchanged, plus the one lifecycle rule at the end.
+# scripts/ci/test_prod_bootstrap_rbac.py holds the rendered result to exactly
+# that, so any other grant fails CI.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nchat-prod-deployer
+  namespace: nchat-prod
+  labels:
+    app.kubernetes.io/component: deployment
+    app.kubernetes.io/name: nchat-prod-deployer
+    app.kubernetes.io/part-of: nchat
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nchat-prod-deployer
+  namespace: nchat-prod
+  labels:
+    app.kubernetes.io/component: deployment
+    app.kubernetes.io/name: nchat-prod-deployer
+    app.kubernetes.io/part-of: nchat
+rules:
+  - apiGroups: [""]
+    resources: [pods, services, configmaps, events]
+    verbs: [get, list, watch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, create, patch, update]
+  - apiGroups: [apps]
+    resources: [replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, watch, create, patch, update]
+  - apiGroups: [""]
+    resourceNames:
+      - admin-service
+      - auth-service
+      - chat-service
+      - document-converter
+      - file-service
+      - media-service
+      - nchat-admin-web
+      - nchat-web
+      - notification-service
+      - search-service
+    resources: [services]
+    verbs: [patch]
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, list, watch, create, update, patch]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch, create, update, patch]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, list, watch, create, update, patch]
+  - apiGroups: [""]
+    resources: [services/proxy]
+    verbs: [get]
+  # GET is already inherited above; repeated here to keep this contract clear.
+  # resourceNames cannot constrain CREATE: creation belongs to bootstrap.
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [nchat-release-state]
+    verbs: [get, patch, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nchat-prod-deployer
+  namespace: nchat-prod
+  labels:
+    app.kubernetes.io/component: deployment
+    app.kubernetes.io/name: nchat-prod-deployer
+    app.kubernetes.io/part-of: nchat
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: nchat-prod-deployer
+subjects:
+  - kind: ServiceAccount
+    name: nchat-prod-deployer
+    namespace: nchat-prod
