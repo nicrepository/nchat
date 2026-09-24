@@ -25,6 +25,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd -P)"
 # shellcheck source=scripts/deploy/nchat-prod/lib.sh
 source "$SCRIPT_DIR/lib.sh"
+# shellcheck source=scripts/deploy/nchat-prod/release-state.sh
+source "$SCRIPT_DIR/release-state.sh"
 # shellcheck source=scripts/deploy/nchat-dev/lib.sh
 source "$ROOT_DIR/scripts/deploy/nchat-dev/lib.sh"
 
@@ -167,6 +169,12 @@ main() {
   require_namespace
   require_secrets
   require_stateful_layer
+  # This runs as nchat-prod-deployer, which may replace the lifecycle record but
+  # never create it (issue #1000): an administrator provisions it beforehand
+  # with bootstrap-release-state.sh. Checked here, before anything is applied,
+  # so an unprovisioned namespace stops now rather than after Blue is deployed.
+  require_provisioned_release_state ||
+    prod_fail "the release lifecycle record is not provisioned and valid; nothing was applied"
   echo "kube context : $(kubectl config current-context)"
   echo "namespace    : $NCHAT_PROD_NAMESPACE"
   echo "environment  : production (first establishment)"
