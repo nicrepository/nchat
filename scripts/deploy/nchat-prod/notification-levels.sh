@@ -95,22 +95,20 @@ slot_is_deployed() {
   [[ -n "$component" ]]
 }
 
-# A Ready pod of one slot's chat-service, or nothing.
+# A Ready pod of one slot's chat-service, nothing when the slot has none, or a
+# failure when its pods could not be listed.
 #
 # Labels are derived from the Deployment's own selector by deployment_component,
 # exactly as deployment_observed_releases does it, rather than guessed here: the
 # component label is `chat`, not the Deployment's name, and a selector written
 # from the name would match nothing and report every slot as having no pod.
+# Readiness is decided by ready_pods, the same filter the release gates use.
 ready_pod_of() {
-  local slot="$1" deployment component template names name
+  local slot="$1" deployment component names name
   deployment="$NCHAT_PROD_NOTIFICATION_LEVELS_SERVICE-$slot"
   component="$(deployment_component "$deployment")" || return 0
   [[ -n "$component" ]] || return 0
-  template='{range .items[?(@.status.conditions[?(@.type=="Ready")].status=="True")]}'
-  template+="{.metadata.name}{'\n'}{end}"
-  names="$(kubectl get pods -n "$NCHAT_PROD_NAMESPACE" \
-    -l "app.kubernetes.io/component=$component,$NCHAT_PROD_SLOT_LABEL=$slot" \
-    -o "jsonpath=$template" 2>/dev/null)" || return 0
+  names="$(ready_pods "$component" "$slot" '.metadata.name')" || return 1
   # The first non-blank name, read in the shell rather than through
   # `| head -1`: head closes the pipe after one line, the writer takes SIGPIPE,
   # and `set -o pipefail` then reports the whole pipeline as failed — which read
@@ -127,10 +125,11 @@ ready_pod_of() {
 #
 # This is the only check that answers the question the operator cares about: the
 # ConfigMap is what the *next* pod will read, and `printenv` is what this pod
-# did read. Prints nothing when the slot has no Ready pod.
+# did read. Prints nothing when the slot has no Ready pod, and fails when its
+# pods could not be listed.
 loaded_value() {
   local slot="$1" pod
-  pod="$(ready_pod_of "$slot")"
+  pod="$(ready_pod_of "$slot")" || return 1
   [[ -n "$pod" ]] || return 0
   # `|| true`: an absent variable makes printenv exit non-zero, which is a
   # reading — "this pod has no such value" — and not a failure of this command.
@@ -142,7 +141,10 @@ loaded_value() {
 # pod are distinguishable in the report.
 slot_report() {
   local slot="$1" value
-  value="$(loaded_value "$slot" | tr -d '\r\n')"
+  value="$(loaded_value "$slot" | tr -d '\r\n')" || {
+    printf 'UNKNOWN, its pods could not be listed'
+    return 0
+  }
   if [[ -z "$value" ]]; then
     printf 'no Ready pod, or the value is unset'
     return 0
@@ -212,7 +214,10 @@ restart_slots() {
 verify_slots() {
   local value="$1" slot observed stale=0 verified=0
   for slot in "${NCHAT_PROD_SLOTS[@]}"; do
-    observed="$(loaded_value "$slot" | tr -d '\r\n')"
+    # An unreadable slot is not an empty one: skipping it as "no Ready pod"
+    # would let a stale slot pass unverified.
+    observed="$(loaded_value "$slot" | tr -d '\r\n')" ||
+      prod_fail "could not list the pods of slot $slot; nothing was proved about the value it loaded"
     if [[ -z "$observed" ]]; then
       echo "slot $slot : no Ready pod; it will read '$value' when scaled up"
       continue
