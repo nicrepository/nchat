@@ -41,8 +41,15 @@
 #   release-state-exists-fails "1" makes only the `-o name` existence probe
 #                        fail, which is the read that separates "no ConfigMap"
 #                        from "ConfigMap with empty data"
-#   release-state-write-fails "1" makes `apply -f -` of that ConfigMap fail, as
+#   release-state-write-fails "1" makes patch/apply of that ConfigMap fail, as
 #                        a refused write
+#   admin-contexts       the contexts, one per line, whose identity may create
+#                        ConfigMaps: `auth can-i create configmaps` says yes and
+#                        a create succeeds only for them. nchat-prod-deployer is
+#                        never one -- the production Role grants it no create --
+#                        so a fixture listing it is refused outright
+#   configmap-create-log every ConfigMap create attempted, allowed or not, so a
+#                        case can prove the deploy identity never tried one
 #   observed/<component>-<slot>  one "<sha>:<id>" per Ready pod of a workload
 #   pods/<component>-<slot>.json the PodList answered verbatim instead
 #   pods-list-fails      "1" refuses every namespaced `get pods -o json`
@@ -69,6 +76,84 @@ namespace_arg() {
     previous="$arg"
   done
 }
+
+# Publish only after the request has been validated, like one API transaction.
+store_release_data() {
+  local data="$1" key
+  mkdir -p "$STATE/release-state"
+  rm -f "$STATE"/release-state/*
+  while IFS= read -r key; do
+    jq -j --arg key "$key" '.[$key]' <<<"$data" >"$STATE/release-state/$key"
+  done < <(jq -r 'keys[]' <<<"$data")
+}
+
+require_release_write() {
+  [[ "$(read_state release-state-write-fails)" != 1 ]] ||
+    { echo 'Error from server (Forbidden): cannot patch configmaps' >&2; exit 1; }
+}
+
+# Whether the current context's identity may create ConfigMaps. Decided by
+# identity, never by a switch the caller sets, so a script running as the deploy
+# context cannot be made privileged by its environment.
+current_context_may_create() {
+  local context
+  context="$(read_state context)"
+  if grep -Fxq nchat-prod-deployer "$STATE/admin-contexts" 2>/dev/null; then
+    echo 'fake: a fixture granted create to nchat-prod-deployer, which production never does' >&2
+    exit 65
+  fi
+  [[ "$context" != nchat-prod-deployer ]] && grep -Fxq "$context" "$STATE/admin-contexts" 2>/dev/null
+}
+
+require_release_create() {
+  printf '%s\n' "$(read_state context)" >>"$STATE/configmap-create-log"
+  current_context_may_create ||
+    { echo "Error from server (Forbidden): configmaps is forbidden: User cannot create resource \"configmaps\" in the namespace \"nchat-prod\"" >&2; exit 1; }
+}
+
+# kubectl auth can-i <verb> <resource> -n <ns>
+#
+# Only "create configmaps" is modelled, and only as the identity allows it:
+# "yes" with exit 0, or "no" with exit 1, exactly as kubectl answers. Anything
+# else is "no", so a question nobody modelled can never read as a grant.
+if [[ "${1:-}" == auth && "${2:-}" == can-i ]]; then
+  if [[ "${3:-}" == create && "${4:-}" == configmaps ]] && current_context_may_create; then
+    echo yes
+    exit 0
+  fi
+  echo no
+  exit 1
+fi
+
+if [[ "${1:-}" == patch && "${2:-}" == configmap && "${3:-}" == nchat-release-state ]]; then
+  require_release_write
+  [[ "$(namespace_arg "$@")" == "$(read_state namespace)" ]] || exit 1
+  [[ -d "$STATE/release-state" ]] || { echo 'Error from server (NotFound)' >&2; exit 1; }
+  [[ "$*" == *--type=json* ]] || exit 64
+  payload=""
+  for arg in "$@"; do
+    [[ "$prev" != -p ]] || payload="$arg"
+    prev="$arg"
+  done
+  jq -e 'length == 1 and .[0].op == "replace" and .[0].path == "/data"
+    and (.[0].value | type == "object")' <<<"$payload" >/dev/null || exit 1
+  store_release_data "$(jq '.[0].value' <<<"$payload")"
+  printf 'patch nchat-release-state\n' >>"$STATE/release-state-write-log"
+  echo 'configmap/nchat-release-state patched'
+  exit 0
+fi
+
+if [[ "${1:-}" == create && "${2:-}" == -n && "$*" == *'-f -'* ]]; then
+  document="$(cat)"
+  require_release_create
+  [[ ! -d "$STATE/release-state" ]] || { echo 'Error from server (AlreadyExists)' >&2; exit 1; }
+  jq -e '.kind == "ConfigMap" and .metadata.name == "nchat-release-state"
+    and .metadata.namespace == "nchat-prod"' <<<"$document" >/dev/null || exit 1
+  store_release_data "$(jq '.data' <<<"$document")"
+  printf 'create nchat-release-state\n' >>"$STATE/release-state-write-log"
+  echo 'configmap/nchat-release-state created'
+  exit 0
+fi
 
 # kubectl config current-context
 #
@@ -511,24 +596,24 @@ fi
 
 # kubectl apply -f -
 #
-# The release record arrives this way, as the document `create --dry-run`
-# rendered. Storing it per key is what makes a write observable to the next
-# read, so a test can prove that a cutover recorded a reservation and that a
-# preparation carried one forward.
+# Keep the previous apply path realistic too: a regression back to apply must
+# not create without privilege or discard unmanaged data keys.
 if [[ "${1:-}" == "apply" && "${2:-}" == "-f" && "${3:-}" == "-" ]]; then
   document="$(cat)"
   printf 'apply -f -\n' >>"$STATE/apply-log"
-  if [[ "$document" == *"kind: ConfigMap"* && "$(read_state release-state-write-fails)" == "1" ]]; then
-    echo "Error from server (Forbidden): configmaps \"nchat-release-state\" is forbidden" >&2
-    exit 1
+  # Existing apply needs PATCH; an absent object needs CREATE even when its
+  # document was produced with a client-side dry run.
+  if [[ -d "$STATE/release-state" ]]; then
+    require_release_write
+  else
+    require_release_create
   fi
-  if [[ "$document" == *"kind: ConfigMap"* ]]; then
-    mkdir -p "$STATE/release-state"
-    while IFS= read -r line; do
-      [[ "$line" =~ ^\ \ ([a-z_]+):\ \"(.*)\"$ ]] || continue
-      printf '%s' "${BASH_REMATCH[2]}" >"$STATE/release-state/${BASH_REMATCH[1]}"
-    done <<<"$document"
-  fi
+  document="$(python3 -c 'import json, sys, yaml; print(json.dumps(yaml.safe_load(sys.stdin)))' <<<"$document")"
+  jq -e '.kind == "ConfigMap" and .metadata.name == "nchat-release-state"' <<<"$document" >/dev/null
+  mkdir -p "$STATE/release-state"
+  while IFS= read -r key; do
+    jq -j --arg key "$key" '.data[$key]' <<<"$document" >"$STATE/release-state/$key"
+  done < <(jq -r '.data | keys[]' <<<"$document")
   echo "configured"
   exit 0
 fi
@@ -596,6 +681,10 @@ fi
 # is what an unreachable API, an expired credential or a refused permission
 # looks like.
 if [[ "${1:-}" == "get" && "${2:-}" == "configmap" && "$*" == *"nchat-release-state"* ]]; then
+  if [[ "$(read_state release-state-read-fails)" == forbidden ]]; then
+    echo 'Error from server (Forbidden): cannot get configmaps' >&2
+    exit 1
+  fi
   if [[ "$(read_state release-state-read-fails)" == "1" ]]; then
     echo "Error from server (InternalError): an error on the server has prevented the request from succeeding" >&2
     exit 1
@@ -624,17 +713,20 @@ fi
 
 # kubectl create configmap <name> --from-literal=k=v ... --dry-run=client -o yaml
 #
-# Rendered, never applied: release-state.sh pipes this into `kubectl apply -f -`
-# so that no value is ever interpolated into a manifest. The rendering here is
-# only as good as it needs to be -- the values in this record are slots, SHAs,
-# run ids and RFC3339 instants, none of which contain a quote.
+# Client-only rendering requires no CREATE. Preserve quoting and reject
+# duplicate literals just as real kubectl does.
 if [[ "${1:-}" == "create" && "${2:-}" == "configmap" ]]; then
-  printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\ndata:\n' "$3"
+  [[ "$*" == *--dry-run=client* ]] || { require_release_create; exit 64; }
+  pairs=()
   for arg in "$@"; do
     [[ "$arg" == --from-literal=* ]] || continue
-    pair="${arg#--from-literal=}"
-    printf '  %s: "%s"\n' "${pair%%=*}" "${pair#*=}"
+    pairs+=("${arg#--from-literal=}")
   done
+  jq -n --arg name "$3" --arg namespace "$(namespace_arg "$@")" --args '
+    $ARGS.positional | map(index("=") as $i | {key: .[:$i], value: .[$i+1:]})
+    | if (map(.key) | unique | length) != length then error("duplicate key") else . end
+    | {apiVersion: "v1", kind: "ConfigMap", metadata: {name: $name, namespace: $namespace}, data: from_entries}
+  ' "${pairs[@]}"
   exit 0
 fi
 

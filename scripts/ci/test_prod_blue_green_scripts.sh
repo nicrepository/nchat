@@ -1145,6 +1145,19 @@ NCHAT_PROD_LIVEKIT_URL=wss://livekit.example.com
 NCHAT_PROD_LIVEKIT_CONNECT_SRC=wss://livekit.example.com https://livekit.example.com
 TOPO
 
+# The administrator's half of provisioning (issue #1000), done the way
+# bootstrap-release-state.sh leaves it: every contract key, all empty. bootstrap.sh
+# runs as the deploy identity and only checks for this; it never creates it.
+provision_release_state() {
+  local key
+  mkdir -p "$1/release-state"
+  printf 'nchat-prod-release-state/v1' >"$1/release-state/schema"
+  for key in candidate_slot candidate_release candidate_ready_at prepare_run_id \
+    active_slot cutover_at rollback_reserved_slot post_cutover_smoke; do
+    : >"$1/release-state/$key"
+  done
+}
+
 release_run() {
   local state="$1"; shift
   FAKE_STATE_DIR="$state" NCHAT_PROD_ASSUME_YES=1 \
@@ -1392,6 +1405,7 @@ fi
 
 begin "bootstrap refuses to start when the migrator Secret is absent"
 state="$(new_state none "")"
+provision_release_state "$state"
 rm -f "$state/secrets/nchat-postgres-migrator"
 status=0; release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
 expect_exit 1 "$status"
@@ -1403,6 +1417,7 @@ pass
 
 begin "bootstrap refuses to start when the stateful layer is absent"
 state="$(new_state none "")"
+provision_release_state "$state"
 rm -f "$state/services/postgres"
 status=0; release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
 expect_exit 1 "$status"
@@ -1412,6 +1427,7 @@ pass
 
 begin "bootstrap refuses a release that is not a commit SHA"
 state="$(new_state none "")"
+provision_release_state "$state"
 RELEASE_SHA=not-a-sha status=0; release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
 expect_exit 1 "$status"
 [[ ! -f "$state/apply-log" ]] || fail "applied resources for an unidentified release"
@@ -1419,6 +1435,7 @@ pass
 
 begin "bootstrap stops when the migration Job fails and never establishes Blue"
 state="$(new_state none "blue")"
+provision_release_state "$state"
 printf '1' >"$state/migration-fails"
 status=0; release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
 expect_exit 1 "$status"
@@ -1431,6 +1448,7 @@ pass
 # half-established production to unpick by hand.
 begin "bootstrap aborts before migrations when the cluster cannot hold Blue"
 state="$(new_state blue "blue")"
+provision_release_state "$state"
 printf '1' >"$state/quota/hard-cpu"
 printf '900m' >"$state/quota/used-cpu"
 status=0; release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
@@ -1443,6 +1461,7 @@ pass
 
 begin "bootstrap aborts before migrations when capacity cannot be determined"
 state="$(new_state blue "blue")"
+provision_release_state "$state"
 rm -rf "$state/quota" "$state/node-allocatable" "$state/cluster-pods" "$state/cluster-pod-slots"
 status=0; release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
 expect_exit 1 "$status"
@@ -1453,12 +1472,89 @@ pass
 
 begin "bootstrap establishes Blue and leaves it selected"
 state="$(new_state blue "blue")"
+provision_release_state "$state"
 status=0; release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
 expect_exit 0 "$status"
 [[ -f "$state/wait-log" ]] || fail "never ran the migration Job"
 [[ "$(wc -l <"$state/rollout-log")" -eq "${#SERVICES[@]}" ]] || fail "did not wait for every workload"
 grep -q "Users must NOT be given the address yet" "$WORK/out.txt" ||
   fail "did not withhold availability until the smoke"
+pass
+
+# Issue 1000: bootstrap.sh runs as nchat-prod-deployer, which may replace the
+# lifecycle record but never create it. It requires the record an administrator
+# provisioned, and checks it before the first mutation: nothing applied, no
+# migration, no Deployment, and no attempt to create anything.
+assert_no_mutation() {
+  local state="$1" what="$2" log
+  for log in apply-log wait-log rollout-log patch-log release-state-write-log configmap-create-log; do
+    [[ ! -s "$state/$log" ]] || fail "$what: $log is not empty -- something was changed"
+  done
+  [[ ! -d "$state/applied" ]] || fail "$what: manifests were applied"
+}
+
+begin "bootstrap refuses an unprovisioned lifecycle record before its first mutation"
+state="$(new_state blue "blue")"
+status=0; release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
+expect_exit 1 "$status"
+grep -q 'bootstrap-release-state.sh' "$WORK/err.txt" || fail "did not name the administrative bootstrap"
+grep -q 'nothing was applied' "$WORK/err.txt" || fail "did not say that nothing was applied"
+assert_no_mutation "$state" "unprovisioned"
+[[ ! -d "$state/release-state" ]] || fail "bootstrap created the lifecycle record"
+pass
+
+begin "bootstrap refuses an invalid lifecycle record before its first mutation"
+for defect in schema missing unexpected partial empty; do
+  state="$(new_state blue "blue")"
+  provision_release_state "$state"
+  case "$defect" in
+    schema) printf 'nchat-prod-release-state/v0' >"$state/release-state/schema" ;;
+    missing) rm "$state/release-state/rollback_reserved_slot" ;;
+    unexpected) printf 'yes' >"$state/release-state/promote_now" ;;
+    partial) printf 'green' >"$state/release-state/candidate_slot" ;;
+    empty) rm -f "$state"/release-state/* ;;
+  esac
+  cp -r "$state/release-state" "$WORK/record-before"
+  status=0; release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
+  [[ "$status" -ne 0 ]] || fail "$defect: bootstrap accepted an invalid record"
+  assert_no_mutation "$state" "$defect"
+  diff -r "$WORK/record-before" "$state/release-state" >/dev/null || fail "$defect: the record was changed"
+  rm -rf "$WORK/record-before"
+done
+pass
+
+begin "bootstrap refuses a lifecycle record it cannot read before its first mutation"
+for failure in release-state-read-fails release-state-exists-fails; do
+  state="$(new_state blue "blue")"
+  printf '1' >"$state/$failure"
+  status=0; release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
+  [[ "$status" -ne 0 ]] || fail "$failure: a failed read let bootstrap proceed"
+  assert_no_mutation "$state" "$failure"
+done
+pass
+
+begin "bootstrap proceeds on a provisioned record and never attempts a create"
+state="$(new_state blue "blue")"
+provision_release_state "$state"
+status=0; release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
+expect_exit 0 "$status"
+[[ -s "$state/rollout-log" ]] || fail "did not deploy Blue"
+[[ ! -e "$state/configmap-create-log" ]] || fail "bootstrap attempted a ConfigMap create"
+[[ ! -s "$state/release-state-write-log" ]] || fail "bootstrap wrote the lifecycle record"
+pass
+
+begin "re-running bootstrap keeps a populated lifecycle record byte for byte"
+state="$(new_state blue "blue")"
+provision_release_state "$state"
+printf 'blue' >"$state/release-state/active_slot"
+printf 'green' >"$state/release-state/rollback_reserved_slot"
+printf '2026-09-24T10:00:00Z' >"$state/release-state/cutover_at"
+cp -r "$state/release-state" "$WORK/record-before"
+status=0; release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
+expect_exit 0 "$status"
+diff -r "$WORK/record-before" "$state/release-state" >/dev/null || fail "bootstrap rewrote a live lifecycle record"
+[[ ! -s "$state/release-state-write-log" ]] || fail "bootstrap wrote to an existing record"
+rm -rf "$WORK/record-before"
 pass
 
 # What the baseline is stamped with, read out of the manifest bootstrap applied.
@@ -1471,6 +1567,7 @@ pass
 # there, and the release id is compared against the manifest it was derived from.
 begin "bootstrap stamps the baseline with the commit and the sealed release"
 state="$(new_state blue "blue")"
+provision_release_state "$state"
 status=0; release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
 expect_exit 0 "$status"
 [[ -f "$state/applied/baseline.yaml" ]] || fail "no baseline manifest was applied"
@@ -1487,6 +1584,7 @@ pass
 # gate compares the annotation to the images again, so nothing would notice.
 begin "bootstrap runs the images the sealed manifest names, not the ones lying around"
 state="$(new_state blue "blue")"
+provision_release_state "$state"
 release_run "$state" "$SCRIPTS/bootstrap.sh" || fail "bootstrap failed"
 for image in web admin-web chat-service media-service auth-service; do
   assert_equals "$image is pinned to the manifest's digest" \
@@ -1509,6 +1607,7 @@ begin "a rebuild of the same commit changes both the identity and the images"
 [[ "$RELEASE_ID_A" != "$RELEASE_ID_A_REBUILT" ]] ||
   fail "two builds of $RELEASE_A share a release id; the identity distinguishes nothing"
 state="$(new_state blue "blue")"
+provision_release_state "$state"
 MANIFEST_DIR="$MANIFEST_A_REBUILT" release_run "$state" "$SCRIPTS/bootstrap.sh" ||
   fail "bootstrap of the rebuild failed"
 assert_equals "the commit is unchanged" "$RELEASE_A" \
@@ -1527,6 +1626,7 @@ pass
 # by the same contract, and both are refused before anything is applied.
 begin "bootstrap refuses a resealed manifest that is missing an image"
 state="$(new_state blue "blue")"
+provision_release_state "$state"
 MANIFEST_DIR="$(reseal_manifest incomplete 'del(.images.web)')" status=0
 release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
 expect_exit 1 "$status"
@@ -1535,6 +1635,7 @@ pass
 
 begin "bootstrap refuses a resealed manifest carrying an unusable digest"
 state="$(new_state blue "blue")"
+provision_release_state "$state"
 MANIFEST_DIR="$(reseal_manifest bad-digest '.images.web = "not-a-digest"')" status=0
 release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
 expect_exit 1 "$status"
@@ -1545,6 +1646,7 @@ pass
 # describes another release, however well-formed it is.
 begin "bootstrap refuses a manifest that seals a different commit"
 state="$(new_state blue "blue")"
+provision_release_state "$state"
 MANIFEST_DIR="$MANIFEST_B" status=0
 release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
 expect_exit 1 "$status"
@@ -1554,6 +1656,7 @@ pass
 
 begin "bootstrap refuses a manifest that is not sealed"
 state="$(new_state blue "blue")"
+provision_release_state "$state"
 unsealed="$WORK/unsealed-manifest"
 rm -rf "$unsealed"; cp -a "$MANIFEST_A" "$unsealed"
 printf 'tampered' >>"$unsealed/release-manifest.json"
@@ -1565,6 +1668,7 @@ pass
 
 begin "bootstrap refuses to start with no manifest to identify the release"
 state="$(new_state blue "blue")"
+provision_release_state "$state"
 MANIFEST_DIR="$WORK/no-such-manifest" status=0
 release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
 expect_exit 1 "$status"
@@ -1576,6 +1680,7 @@ pass
 # never be promoted away from.
 begin "bootstrap and deploy stamp the same identity contract"
 state="$(new_state blue "blue")"
+provision_release_state "$state"
 release_run "$state" "$SCRIPTS/bootstrap.sh" || fail "bootstrap failed"
 deployed="$(new_state blue "blue green")"
 release_run "$deployed" "$SCRIPTS/deploy.sh" || fail "deploy failed"
@@ -1597,6 +1702,7 @@ echo "--- bootstrap -> baseline smoke (first production, end to end) ---"
 # sequence, which is the only way that class of contradiction shows up.
 begin "bootstrap then baseline smoke completes the first production sequence"
 state="$(new_state blue "blue")"
+provision_release_state "$state"
 release_run "$state" "$SCRIPTS/bootstrap.sh" || fail "bootstrap failed"
 # Bootstrap leaves Blue selected: that is the baseline, not a mistake.
 assert_all_on "$state" blue
@@ -1713,6 +1819,7 @@ pass
 
 begin "bootstrap follows the same rules and never deletes an active Job"
 state="$(new_state blue "blue")"
+provision_release_state "$state"
 printf '0 0\n' >"$state/jobs/$JOB_A"
 status=0; release_run "$state" "$SCRIPTS/bootstrap.sh" || status=$?
 expect_exit 0 "$status"

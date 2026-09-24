@@ -162,18 +162,29 @@ release_state_configmap_exists() {
 
 # The record a transition is about to carry forward.
 #
-# Absence is fine -- it is the first write into a namespace that has none --
-# but a failed read is not: carrying forward what could not be read would
-# write empty strings over `active_slot`, `cutover_at` and the rollback
-# reservation, destroying exactly the state the next release depends on.
+# A failed read must not reach the writer: carrying forward what could not be
+# read would write empty strings over `active_slot`, `cutover_at` and the
+# rollback reservation, destroying exactly the state the next release depends
+# on. An absent record is refused too, and named: the writer can only replace
+# a record the privileged bootstrap created (issue #1000), so there is nothing
+# to carry forward into.
 release_state_read_for_update() {
   local record status=0
   record="$(release_state_read)" || status=$?
   case "$status" in
     0) printf '%s' "$record" ;;
-    "$NCHAT_PROD_RELEASE_STATE_ABSENT") printf '' ;;
+    "$NCHAT_PROD_RELEASE_STATE_ABSENT")
+      release_state_explain_absent
+      return 1
+      ;;
     *) return 1 ;;
   esac
+}
+
+release_state_explain_absent() {
+  echo "the release lifecycle record $NCHAT_PROD_RELEASE_STATE_CONFIGMAP does not exist. An administrator" >&2
+  echo "creates it once, with scripts/deploy/nchat-prod/bootstrap-release-state.sh, before anything" >&2
+  echo "runs as the deploy identity, which may only replace it" >&2
 }
 
 # Whether a key is present at all, which is not the same question as whether
@@ -192,26 +203,54 @@ release_state_field() {
   sed -n "s/^$key=//p" <<<"$record" | head -1
 }
 
-# Replaces the record wholesale.
+# Replaces the record wholesale, as one request.
 #
-# `create --dry-run=client | apply` rather than `patch`: the record is written
-# as one document at every call site, so there is no sequence of patches that
-# can leave half of a transition applied. A caller that wants to keep a field
-# passes it back in, visibly.
+# A JSON Patch whose single operation replaces `/data`. It was
+# `create --dry-run | apply`, and apply is the wrong verb for an object the
+# writer must never create: on a missing ConfigMap it turns into a CREATE,
+# which is exactly the request production refused (issue #1000), and on an
+# object created without its last-applied annotation it merges rather than
+# replaces, keeping any key the new document leaves out. The patch needs only
+# `patch` on this one named object, fails NotFound instead of creating one, and
+# replaces every key at once: the API applies a patch as a single update, so no
+# failure can leave half a transition written. A caller that wants to keep a
+# field passes it back in, visibly.
+release_state_write() {
+  local document patch
+  document="$(release_state_document "$@")" || return 1
+  patch="$(jq -c '[{op: "replace", path: "/data", value: .data}]' <<<"$document")" || return 1
+  kubectl patch configmap "$NCHAT_PROD_RELEASE_STATE_CONFIGMAP" \
+    -n "$NCHAT_PROD_NAMESPACE" --type=json -p "$patch"
+}
+
+# The whole record as a ConfigMap document, shared by the bootstrap's one CREATE
+# and every later write, so the two cannot disagree about the contract.
 #
 # Every value is passed through --from-literal, never interpolated into a
-# manifest, so nothing a value contains can become YAML.
-release_state_write() {
-  local pair
-  for pair in "$@"; do
-    [[ "$pair" == *=* ]] || { echo "release state pair is not key=value: '$pair'" >&2; return 1; }
-    release_state_key_is_known "${pair%%=*}" || return 1
-  done
+# manifest, so nothing a value contains can become YAML; `--dry-run=client`
+# renders locally and asks the API for nothing.
+release_state_document() {
+  release_state_pairs_complete "$@" || return 1
   kubectl create configmap "$NCHAT_PROD_RELEASE_STATE_CONFIGMAP" \
     -n "$NCHAT_PROD_NAMESPACE" \
     --from-literal="schema=$NCHAT_PROD_RELEASE_STATE_SCHEMA" \
     "${@/#/--from-literal=}" \
-    --dry-run=client -o yaml | kubectl apply -f -
+    --dry-run=client -o json
+}
+
+# Every contract key, each exactly once. The record is replaced whole, so a
+# missing key would be deleted from it and a repeated one is ambiguous.
+release_state_pairs_complete() {
+  local pair key seen=" "
+  for pair in "$@"; do
+    [[ "$pair" == *=* ]] || { echo "release state pair is not key=value: '$pair'" >&2; return 1; }
+    key="${pair%%=*}"
+    release_state_key_is_known "$key" || return 1
+    [[ "$seen" != *" $key "* ]] || { echo "release state key given twice: '$key'" >&2; return 1; }
+    seen+="$key "
+  done
+  [[ "$#" -eq "${#NCHAT_PROD_RELEASE_STATE_KEYS[@]}" ]] ||
+    { echo "release state must carry every contract key; got $# of ${#NCHAT_PROD_RELEASE_STATE_KEYS[@]}" >&2; return 1; }
 }
 
 release_state_key_is_known() {
@@ -221,6 +260,98 @@ release_state_key_is_known() {
   done
   echo "unknown release state key: '$key'" >&2
   return 1
+}
+
+# --- provisioning (issue #1000) --------------------------------------------
+#
+# The deploy identity may replace this record and may not create it: `create`
+# cannot be narrowed to one object name, so granting it would mean any
+# ConfigMap. The record is therefore created once, by an administrator running
+# bootstrap-release-state.sh, and from then on only ever replaced. Everything
+# that runs as the deploy identity -- bootstrap.sh included -- only checks that
+# this was done, with require_provisioned_release_state.
+
+# The record exists, can be read, and is structurally valid: the precondition
+# for anything the deploy identity is about to do in production.
+#
+# Read-only, and meant to run before the first mutation. Without it an
+# unprovisioned namespace was discovered at the end, by the first write, after
+# the release had already been deployed.
+require_provisioned_release_state() {
+  local record status=0
+  record="$(release_state_read)" || status=$?
+  case "$status" in
+    0) require_valid_release_state "$record" ;;
+    "$NCHAT_PROD_RELEASE_STATE_ABSENT")
+      release_state_explain_absent
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# What a present record must satisfy on its own; shared by the preflight above
+# and by the administrative bootstrap, so the two cannot disagree about "valid".
+require_valid_release_state() {
+  local record="$1"
+  require_release_state_contract "$record" || return 1
+  require_record_candidate_complete "$record"
+}
+
+# The identity running the administrative bootstrap can create ConfigMaps here.
+#
+# Proved by asking the API server, not inferred from a context name: a context
+# is a string anyone can name anything. `kubectl auth can-i` answers "yes" and
+# exits 0 only when the request would be authorised; "no", an error and an
+# unreachable API all fail this, before anything is confirmed or written.
+#
+# The deploy context is refused by name as well, only because running this with
+# it is an obvious slip worth a clearer message; the check that decides is the
+# second one.
+require_release_state_creator() {
+  local answer
+  [[ "$NCHAT_PROD_CONTEXT" != nchat-prod-deployer ]] ||
+    prod_fail "the lifecycle bootstrap cannot run as nchat-prod-deployer, which may replace $NCHAT_PROD_RELEASE_STATE_CONFIGMAP but never create it; use an administrative context"
+  answer="$(kubectl auth can-i create configmaps -n "$NCHAT_PROD_NAMESPACE")" || answer=""
+  [[ "$answer" == yes ]] ||
+    prod_fail "context $NCHAT_PROD_CONTEXT cannot create ConfigMaps in $NCHAT_PROD_NAMESPACE; the lifecycle bootstrap requires an administrative identity that can create the initial $NCHAT_PROD_RELEASE_STATE_CONFIGMAP"
+}
+
+# The administrative bootstrap. Safe to re-run against a live namespace, and
+# that is the point of the four answers below. Applying an empty record every
+# time would silently wipe a prepared candidate and the rollback reservation;
+# this creates only what is absent and never writes over what is present.
+#
+#   absent             create the empty record the contract defines
+#   present, valid     leave it exactly as it is
+#   present, invalid   refuse: a record this pipeline did not write, or wrote
+#                      and died, is a question for a person, not for a reset
+#   unreadable         refuse: a failed read is not absence
+release_state_bootstrap() {
+  local record status=0
+  record="$(release_state_read)" || status=$?
+  case "$status" in
+    0) release_state_bootstrap_keep "$record" ;;
+    "$NCHAT_PROD_RELEASE_STATE_ABSENT") release_state_bootstrap_create ;;
+    *) return 1 ;;
+  esac
+}
+
+release_state_bootstrap_keep() {
+  require_valid_release_state "$1" || return 1
+  echo "release lifecycle record $NCHAT_PROD_RELEASE_STATE_CONFIGMAP is valid; left unchanged"
+}
+
+# `kubectl create`, never apply: if something else created the record since it
+# was read, this fails AlreadyExists instead of overwriting it.
+release_state_bootstrap_create() {
+  local key document initial=()
+  for key in "${NCHAT_PROD_RELEASE_STATE_KEYS[@]}"; do
+    initial+=("$key=")
+  done
+  document="$(release_state_document "${initial[@]}")" || return 1
+  kubectl create -n "$NCHAT_PROD_NAMESPACE" -f - <<<"$document" || return 1
+  echo "release lifecycle record $NCHAT_PROD_RELEASE_STATE_CONFIGMAP created, empty"
 }
 
 # --- shape ----------------------------------------------------------------
@@ -239,15 +370,16 @@ NCHAT_PROD_RELEASE_STATE_REQUIRED_KEYS=(schema "${NCHAT_PROD_RELEASE_STATE_KEYS[
 # question, asked by lifecycle.sh against a reading of that cluster; a parser
 # that also knew about slots and selectors would be two things.
 release_state_shape_problem() {
-  local record="$1" key missing=() unexpected=()
+  local record="$1" key missing_keys=() unexpected_keys=()
   for key in "${NCHAT_PROD_RELEASE_STATE_REQUIRED_KEYS[@]}"; do
-    release_state_has_key "$record" "$key" || missing+=("$key")
+    release_state_has_key "$record" "$key" || missing_keys+=("$key")
   done
   while IFS= read -r key; do
     [[ -n "$key" ]] || continue
-    release_state_key_is_required "$key" || unexpected+=("$key")
+    release_state_key_is_required "$key" || unexpected_keys+=("$key")
   done < <(sed -n 's/=.*//p' <<<"$record")
-  release_state_describe_shape "${#missing[@]}" "${missing[*]-}" "${#unexpected[@]}" "${unexpected[*]-}"
+  release_state_describe_shape "${#missing_keys[@]}" "${missing_keys[*]-}" \
+    "${#unexpected_keys[@]}" "${unexpected_keys[*]-}"
 }
 
 release_state_key_is_required() {
@@ -280,6 +412,45 @@ release_state_schema_problem() {
   schema="$(release_state_field "$record" schema)"
   [[ "$schema" == "$NCHAT_PROD_RELEASE_STATE_SCHEMA" ]] ||
     printf "the record declares schema '%s', expected %s" "$schema" "$NCHAT_PROD_RELEASE_STATE_SCHEMA"
+}
+
+# --- the record's own invariants -------------------------------------------
+#
+# What a present record must satisfy on its own, before anyone compares it with
+# the cluster: the contract's schema and keys, and a candidate written whole.
+# Here rather than in lifecycle.sh because they read nothing but the record, so
+# the privileged bootstrap can validate an existing record without sourcing the
+# code that decides releases. Whether the record agrees with the cluster stays
+# lifecycle.sh's question.
+
+# Emptiest condition first, then the schema that decides which keys apply, then
+# the keys themselves. An existing ConfigMap with empty `data` renders exactly
+# like an absent one, so it has to be named as its own fault rather than
+# reported as eight missing keys.
+require_release_state_contract() {
+  local record="$1" problem
+  [[ -n "$record" ]] ||
+    { echo "the lifecycle record exists but carries no data at all; refusing to act on it" >&2; return 1; }
+  problem="$(release_state_schema_problem "$record")"
+  [[ -z "$problem" ]] || { echo "$problem; refusing to act on it" >&2; return 1; }
+  problem="$(release_state_shape_problem "$record")"
+  [[ -z "$problem" ]] || { echo "$problem; refusing to act on it" >&2; return 1; }
+}
+
+# The four candidate fields are written together and cleared together, so any
+# mixture of set and empty is a preparation or a cutover that did not finish.
+require_record_candidate_complete() {
+  local record="$1" key value set_count=0 empty_count=0
+  for key in candidate_slot candidate_release candidate_ready_at prepare_run_id; do
+    value="$(release_state_field "$record" "$key")"
+    if [[ -n "$value" ]]; then
+      set_count=$((set_count + 1))
+    else
+      empty_count=$((empty_count + 1))
+    fi
+  done
+  ((set_count == 0 || empty_count == 0)) ||
+    { echo "the lifecycle record holds a half-written candidate ($set_count of 4 fields set); a preparation or a cutover did not finish" >&2; return 1; }
 }
 
 # --- transitions ---------------------------------------------------------

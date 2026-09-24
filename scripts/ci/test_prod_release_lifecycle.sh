@@ -142,6 +142,8 @@ record_empty() {
 # Nothing wrote the lifecycle record during this case.
 assert_no_state_write() {
   local state="$1" what="$2"
+  [[ ! -s "$state/release-state-write-log" ]] ||
+    fail "$what: the lifecycle record was written"
   grep -q 'apply -f -' "$state/apply-log" 2>/dev/null &&
     fail "$what: the lifecycle record was written"
   return 0
@@ -181,6 +183,220 @@ assert_absent() {
 }
 
 echo "--- the lifecycle record is a claim, never an authorisation ---"
+
+# One release-state.sh function, run in a fresh shell as the current context of
+# the fixture would run it -- the deploy identity unless a case switches it.
+state_run() {
+  local state="$1"
+  shift
+  # shellcheck disable=SC2016 # expanded by the inner shell.
+  run_script "$state" bash -Eeuo pipefail -c '
+    source "$1/lib.sh"; source "$1/release-state.sh"; shift; "$@"' _ "$SCRIPTS" "$@"
+}
+
+# An administrative identity: its own context, allowed to create ConfigMaps.
+# The deploy identity is never given that; the fake refuses a fixture that tries.
+ADMIN_CONTEXT=nchat-prod-admin
+
+as_context() { printf '%s' "$2" >"$1/context"; }
+
+grant_admin() { printf '%s\n' "$ADMIN_CONTEXT" >"$1/admin-contexts"; }
+
+# The administrative bootstrap, as an administrator, then back to the deployer
+# for whatever the case does next.
+bootstrap_state() {
+  local state="$1"
+  grant_admin "$state"
+  as_context "$state" "$ADMIN_CONTEXT"
+  run_script "$state" env NCHAT_PROD_CONTEXT="$ADMIN_CONTEXT" NCHAT_PROD_ASSUME_YES=1 \
+    bash "$SCRIPTS/bootstrap-release-state.sh"
+  as_context "$state" nchat-prod-deployer
+}
+
+begin "privileged bootstrap creates the complete empty contract"
+STATE="$(new_state green)"
+bootstrap_state "$STATE"
+assert_status "fresh bootstrap" 0
+EXPECTED="$(new_state green)"
+record "$EXPECTED"
+diff -r "$EXPECTED/release-state" "$STATE/release-state" || fail "initial contract differs"
+pass
+
+begin "bootstrap preserves every byte of an existing valid record"
+STATE="$(new_state green)"
+record "$STATE" candidate_slot=blue "candidate_release=$RELEASE_A:$ID_A" \
+  candidate_ready_at=2026-09-24T10:00:00Z prepare_run_id=123 rollback_reserved_slot=green
+cp -r "$STATE/release-state" "$WORK/preserved-record"
+bootstrap_state "$STATE"
+assert_status "repeat bootstrap" 0
+diff -r "$WORK/preserved-record" "$STATE/release-state" || fail "bootstrap reset live state"
+assert_no_state_write "$STATE" "repeat bootstrap"
+pass
+
+for defect in missing schema unexpected partial empty; do
+  begin "bootstrap refuses and preserves invalid record: $defect"
+  STATE="$(new_state green)"
+  record "$STATE"
+  case "$defect" in
+    missing) rm "$STATE/release-state/prepare_run_id" ;;
+    schema) printf 'unknown/v2' >"$STATE/release-state/schema" ;;
+    unexpected) printf 'value' >"$STATE/release-state/unexpected" ;;
+    partial) printf 'blue' >"$STATE/release-state/candidate_slot" ;;
+    empty) record_empty "$STATE" ;;
+  esac
+  cp -r "$STATE/release-state" "$STATE/before"
+  bootstrap_state "$STATE"
+  assert_status "invalid bootstrap" 1
+  diff -r "$STATE/before" "$STATE/release-state" || fail "invalid state was modified"
+  assert_no_state_write "$STATE" "invalid bootstrap"
+  pass
+done
+
+for failure in release-state-read-fails release-state-exists-fails; do
+  begin "bootstrap fails closed on $failure"
+  STATE="$(new_state green)"
+  printf '1' >"$STATE/$failure"
+  bootstrap_state "$STATE"
+  assert_status "unreadable bootstrap" 1
+  [[ ! -d "$STATE/release-state" ]] || fail "read error became absence"
+  assert_no_state_write "$STATE" "unreadable bootstrap"
+  pass
+done
+
+begin "first candidate transition after bootstrap needs no CREATE"
+STATE="$(new_state green)"
+bootstrap_state "$STATE"
+assert_status "initial bootstrap" 0
+run_script "$STATE" bash "$SCRIPTS/prepare-slot.sh" "$WORK/bootstrap-before.txt"
+assert_status "first candidate preparation" 0
+assert_contains "first candidate preparation" "candidate=blue"
+state_run "$STATE" record_candidate_ready blue "$RELEASE_A:$ID_A" 123
+assert_status "candidate write without CREATE" 0
+[[ "$(record_field "$STATE" candidate_slot)" == blue ]] || fail "candidate slot missing"
+[[ "$(record_field "$STATE" candidate_release)" == "$RELEASE_A:$ID_A" ]] || fail "candidate release missing"
+[[ -n "$(record_field "$STATE" candidate_ready_at)" ]] || fail "candidate timestamp missing"
+[[ "$(record_field "$STATE" prepare_run_id)" == 123 ]] || fail "candidate run missing"
+pass
+
+begin "Forbidden read is not absence, even on a populated record"
+STATE="$(new_state green)"
+record "$STATE" active_slot=green
+cp -r "$STATE/release-state" "$STATE/before"
+printf 'forbidden' >"$STATE/release-state-read-fails"
+bootstrap_state "$STATE"
+assert_status "Forbidden bootstrap" 1
+diff -r "$STATE/before" "$STATE/release-state" || fail "Forbidden reset data"
+assert_no_state_write "$STATE" "Forbidden bootstrap"
+pass
+
+begin "full-record patch replaces all data in a single write"
+STATE="$(new_state green)"
+record "$STATE"
+printf 'stale' >"$STATE/release-state/obsolete"
+state_run "$STATE" record_candidate_ready blue "$RELEASE_A:$ID_A" 123
+assert_status "atomic full replacement" 0
+[[ ! -e "$STATE/release-state/obsolete" ]] || fail "writer merged instead of replacing data"
+[[ "$(wc -l <"$STATE/release-state-write-log")" == 1 ]] || fail "more than one write"
+pass
+
+begin "Forbidden patch leaves the entire record unchanged"
+STATE="$(new_state green)"
+record "$STATE" active_slot=green
+cp -r "$STATE/release-state" "$STATE/before"
+printf '1' >"$STATE/release-state-write-fails"
+state_run "$STATE" record_candidate_ready blue "$RELEASE_A:$ID_A" 123
+assert_status "Forbidden write" 1
+diff -r "$STATE/before" "$STATE/release-state" || fail "partial transition persisted"
+assert_no_state_write "$STATE" "Forbidden write"
+pass
+
+begin "the administrative bootstrap refuses the deploy context before anything"
+STATE="$(new_state green)"
+grant_admin "$STATE"
+run_script "$STATE" env NCHAT_PROD_CONTEXT=nchat-prod-deployer NCHAT_PROD_ASSUME_YES=1 \
+  bash "$SCRIPTS/bootstrap-release-state.sh"
+assert_status "deploy-context bootstrap" 1
+assert_contains "deploy-context bootstrap" "cannot run as nchat-prod-deployer"
+[[ ! -e "$STATE/configmap-create-log" ]] || fail "attempted a create as the deploy identity"
+[[ ! -d "$STATE/release-state" ]] || fail "the deploy context created the record"
+pass
+
+# A context that is not the deployer by name, but cannot create ConfigMaps
+# either. The name proves nothing; the API server's answer does. No
+# NCHAT_PROD_ASSUME_YES and no stdin: reaching the confirmation would itself
+# fail, with a different message, so the refusal below can only come first.
+begin "the administrative bootstrap refuses an identity that cannot create, before confirming"
+STATE="$(new_state green)"
+grant_admin "$STATE"
+as_context "$STATE" ops-readonly
+run_script "$STATE" env NCHAT_PROD_CONTEXT=ops-readonly \
+  bash "$SCRIPTS/bootstrap-release-state.sh" </dev/null
+assert_status "read-only bootstrap" 1
+assert_contains "read-only bootstrap" "requires an administrative identity"
+assert_absent "read-only bootstrap" "aborted by operator"
+[[ ! -e "$STATE/configmap-create-log" ]] || fail "attempted a create without the permission"
+[[ ! -d "$STATE/release-state" ]] || fail "an unprivileged identity created the record"
+pass
+
+begin "the fake answers can-i by identity, never for the deploy context"
+STATE="$(new_state green)"
+grant_admin "$STATE"
+for context in nchat-prod-deployer "$ADMIN_CONTEXT" ops-readonly; do
+  as_context "$STATE" "$context"
+  run_script "$STATE" kubectl auth can-i create configmaps -n nchat-prod
+  case "$context" in
+    "$ADMIN_CONTEXT") [[ "$status" -eq 0 && "$output" == yes ]] || fail "$context: expected yes, got '$output'" ;;
+    *) [[ "$status" -ne 0 && "$output" == no ]] || fail "$context: expected no, got '$output'" ;;
+  esac
+done
+printf 'nchat-prod-deployer\n' >>"$STATE/admin-contexts"
+as_context "$STATE" nchat-prod-deployer
+run_script "$STATE" kubectl auth can-i create configmaps -n nchat-prod
+[[ "$status" -eq 65 ]] || fail "a fixture granting create to the deployer was not refused"
+pass
+
+begin "candidate write cannot create even with a privileged credential"
+STATE="$(new_state green)"
+grant_admin "$STATE"
+as_context "$STATE" "$ADMIN_CONTEXT"
+state_run "$STATE" record_candidate_ready blue "$RELEASE_A:$ID_A" 123
+assert_status "missing bootstrap" 1
+assert_contains "missing bootstrap" "bootstrap-release-state.sh"
+[[ ! -d "$STATE/release-state" ]] || fail "writer implicitly created the ConfigMap"
+[[ ! -e "$STATE/configmap-create-log" ]] || fail "the writer attempted a create"
+assert_no_state_write "$STATE" "missing bootstrap"
+pass
+
+# The writer replaces the whole record, so a key left out would be deleted from
+# it and a repeated one is ambiguous. Both are refused before the API is asked.
+begin "a write that does not carry every key exactly once is refused before any request"
+for pairs in "candidate_slot=blue" \
+  "candidate_slot=blue candidate_slot=green candidate_release= candidate_ready_at= prepare_run_id= active_slot= cutover_at= rollback_reserved_slot=" \
+  "candidate_slot=blue candidate_release= candidate_ready_at= prepare_run_id= active_slot= cutover_at= rollback_reserved_slot= post_cutover_smoke= promote_now=yes"; do
+  STATE="$(new_state green)"
+  record "$STATE" active_slot=green
+  cp -r "$STATE/release-state" "$STATE/before"
+  # shellcheck disable=SC2086 # the pairs are a deliberate word list.
+  state_run "$STATE" release_state_write $pairs
+  assert_status "incomplete write" 1
+  diff -r "$STATE/before" "$STATE/release-state" >/dev/null || fail "an incomplete write changed the record"
+  assert_no_state_write "$STATE" "incomplete write"
+done
+pass
+
+begin "the first cutover after bootstrap is recorded without CREATE"
+STATE="$(new_state green)"
+bootstrap_state "$STATE"
+state_run "$STATE" record_candidate_ready blue "$RELEASE_A:$ID_A" 123
+assert_status "first candidate write" 0
+state_run "$STATE" record_cutover blue green
+assert_status "first cutover write" 0
+[[ "$(record_field "$STATE" active_slot)" == blue ]] || fail "active slot not recorded"
+[[ "$(record_field "$STATE" rollback_reserved_slot)" == green ]] || fail "reservation not recorded"
+[[ -z "$(record_field "$STATE" candidate_slot)" ]] || fail "candidate not consumed"
+[[ "$(grep -c '^patch ' "$STATE/release-state-write-log")" == 2 ]] || fail "expected two patches"
+[[ "$(grep -c '^create ' "$STATE/release-state-write-log")" == 1 ]] || fail "expected only the bootstrap create"
+pass
 
 begin "an absent record blocks a cutover instead of allowing one"
 STATE="$(new_state green)"

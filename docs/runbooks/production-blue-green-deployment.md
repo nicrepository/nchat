@@ -675,6 +675,12 @@ database unmigratable — so the failure mode stays proven rather than remembere
 Blue is the baseline by definition; Green is the next candidate and is not
 deployed.
 
+Bootstrap runs as `nchat-prod-deployer` and requires the administrative
+provisioning to be done first — the deployer's RBAC and the lifecycle record
+(see "Who creates the record" below). It does not create the record: it checks
+for it before applying anything and stops, naming
+`bootstrap-release-state.sh`, when it is absent, unreadable or invalid.
+
 ```bash
 NCHAT_PROD_RELEASE_SHA=<40-hex commit sha> \
 NCHAT_PROD_TOPOLOGY_FILE=/secure/path/topology.env \
@@ -1342,14 +1348,14 @@ something that died half-way, and neither is a state to reason forward from.
 **Absent, empty and unreadable are three different answers.** Only the first is
 a bootstrap:
 
-| The read found                     | Meaning                         | Outcome       |
-| ---------------------------------- | ------------------------------- | ------------- |
-| no ConfigMap                       | first release in this namespace | proceed       |
-| a ConfigMap, valid                 | the recorded state              | validate, use |
-| a ConfigMap with empty `data`      | something wrote a husk          | **refuse**    |
-| a ConfigMap missing a contract key | a write that did not finish     | **refuse**    |
-| a ConfigMap with an unexpected key | not written by this pipeline    | **refuse**    |
-| the read failed                    | nothing is known                | **refuse**    |
+| The read found                     | Meaning                        | Outcome       |
+| ---------------------------------- | ------------------------------ | ------------- |
+| no ConfigMap                       | the bootstrap never created it | see below     |
+| a ConfigMap, valid                 | the recorded state             | validate, use |
+| a ConfigMap with empty `data`      | something wrote a husk         | **refuse**    |
+| a ConfigMap missing a contract key | a write that did not finish    | **refuse**    |
+| a ConfigMap with an unexpected key | not written by this pipeline   | **refuse**    |
+| the read failed                    | nothing is known               | **refuse**    |
 
 The distinction is made with `kubectl get --ignore-not-found`, which exits 0
 and prints nothing for a missing object while keeping its non-zero exit for
@@ -1363,6 +1369,79 @@ This matters most in the one case it was getting wrong: a transient read error
 used to arrive as an empty record, which read as "no rollback is reserved" —
 and from there the next release would have drained the slot that was the way
 back.
+
+#### Who creates the record, and who may write it (issue #1000)
+
+The record is **created once, by an administrator**, and from then on only
+**replaced** by `nchat-prod-deployer`. The deploy identity holds exactly this on
+ConfigMaps, and nothing else:
+
+| Request                                        | `nchat-prod-deployer` |
+| ---------------------------------------------- | --------------------- |
+| `get`/`list`/`watch` any ConfigMap             | yes (unchanged)       |
+| `get`, `patch`, `update` `nchat-release-state` | yes                   |
+| `create` any ConfigMap                         | **no**                |
+| `delete` any ConfigMap                         | **no**                |
+| `patch`/`update` any other ConfigMap           | **no**                |
+
+`create` cannot be narrowed to one name — RBAC `resourceNames` never match a
+create — so granting it would mean every ConfigMap in the namespace. Hence the
+split, and it is a split between identities:
+
+- **Administrative provisioning**, as a cluster administrator: the deployer's
+  RBAC (`infra/k8s/bootstrap/nchat-prod`) and the empty record
+  (`bootstrap-release-state.sh`). The script refuses the `nchat-prod-deployer`
+  context, and asks the API server `kubectl auth can-i create configmaps`
+  before it confirms anything: an identity that cannot create is refused there.
+  It is safe to re-run: an absent record is created with every key empty, a
+  valid one is **left exactly as it is**, and an invalid one or a failed read
+  stops it without writing — an invalid record is for a person to investigate,
+  never to reset.
+- **Everything else runs as `nchat-prod-deployer`**, `bootstrap.sh` included.
+  None of it creates the record. `bootstrap.sh` checks, before it applies
+  anything, that the record exists, can be read and is structurally valid, and
+  stops with a pointer to `bootstrap-release-state.sh` when it does not.
+
+Every lifecycle transition writes with **one** JSON Patch replacing the whole
+`data` of the existing object. It needs `patch` on that one name, replaces every
+key at once, and fails `NotFound` rather than creating a missing record; a
+transition that finds no record refuses and names the administrative command.
+
+The deployer's ServiceAccount, Role and RoleBinding live in
+`infra/k8s/bootstrap/nchat-prod`. Nothing a release renders includes them or
+the record (`make prod-bootstrap-rbac-test` checks both, and that the Role is
+the production baseline plus the one rule above). They are applied by a cluster
+administrator, never by CD.
+
+**Order, for a new namespace.** Steps 1 and 2 are the administrator's; only
+then does anything run as the deployer:
+
+```bash
+# 1. administrator: the deployer's RBAC — review exactly what changes, then apply
+kubectl diff  -k infra/k8s/bootstrap/nchat-prod
+kubectl apply -k infra/k8s/bootstrap/nchat-prod
+
+# 2. administrator: the lifecycle record, created only if it is absent
+NCHAT_PROD_CONTEXT=<administrator context> \
+  scripts/deploy/nchat-prod/bootstrap-release-state.sh
+
+# 3. only now, as nchat-prod-deployer: section 4, `make prod-blue-green-bootstrap`
+```
+
+**For the production namespace as it exists today**, steps 1 and 2 are the
+migration required before the next `CD / Prepare Production`. Afterwards,
+prove the matrix above:
+
+```bash
+SA=system:serviceaccount:nchat-prod:nchat-prod-deployer
+kubectl auth can-i patch  configmap/nchat-release-state -n nchat-prod --as=$SA  # yes
+kubectl auth can-i update configmap/nchat-release-state -n nchat-prod --as=$SA  # yes
+kubectl auth can-i create configmaps                    -n nchat-prod --as=$SA  # no
+kubectl auth can-i delete configmap/nchat-release-state -n nchat-prod --as=$SA  # no
+kubectl auth can-i patch  configmap/nchat-config        -n nchat-prod --as=$SA  # no
+```
+
+The `kubectl diff` in step 1 must show one added rule and nothing else.
 
 The cluster stays the source of truth for **where production is**. The active
 slot is always `resolve_active_slot(collect_service_slots())`, never
