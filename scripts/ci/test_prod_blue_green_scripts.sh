@@ -20,6 +20,10 @@ cp "$ROOT_DIR/scripts/ci/testdata/nchat-prod/fake-kubectl" "$FAKE_BIN/kubectl"
 chmod +x "$FAKE_BIN/kubectl"
 PATH="$FAKE_BIN:$PATH"
 export PATH
+# The release observation waits for replaced pods to leave; here it looks three
+# times without sleeping, so a case about settling decides in milliseconds and
+# the production window (19 x 5s) is asserted once, by value.
+export NCHAT_PROD_RELEASE_SETTLE_ATTEMPTS=3 NCHAT_PROD_RELEASE_SETTLE_INTERVAL=0
 
 SERVICES=(nchat-web nchat-admin-web auth-service chat-service file-service
   document-converter notification-service admin-service search-service media-service)
@@ -144,7 +148,9 @@ replicas_for() {
 # Builds a cluster: every Service on $1, every Deployment of the slots in $2 Ready.
 new_state() {
   local active="$1" ready_slots="$2" state slot service secret count
-  state="$WORK/state.$RANDOM"
+  # A fresh directory every time. `state.$RANDOM` drew ~200 names from 32768,
+  # so a run often reused an earlier case's cluster, failure flags and all.
+  state="$(mktemp -d "$WORK/state.XXXXXX")"
   mkdir -p "$state/services" "$state/ready" "$state/sha" "$state/image" "$state/secrets"
   printf 'nchat-prod-deployer' >"$state/context"
   printf 'nchat-prod' >"$state/namespace"
@@ -2498,6 +2504,324 @@ status=0; run "$state" "$SCRIPTS/notification-levels.sh" --set true || status=$?
 [[ "$status" -ne 0 ]] || fail "--set succeeded without reading the pods it had to verify"
 grep -q 'could not list the pods of slot' "$WORK/err.txt" || fail "the failure does not name the unreadable slot"
 grep -q 'no Ready pod' "$WORK/out.txt" && fail "an unreadable slot was reported as having no Ready pod"
+pass
+
+echo
+echo "--- release identity stabilization ---"
+
+# Issue 995: `rollout status` returned, the smoke read the candidate's pods
+# while a replaced pod was still Ready beside the new ones, classified MIXED,
+# and then read the slot again to explain itself -- printing a later snapshot
+# with every workload on one release under that verdict. These cases pin the
+# order (Deployments, rollout, then pods), that only the candidate smoke waits
+# for that one transient shape and only for a bounded window, that every other
+# gate answers from a single observation, and that the evidence printed is the
+# snapshot that decided.
+ID_A="$(identity "$RELEASE_A" "$RELEASE_ID_A")"
+ID_A_REBUILT="$(identity "$RELEASE_A" "$RELEASE_ID_A_REBUILT")"
+ID_B="$(identity "$RELEASE_B" "$RELEASE_ID_B")"
+ID_B_REBUILT="$(identity "$RELEASE_B" "$RELEASE_ID_B_REBUILT")"
+
+# How many times one workload's pods were listed.
+pods_listings() {
+  [[ -f "$1/pods-list-log" ]] || { printf '0'; return 0; }
+  grep -cx "$2" "$1/pods-list-log" || true
+}
+
+# The Ready pods of one workload now, and the ones it has once they are listed.
+set_pods_then() {
+  local state="$1" workload="$2" now="$3" next="${4-}"
+  printf '%s\n' "$now" >"$state/observed/$workload"
+  [[ -n "$next" ]] || return 0
+  mkdir -p "$state/observed-next"
+  printf '%s\n' "$next" >"$state/observed-next/$workload"
+}
+
+# A replaced pod still Ready beside the new ones, gone once it has been seen:
+# the shape the production smoke met, on web-<slot>.
+set_replaced_pod_leaving() {
+  set_pods_then "$1" "web-$2" "$ID_A
+$ID_B" "$ID_A
+$ID_A"
+}
+
+# The state an observation printed: its first line.
+observed_state() { head -n 1 "$WORK/out.txt"; }
+
+begin "the production settle window outlasts the 60s termination grace period"
+# shellcheck disable=SC2016 # expanded by the inner shell, after lib.sh sets them.
+defaults="$(env -u NCHAT_PROD_RELEASE_SETTLE_ATTEMPTS -u NCHAT_PROD_RELEASE_SETTLE_INTERVAL \
+  bash -c 'source "$1/lib.sh"; release_settle_bounds_valid && echo "$NCHAT_PROD_RELEASE_SETTLE_ATTEMPTS $NCHAT_PROD_RELEASE_SETTLE_INTERVAL"' _ "$SCRIPTS")" ||
+  defaults="refused"
+assert_equals "attempts and interval" "19 5" "$defaults"
+grep -q 'terminationGracePeriodSeconds: 60' \
+  "$ROOT_DIR/infra/k8s/overlays/k3s-prod/slots/workloads/runtime-patch.yaml" ||
+  fail "the grace period changed; revisit NCHAT_PROD_RELEASE_SETTLE_ATTEMPTS/INTERVAL"
+pass
+
+begin "an unbounded or malformed settle window is refused, never used"
+state="$(new_state blue "blue green")"
+for bounds in "0 0" "abc 0" "2 999" "400 1"; do
+  read -r attempts interval <<<"$bounds"
+  status=0
+  NCHAT_PROD_RELEASE_SETTLE_ATTEMPTS="$attempts" NCHAT_PROD_RELEASE_SETTLE_INTERVAL="$interval" \
+    lib_run "$state" observe_settled_slot_release green || status=$?
+  [[ "$status" -ne 0 ]] || fail "settle window '$bounds' was accepted: $(observed_state)"
+done
+pass
+
+begin "a slot with none of its workloads is NOT_DEPLOYED"
+state="$(new_state blue blue)"
+status=0; lib_run "$state" slot_release_state green || status=$?
+expect_exit 0 "$status"
+assert_equals "slot state" NOT_DEPLOYED "$(cat "$WORK/out.txt")"
+pass
+
+begin "a slot with only some of its workloads is MIXED, never ROLLING_OUT"
+state="$(new_state blue "blue green")"
+rm -f "$state/ready/media-service-green" "$state/ready/search-service-green"
+status=0; lib_run "$state" observe_slot_release green || status=$?
+expect_exit 0 "$status"
+assert_equals "slot state" MIXED "$(observed_state)"
+grep -Eq '^media-service none absent$' "$WORK/out.txt" || fail "the evidence does not name the missing workload"
+# The same half-landed slot with a rollout also unfinished is still MIXED: the
+# missing workloads decide first.
+set_rollout "$state" nchat-web-green 2 1 2 2 2 2 0
+status=0; lib_run "$state" slot_release_state green || status=$?
+assert_equals "slot state, rollout also unfinished" MIXED "$(cat "$WORK/out.txt")"
+pass
+
+begin "a slot with every workload and an unfinished rollout is ROLLING_OUT, its pods never classified"
+state="$(new_state blue "blue green")"
+set_rollout "$state" nchat-web-green 2 1 2 2 2 2 0
+set_pods_then "$state" web-green "$ID_A
+$ID_B"
+for observe in slot_release_state observe_settled_slot_release; do
+  status=0; lib_run "$state" "$observe" green || status=$?
+  expect_exit 0 "$status"
+  assert_equals "$observe" ROLLING_OUT "$(observed_state)"
+done
+# One listing each, for evidence: ROLLING_OUT is never waited out.
+assert_equals "web-green listings" 2 "$(pods_listings "$state" web-green)"
+pass
+
+begin "slot_release_state takes one observation and never waits"
+state="$(new_state blue "blue green")"
+set_replaced_pod_leaving "$state" green
+status=0
+NCHAT_PROD_RELEASE_SETTLE_INTERVAL=999 lib_run "$state" slot_release_state green || status=$?
+expect_exit 0 "$status"
+assert_equals "slot state" MIXED "$(cat "$WORK/out.txt")"
+assert_equals "web-green listings" 1 "$(pods_listings "$state" web-green)"
+grep -q 'observing again' "$WORK/err.txt" && fail "a plain state read waited to settle"
+pass
+
+begin "the settle window: a replaced pod leaving converges to CONSISTENT"
+state="$(new_state blue "blue green")"
+set_replaced_pod_leaving "$state" green
+status=0; lib_run "$state" observe_settled_slot_release green || status=$?
+expect_exit 0 "$status"
+assert_equals "slot state" "CONSISTENT $ID_A" "$(observed_state)"
+assert_equals "web-green listings" 2 "$(pods_listings "$state" web-green)"
+grep -q 'observing again' "$WORK/err.txt" || fail "waited without saying so"
+pass
+
+begin "the settle window: a disagreement that outlasts it stays MIXED after exactly the bounded attempts"
+state="$(new_state blue "blue green")"
+set_pods_then "$state" web-green "$ID_A
+$ID_B"
+status=0; lib_run "$state" observe_settled_slot_release green || status=$?
+expect_exit 0 "$status"
+assert_equals "slot state" MIXED "$(observed_state)"
+assert_equals "web-green listings" 3 "$(pods_listings "$state" web-green)"
+pass
+
+begin "one commit sealed twice is two releases, within a workload and across them"
+state="$(new_state blue "blue green")"
+set_pods_then "$state" web-green "$ID_A
+$ID_A_REBUILT"
+status=0; lib_run "$state" observe_settled_slot_release green || status=$?
+assert_equals "slot state, one workload" MIXED "$(observed_state)"
+state="$(new_state blue "blue green")"
+set_workload_release "$state" media-service-green "$RELEASE_A" "$RELEASE_ID_A_REBUILT"
+status=0; lib_run "$state" observe_settled_slot_release green || status=$?
+assert_equals "slot state, two workloads" MIXED "$(observed_state)"
+# Every workload agreeing with itself is not a pod leaving: nothing to wait for.
+assert_equals "media-green listings" 1 "$(pods_listings "$state" media-green)"
+pass
+
+begin "a missing half of the identity, or no Ready pod, is MIXED at once, even with the window"
+for pods in "$RELEASE_A:" ":$RELEASE_ID_A" ""; do
+  state="$(new_state blue "blue green")"
+  set_pods_then "$state" web-green "$pods"
+  status=0; lib_run "$state" observe_settled_slot_release green || status=$?
+  expect_exit 0 "$status"
+  assert_equals "slot state for '$pods'" MIXED "$(observed_state)"
+  assert_equals "web-green listings for '$pods'" 1 "$(pods_listings "$state" web-green)"
+done
+# A replaced pod beside one missing an annotation is not waited out either:
+# the annotation will not appear, so the wait could only delay the refusal.
+state="$(new_state blue "blue green")"
+set_pods_then "$state" web-green "$ID_A
+$ID_B"
+set_pods_then "$state" chat-green ":$RELEASE_ID_A"
+status=0; lib_run "$state" observe_settled_slot_release green || status=$?
+assert_equals "slot state" MIXED "$(observed_state)"
+assert_equals "web-green listings" 1 "$(pods_listings "$state" web-green)"
+pass
+
+begin "a pod listing that fails is an immediate error, never retried"
+state="$(new_state blue "blue green")"
+set_pods_then "$state" web-green "$ID_A
+$ID_B" "$ID_A"
+printf '1' >"$state/pods-list-fails"
+status=0; lib_run "$state" observe_settled_slot_release green || status=$?
+[[ "$status" -ne 0 ]] || fail "answered '$(observed_state)' without its pods"
+assert_equals "state printed" "" "$(cat "$WORK/out.txt")"
+assert_equals "pod listings" 1 "$(wc -l <"$state/pods-list-log")"
+grep -q 'observing again' "$WORK/err.txt" && fail "retried a refused read as if it were settling"
+pass
+
+begin "a Deployment that cannot be read is an error, never NOT_DEPLOYED"
+state="$(new_state blue "blue green")"
+printf '1' >"$state/deployment-read-fails"
+for observe in slot_release_state observe_settled_slot_release; do
+  status=0; lib_run "$state" "$observe" green || status=$?
+  [[ "$status" -ne 0 ]] || fail "$observe: an unreadable slot answered '$(observed_state)'"
+done
+# The baseline smoke accepts NOT_DEPLOYED as "no rival slot"; an unreadable
+# rival must fail that check instead of passing it.
+state="$(new_state blue blue)"
+printf '1' >"$state/deployment-read-fails"
+status=0; run "$state" "$SCRIPTS/smoke.sh" --target blue --baseline || status=$?
+expect_exit 1 "$status"
+grep -q 'slot green is deployed (UNKNOWN)' "$WORK/err.txt" ||
+  fail "an unreadable rival slot was not refused as UNKNOWN"
+status=0; run "$state" "$SCRIPTS/status.sh" || status=$?
+[[ "$status" -ne 0 ]] || fail "status reported an unreadable cluster as healthy"
+grep -q 'release   UNKNOWN' "$WORK/out.txt" || fail "status did not say the release could not be read"
+grep -q 'NOT DEPLOYED' "$WORK/out.txt" && fail "status reported an unreadable slot as not deployed"
+pass
+
+begin "notification-levels does not read an unreadable Deployment as having no pod"
+state="$(new_state blue "blue green")"
+set_levels_state "$state" false true true
+printf '1' >"$state/deployment-read-fails"
+status=0; run "$state" "$SCRIPTS/notification-levels.sh" --set true || status=$?
+[[ "$status" -ne 0 ]] || fail "--set succeeded without reading the Deployments it had to verify"
+grep -q 'no Ready pod' "$WORK/out.txt" && fail "an unreadable slot was reported as having no Ready pod"
+pass
+
+begin "the candidate smoke waits out a replaced pod and passes on the settled release"
+state="$(new_state blue "blue green")"
+set_replaced_pod_leaving "$state" green
+status=0; run "$state" "$SCRIPTS/smoke.sh" --target green || status=$?
+expect_exit 0 "$status"
+grep -q "slot green carries one release across every workload ($ID_A)" "$WORK/out.txt" ||
+  fail "the smoke did not settle on the release the slot converged to"
+assert_equals "web-green listings" 2 "$(pods_listings "$state" web-green)"
+pass
+
+begin "the smoke prints the snapshot that decided MIXED, not a later one"
+state="$(new_state blue "blue green")"
+set_replaced_pod_leaving "$state" green
+status=0
+NCHAT_PROD_RELEASE_SETTLE_ATTEMPTS=1 run "$state" "$SCRIPTS/smoke.sh" --target green || status=$?
+expect_exit 1 "$status"
+grep -q 'carries more than one release' "$WORK/err.txt" || fail "the transient snapshot was not MIXED"
+grep -Eq '^ +nchat-web +mixed ' "$WORK/err.txt" || fail "the evidence does not show the disagreement that decided"
+grep -Eq "^ +nchat-web +$ID_A " "$WORK/err.txt" && fail "printed a later snapshot under the MIXED verdict"
+assert_equals "web-green listings" 1 "$(pods_listings "$state" web-green)"
+# The cluster did move on: a second look, had the smoke taken one, would agree.
+status=0; lib_run "$state" slot_release_state green || status=$?
+assert_equals "slot state afterwards" "CONSISTENT $ID_A" "$(cat "$WORK/out.txt")"
+pass
+
+# The gates below meet the same transient slot the smoke waits out, and must
+# not: each refuses from the one observation it took, with that observation as
+# its evidence, and the slot would have converged had it waited.
+begin "status reports the present MIXED from one observation, without waiting"
+state="$(new_state blue "blue green")"
+set_replaced_pod_leaving "$state" green
+status=0; run "$state" "$SCRIPTS/status.sh" || status=$?
+[[ "$status" -ne 0 ]] || fail "status reported a MIXED candidate as healthy"
+grep -Eq '^ +nchat-web +mixed ' "$WORK/out.txt" || fail "the evidence does not show the disagreement that decided"
+assert_equals "web-green listings" 1 "$(pods_listings "$state" web-green)"
+grep -q 'observing again' "$WORK/err.txt" && fail "status waited for the slot to settle"
+pass
+
+begin "require_consistent_release refuses the present MIXED without waiting"
+state="$(new_state blue "blue green")"
+set_replaced_pod_leaving "$state" green
+status=0; lib_run "$state" require_consistent_release green || status=$?
+expect_exit 1 "$status"
+grep -q 'does not carry one release' "$WORK/err.txt" || fail "did not name the inconsistency"
+grep -Eq '^ +nchat-web +mixed ' "$WORK/err.txt" || fail "the refusal does not show the disagreement"
+assert_equals "web-green listings" 1 "$(pods_listings "$state" web-green)"
+pass
+
+begin "require_slot_release_identity answers from one observation"
+state="$(new_state blue "blue green")"
+set_replaced_pod_leaving "$state" green
+status=0; identity_run "$state" green "$ID_A" || status=$?
+expect_exit 1 "$status"
+grep -q "carries 'MIXED'" "$WORK/err.txt" || fail "the identity check did not refuse the present MIXED"
+assert_equals "web-green listings" 1 "$(pods_listings "$state" web-green)"
+pass
+
+begin "cutover refuses a MIXED candidate at once, from one observation"
+state="$(new_state blue "blue green")"
+for svc in "${SERVICES[@]}"; do set_workload_release "$state" "$svc-green" "$RELEASE_B" "$RELEASE_ID_B"; done
+set_pods_then "$state" web-green "$ID_B
+$ID_B_REBUILT" "$ID_B"
+SMOKE="$(evidence green "$RELEASE_B" "$RELEASE_ID_B")" MANIFEST_DIR="$MANIFEST_B" status=0
+run "$state" "$SCRIPTS/cutover.sh" --target green || status=$?
+expect_exit 1 "$status"
+assert_all_on "$state" blue
+[[ ! -s "$state/patch-log" ]] || fail "moved traffic onto a slot carrying two releases"
+grep -q 'does not carry one release' "$WORK/err.txt" || fail "did not name the inconsistency"
+grep -Eq '^ +nchat-web +mixed ' "$WORK/err.txt" || fail "the refusal does not show the disagreement"
+assert_equals "web-green listings" 1 "$(pods_listings "$state" web-green)"
+grep -q 'observing again' "$WORK/err.txt" && fail "cutover waited for the slot to settle"
+pass
+
+begin "rollback refuses a MIXED target at once, from one observation"
+state="$(new_state green "blue green")"
+set_replaced_pod_leaving "$state" blue
+status=0; run "$state" "$SCRIPTS/rollback.sh" --target blue "incident" || status=$?
+expect_exit 1 "$status"
+assert_all_on "$state" green
+[[ ! -s "$state/patch-log" ]] || fail "moved traffic onto a slot carrying two releases"
+grep -q 'does not carry one release' "$WORK/err.txt" || fail "did not name the inconsistency"
+assert_equals "web-blue listings" 1 "$(pods_listings "$state" web-blue)"
+grep -q 'observing again' "$WORK/err.txt" && fail "rollback waited for the slot to settle"
+pass
+
+# The workflow's own order: the smoke settles, then the next step binds the
+# settled candidate to the release this run built, from one observation.
+begin "a candidate that settles on another build of the commit is not the requested release"
+state="$(new_state blue "blue green")"
+for svc in "${SERVICES[@]}"; do set_workload_release "$state" "$svc-green" "$RELEASE_B" "$RELEASE_ID_B_REBUILT"; done
+set_pods_then "$state" web-green "$ID_B
+$ID_B_REBUILT" "$ID_B_REBUILT"
+status=0; run "$state" "$SCRIPTS/smoke.sh" --target green || status=$?
+expect_exit 0 "$status"
+status=0; identity_run "$state" green "$ID_B" || status=$?
+expect_exit 1 "$status"
+grep -q "carries 'CONSISTENT $ID_B_REBUILT', expected 'CONSISTENT $ID_B'" "$WORK/err.txt" ||
+  fail "a settled rebuild was accepted as the requested release"
+pass
+
+begin "a candidate that settles on exactly the requested release passes"
+state="$(new_state blue "blue green")"
+for svc in "${SERVICES[@]}"; do set_workload_release "$state" "$svc-green" "$RELEASE_B" "$RELEASE_ID_B"; done
+set_pods_then "$state" web-green "$ID_B
+$ID_A" "$ID_B"
+status=0; run "$state" "$SCRIPTS/smoke.sh" --target green || status=$?
+expect_exit 0 "$status"
+status=0; identity_run "$state" green "$ID_B" || status=$?
+expect_exit 0 "$status"
+assert_equals "identity" "$ID_B" "$(cat "$WORK/out.txt")"
 pass
 
 echo

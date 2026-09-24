@@ -170,12 +170,21 @@ check_release_configuration() {
 # has nothing coherent to validate and the run stops meaning anything.
 SMOKE_RELEASE=""
 
+# The verdict and the per-workload evidence printed under it come from one
+# observation. Reading the slot again to explain a failure once printed a
+# second, later snapshot -- every workload on one release -- under the MIXED
+# verdict the first one produced, which destroyed the evidence of what blocked.
+#
+# The one caller that waits: it runs right after `rollout status`, when a
+# replaced pod may still be Ready beside the new ones (see
+# observe_settled_slot_release).
 check_release_identity() {
-  local slot="$1" state
-  state="$(slot_release_state "$slot")" || {
+  local slot="$1" observation state
+  observation="$(observe_settled_slot_release "$slot")" || {
     record fail "cannot read the release identity of slot $slot"
     return
   }
+  state="$(release_observation_state "$observation")"
   case "$state" in
     CONSISTENT\ *)
       SMOKE_RELEASE="${state#CONSISTENT }"
@@ -188,11 +197,11 @@ check_release_identity() {
       # No evidence may be produced here. The pods answering probes are the ones
       # the release is replacing, so a PASS would describe the previous release.
       record fail "slot $slot has not finished rolling out; its Ready pods are not on the release it declares"
-      slot_workload_releases "$slot" | awk '{ printf "         %-22s observed=%s  %s\n", $1, $2, $3 }' >&2
+      print_release_observation "$observation" '         ' >&2
       ;;
     *)
       record fail "slot $slot carries more than one release; deploy it again before smoking it"
-      slot_workload_releases "$slot" | awk '{ printf "         %-22s %s  %s\n", $1, $2, $3 }' >&2
+      print_release_observation "$observation" '         ' >&2
       ;;
   esac
 }
