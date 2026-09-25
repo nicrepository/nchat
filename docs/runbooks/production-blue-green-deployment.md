@@ -2131,6 +2131,47 @@ slot depends on the old shape any more, which is a statement about the future;
 the slot a rollback targets is precisely one that does depend on it. The
 pre-policy exceptions list is not honoured here either.
 
+Each migration added between the two releases is judged on its own:
+
+| The migration                                                | Rollback gate                                 |
+| ------------------------------------------------------------ | --------------------------------------------- |
+| **expand-only** — the scanner finds nothing destructive      | `[OK]`, passes on its own                     |
+| destructive, and **attested** by exact key and exact SHA-256 | `[ATTESTED]`, passes                          |
+| destructive, and not attested — contract-phase marker or not | **blocks**, with the operation and the reason |
+| destructive, and only in the forward pre-policy exceptions   | **blocks**: that list is for going forwards   |
+| missing from the checkout, or cannot be hashed               | **blocks**                                    |
+
+**Rollback attestations** (issue #1008) live in
+`scripts/ci/rollback-schema-attestations.txt`, one per line:
+
+```text
+<sha256> <domain>/<ordinal>_<name>.up.sql
+```
+
+The checksum is `sha256sum migrations/<domain>/<file> | cut -d ' ' -f 1`, the
+value `scripts/db/migrate.sh` pins in `schema_migrations`, and a comment above
+the entry records the review: what the migration takes away, why the release
+before it still works, and what would make that stop being true. They exist
+because the scanner is conservative on purpose — a CHECK constraint dropped and
+re-added wider (`chat/000052`) looks exactly like one dropped for good — and a
+person, in review, is the only one who can tell the two apart.
+
+- It names **one exact file by its exact bytes**. No wildcard, no pattern, no
+  second entry for the same key. Changing any byte of the migration invalidates
+  it.
+- It is not an operational bypass. There is no `--force`, no variable and no
+  workflow input that skips the gate; the attestation arrives through a
+  reviewed pull request like any other code, before anyone needs a rollback.
+- A malformed or ambiguous policy stops the gate on **every** rollback, expand-
+  only ones included, until it is fixed in review. An absent or unreadable
+  policy attests nothing: expand-only rollbacks still pass, anything that
+  would need an attestation blocks.
+- **An applied migration is never edited** to add a marker or a note: the
+  runner would refuse every environment that has already run it. The
+  attestation is recorded beside it, never in it.
+- It is not a contract-phase marker and does not replace one. The forward gate
+  (`make migrations-check`) never reads this file.
+
 **What it cannot see.** It reads the repository, not the database. It proves
 what the releases _contained_; it cannot see a migration applied out of band, a
 schema edited by hand, or a backfill run from a console. It is a necessary
@@ -2142,9 +2183,14 @@ When it refuses:
 ROLLBACK BLOCKED: the schema has moved past the release on the target slot.
 ```
 
-Nothing has been changed — the serving slot is untouched and the target is
-still running. **Do not run a down migration to make it pass.** Roll forward
-with a fix, or perform a deliberate database recovery with the DBA present.
+Each blocking migration is listed with its operation and why no attestation
+applied: not attested, a checksum mismatch (the file changed after review), or
+a policy that could not be read. Nothing has been changed — the serving slot is
+untouched and the target is still running. **Do not run a down migration to
+make it pass, and do not write an attestation during an incident to get a
+rollback through**: an attestation is a review of compatibility, and without
+that proof the answer is to roll forward with a fix, or perform a deliberate
+database recovery with the DBA present.
 
 ---
 
