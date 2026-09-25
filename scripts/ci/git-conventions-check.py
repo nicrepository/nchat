@@ -88,12 +88,24 @@ def main() -> int:
     try:
         base_sha = required_environment("PR_BASE_SHA")
         head_sha = required_environment("PR_HEAD_SHA")
+        base_ref = required_environment("PR_BASE_REF")
+        actor = required_environment("PR_AUTHOR")
+        branch = required_environment("PR_HEAD_REF")
+        # base..head mixes governed integration history with release-only commits.
+        # No immutable release-cut SHA exists to separate them on promotion.
+        subjects = (
+            ()
+            if base_ref == "main"
+            and branch.startswith("release/")
+            and actor != DEPENDABOT_ACTOR
+            else pull_request_subjects(base_sha, head_sha)
+        )
         errors = validate_event(
             event_name=event_name,
-            actor=required_environment("PR_AUTHOR"),
-            branch=required_environment("PR_HEAD_REF"),
+            actor=actor,
+            branch=branch,
             title=required_environment("PR_TITLE"),
-            subjects=pull_request_subjects(base_sha, head_sha),
+            subjects=subjects,
         )
     except (OSError, subprocess.CalledProcessError, ValueError) as error:
         print(f"Unable to validate Git conventions: {error}", file=sys.stderr)
