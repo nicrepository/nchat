@@ -1,6 +1,11 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 
 import {
+  allowsServiceUnavailable,
+  captureBrowserErrors,
+  expectNoUnexpectedBrowserErrors,
+} from "../helpers/browserErrors";
+import {
   GROUP_DM_NAME,
   OTHER_CHANNEL_NAME,
   OTHER_USER_ID,
@@ -274,6 +279,63 @@ test.describe("rascunho com anexo", () => {
       originalText,
     );
     await expectNothingLeftOf(page, surface, targetName, draftText);
+  });
+
+  test("uma falha preserva reply + texto + anexo para retry sem novo upload", async ({
+    page,
+  }, testInfo) => {
+    test.fixme(true, "#1003: o ACK do retry atualiza AppShell durante o render de ChatComposer");
+    captureBrowserErrors(page, [allowsServiceUnavailable("/api/chat/channels/")]);
+    const { scenario, targetId, original, originalText } = await openScenario(
+      page,
+      surface,
+      targetName,
+      testInfo,
+    );
+    const draftText = "retry com o mesmo anexo";
+    let postAttempts = 0;
+    await page.route(`**${surface.postUrl(targetId)}`, async (route) => {
+      if (route.request().method() !== "POST") return route.fallback();
+      postAttempts += 1;
+      if (postAttempts > 1) return route.fallback();
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "unavailable", message: "temporary failure" } }),
+      });
+    });
+
+    await replyToOriginal(page, original.id, originalText);
+    await fillComposer(page, draftText);
+    await attachFile(page, "retry.pdf");
+    const failed = page.waitForResponse(
+      (response) =>
+        response.url().includes(surface.postUrl(targetId)) &&
+        response.request().method() === "POST" &&
+        response.status() === 503,
+    );
+    await page.getByRole("button", { name: "Enviar mensagem" }).click();
+    await failed;
+
+    await expect(page.getByTestId("chat-send-error")).toBeVisible();
+    await expect(composerQuote(page)).toContainText(originalText);
+    await expect(composerInput(page)).toHaveText(draftText);
+    await expect(pendingAttachment(page)).toContainText("retry.pdf");
+    expect(scenario.requests.attachmentUploads).toHaveLength(1);
+
+    await sendAndAwaitAck(page, surface, targetId);
+
+    expect(postAttempts).toBe(2);
+    expect(scenario.requests.attachmentUploads).toHaveLength(1);
+    expect(surface.posts(scenario)).toEqual([
+      expect.objectContaining({
+        body_text: draftText,
+        parent_message_id: original.id,
+        attachment_ids: ["upload-1"],
+      }),
+    ]);
+    await expectNothingLeftOf(page, surface, targetName, draftText);
+    expectNoUnexpectedBrowserErrors(page);
   });
 });
 

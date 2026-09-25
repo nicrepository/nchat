@@ -1,6 +1,12 @@
 import { expect, test, type Locator, type Page, type TestInfo } from "@playwright/test";
 
 import {
+  allowsServiceUnavailable,
+  captureBrowserErrors,
+  expectNoUnexpectedBrowserErrors,
+} from "../helpers/browserErrors";
+
+import {
   CURRENT_USER_ID,
   OTHER_USER_ID,
   createScenario,
@@ -17,32 +23,17 @@ interface CallFixture {
   createdAt: string;
 }
 
-const browserErrors = new WeakMap<Page, string[]>();
-
 test.describe.configure({ retries: 0 });
 
 test.beforeEach(async ({ page }) => {
-  const errors: string[] = [];
-  browserErrors.set(page, errors);
-  page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
-  page.on("console", (message) => {
-    if (message.type() !== "error") return;
-    const expectedTokenFailure =
-      message.text() ===
-        "Failed to load resource: the server responded with a status of 503 (Service Unavailable)" &&
-      message.location().url.includes("/api/media/media/livekit/token");
-    const expectedSidebarFailure =
-      message.text() ===
-        "Failed to load resource: the server responded with a status of 503 (Service Unavailable)" &&
-      message.location().url.includes("/api/chat/sidebar");
-    if (!expectedTokenFailure && !expectedSidebarFailure) {
-      errors.push(`console.error: ${message.text()}`);
-    }
-  });
+  captureBrowserErrors(page, [
+    allowsServiceUnavailable("/api/media/media/livekit/token"),
+    allowsServiceUnavailable("/api/chat/sidebar"),
+  ]);
 });
 
 test.afterEach(async ({ page }) => {
-  expect(browserErrors.get(page)).toEqual([]);
+  expectNoUnexpectedBrowserErrors(page);
 });
 
 test.describe("chamada 1:1", () => {
