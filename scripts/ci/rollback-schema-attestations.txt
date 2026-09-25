@@ -1,0 +1,58 @@
+# Rollback compatibility attestations (issue #1008).
+#
+# Read by scripts/deploy/nchat-prod/rollback-schema-gate.sh, and by nothing
+# else. The rollback gate refuses any migration added since the target release
+# in which the forward gate's scanner finds an operation that can break the
+# slot running the previous release. The scanner is conservative on purpose: a
+# CHECK constraint dropped and immediately re-added wider looks exactly like
+# one dropped for good. An entry here is a person's answer, recorded in review,
+# that ONE EXACT FILE is nevertheless safe to roll back across.
+#
+# Three separate contracts, deliberately not merged:
+#   - this file answers "can the release before this migration still run
+#     against it?", for rollbacks only;
+#   - `-- nchat:blue-green contract-phase` in a migration answers "may this go
+#     forwards?"; it never authorises a rollback;
+#   - blue-green-migration-exceptions.txt exempts pre-policy migrations from
+#     the forward gate; it never authorises a rollback either.
+#
+# Format, one attestation per line:
+#
+#     <sha256> <domain>/<ordinal>_<name>.up.sql
+#
+# - <sha256> is 64 lowercase hex characters, the value of
+#     sha256sum migrations/<domain>/<file> | cut -d ' ' -f 1
+#   which is how scripts/db/migrate.sh pins the file in schema_migrations.
+#   Change one byte of the migration and its attestation stops matching.
+# - the key is exact: no wildcard, no pattern, no path beyond <domain>/<file>.
+# - one entry per key. Comments are whole lines starting with '#'.
+#
+# A malformed or ambiguous line fails the gate for every rollback until it is
+# fixed. There is no flag, variable or workflow input that skips this file.
+#
+# Before adding an entry, write in a comment above it what the migration takes
+# away, why the release before it still works, and what would make that stop
+# being true. Never edit an applied migration to satisfy either gate.
+
+# chat/000052 (issue #807). Reviewed against the release before it
+# (53cb7b52, NChat 0.1.3), the rollback target when the gate first refused it.
+#
+# - The only operation the scanner reports is DROP CONSTRAINT
+#   link_scans_status_check. The next statement, in the same transaction,
+#   re-adds it as
+#       CHECK (status IN ('pending', 'safe', 'malicious', 'inconclusive', 'unknown'))
+#   a strict superset of 000026's (pending, safe, malicious, inconclusive):
+#   every status the previous release writes is still accepted.
+# - The previous release does not treat 'unknown' as a clearance. Its verdict
+#   aggregation (link_reconcile_store.go) yields NULL, never 'safe', for any
+#   message with an 'unknown' link, and its scan accounting treats such a URL
+#   as needing a scan. A row the new release settles as 'unknown' is withheld,
+#   or scanned again, by the older code; it is never shown as safe.
+# - The new CHECK link_scans_pending_deadline_check is satisfied by the
+#   previous release's writes too: deadline_at gets a DEFAULT, the trigger
+#   link_scans_pending_deadline sets it on any INSERT or UPDATE into 'pending'
+#   that does not, and the back-fill covers the existing pending rows.
+# - The rest adds columns, two tables, a function, a trigger and indexes, and
+#   recreates idx_link_scans_decided_at with a wider predicate; no statement
+#   removes or renames anything the previous release reads or writes.
+72a6d8f43609cf0ab3edce7ddb2f78feb1991534d3aa56f354ecc15f72dc904b chat/000052_link_targets_convergence_and_previews.up.sql
