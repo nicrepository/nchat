@@ -551,6 +551,25 @@ func TestChannelDetails_ReportsCanManageMembers(t *testing.T) {
 	}
 }
 
+func TestChannelDetails_ReportsCanAddMembersIndependently(t *testing.T) {
+	provider := &fakeChannelProvider{details: service.ChannelDetails{
+		Channel:          detailsChannel(),
+		CanAddMembers:    true,
+		CanManageMembers: false,
+		CanRemoveMembers: false,
+	}}
+
+	rec := serveDetails(t, channelTestHandler(provider), testChannelID)
+
+	data := detailsData(t, rec)
+	if data["can_add_members"] != true {
+		t.Fatalf("can_add_members = %v, want true", data["can_add_members"])
+	}
+	if data["can_manage_members"] != false || data["can_remove_members"] != false {
+		t.Fatalf("administrative fields widened: %v", data)
+	}
+}
+
 // The removal control reads its own field (issue #469). It is serialized
 // beside can_manage_members and independently of it, so a client can never be
 // in the position of inferring one from the other.

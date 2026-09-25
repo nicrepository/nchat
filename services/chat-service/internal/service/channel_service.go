@@ -164,21 +164,21 @@ type ChannelDetails struct {
 	// absent renders as an empty or neutral state — never as a placeholder and
 	// never as an identifier.
 	About storage.ConversationAbout
-	// CanManageMembers is the server's own answer to "may this caller add
-	// participants" (issue #398), derived from the membership this method already
-	// had to load. It exists so the panel can disable an action the server would
-	// refuse, and it is never the control: POST .../members re-derives the
-	// decision from the session on every call. A client that ignores it gets a
-	// 403, not a membership row.
+	// CanAddMembers is the access-based rendering hint for POST .../members.
+	// GetVisibleChannelByID above has already established the same read access
+	// CanAddChannelMembers requires. The POST and candidate search independently
+	// re-establish it from the authenticated session.
+	CanAddMembers bool
+	// CanManageMembers is the legacy administrative panel capability used by
+	// administrative roster surfaces; adding uses CanAddMembers instead.
 	//
 	// It is false for #geral, matching the write path: membership there is owned
 	// by the workspace sync, not by this flow.
 	CanManageMembers bool
 	// CanRemoveMembers is the server's own answer to "may this caller remove
 	// another member" (issue #469). It is a separate field from
-	// CanManageMembers although both evaluate the same predicate today: adding
-	// and removing are different questions, the panel asks them separately, and
-	// the day one policy moves the other must not follow it silently. Like its
+	// CanManageMembers. Adding and removing are different questions and their
+	// backend policies are now separate. Like its
 	// neighbour it is a rendering hint — DELETE .../members/{userID} re-derives
 	// the decision from the session — and it is false for #geral, matching the
 	// write path.
@@ -223,6 +223,9 @@ func (s *ChannelService) GetChannelDetails(ctx context.Context, input ChannelDet
 		OnlineCount:   page.OnlineCount,
 		MemberCount:   page.TotalCount,
 		About:         about,
+		// A successful visible-channel lookup is the canonical access decision for
+		// this endpoint, so every returned channel may use the add flow.
+		CanAddMembers: true,
 		// The same predicate the write path checks, evaluated on the membership
 		// already loaded above — not a second, parallel rule that could drift.
 		CanManageMembers: !channel.IsGeneral && domain.CanManageChannelMembers(&member),

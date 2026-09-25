@@ -14,8 +14,23 @@
 // modules embed the same string.
 package channelmembership
 
+// EligibleWorkspaceTargetJoinsSQL and EligibleWorkspaceTargetWhereSQL form the
+// common target predicate for batch adds and structural #geral materialization.
+// Consumers supply chat.workspace_members wm, append target/channel filters and
+// lock wm,u before writing.
+//
+// Bind contract: the joins contain no binds; $1 in the WHERE fragment is the
+// workspace id (uuid). Consumers declare any later binds in their own contract.
+const EligibleWorkspaceTargetJoinsSQL = `
+		JOIN chat.workspaces w
+		  ON w.id = wm.workspace_id AND w.status = 'active'
+		JOIN auth.users u
+		  ON u.id = wm.user_id AND u.status = 'active' AND u.deleted_at IS NULL`
+
+const EligibleWorkspaceTargetWhereSQL = `wm.workspace_id = $1::uuid AND wm.status = 'active'`
+
 // EligibleTargetsCTE selects, from a candidate list, the users who may be added
-// to a channel.
+// to an active channel.
 //
 // Bind order, fixed for every consumer:
 //
@@ -28,7 +43,9 @@ package channelmembership
 // target was eligible — which is what lets an add be all-or-nothing rather than
 // silently partial.
 //
-// Every join is part of the rule, not incidental:
+// The shared fragment decides active workspace membership, active workspace
+// and active undeleted account. The channel check below adds the active channel
+// in that same workspace. Every part is required:
 //
 //   - the target must be an ACTIVE member of the channel's workspace. Adding
 //     somebody to a channel of a workspace they do not belong to would grant
@@ -40,26 +57,24 @@ package channelmembership
 //     person is never (re)admitted anywhere.
 //
 // Guests are deliberately NOT excluded. A guest reaching a channel *is* being
-// added to it — that is the only way a guest reaches any channel, #geral
-// included — so excluding them here would remove the one path RF-74 gives them.
+// added to it. RF-18 also materializes their #geral membership automatically;
+// neither path grants implicit access to other public channels.
 // See docs/security/rbac-matrix.md.
 //
 // The candidate list is a bound uuid[]; nothing here is concatenated.
 const EligibleTargetsCTE = `
 		SELECT wm.user_id
 		FROM unnest($3::uuid[]) AS candidate(user_id)
-		JOIN chat.workspace_members wm
-		  ON wm.workspace_id = $1::uuid
-		 AND wm.user_id = candidate.user_id
-		 AND wm.status = 'active'
-		JOIN chat.workspaces w
-		  ON w.id = wm.workspace_id AND w.status = 'active'
-		JOIN chat.channels c
-		  ON c.id = $2::uuid
-		 AND c.workspace_id = wm.workspace_id
-		 AND c.status = 'active'
-		JOIN auth.users u
-		  ON u.id = wm.user_id AND u.status = 'active' AND u.deleted_at IS NULL`
+		JOIN chat.workspace_members wm ON wm.user_id = candidate.user_id
+		` + EligibleWorkspaceTargetJoinsSQL + `
+		WHERE ` + EligibleWorkspaceTargetWhereSQL + `
+		  AND EXISTS (
+			SELECT 1 FROM chat.channels c
+			WHERE c.id = $2::uuid
+			  AND c.workspace_id = wm.workspace_id
+			  AND c.status = 'active'
+		  )
+		FOR SHARE OF wm, u`
 
 // DefaultChannelRole is the role every administratively added member receives.
 //
@@ -95,13 +110,10 @@ const DefaultChannelRole = "member"
 // before the commit, so it sees every earlier commit plus this transaction's
 // own change, and the next transaction in line sees this one.
 //
-// The order matters beyond correctness of the count. chat-service's
-// AddWorkspaceMember locks a workspace_members row and then takes FOR SHARE on
-// the #geral channel — the opposite order. No cycle is reachable, because the
-// membership paths that lock the channel first either refuse #geral outright
-// (chat-service) or never lock a workspace_members row at all (admin-service,
-// whose authority is a platform capability). Changing either of those two facts
-// means re-checking this.
+// Automatic #geral membership takes FOR SHARE on the channel before changing
+// workspace membership, including reactivation. Add-members takes FOR UPDATE
+// before actor/target locks. Either channel lock is acquired before target rows,
+// preventing the opposite-order cycle without serializing concurrent joins.
 //
 // $1 is the channel id. Returns no row for a channel that does not exist, which
 // every caller maps to its own not-found.

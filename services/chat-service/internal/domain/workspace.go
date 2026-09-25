@@ -595,26 +595,29 @@ var ErrGeneralChannelImmutable = errors.New("general channel is immutable")
 // panel's selector produces in one human confirmation.
 const MaxAddMembersPerRequest = 25
 
-// CanManageChannelMembers reports whether a user may add participants to a
-// channel (issue #398).
+// CanAddChannelMembers reports whether wm may add participants to ch.
+//
+// Adding follows access: an active workspace member who may read the channel
+// may invite another eligible workspace member. Keeping this as a separate
+// predicate prevents that narrow ability from widening removal, rename or
+// workspace administration.
+func CanAddChannelMembers(wm *WorkspaceMember, cm *ChannelMember, ch Channel) bool {
+	return CanReadChannel(wm, cm, ch)
+}
+
+// CanManageChannelMembers reports whether a user may administratively remove
+// participants from a channel (issue #398).
 //
 // It is the workspace moderation gate — active owner, admin or moderator —
 // reusing CanModerateWorkspace rather than restating it, exactly as channel
-// categories do. The choice is not a new policy: removing a member from a
-// channel is the same authority (MemberService.RemoveMemberFromChannel), and
-// docs/runbooks/task-chat-channel-join-leave.md names the addition its
-// "manager-add flow". Adding and removing the same row are the same authority.
+// categories do. It governs administrative removal and roster management;
+// adding is intentionally a distinct access-based capability.
 //
 // RF-74 is what widened this from owner/admin to include the moderator: this
-// predicate was written as the named seam for exactly that, and the seam is now
-// spent. The widening reaches the store as well — PGXMemberStore.AddChannelMembers
-// re-derives the same role list inside its transaction.
+// predicate was written as the named seam for exactly that.
 //
-// Deliberately *not* "any member of the channel": that would let anyone with
-// read access to a private channel widen its audience, which is precisely the
-// property a private channel has. Deliberately not the per-channel 'moderator'
-// role either — that role is per channel and is never read as workspace
-// authority.
+// Deliberately not the per-channel 'moderator' role — that role is per channel
+// and is never read as workspace authority.
 //
 // Group DM participation is a different question with a different answer and is
 // deliberately not routed through here: chat.dm_members.role is closed by CHECK

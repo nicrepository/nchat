@@ -820,8 +820,10 @@ export interface ChannelDetails {
   memberCount: number;
   onlineCount: number;
   onlineMembers: ChannelMemberProfile[];
+  /** Access-based add capability; absent from an older server means false. */
+  canAddMembers?: boolean;
   /**
-   * Whether the server would let this caller add participants (issue #398).
+   * Legacy administrative channel-membership capability.
    *
    * A rendering hint, never a control: `POST .../members` re-derives the same
    * decision from the session on every call, so hiding the action protects

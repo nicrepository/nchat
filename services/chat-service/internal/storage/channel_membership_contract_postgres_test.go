@@ -236,13 +236,8 @@ func mentionUserIDs(t *testing.T, store *storage.PGXMemberStore, ctx context.Con
 // addMemberCandidateIDs runs the production candidate search and returns the
 // user IDs it offers, sorted.
 //
-// callerID is an actor the current policy authorizes for this endpoint —
-// domain.CanManageChannelMembers, which RF-74 states as active owner, admin or
-// workspace moderator. The store does not re-derive the role (MemberService
-// does, and PGXMemberStore.AddChannelMembers does for the write), so passing an
-// authorized actor here is about running the query the way production runs it,
-// not about asserting anything on authorization. Issue #881 changes no
-// authorization rule; #884 owns any change to this endpoint's gate.
+// Candidate search follows channel access. This helper exercises the storage
+// query's independent visibility revalidation.
 func addMemberCandidateIDs(
 	t *testing.T, store *storage.PGXMemberStore, ctx context.Context, channelID, callerID string,
 ) []string {
@@ -421,58 +416,54 @@ func TestChannelMembershipContractPostgreSQL_PrivateChannelVisibilityMatchesExpl
 	})
 
 	t.Run("the current member is excluded from candidates", func(t *testing.T) {
-		got := addMemberCandidateIDs(t, store, ctx, mcPrivate, mcAdmin)
-		assertSameIDs(t, "add-member candidates", got, sortedIDs(mcOwner, mcModerator, mcGuest))
+		got := addMemberCandidateIDs(t, store, ctx, mcPrivate, mcMember)
+		assertSameIDs(t, "add-member candidates", got, sortedIDs(mcOwner, mcAdmin, mcModerator, mcGuest))
 	})
 }
 
-// Baseline for #geral, and a characterization of the RF-74 guest boundary.
-//
-// #geral is the one public channel whose membership is materialized, by
-// SyncGeneralMemberships, so its four surfaces agree the way a private
-// channel's do — for the roles the sync covers. A guest is not one of them, and
-// a guest also does not reach a public channel implicitly, so the two exclusions
-// line up and #geral stays internally consistent.
-//
-// This records the policy as it is. Issue #882 owns consolidating RF-18's
-// "every user joins #geral automatically" against RF-74's guest exclusion, and
-// is expected to update this case. Nothing here decides that, auto-adds a
-// guest, or touches CanReachPublicChannels or generalMembershipRoles.
-func TestChannelMembershipContractPostgreSQL_GeneralChannelKeepsMembershipForNonGuestRoles(t *testing.T) {
+// RF-18 makes #geral a structural exception: its materialized membership
+// includes every eligible active workspace role, including guests. That row
+// does not grant guests implicit access to any other public channel.
+func TestChannelMembershipContractPostgreSQL_GeneralChannelMaterializesEveryActiveRole(t *testing.T) {
 	pool, ctx := membershipContractPostgres(t)
 	store := storage.NewPGXMemberStore(pool)
 
-	synced := sortedIDs(mcOwner, mcAdmin, mcModerator, mcMember)
+	nonGuests := sortedIDs(mcOwner, mcAdmin, mcModerator, mcMember)
+	synced := sortedIDs(mcOwner, mcAdmin, mcModerator, mcMember, mcGuest)
 
-	t.Run("workspace activation materializes every eligible role", func(t *testing.T) {
-		for _, userID := range synced {
+	t.Run("public-membership trigger leaves the guest for the structural sync", func(t *testing.T) {
+		for _, userID := range nonGuests {
 			if !hasExplicitChannelMembership(t, pool, ctx, mcGeneral, userID) {
 				t.Fatalf("%s holds no #geral row after workspace activation", userID)
 			}
 		}
 		if hasExplicitChannelMembership(t, pool, ctx, mcGeneral, mcGuest) {
-			t.Error("workspace activation gave a guest a #geral row; RF-74 excludes guests from it")
+			t.Error("ordinary public-channel trigger unexpectedly included the guest")
 		}
 	})
 
-	t.Run("the compatibility sync is idempotent after automatic materialization", func(t *testing.T) {
+	t.Run("the structural sync adds the guest once and is idempotent", func(t *testing.T) {
 		inserted, err := store.SyncGeneralMemberships(ctx, mcWorkspace)
 		if err != nil {
-			t.Fatalf("SyncGeneralMemberships (repeat): %v", err)
+			t.Fatalf("SyncGeneralMemberships: %v", err)
 		}
-		if inserted != 0 {
-			t.Fatalf("repeat sync inserted %d rows, want 0", inserted)
+		if inserted != 1 {
+			t.Fatalf("sync inserted %d rows, want the guest only", inserted)
+		}
+		if again, err := store.SyncGeneralMemberships(ctx, mcWorkspace); err != nil || again != 0 {
+			t.Fatalf("repeat sync inserted %d rows: %v", again, err)
 		}
 	})
 
-	t.Run("the guest neither holds a row nor reads the channel", func(t *testing.T) {
-		if channelVisibleToUser(t, pool, ctx, mcGeneral, mcGuest) {
-			t.Error("installed visibility admits a guest to #geral with no membership row")
+	t.Run("guest reads geral through its row but no ordinary public channel", func(t *testing.T) {
+		if !channelVisibleToUser(t, pool, ctx, mcGeneral, mcGuest) {
+			t.Error("guest cannot read its materialized #geral membership")
 		}
-		// The two exclusions agreeing keeps #geral consistent: the guest is
-		// absent from both the roster and readership until explicitly invited.
-		if hasExplicitChannelMembership(t, pool, ctx, mcGeneral, mcGuest) {
-			t.Error("the guest holds a #geral membership row")
+		if !hasExplicitChannelMembership(t, pool, ctx, mcGeneral, mcGuest) {
+			t.Error("guest has no materialized #geral row")
+		}
+		if channelVisibleToUser(t, pool, ctx, mcPublic, mcGuest) {
+			t.Error("#geral membership widened guest access to another public channel")
 		}
 	})
 
@@ -491,12 +482,8 @@ func TestChannelMembershipContractPostgreSQL_GeneralChannelKeepsMembershipForNon
 		assertSameIDs(t, "mention candidates", mentionUserIDs(t, store, ctx, mcGeneral), synced)
 	})
 
-	t.Run("only the guest remains as a candidate", func(t *testing.T) {
-		// Not a recommendation to add them: add-members refuses #geral in
-		// MemberService before the store is ever reached. It is what this
-		// query returns, and the gap between the two is itself part of what
-		// #882 has to settle.
+	t.Run("no synchronized member remains as a candidate", func(t *testing.T) {
 		got := addMemberCandidateIDs(t, store, ctx, mcGeneral, mcAdmin)
-		assertSameIDs(t, "add-member candidates", got, []string{mcGuest})
+		assertSameIDs(t, "add-member candidates", got, []string{})
 	})
 }

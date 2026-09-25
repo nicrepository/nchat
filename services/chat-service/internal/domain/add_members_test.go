@@ -7,10 +7,8 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
-// CanManageChannelMembers is the named seam for issue #398. The assertion that
-// matters is not that it returns true for owners, but that it returns false for
-// a plain member and a guest: a channel member who could add others would make
-// a private channel's audience grow without a manager ever deciding to.
+// CanManageChannelMembers is the administrative removal/roster seam. It must
+// remain narrow even though adding now follows channel access.
 func TestCanManageChannelMembers(t *testing.T) {
 	tests := map[string]struct {
 		member *domain.WorkspaceMember
@@ -51,12 +49,11 @@ func TestCanManageChannelMembers(t *testing.T) {
 	}
 }
 
-// The predicate must stay identical to CanManageWorkspace rather than becoming a
-// second, independently-edited copy of the same rule. If a future change widens
-// one, this fails and forces the divergence to be deliberate.
-func TestCanManageChannelMembersMatchesWorkspaceManagement(t *testing.T) {
+// The predicate delegates to the workspace moderation capability rather than
+// restating its role list.
+func TestCanManageChannelMembersMatchesWorkspaceModeration(t *testing.T) {
 	roles := []domain.WorkspaceRole{
-		domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin,
+		domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin, domain.WorkspaceRoleModerator,
 		domain.WorkspaceRoleMember, domain.WorkspaceRoleGuest,
 	}
 	statuses := []domain.MemberStatus{
@@ -65,10 +62,60 @@ func TestCanManageChannelMembersMatchesWorkspaceManagement(t *testing.T) {
 	for _, role := range roles {
 		for _, status := range statuses {
 			member := &domain.WorkspaceMember{Role: role, Status: status}
-			if domain.CanManageChannelMembers(member) != domain.CanManageWorkspace(member) {
+			if domain.CanManageChannelMembers(member) != domain.CanModerateWorkspace(member) {
 				t.Fatalf("divergence for role=%s status=%s", role, status)
 			}
 		}
+	}
+}
+
+func TestCanAddChannelMembersFollowsChannelAccessWithoutGrantingManagement(t *testing.T) {
+	public := domain.Channel{
+		ID: "ch-public", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive,
+	}
+	private := domain.Channel{
+		ID: "ch-private", WorkspaceID: "ws-1", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive,
+	}
+	member := &domain.WorkspaceMember{
+		WorkspaceID: "ws-1", UserID: "user-1", Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusActive,
+	}
+	guest := &domain.WorkspaceMember{
+		WorkspaceID: "ws-1", UserID: "guest-1", Role: domain.WorkspaceRoleGuest, Status: domain.MemberStatusActive,
+	}
+
+	tests := []struct {
+		name string
+		wm   *domain.WorkspaceMember
+		cm   *domain.ChannelMember
+		ch   domain.Channel
+		want bool
+	}{
+		{name: "member reaches public channel", wm: member, ch: public, want: true},
+		{name: "member needs private membership", wm: member, ch: private, want: false},
+		{
+			name: "member with private access", wm: member,
+			cm: &domain.ChannelMember{ChannelID: private.ID, UserID: member.UserID}, ch: private, want: true,
+		},
+		{name: "guest needs explicit public membership", wm: guest, ch: public, want: false},
+		{
+			name: "guest with explicit public access", wm: guest,
+			cm: &domain.ChannelMember{ChannelID: public.ID, UserID: guest.UserID}, ch: public, want: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := domain.CanAddChannelMembers(test.wm, test.cm, test.ch); got != test.want {
+				t.Fatalf("CanAddChannelMembers = %v, want %v", got, test.want)
+			}
+		})
+	}
+
+	if domain.CanManageChannelMembers(member) {
+		t.Fatal("add access granted channel-management authority to an ordinary member")
+	}
+	if domain.CanManageWorkspace(member) || domain.CanRenameChannel(member, public) {
+		t.Fatal("add access granted workspace or rename authority to an ordinary member")
 	}
 }
 

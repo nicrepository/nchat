@@ -2916,6 +2916,7 @@ describe("fetchChannelDetails", () => {
       createdAt: "2024-01-12T09:30:00Z",
       memberCount: 12,
       onlineCount: 3,
+      canAddMembers: false,
       onlineMembers: [
         {
           userId: "u-1",
@@ -3183,6 +3184,32 @@ describe("fetchChannelDetails — can_manage_members", () => {
 
     expect((await fetchChannelDetails("ch-1")).canManageMembers).toBe(true);
   });
+
+  it("maps can_add_members independently from administrative management", async () => {
+    mockAuthFetch.mockResolvedValue(
+      detailsPayload({
+        can_add_members: true,
+        can_manage_members: false,
+        can_remove_members: false,
+      }),
+    );
+
+    await expect(fetchChannelDetails("ch-1")).resolves.toMatchObject({
+      canAddMembers: true,
+      canManageMembers: false,
+      canRemoveMembers: false,
+    });
+  });
+
+  it.each([undefined, false, null, "true", 1])(
+    "treats malformed can_add_members=%s as no add capability",
+    async (value) => {
+      const extra = value === undefined ? {} : { can_add_members: value };
+      mockAuthFetch.mockResolvedValue(detailsPayload(extra));
+
+      expect((await fetchChannelDetails("ch-1")).canAddMembers).toBe(false);
+    },
+  );
 
   // Anything that is not literally true must read as "no permission": a truthy
   // string or a missing field must never enable a control the server refuses.

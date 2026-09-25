@@ -308,6 +308,9 @@ type channelDetailsResponse struct {
 	MemberCount        int                        `json:"member_count"`
 	OnlineMemberCount  int                        `json:"online_member_count"`
 	OnlineMembers      []channelDetailsMemberJSON `json:"online_members"`
+	// CanAddMembers is the access-based hint consumed by the add-members UI.
+	// It is separate from administrative management/removal and always emitted.
+	CanAddMembers bool `json:"can_add_members"`
 	// CanManageMembers lets the panel disable an action the server would refuse
 	// (issue #398). It is a hint for the UI and never a control: the add-members
 	// route re-derives the same decision from the session on every call. It is
@@ -411,6 +414,7 @@ func channelDetailsBody(details service.ChannelDetails) channelDetailsResponse {
 		MemberCount:        details.MemberCount,
 		OnlineMemberCount:  details.OnlineCount,
 		OnlineMembers:      members,
+		CanAddMembers:      details.CanAddMembers,
 		CanManageMembers:   details.CanManageMembers,
 		CanRemoveMembers:   details.CanRemoveMembers,
 	}
@@ -893,10 +897,9 @@ func (h *ChannelHandler) MemberCandidates(w http.ResponseWriter, r *http.Request
 
 // writeCandidateSearchError maps both contextual candidate searches.
 //
-// A caller without management rights on a channel, and one who does not
-// participate in a group, both land on the same statuses the corresponding
-// write already returns, so the search cannot be used to discover something the
-// mutation would refuse to act on.
+// A caller without access to a channel, and one who does not participate in a
+// group, both land on the same statuses the corresponding write already
+// returns, so search cannot discover something mutation would refuse to act on.
 func writeCandidateSearchError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, domain.ErrInvalidInput):

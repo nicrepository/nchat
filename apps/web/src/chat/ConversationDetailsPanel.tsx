@@ -1022,25 +1022,28 @@ function PinnedMessageSection({
  *
  * "" while loading, and "" for a direct payload — which cannot reach here, but
  * the type permits it and an id borrowed from the wrong aggregate would be the
- * worst possible default. `canManage` is the server's own answer, never
- * inferred: a rendering hint only, since POST .../members re-derives it from
- * the session on every call (issue #398).
+ * worst possible default. `canAdd` is the server's own answer, never inferred
+ * from administrative management: POST .../members re-derives it from the
+ * session on every call.
  */
 function manageableTarget(details: ConversationDetailsState["details"]): {
   id: string;
   name: string;
-  canManage: boolean;
+  canAdd: boolean;
   canRemove: boolean;
 } {
   if (details.status !== "ready" || details.data.kind === "direct") {
-    return { id: "", name: "", canManage: false, canRemove: false };
+    return { id: "", name: "", canAdd: false, canRemove: false };
   }
   return {
     id: details.data.id,
     // The server's own name for the conversation, which the removal
     // confirmation states so it cannot be about the wrong one.
     name: details.data.name,
-    canManage: details.data.canManageMembers,
+    canAdd:
+      details.data.kind === "channel"
+        ? details.data.canAddMembers === true
+        : details.data.canManageMembers,
     // The server's separate answer for removal (issue #469). Read, never
     // derived: in a group the two differ, and in a channel they are two
     // questions that happen to share a predicate today.
@@ -1236,7 +1239,7 @@ function PeopleSection({
   // unrepresentable: the panel is deliberately not remounted on a target
   // switch, so a boolean would survive one and let a dialog opened for A post
   // its selection to B.
-  const { id: targetId, name: conversationName, canManage, canRemove } = manageableTarget(details);
+  const { id: targetId, name: conversationName, canAdd, canRemove } = manageableTarget(details);
 
   /*
     One subscription for the whole roster, scoped to this conversation, read
@@ -1290,7 +1293,7 @@ function PeopleSection({
   // memoization anyway.
   function closePicker() {
     setPickerFor(null);
-    // The button is only rendered while the caller may manage members, so the
+    // The button is only rendered while the caller may add members, so the
     // ref can be detached by the time this runs (a refetch that revoked the
     // permission). Focusing a detached node would drop focus to <body>.
     addMembersButtonRef.current?.focus();
@@ -1355,11 +1358,11 @@ function PeopleSection({
         <RosterShortfallNote note={shortfall.note} />
         {/*
           Rendered only once the server has answered and said this caller may
-          manage members. Loading, error and "not permitted" all leave it absent
-          — the safe default, since canManageMembers is false unless the server
-          sent exactly true. Hiding it is not the security boundary.
+          add members. Loading, error and "not permitted" all leave it absent —
+          the safe default, since canAddMembers is false unless the server sent
+          exactly true. Hiding it is not the security boundary.
         */}
-        {canManage && (
+        {canAdd && (
           <button
             ref={addMembersButtonRef}
             type="button"

@@ -102,11 +102,9 @@ O lock e **por canal**: mutacoes em canais diferentes nao esperam umas pelas
 outras. Ordem canonica: canal, depois ator/alvos, depois a mutacao, depois a
 contagem.
 
-`AddWorkspaceMember` do chat-service trava na ordem inversa (workspace_members e
-depois `#geral` com `FOR SHARE`), mas nao ha ciclo alcancavel: os caminhos que
-travam o canal primeiro ou recusam `#geral` (chat-service) ou nunca travam uma
-linha de `workspace_members` (admin-service, cuja autoridade e capability de
-plataforma). Mudar qualquer um desses dois fatos exige reavaliar isto.
+`AddWorkspaceMember`, reativacao e reparo de `#geral` tambem travam o canal
+antes da linha alvo. Assim todos os writers seguem canal -> ator/alvos, inclusive
+quando o chat-service admite add idempotente em `#geral`.
 
 `TestPostgreSQL_ConcurrentAddsReportConsecutiveTotals` prova a corrida: uma
 terceira transacao segura a linha do canal, as duas operacoes ficam na fila, o

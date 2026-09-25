@@ -69,7 +69,7 @@ func TestPGXMemberStore_AddChannelMembers_RevalidatesActorBeforeWriting(t *testi
 	// chat.channel_members obeys.
 	mock.ExpectExec(`FROM chat.channels WHERE id = \$1::uuid FOR UPDATE`).WithArgs(pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator'\).*FOR SHARE OF wm`).
+	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*JOIN auth\.users u.*chat\.channel_visible_to_user\(c\.id, wm\.user_id\).*FOR SHARE OF wm, w, u`).
 		WithArgs(msWorkspace, msChannel, msActor).
 		WillReturnRows(pgxmock.NewRows([]string{"ok"}).AddRow(true))
 	mock.ExpectQuery(`(?s)WITH eligible AS.*INSERT INTO chat\.channel_members.*ON CONFLICT \(channel_id, user_id\) DO NOTHING`).

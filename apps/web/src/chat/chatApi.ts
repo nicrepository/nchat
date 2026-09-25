@@ -2098,6 +2098,7 @@ interface ChannelDetailsEnvelope {
     member_count?: unknown;
     online_member_count?: unknown;
     online_members?: unknown;
+    can_add_members?: unknown;
     can_manage_members?: unknown;
     can_remove_members?: unknown;
   };
@@ -2203,6 +2204,9 @@ export async function fetchChannelDetails(
     memberCount: nonNegativeCount(data.member_count),
     onlineCount: nonNegativeCount(data.online_member_count),
     onlineMembers,
+    // Independent from administrative management. Strict true makes rolling
+    // deploys with an older server fail closed by hiding the action.
+    canAddMembers: data.can_add_members === true,
     // Strict `=== true`, exactly like can_write: an absent, null or truthy-ish
     // field must never read as permission. A server that predates issue #398
     // therefore leaves the action hidden, which is the safe direction, and the

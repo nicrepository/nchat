@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -14,8 +15,8 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
-// Issue #398 identifiers. Distinct prefixes from the sibling fixtures so a
-// leftover row from another test can never satisfy an assertion here.
+// Issue #398 fixture identifiers. addMembersPostgres removes these seeded users
+// after dropping the chat schema.
 const (
 	amWS       = "f1000000-0000-4000-8000-000000000001"
 	amOtherWS  = "f2000000-0000-4000-8000-000000000001"
@@ -62,7 +63,17 @@ func addMembersPostgres(t *testing.T) (*pgxpool.Pool, context.Context) {
 	if _, err := pool.Exec(ctx, `DROP SCHEMA IF EXISTS chat CASCADE`); err != nil {
 		t.Fatalf("reset chat schema: %v", err)
 	}
-	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DROP SCHEMA IF EXISTS chat CASCADE`) })
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		if _, err := pool.Exec(cleanupCtx, `DROP SCHEMA IF EXISTS chat CASCADE`); err != nil {
+			t.Errorf("cleanup chat schema: %v", err)
+			return
+		}
+		ids := []string{amAdmin, amActive1, amActive2, amActive3, amSuspended, amDeleted, amForeignU}
+		if _, err := pool.Exec(cleanupCtx, `DELETE FROM auth.users WHERE id = ANY($1::uuid[])`, ids); err != nil {
+			t.Errorf("cleanup add-members users: %v", err)
+		}
+	})
 	if _, err := pool.Exec(ctx, `
 		CREATE SCHEMA IF NOT EXISTS auth;
 		CREATE TABLE IF NOT EXISTS auth.users (
@@ -156,22 +167,36 @@ func countChannelMembers(t *testing.T, pool *pgxpool.Pool, ctx context.Context, 
 	return total
 }
 
+func addPrivateActorMembership(t *testing.T, pool *pgxpool.Pool, ctx context.Context, userID string) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO chat.channel_members (channel_id, user_id, role)
+		VALUES ($1, $2, 'member')
+		ON CONFLICT (channel_id, user_id) DO NOTHING`, amPrivate, userID); err != nil {
+		t.Fatalf("seed private-channel actor: %v", err)
+	}
+}
+
 // ── Channel members ─────────────────────────────────────────────────────────
 
 func TestPGXAddChannelMembersPostgreSQL(t *testing.T) {
 	pool, ctx := addMembersPostgres(t)
 	store := storage.NewPGXMemberStore(pool)
+	addPrivateActorMembership(t, pool, ctx, amAdmin)
 
 	t.Run("adds eligible members and reports the real total", func(t *testing.T) {
 		result, err := store.AddChannelMembers(ctx, amWS, amPrivate, amAdmin, []string{amActive1, amActive2})
 		if err != nil {
 			t.Fatalf("AddChannelMembers: %v", err)
 		}
-		if result.Added != 2 || result.AlreadyMembers != 0 || result.TotalCount != 2 {
-			t.Fatalf("result = %+v, want 2/0/2", result)
+		if result.Added != 2 || result.AlreadyMembers != 0 || result.TotalCount != 3 {
+			t.Fatalf("result = %+v, want 2/0/3 including the actor", result)
 		}
-		if got := countChannelMembers(t, pool, ctx, amPrivate); got != 2 {
-			t.Fatalf("persisted rows = %d, want 2", got)
+		if got := countChannelMembers(t, pool, ctx, amPrivate); got != 3 {
+			t.Fatalf("persisted rows = %d, want actor plus two targets", got)
+		}
+		if got := countAutoAddEvents(t, pool, ctx, amPrivate, ""); got != 1 {
+			t.Fatalf("member-added events = %d, want one batch event", got)
 		}
 	})
 
@@ -185,8 +210,11 @@ func TestPGXAddChannelMembersPostgreSQL(t *testing.T) {
 		if result.Added != 0 || result.AlreadyMembers != 2 {
 			t.Fatalf("retry result = %+v, want 0 added / 2 already", result)
 		}
-		if got := countChannelMembers(t, pool, ctx, amPrivate); got != 2 {
-			t.Fatalf("rows after retry = %d, want 2", got)
+		if got := countChannelMembers(t, pool, ctx, amPrivate); got != 3 {
+			t.Fatalf("rows after retry = %d, want 3", got)
+		}
+		if got := countAutoAddEvents(t, pool, ctx, amPrivate, ""); got != 1 {
+			t.Fatalf("retry changed event count to %d", got)
 		}
 	})
 
@@ -242,6 +270,174 @@ func TestPGXAddChannelMembersPostgreSQL(t *testing.T) {
 	})
 }
 
+func TestPGXAddChannelMembersUsesChannelAccessNotWorkspaceRolePostgreSQL(t *testing.T) {
+	pool, ctx := addMembersPostgres(t)
+	store := storage.NewPGXMemberStore(pool)
+
+	t.Run("ordinary member with implicit public access may add", func(t *testing.T) {
+		if _, err := pool.Exec(ctx, `DELETE FROM chat.channel_members WHERE channel_id = $1 AND user_id = ANY($2::uuid[])`, amGeneral, []string{amActive3, amActive1}); err != nil {
+			t.Fatal(err)
+		}
+		result, err := store.AddChannelMembers(ctx, amWS, amGeneral, amActive3, []string{amActive1})
+		if err != nil || result.Added != 1 {
+			t.Fatalf("public add = %+v, %v", result, err)
+		}
+	})
+
+	t.Run("ordinary member with private membership may add", func(t *testing.T) {
+		addPrivateActorMembership(t, pool, ctx, amActive3)
+		result, err := store.AddChannelMembers(ctx, amWS, amPrivate, amActive3, []string{amActive1})
+		if err != nil {
+			t.Fatalf("AddChannelMembers: %v", err)
+		}
+		if result.Added != 1 {
+			t.Fatalf("Added = %d, want 1", result.Added)
+		}
+	})
+
+	t.Run("ordinary member without private membership is refused", func(t *testing.T) {
+		if _, err := pool.Exec(ctx, `DELETE FROM chat.channel_members WHERE channel_id = $1 AND user_id = $2`, amPrivate, amActive3); err != nil {
+			t.Fatal(err)
+		}
+		_, err := store.AddChannelMembers(ctx, amWS, amPrivate, amActive3, []string{amActive2})
+		if !errors.Is(err, domain.ErrForbidden) {
+			t.Fatalf("err = %v, want ErrForbidden", err)
+		}
+	})
+}
+
+// RF-18: the same target eligibility and atomic batch contract applies when
+// an authorized workspace manager repairs missing #geral rows.
+func TestPGXAddGeneralChannelMembersPostgreSQL(t *testing.T) {
+	pool, ctx := addMembersPostgres(t)
+	store := storage.NewPGXMemberStore(pool)
+	if _, err := pool.Exec(ctx, `DELETE FROM chat.channel_members WHERE channel_id = $1`, amGeneral); err != nil {
+		t.Fatalf("clear materialized general rows: %v", err)
+	}
+
+	result, err := store.AddChannelMembers(ctx, amWS, amGeneral, amAdmin, []string{amActive1, amActive1, amActive2})
+	if err != nil || result.Added != 2 || result.TotalCount != 2 {
+		t.Fatalf("general repair = %+v, %v", result, err)
+	}
+	result, err = store.AddChannelMembers(ctx, amWS, amGeneral, amAdmin, []string{amActive1, amActive2})
+	if err != nil || result.Added != 0 || result.AlreadyMembers != 2 || result.TotalCount != 2 {
+		t.Fatalf("general retry = %+v, %v", result, err)
+	}
+	for name, target := range map[string]string{
+		"other workspace":  amForeignU,
+		"inactive account": amSuspended,
+		"deleted account":  amDeleted,
+		"missing user":     "f1000000-0000-4000-8000-0000000000ff",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := store.AddChannelMembers(ctx, amWS, amGeneral, amAdmin, []string{amActive3, target})
+			if !errors.Is(err, domain.ErrForbidden) || countChannelMembers(t, pool, ctx, amGeneral) != 2 {
+				t.Fatalf("invalid general batch = %v, count %d", err, countChannelMembers(t, pool, ctx, amGeneral))
+			}
+		})
+	}
+	if _, err := pool.Exec(ctx, `UPDATE chat.workspace_members SET status = 'left' WHERE workspace_id = $1 AND user_id = $2`, amWS, amActive3); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddChannelMembers(ctx, amWS, amGeneral, amAdmin, []string{amActive3}); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("left target: %v", err)
+	}
+}
+
+func TestPGXGeneralChannelStructuralGuardsPostgreSQL(t *testing.T) {
+	pool, ctx := addMembersPostgres(t)
+	channels := storage.NewPGXChannelStore(pool)
+	members := storage.NewPGXMemberStore(pool)
+	if _, err := pool.Exec(ctx, `UPDATE chat.channels SET display_name = 'Boas-vindas' WHERE id = $1`, amGeneral); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := channels.UpdateChannel(ctx, storage.UpdateChannelInput{
+		WorkspaceID: amWS, ChannelID: amGeneral, CallerID: amAdmin,
+		Slug: "geral", DisplayName: "Outro nome", Type: domain.ChannelTypePublic,
+	})
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("rename structural #geral: %v", err)
+	}
+	if _, err := channels.ArchiveChannel(ctx, amWS, amGeneral, amAdmin); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("archive structural #geral: %v", err)
+	}
+	if err := members.RemoveChannelMember(ctx, amWS, amGeneral, amActive1); !errors.Is(err, domain.ErrCannotLeaveGeneralChannel) {
+		t.Fatalf("leave structural #geral: %v", err)
+	}
+
+	if _, err := channels.UpdateChannel(ctx, storage.UpdateChannelInput{
+		WorkspaceID: amWS, ChannelID: amPrivate, CallerID: amAdmin,
+		Slug: "privado", DisplayName: "Geral", Type: domain.ChannelTypePublic,
+	}); err != nil {
+		t.Fatalf("rename ordinary public channel to Geral: %v", err)
+	}
+	if _, err := members.AddChannelMembers(ctx, amWS, amPrivate, amAdmin, []string{amActive1}); err != nil {
+		t.Fatalf("add member to ordinary public Geral: %v", err)
+	}
+	if err := members.RemoveChannelMember(ctx, amWS, amPrivate, amActive1); err != nil {
+		t.Fatalf("leave ordinary Geral: %v", err)
+	}
+	if _, err := channels.ArchiveChannel(ctx, amWS, amPrivate, amAdmin); err != nil {
+		t.Fatalf("archive ordinary Geral: %v", err)
+	}
+}
+
+// Reactivation and add-members both acquire the structural channel before
+// touching the same target. Either may insert first; both must finish and the
+// final materialized membership must be unique.
+func TestPGXGeneralChannelConcurrentReactivationAndAddPostgreSQL(t *testing.T) {
+	pool, setupCtx := addMembersPostgres(t)
+	store := storage.NewPGXMemberStore(pool)
+	if _, err := pool.Exec(setupCtx, `UPDATE chat.workspace_members SET status = 'left'
+		WHERE workspace_id = $1 AND user_id = $2`, amWS, amActive1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(setupCtx, `DELETE FROM chat.channel_members WHERE channel_id = $1 AND user_id = $2`, amGeneral, amActive1); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var reactivateErr, addErr error
+	var addResult storage.AddMembersResult
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, reactivateErr = store.ActivateWorkspaceMember(ctx, amWS, amActive1)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		addResult, addErr = store.AddChannelMembers(ctx, amWS, amGeneral, amAdmin, []string{amActive1})
+	}()
+	close(start)
+	wg.Wait()
+	// If add-members acquired the channel first, the still-left target is
+	// forbidden; otherwise it sees the reactivation and succeeds idempotently.
+	if reactivateErr != nil || (addErr != nil && !errors.Is(addErr, domain.ErrForbidden)) {
+		t.Fatalf("concurrent reactivation/add: reactivation=%v add=%v", reactivateErr, addErr)
+	}
+	var status string
+	if err := pool.QueryRow(t.Context(), `SELECT status FROM chat.workspace_members
+		WHERE workspace_id = $1 AND user_id = $2`, amWS, amActive1).Scan(&status); err != nil || status != "active" {
+		t.Fatalf("workspace membership after reactivation = %q, %v", status, err)
+	}
+	var targetRows int
+	if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM chat.channel_members WHERE channel_id = $1 AND user_id = $2`, amGeneral, amActive1).Scan(&targetRows); err != nil || targetRows != 1 {
+		t.Fatalf("target general rows = %d, want one (err=%v)", targetRows, err)
+	}
+	if addErr == nil && addResult.Added+addResult.AlreadyMembers != 1 {
+		t.Fatalf("add result = %+v, want one eligible target", addResult)
+	}
+	retry, err := store.AddChannelMembers(t.Context(), amWS, amGeneral, amAdmin, []string{amActive1})
+	if err != nil || retry.Added != 0 || retry.AlreadyMembers != 1 {
+		t.Fatalf("idempotent retry = %+v, %v", retry, err)
+	}
+}
+
 // Two managers adding the same person at the same moment must converge on one
 // row. This is the case a check-then-insert loses: both would observe "not a
 // member" and one would then raise a unique violation.
@@ -252,11 +448,14 @@ func TestPGXAddChannelMembersPostgreSQL(t *testing.T) {
 func TestPGXAddChannelMembersConcurrentPostgreSQL(t *testing.T) {
 	pool, ctx := addMembersPostgres(t)
 	store := storage.NewPGXMemberStore(pool)
+	addPrivateActorMembership(t, pool, ctx, amAdmin)
+	addPrivateActorMembership(t, pool, ctx, amActive3)
 
 	const writers = 8
 	start := make(chan struct{})
 	errs := make([]error, writers)
 	added := make([]int, writers)
+	totals := make([]int, writers)
 
 	var wg sync.WaitGroup
 	wg.Add(writers)
@@ -264,8 +463,12 @@ func TestPGXAddChannelMembersConcurrentPostgreSQL(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			result, err := store.AddChannelMembers(ctx, amWS, amPrivate, amAdmin, []string{amActive1})
-			errs[i], added[i] = err, result.Added
+			actorID := amAdmin
+			if i%2 == 1 {
+				actorID = amActive3
+			}
+			result, err := store.AddChannelMembers(ctx, amWS, amPrivate, actorID, []string{amActive1})
+			errs[i], added[i], totals[i] = err, result.Added, result.TotalCount
 		}(i)
 	}
 	close(start)
@@ -277,13 +480,19 @@ func TestPGXAddChannelMembersConcurrentPostgreSQL(t *testing.T) {
 			t.Fatalf("writer %d failed: %v", i, err)
 		}
 		totalAdded += added[i]
+		if totals[i] != 3 {
+			t.Fatalf("writer %d TotalCount = %d, want 3", i, totals[i])
+		}
 	}
 	// Exactly one writer may claim the insert; the rest see it as pre-existing.
 	if totalAdded != 1 {
 		t.Fatalf("sum of Added = %d, want exactly 1", totalAdded)
 	}
-	if got := countChannelMembers(t, pool, ctx, amPrivate); got != 1 {
-		t.Fatalf("membership rows = %d, want exactly 1", got)
+	if got := countChannelMembers(t, pool, ctx, amPrivate); got != 3 {
+		t.Fatalf("membership rows = %d, want two actors plus target", got)
+	}
+	if got := countAutoAddEvents(t, pool, ctx, amPrivate, ""); got != 1 {
+		t.Fatalf("member-added events = %d, want exactly one", got)
 	}
 }
 
@@ -723,6 +932,7 @@ func containsID(ids []string, want string) bool {
 func TestPGXSearchChannelMemberCandidatesPostgreSQL(t *testing.T) {
 	pool, ctx := addMembersPostgres(t)
 	store := storage.NewPGXMemberStore(pool)
+	addPrivateActorMembership(t, pool, ctx, amAdmin)
 
 	// amActive1 and amActive2 are put in the channel; neither is "online"
 	// anywhere in this test, which is precisely the case that used to leak.
@@ -782,17 +992,15 @@ func TestPGXSearchChannelMemberCandidatesPostgreSQL(t *testing.T) {
 		}
 	})
 
-	// A channel from another tenant must not resolve, so its members are not
-	// excluded and — more importantly — nothing about it is revealed.
-	t.Run("a cross-workspace channel excludes nobody", func(t *testing.T) {
+	// The storage query independently revalidates channel visibility, so a direct
+	// call cannot expose the workspace directory through a foreign channel.
+	t.Run("a cross-workspace channel exposes no candidates", func(t *testing.T) {
 		got, err := store.SearchChannelMemberCandidates(ctx, amWS, amForeignC, amAdmin, "", 50)
 		if err != nil {
 			t.Fatalf("SearchChannelMemberCandidates: %v", err)
 		}
-		// Everyone eligible in *this* workspace is still a candidate: the foreign
-		// channel's membership has no effect here.
-		if !containsID(candidateIDs(t, got), amActive1) {
-			t.Fatal("a cross-workspace channel wrongly excluded a local member")
+		if len(got) != 0 {
+			t.Fatalf("cross-workspace candidates = %+v, want none", got)
 		}
 	})
 
@@ -945,6 +1153,7 @@ func groupFixtureUUID(i int) string {
 func TestPGXAddMembersReportsOnlyTheInsertedUserIDsPostgreSQL(t *testing.T) {
 	pool, ctx := addMembersPostgres(t)
 	members := storage.NewPGXMemberStore(pool)
+	addPrivateActorMembership(t, pool, ctx, amAdmin)
 
 	first, err := members.AddChannelMembers(ctx, amWS, amPrivate, amAdmin, []string{amActive1})
 	if err != nil {
@@ -1021,6 +1230,11 @@ func seedBulkMembers(t *testing.T, pool *pgxpool.Pool, ctx context.Context, pref
 	for i := 0; i < count; i++ {
 		ids = append(ids, bulkUUID(prefix, i))
 	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(context.Background(), `DELETE FROM auth.users WHERE id = ANY($1::uuid[])`, ids); err != nil {
+			t.Errorf("cleanup bulk users: %v", err)
+		}
+	})
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO auth.users (id, email, display_name, status)
 		SELECT id, 'bulk-' || id::text || '@example.test', 'Bulk ' || id::text, 'active'
@@ -1052,6 +1266,7 @@ func bulkUUID(prefix string, i int) string {
 func TestPGXAddChannelMembersHasNoTotalCapacityPostgreSQL(t *testing.T) {
 	pool, ctx := addMembersPostgres(t)
 	store := storage.NewPGXMemberStore(pool)
+	addPrivateActorMembership(t, pool, ctx, amAdmin)
 
 	// Seed a channel with 80 members — well past 50 — directly.
 	existing := seedBulkMembers(t, pool, ctx, "f4000000", 80)

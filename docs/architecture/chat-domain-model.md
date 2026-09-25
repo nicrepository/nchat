@@ -129,10 +129,9 @@ responses do not include it, and future HTTP responses must not expose it.
 | joined_at       | timestamptz |                                        |
 | left_at         | timestamptz | Nullable; set only when status is left |
 
-Under CURRENT RF-74, active workspace owners, admins, moderators and members
-are eligible for automatic sync into their workspace's mandatory `#geral`
-channel; guests are excluded by `generalMembershipRoles`. The future policy
-and RF-18/RF-74 consolidation belong to #882. The pgx member store performs workspace
+RF-18 materializes every active, account-eligible workspace member in the
+mandatory `#geral`, including guests. This structural row does not widen a
+guest's implicit reach to other public channels. The pgx member store performs workspace
 join/reactivation and `#geral` `channel_members` insertion in one transaction
 where the general channel is loaded by the same `workspace_id`. Duplicate rows
 are ignored with `ON CONFLICT DO NOTHING`; unexpected database errors propagate.
@@ -685,9 +684,9 @@ conversation refuses the operation: a third participant would convert it into a
 group, and its `direct_pair_key` would then describe a conversation that is no
 longer a pair.
 
-Authorization differs between the two because the schema does. Channels use
-`domain.CanManageChannelMembers` (active workspace `owner` or `admin`), the same
-authority that already removes a channel member. Groups take active
+Authorization differs between the two because the schema does. Channel adds use
+`domain.CanAddChannelMembers`, which follows canonical channel access without
+granting administrative removal. Groups take active
 participation, because `chat.dm_members.role` is closed by CHECK to `'member'`
 and a group has no privileged participant to require. Both decisions and the
 alternatives rejected are recorded in `SECURITY.md`.
@@ -736,15 +735,15 @@ from the bus is never republished onto it.
 Both writes take the authenticated actor as an explicit argument and re-establish
 their authority in the same transaction that inserts, under a row lock:
 
-- channels re-read `chat.workspace_members` for the actor and require an active
-  `owner`/`admin` row -- the SQL statement of `domain.CanManageChannelMembers`;
+- channels re-read the actor's active workspace membership and account, then
+  require `chat.channel_visible_to_user` -- the SQL statement corresponding to
+  `domain.CanAddChannelMembers`;
 - groups re-read the actor's active `chat.dm_members` row, joined to an active
   workspace membership, because a participation row outlives the workspace
   membership that justified it.
 
-The service still checks first, but only so a caller with no business here is
-refused before the conversation lookup can leak whether an ID exists. It is not
-the control: a role demoted, a membership suspended, or a participant removed
+The service still checks first, but it is not the transactional control: channel
+access revoked, a membership/account suspended, or a participant removed
 between that check and the write leaves the transaction with nothing to insert
 from, and the whole thing rolls back with `ErrForbidden`. The service's
 verdict is deliberately not passed down as a boolean; a boolean computed a moment

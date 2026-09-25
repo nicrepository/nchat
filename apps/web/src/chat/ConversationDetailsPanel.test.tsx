@@ -75,6 +75,7 @@ function channelDetails(
     memberCount: 12,
     onlineCount: 0,
     onlineMembers: [],
+    canAddMembers: false,
     // Off unless a case turns it on: the add action is absent by default, which
     // is what the server's own strict `=== true` normalization produces.
     canManageMembers: false,
@@ -226,7 +227,10 @@ describe("ConversationDetailsPanel — canal: estrutura e acessibilidade", () =>
   it("stays open when Escape dismisses a dialog it opened", async () => {
     const { onClose } = renderPanel({
       state: state({
-        details: { status: "ready", data: channelDetails({ canManageMembers: true }) },
+        details: {
+          status: "ready",
+          data: channelDetails({ canAddMembers: true, canManageMembers: true }),
+        },
       }),
     });
 
@@ -2063,7 +2067,7 @@ function readyChannel(overrides: Partial<ChannelDetails> = {}, reload = vi.fn())
   return {
     details: {
       status: "ready" as const,
-      data: channelDetails({ canManageMembers: true, ...overrides }),
+      data: channelDetails({ canAddMembers: true, canManageMembers: true, ...overrides }),
     },
     files: { status: "ready" as const, data: [] },
     roster: { status: "loading" as const },
@@ -2099,8 +2103,8 @@ describe("ConversationDetailsPanel — adicionar membros: permissão", () => {
   // The action is server-gated. `canManageMembers` is normalized to false unless
   // the server explicitly said true, so every state that is not "ready and
   // permitted" must leave the control absent.
-  it("offers the action when the server says the caller may manage members", () => {
-    renderPanel({ state: state({ details: readyChannel().details }) });
+  it("offers the action when the server says the caller may add members", () => {
+    renderPanel({ state: state({ details: readyChannel({ canAddMembers: true }).details }) });
 
     expect(screen.getByTestId("chat-details-add-members")).toBeEnabled();
     expect(screen.getByTestId("chat-details-add-members")).toHaveTextContent("Adicionar membros");
@@ -2110,7 +2114,7 @@ describe("ConversationDetailsPanel — adicionar membros: permissão", () => {
     ["public", "public" as const],
     ["private", "private" as const],
   ])("offers the action on a %s channel", (_label, type) => {
-    renderPanel({ state: state({ details: readyChannel({ type }).details }) });
+    renderPanel({ state: state({ details: readyChannel({ type, canAddMembers: true }).details }) });
 
     expect(screen.getByTestId("chat-details-add-members")).toBeInTheDocument();
   });
@@ -2123,10 +2127,28 @@ describe("ConversationDetailsPanel — adicionar membros: permissão", () => {
     );
   });
 
-  it("hides the action when the caller may not manage members", () => {
+  it("offers add without widening administrative management", () => {
     renderPanel({
       state: state({
-        details: { status: "ready", data: channelDetails({ canManageMembers: false }) },
+        details: {
+          status: "ready",
+          data: channelDetails({
+            canAddMembers: true,
+            canManageMembers: false,
+            canRemoveMembers: false,
+          }),
+        },
+      }),
+    });
+
+    expect(screen.getByTestId("chat-details-add-members")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-remove-member")).not.toBeInTheDocument();
+  });
+
+  it("hides the action when the server withholds the add capability", () => {
+    renderPanel({
+      state: state({
+        details: { status: "ready", data: channelDetails({ canAddMembers: false }) },
       }),
     });
     expect(screen.queryByTestId("chat-details-add-members")).not.toBeInTheDocument();

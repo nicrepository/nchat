@@ -966,21 +966,19 @@ var createMessageQuery = `
 			FROM user_mentions um
 			JOIN chat.channels c
 			  ON c.id = $2::uuid AND c.workspace_id = $1::uuid AND c.status = 'active'
+			JOIN chat.workspace_members actor_wm
+			  ON actor_wm.workspace_id = c.workspace_id
+			 AND actor_wm.user_id = $4::uuid AND actor_wm.status = 'active'
+			JOIN auth.users actor_user
+			  ON actor_user.id = actor_wm.user_id
+			 AND actor_user.status = 'active' AND actor_user.deleted_at IS NULL
 			JOIN chat.workspace_members target_wm
 			  ON target_wm.workspace_id = c.workspace_id
 			 AND target_wm.user_id = um.user_id AND target_wm.status = 'active'
 			JOIN auth.users target_user
 			  ON target_user.id = um.user_id
 			 AND target_user.status = 'active' AND target_user.deleted_at IS NULL
-			WHERE EXISTS (
-				SELECT 1 FROM chat.channel_members cm
-				WHERE cm.channel_id = c.id AND cm.user_id = um.user_id
-			) OR EXISTS (
-				SELECT 1 FROM chat.workspace_members actor
-				WHERE actor.workspace_id = c.workspace_id
-				  AND actor.user_id = $4::uuid AND actor.status = 'active'
-				  AND actor.role IN ('owner', 'admin', 'moderator')
-			)
+			WHERE chat.channel_visible_to_user(c.id, actor_wm.user_id)
 			UNION ALL
 			SELECT um.user_id
 			FROM user_mentions um
@@ -2447,15 +2445,13 @@ func (s *PGXMessageStore) ResolveAuthorizedMentionLabels(ctx context.Context, wo
 		 AND wm.status = 'active'
 		JOIN auth.users u
 		  ON u.id = wm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
-		WHERE EXISTS (
-			SELECT 1 FROM chat.channel_members cm
-			WHERE cm.channel_id = source_channel.id AND cm.user_id = wm.user_id
-		) OR EXISTS (
-			SELECT 1 FROM chat.workspace_members requester
-			WHERE requester.workspace_id = source_channel.workspace_id
-			  AND requester.user_id = $4::uuid AND requester.status = 'active'
-			  AND requester.role IN ('owner', 'admin', 'moderator')
-		)
+		JOIN chat.workspace_members requester
+		  ON requester.workspace_id = source_channel.workspace_id
+		 AND requester.user_id = $4::uuid AND requester.status = 'active'
+		JOIN auth.users requester_user
+		  ON requester_user.id = requester.user_id
+		 AND requester_user.status = 'active' AND requester_user.deleted_at IS NULL
+		WHERE chat.channel_visible_to_user(source_channel.id, requester.user_id)
 		UNION ALL
 		SELECT 'user', u.id::text, u.display_name
 		FROM unnest($5::text[]) AS ids(id)

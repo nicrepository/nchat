@@ -256,15 +256,9 @@ Consequencias deliberadas para o Guest:
   o isolamento seria contornavel em uma requisicao;
 - **nao** cria canal (`domain.CanCreateChannel`), re-verificado no proprio
   `INSERT`;
-- **nao** e adicionado automaticamente a `#geral`: `generalMembershipRoles`
-  exclui guest, tanto no sync individual quanto no backfill. Uma row explicita
-  existente (legada ou administrativa) pode satisfazer o predicate de
-  visibilidade, mantidas as demais condicoes de acesso; o sync nao a remove.
-  O fluxo de `MemberService.AddChannelMembers` no chat-service rejeita
-  `is_general`. Ha um caminho administrativo distinto: a API do admin-service,
-  com `admin.channels.manage`, chama `PGXChannelDirectoryStore.AddChannelMembers`,
-  que admite alvos elegiveis sem recusar `is_general`, inclusive guest.
-  Esta e a descricao CURRENT; a consolidacao futura pertence a #882.
+- e adicionado automaticamente a `#geral` como excecao estrutural de RF-18,
+  desde que membership e conta estejam ativas. Isso nao amplia seu alcance para
+  outros canais publicos: fora de `#geral`, guest continua invite-only.
 
 Canal privado continua exigindo membership de canal para **todos** os papeis:
 nem owner, nem admin, nem moderador leem um canal privado do qual nao
@@ -319,28 +313,25 @@ de mudar o que um canal e ou de arquiva-lo.
 
 ## Autorizacao para adicionar membros
 
-Adicionar participantes a um **canal** (issue #398) exige papel ativo de
-`owner`, `admin` ou `moderator` no workspace, exposto como
-`domain.CanManageChannelMembers`, que delega a `CanModerateWorkspace`. E o mesmo
-gate usado para categorias e para a operacao inversa -- remover membro de canal.
-Adicionar e remover a mesma linha sao a mesma autoridade;
-`docs/runbooks/task-chat-channel-join-leave.md` ja chamava a adicao de
-"manager-add flow". `MemberService.RemoveMemberFromChannel` deixou de repetir
-uma lista de papeis propria e passou a consultar o mesmo predicado, para que as
-duas nao possam divergir.
+Adicionar participantes a um **canal** usa a capability especifica
+`domain.CanAddChannelMembers`, que segue a policy canonica de acesso: membership
+ativa no workspace e acesso valido ao canal. Em canal publico, os papeis que
+`CanReachPublicChannels` admite nao precisam de row explicita; em canal privado
+e para guest, a row de `chat.channel_members` e obrigatoria. Falta de acesso a
+canal privado responde como canal inexistente, sem oracle de existencia.
 
-O RF-74 e o que alargou esse predicado de owner/admin para incluir o moderador:
-ele foi escrito como costura nomeada exatamente para isso, e a costura foi
-gasta. O alargamento chega ao store tambem --
-`PGXMemberStore.AddChannelMembers` re-deriva a mesma lista de papeis dentro da
-sua transacao, sob `FOR SHARE`, entao uma revogacao de papel em voo e
-serializada contra a escrita em vez de correr com ela.
+O store revalida a decisao dentro da transacao com
+`chat.channel_visible_to_user`, depois de travar o canal, e bloqueia membership
+de workspace, workspace e conta do ator sob `FOR SHARE`. Alvos usam a mesma
+elegibilidade compartilhada com o admin-service e tambem ficam bloqueados ate o
+commit. Revogacao, suspensao e remocao concorrentes nao transformam um "sim"
+antigo do service em autorizacao persistente.
 
-Deliberadamente **nao** e "qualquer membro do canal": isso permitiria a quem
-apenas le um canal privado ampliar a audiencia dele, que e precisamente a
-propriedade que um canal privado tem. O papel `moderator` de
-`chat.channel_members` tambem nao e consultado -- ele e por canal, e moderar um
-canal nao confere autoridade de workspace.
+Remover membro e administrar o roster continuam usando
+`domain.CanManageChannelMembers` (`owner`/`admin`/`moderator`). Rename/archive
+continuam em `CanManageWorkspace`. A capability estreita de add nao concede
+nenhuma dessas autoridades. O chat-service admite reparo idempotente de
+`#geral`, reutilizando a elegibilidade e os invariantes consolidados pela #882.
 
 Adicionar participantes a um **grupo** (`chat.dm_conversations` com
 `type = 'group'`) exige apenas participacao ativa na conversa. Nao ha gestor a

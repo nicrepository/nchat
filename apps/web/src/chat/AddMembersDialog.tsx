@@ -10,7 +10,7 @@
  * - Only user IDs leave this component. The workspace, the actor and every
  *   membership field come from the session server-side.
  * - Nothing here is an authorization check. The action is hidden when the server
- *   said the caller may not manage members, but that is presentation: the POST
+ *   withheld the add capability, but that is presentation: the POST
  *   is re-authorized, and a 403 is rendered as a refusal rather than swallowed.
  * - Every server-supplied name is a React text node. No dangerouslySetInnerHTML,
  *   no URL is built from a display name.

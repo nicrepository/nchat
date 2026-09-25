@@ -56,6 +56,7 @@ function channelDetails(overrides: Partial<ChannelDetails> = {}): {
     onlineMembers: [
       { userId: "u-online", displayName: "Bruno Dias", role: "member", presence: "online" },
     ],
+    canAddMembers: true,
     canManageMembers: true,
     canRemoveMembers: true,
     ...overrides,
@@ -180,10 +181,16 @@ describe("channel removal controls", () => {
     expect(removeButtons()).toHaveLength(0);
   });
 
-  // can_manage_members is the *add* capability. A caller who may add and may
+  // can_add_members is independent from removal. A caller who may add and may
   // not remove must see the add action and no minus button.
   it("does not read the add capability as the removal one", () => {
-    renderChannel(channelDetails({ canManageMembers: true, canRemoveMembers: false }));
+    renderChannel(
+      channelDetails({
+        canAddMembers: true,
+        canManageMembers: false,
+        canRemoveMembers: false,
+      }),
+    );
 
     expect(screen.getByTestId("chat-details-add-members")).toBeInTheDocument();
     expect(removeButtons()).toHaveLength(0);
