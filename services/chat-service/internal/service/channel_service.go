@@ -175,10 +175,8 @@ type ChannelDetails struct {
 	// by the workspace sync, not by this flow.
 	CanManageMembers bool
 	// CanRemoveMembers is the server's own answer to "may this caller remove
-	// another member" (issue #469). It is a separate field from
-	// CanManageMembers although both evaluate the same predicate today: adding
-	// and removing are different questions, the panel asks them separately, and
-	// the day one policy moves the other must not follow it silently. Like its
+	// another member" (issue #469). It is separate from CanManageMembers because
+	// adding and removing have independent authorization policies. Like its
 	// neighbour it is a rendering hint — DELETE .../members/{userID} re-derives
 	// the decision from the session — and it is false for #geral, matching the
 	// write path.
@@ -223,12 +221,11 @@ func (s *ChannelService) GetChannelDetails(ctx context.Context, input ChannelDet
 		OnlineCount:   page.OnlineCount,
 		MemberCount:   page.TotalCount,
 		About:         about,
-		// The same predicate the write path checks, evaluated on the membership
-		// already loaded above — not a second, parallel rule that could drift.
-		CanManageMembers: !channel.IsGeneral && domain.CanManageChannelMembers(&member),
-		// MemberService.RemoveMemberFromChannel's own two refusals, in the order
-		// it applies them: #geral is never administrable here, and everyone else
-		// needs the same management authority the add path needs.
+		// #705 keeps the legacy JSON name for frontend compatibility. The value is
+		// add-only; removal still uses CanManageChannelMembers independently.
+		CanManageMembers: !channel.IsGeneral && domain.CanAddChannelMembers(&member),
+		// Removal is independent from the add capability: #geral is never
+		// administrable here, and everyone else needs CanManageChannelMembers.
 		CanRemoveMembers: !channel.IsGeneral && domain.CanManageChannelMembers(&member),
 	}, nil
 }

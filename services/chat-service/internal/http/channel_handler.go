@@ -308,17 +308,18 @@ type channelDetailsResponse struct {
 	MemberCount        int                        `json:"member_count"`
 	OnlineMemberCount  int                        `json:"online_member_count"`
 	OnlineMembers      []channelDetailsMemberJSON `json:"online_members"`
-	// CanManageMembers lets the panel disable an action the server would refuse
-	// (issue #398). It is a hint for the UI and never a control: the add-members
-	// route re-derives the same decision from the session on every call. It is
+	// CanManageMembers is the legacy #398 name kept by hotfix #705. Its value is
+	// the add-members capability only; it is a hint for the UI and never a
+	// control. The add-members route re-derives the same decision from the
+	// session on every call. It is
 	// always sent, so a client that predates it reads absent-as-false and hides
 	// the action — the safe direction — rather than enabling it by default.
 	CanManageMembers bool `json:"can_manage_members"`
 	// CanRemoveMembers is the same kind of hint for the removal control
 	// (issue #469). Sent beside can_manage_members rather than folded into it:
-	// the two answer different questions, and a client must not infer one from
-	// the other even while the channel policy makes them agree. Absent reads as
-	// false, so an older server hides the control.
+	// addition and removal have independent authorization policies, so a client
+	// must never infer one capability from the other. Absent reads as false, so
+	// an older server hides the control.
 	CanRemoveMembers bool `json:"can_remove_members"`
 }
 
