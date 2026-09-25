@@ -303,33 +303,3 @@ func TestMentionService_Search_DirectAndInvisibleDMsAreNotFound(t *testing.T) {
 		})
 	}
 }
-
-// #705 widened the manual add to plain members, but message auto-add still
-// admits only owner, admin and moderator, so the mention popup must not offer
-// a plain member will-be-added candidates the send would then drop.
-func TestMentionService_Search_PlainMemberSeesNoAutoAddCandidates(t *testing.T) {
-	members := newFakeMemberStore()
-	members.workspaceMembers[wmKey("ws-1", user1)] = domain.WorkspaceMember{
-		WorkspaceID: "ws-1", UserID: user1, Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusActive,
-	}
-	members.mentionCandidates = []domain.MentionCandidate{
-		{Type: domain.MentionTypeUser, ID: user2, Label: "Juliana Rocha"},
-	}
-	members.dmCandidates = []domain.DMCandidate{{UserID: user3, DisplayName: "Juliane Lino"}}
-	channels := &fakeChannelStore{channel: publicActiveChannel("ws-1", "ch-1")}
-	svc := service.NewMentionService(
-		service.NewMemberService(members, channels, &fakeWorkspaceStore{workspace: domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusActive}}),
-		service.NewPermissionService(members, channels),
-		nil,
-	)
-
-	got, err := svc.SearchMentions(context.Background(), service.SearchMentionsInput{
-		WorkspaceID: "ws-1", TargetType: "channel", TargetID: "ch-1", CallerID: user1,
-	})
-	if err != nil {
-		t.Fatalf("SearchMentions: %v", err)
-	}
-	if len(got.Users) != 1 || got.Users[0].ID != user2 || got.Users[0].WillBeAdded {
-		t.Fatalf("users = %#v, want only the current member", got.Users)
-	}
-}

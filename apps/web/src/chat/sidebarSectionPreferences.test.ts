@@ -17,15 +17,20 @@ describe("sidebarSectionPreferences", () => {
     vi.restoreAllMocks();
   });
 
-  it("returns safe defaults (all expanded, unread-only off) when nothing is persisted", () => {
+  it("returns safe defaults (all expanded) when nothing is persisted", () => {
+    expect(DEFAULT_SECTION_PREFS).toEqual({
+      channels: { collapsed: false },
+      directs: { collapsed: false },
+      groups: { collapsed: false },
+    });
     expect(loadSectionPrefs(userId, workspaceId)).toEqual(DEFAULT_SECTION_PREFS);
   });
 
   it("round-trips a save/load", () => {
     const prefs: SidebarSectionPrefs = {
-      channels: { collapsed: true, showUnreadOnly: true },
-      directs: { collapsed: true, showUnreadOnly: false },
-      groups: { collapsed: false, showUnreadOnly: false },
+      channels: { collapsed: true },
+      directs: { collapsed: false },
+      groups: { collapsed: true },
     };
     saveSectionPrefs(userId, workspaceId, prefs);
 
@@ -34,9 +39,9 @@ describe("sidebarSectionPreferences", () => {
 
   it("isolates storage by (userId, workspaceId)", () => {
     saveSectionPrefs("user-a", "workspace-1", {
-      channels: { collapsed: true, showUnreadOnly: true },
-      directs: { collapsed: false, showUnreadOnly: false },
-      groups: { collapsed: false, showUnreadOnly: false },
+      channels: { collapsed: true },
+      directs: { collapsed: false },
+      groups: { collapsed: false },
     });
 
     expect(loadSectionPrefs("user-b", "workspace-1")).toEqual(DEFAULT_SECTION_PREFS);
@@ -50,23 +55,27 @@ describe("sidebarSectionPreferences", () => {
     expect(loadSectionPrefs(userId, workspaceId)).toEqual(DEFAULT_SECTION_PREFS);
   });
 
-  it("returns defaults when the stored value is not an object", () => {
-    localStorage.setItem(storageKey, JSON.stringify(["not", "an", "object"]));
-    expect(loadSectionPrefs(userId, workspaceId)).toEqual(DEFAULT_SECTION_PREFS);
-  });
+  it.each([JSON.stringify(["not", "an", "object"]), "null", "42", '"text"'])(
+    "returns defaults when the stored value is not an object (%s)",
+    (stored) => {
+      localStorage.setItem(storageKey, stored);
+      expect(loadSectionPrefs(userId, workspaceId)).toEqual(DEFAULT_SECTION_PREFS);
+    },
+  );
 
   it("falls back to defaults per-section when one section's shape is invalid", () => {
     localStorage.setItem(
       storageKey,
       JSON.stringify({
-        channels: { collapsed: true, showUnreadOnly: true },
-        directs: { collapsed: "yes", showUnreadOnly: false },
+        channels: { collapsed: true },
+        directs: { collapsed: "yes" },
         groups: null,
+        unknownSection: { collapsed: true },
       }),
     );
 
     expect(loadSectionPrefs(userId, workspaceId)).toEqual({
-      channels: { collapsed: true, showUnreadOnly: true },
+      channels: { collapsed: true },
       directs: DEFAULT_SECTION_PREFS.directs,
       groups: DEFAULT_SECTION_PREFS.groups,
     });
@@ -76,16 +85,52 @@ describe("sidebarSectionPreferences", () => {
     localStorage.setItem(
       storageKey,
       JSON.stringify({
-        channels: { collapsed: true, showUnreadOnly: false, extra: "ignored" },
+        channels: { collapsed: true, extra: "ignored" },
         directs: DEFAULT_SECTION_PREFS.directs,
         groups: DEFAULT_SECTION_PREFS.groups,
       }),
     );
 
-    expect(loadSectionPrefs(userId, workspaceId).channels).toEqual({
-      collapsed: true,
-      showUnreadOnly: false,
+    expect(loadSectionPrefs(userId, workspaceId).channels).toEqual({ collapsed: true });
+  });
+
+  // Issue #779 stored `{ collapsed, showUnreadOnly }` under the same key. Since
+  // issue #1005 collapsing always shows unread, so only `collapsed` survives.
+  it.each([
+    { legacy: { collapsed: true, showUnreadOnly: true }, collapsed: true },
+    { legacy: { collapsed: true, showUnreadOnly: false }, collapsed: true },
+    { legacy: { collapsed: false, showUnreadOnly: true }, collapsed: false },
+  ])("keeps only `collapsed` from the legacy #779 shape $legacy", ({ legacy, collapsed }) => {
+    localStorage.setItem(
+      storageKey,
+      JSON.stringify({ channels: legacy, directs: legacy, groups: legacy }),
+    );
+
+    expect(loadSectionPrefs(userId, workspaceId)).toEqual({
+      channels: { collapsed },
+      directs: { collapsed },
+      groups: { collapsed },
     });
+  });
+
+  it("falls back to defaults for a legacy entry whose `collapsed` is invalid", () => {
+    localStorage.setItem(
+      storageKey,
+      JSON.stringify({ channels: { collapsed: null, showUnreadOnly: true } }),
+    );
+
+    expect(loadSectionPrefs(userId, workspaceId)).toEqual(DEFAULT_SECTION_PREFS);
+  });
+
+  it("drops the legacy field on the next save", () => {
+    localStorage.setItem(
+      storageKey,
+      JSON.stringify({ channels: { collapsed: true, showUnreadOnly: true } }),
+    );
+
+    saveSectionPrefs(userId, workspaceId, loadSectionPrefs(userId, workspaceId));
+
+    expect(localStorage.getItem(storageKey)).not.toContain("showUnreadOnly");
   });
 
   it("does not throw and returns defaults when localStorage.getItem throws", () => {

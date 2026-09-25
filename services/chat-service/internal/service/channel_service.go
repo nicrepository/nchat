@@ -165,22 +165,21 @@ type ChannelDetails struct {
 	// never as an identifier.
 	About storage.ConversationAbout
 	// CanManageMembers is the server's own answer to "may this caller add
-	// participants" (issues #398 and #705), derived from the membership this
-	// method already had to load. It exists so the panel can disable an action
-	// the server would refuse, and it is never the control: POST .../members
-	// re-derives the decision from the session on every call. A client that ignores it gets a
+	// participants" (issue #398), derived from the membership this method already
+	// had to load. It exists so the panel can disable an action the server would
+	// refuse, and it is never the control: POST .../members re-derives the
+	// decision from the session on every call. A client that ignores it gets a
 	// 403, not a membership row.
 	//
 	// It is false for #geral, matching the write path: membership there is owned
 	// by the workspace sync, not by this flow.
 	CanManageMembers bool
 	// CanRemoveMembers is the server's own answer to "may this caller remove
-	// another member" (issue #469). It is a separate field from
-	// CanManageMembers because adding and removing are different questions: since
-	// #705 a plain member may add (CanAddChannelMembers) but never remove
-	// (CanManageChannelMembers). Like its neighbour it is a rendering hint —
-	// DELETE .../members/{userID} re-derives the decision from the session — and
-	// it is false for #geral, matching the write path.
+	// another member" (issue #469). It is separate from CanManageMembers because
+	// adding and removing have independent authorization policies. Like its
+	// neighbour it is a rendering hint — DELETE .../members/{userID} re-derives
+	// the decision from the session — and it is false for #geral, matching the
+	// write path.
 	CanRemoveMembers bool
 }
 
@@ -225,9 +224,8 @@ func (s *ChannelService) GetChannelDetails(ctx context.Context, input ChannelDet
 		// #705 keeps the legacy JSON name for frontend compatibility. The value is
 		// add-only; removal still uses CanManageChannelMembers independently.
 		CanManageMembers: !channel.IsGeneral && domain.CanAddChannelMembers(&member),
-		// MemberService.RemoveMemberFromChannel's own two refusals, in the order
-		// it applies them: #geral is never administrable here, and everyone else
-		// needs the same management authority the add path needs.
+		// Removal is independent from the add capability: #geral is never
+		// administrable here, and everyone else needs CanManageChannelMembers.
 		CanRemoveMembers: !channel.IsGeneral && domain.CanManageChannelMembers(&member),
 	}, nil
 }

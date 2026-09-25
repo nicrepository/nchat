@@ -281,36 +281,24 @@ interface SectionProps {
   title: string;
   /** Only the first section sits flush against the CTA above it. */
   spaced?: boolean;
-  /** Independent per-section state (issue #779): expanded/collapsed and "show unread only" preference. */
+  /** Per-section state; a collapsed section still lists its unread conversations (issue #1005). */
   collapsed: boolean;
   onToggleCollapse: () => void;
-  showUnreadOnly: boolean;
-  onToggleShowUnreadOnly: () => void;
   /** Conversations with unread in this section, never a sum of message counts. */
   badgeCount: number;
   children: React.ReactNode;
 }
 
 /**
- * One sidebar category: a real heading plus its list (issue #396), now with
- * two independent controls per section (issue #779) — collapse/expand and
- * "show unread conversations when collapsed".
+ * One sidebar category: a real heading plus its list (issue #396), with a
+ * single collapse/expand control (issue #1005). Collapsing never hides
+ * activity: the caller keeps the section's unread conversations listed.
  *
- * The two controls are siblings, never nested buttons. The collapse button is
- * the only element inside the `<h2>`, so the heading's accessible name stays
- * exactly the section title; the count and the switch sit beside it and do
- * not change that name.
- *
- * Issue #787 refines the two of them without touching the state behind either.
- * The count is rendered only when there is something to count — a literal "0"
- * beside every quiet section was noise, and an element that is absent also
- * stops reserving width in the header. The switch keeps its role, its
- * aria-checked and its handler and changes only how it is drawn: a rail with a
- * thumb that physically moves, so on/off is legible without relying on colour.
- * Its hover hint is a plain `title`: the browser already draws that, outside
- * the sidebar's scrollport, so it cannot be clipped by the nav or widen it.
- * `aria-label` stays the accessible name — it is the part that says *which*
- * section this switch belongs to, which a generic hint must never replace.
+ * The collapse button is the only element inside the `<h2>`, so the heading's
+ * accessible name stays exactly the section title; the count sits beside it
+ * and does not change that name. The count is rendered only when there is
+ * something to count (issue #787) — a literal "0" beside every quiet section
+ * was noise, and an absent element also stops reserving width in the header.
  *
  * The listbox lives inside each list component rather than here so that an
  * empty section renders its message *instead of* an options container — an
@@ -322,8 +310,6 @@ function Section({
   spaced,
   collapsed,
   onToggleCollapse,
-  showUnreadOnly,
-  onToggleShowUnreadOnly,
   badgeCount,
   children,
 }: SectionProps) {
@@ -347,29 +333,14 @@ function Section({
             {title}
           </button>
         </h2>
-        <span className="chat-sidebar__section-controls">
-          {badgeCount > 0 ? (
-            <span
-              className="chat-sidebar__section-unread-count"
-              aria-label={unreadConversationCountLabel(badgeCount)}
-            >
-              {badgeCount}
-            </span>
-          ) : null}
-          <button
-            type="button"
-            role="switch"
-            aria-checked={showUnreadOnly}
-            aria-label={`Mostrar mensagens não lidas quando ${title} estiver recolhida`}
-            title="Exibir não lidas quando a seção estiver recolhida"
-            className={`chat-sidebar__section-unread-toggle${showUnreadOnly ? " chat-sidebar__section-unread-toggle--on" : ""}`}
-            onClick={onToggleShowUnreadOnly}
+        {badgeCount > 0 ? (
+          <span
+            className="chat-sidebar__section-unread-count"
+            aria-label={unreadConversationCountLabel(badgeCount)}
           >
-            <span className="chat-sidebar__section-unread-track" aria-hidden="true">
-              <span className="chat-sidebar__section-unread-thumb" />
-            </span>
-          </button>
-        </span>
+            {badgeCount}
+          </span>
+        ) : null}
       </div>
       {children}
     </section>
@@ -881,7 +852,7 @@ interface ChannelsByCategoryProps {
   collapsed: Record<string, boolean>;
   onToggleCategory: (key: string) => void;
   /**
-   * The section-level unread filter (issue #779) already dropped every read
+   * The collapsed-section unread filter (issue #1005) already dropped every read
    * channel from `grouped`; a category that lost every channel that way is
    * skipped instead of rendering a header over an empty, misleading list —
    * distinct from a category that is genuinely empty, which keeps its usual
@@ -1127,20 +1098,17 @@ export default function ChatSidebar({
     }));
   };
 
-  // Independent collapse/"show unread" state for the three sections (issue
-  // #779), scoped to (user, workspace) — presentation only, so it lives here
+  // Collapse state for the three sections (issue #1005), scoped to
+  // (user, workspace) — presentation only, so it lives here
   // rather than in useChatSidebar or a shared context. See
   // useSidebarSectionPreferences for how it stays correct on the first ready
   // render and drops any stale value when the user or workspace changes,
   // without ever calling setState during this render.
-  const {
-    prefs: sectionPrefs,
-    toggleCollapsed: toggleSectionCollapsed,
-    toggleShowUnreadOnly: toggleSectionShowUnreadOnly,
-  } = useSidebarSectionPreferences(
-    state.status === "ready" ? state.currentUserId : undefined,
-    state.status === "ready" ? state.workspaceId : undefined,
-  );
+  const { prefs: sectionPrefs, toggleCollapsed: toggleSectionCollapsed } =
+    useSidebarSectionPreferences(
+      state.status === "ready" ? state.currentUserId : undefined,
+      state.status === "ready" ? state.workspaceId : undefined,
+    );
 
   const newConversationButtonRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef(false);
@@ -1223,11 +1191,16 @@ export default function ChatSidebar({
     return { orderedDirects: sortByActivity(directs), orderedGroups: sortByActivity(groups) };
   }, [dms]);
 
-  // Issue #779 — each section's "recolhida + mostrar não lidas" view: the
-  // already-sorted list, filtered to conversations with unread. Filtering
-  // after sorting rather than introducing a second order, and derived from
-  // the same canonical arrays as the header count and the badges, so there is
-  // never a second source of truth for what counts as unread.
+  // A collapsed section's view (issue #1005): the already-sorted list,
+  // filtered to conversations with unread. Filtering after sorting rather than
+  // introducing a second order, and derived from the same canonical arrays as
+  // the header count and the badges, so there is never a second source of
+  // truth for what counts as unread.
+  //
+  // Memoized, not recomputed per render: these arrays feed
+  // `visualConversationOrder`, whose layout effect publishes into AppShell's
+  // state. A fresh array every render republished every render — the
+  // "Maximum update depth exceeded" white screen of issue #1005.
   const groupedChannelsByCategoryUnreadOnly = useMemo(
     () =>
       groupedChannelsByCategory.map(({ category, channels: categoryChannels }) => ({
@@ -1237,37 +1210,30 @@ export default function ChatSidebar({
     [groupedChannelsByCategory],
   );
   const unreadChannelsCount = (channels ?? []).filter((ch) => hasUnread(ch.unreadCount)).length;
-  const unreadDirects = orderedDirects.filter((dm) => hasUnread(dm.unreadCount));
-  const unreadGroups = orderedGroups.filter((dm) => hasUnread(dm.unreadCount));
+  const unreadDirects = useMemo(
+    () => orderedDirects.filter((dm) => hasUnread(dm.unreadCount)),
+    [orderedDirects],
+  );
+  const unreadGroups = useMemo(
+    () => orderedGroups.filter((dm) => hasUnread(dm.unreadCount)),
+    [orderedGroups],
+  );
 
-  // Issue #779, code review — the section's visual state, computed once so
-  // each list renders exactly once instead of twice with complementary
-  // conditions. `showUnreadOnly` is purely the configuration (collapsed AND
-  // the preference is on); it deliberately never looks at `unreadCount`, so
-  // it cannot be confused with whether there happens to be anything to show.
-  // `sectionVisible` is the one place configuration and data mix: expanded is
-  // always visible, and a collapsed section in unread-only mode is visible
-  // only once there is at least one unread conversation — which is what keeps
-  // a genuinely-zero collapsed section from rendering an incorrect "Nenhum…"
-  // empty state instead of just its header.
-  const channelsShowUnreadOnly =
-    sectionPrefs.channels.collapsed && sectionPrefs.channels.showUnreadOnly;
-  const channelsSectionVisible =
-    !sectionPrefs.channels.collapsed || (channelsShowUnreadOnly && unreadChannelsCount > 0);
-  const visibleChannelGroups = channelsShowUnreadOnly
+  // Each section's visual state. Expanded shows the whole list; collapsed
+  // shows only its unread conversations, and renders no list at all when
+  // there are none — so a quiet collapsed section is just its header, never
+  // an incorrect "Nenhum…" empty state.
+  const channelsCollapsed = sectionPrefs.channels.collapsed;
+  const channelsSectionVisible = !channelsCollapsed || unreadChannelsCount > 0;
+  const visibleChannelGroups = channelsCollapsed
     ? groupedChannelsByCategoryUnreadOnly
     : groupedChannelsByCategory;
 
-  const directsShowUnreadOnly =
-    sectionPrefs.directs.collapsed && sectionPrefs.directs.showUnreadOnly;
-  const directsSectionVisible =
-    !sectionPrefs.directs.collapsed || (directsShowUnreadOnly && unreadDirects.length > 0);
-  const visibleDirects = directsShowUnreadOnly ? unreadDirects : orderedDirects;
+  const directsSectionVisible = !sectionPrefs.directs.collapsed || unreadDirects.length > 0;
+  const visibleDirects = sectionPrefs.directs.collapsed ? unreadDirects : orderedDirects;
 
-  const groupsShowUnreadOnly = sectionPrefs.groups.collapsed && sectionPrefs.groups.showUnreadOnly;
-  const groupsSectionVisible =
-    !sectionPrefs.groups.collapsed || (groupsShowUnreadOnly && unreadGroups.length > 0);
-  const visibleGroups = groupsShowUnreadOnly ? unreadGroups : orderedGroups;
+  const groupsSectionVisible = !sectionPrefs.groups.collapsed || unreadGroups.length > 0;
+  const visibleGroups = sectionPrefs.groups.collapsed ? unreadGroups : orderedGroups;
 
   const visualConversationOrder = useMemo<SidebarConversationTarget[]>(
     () => [
@@ -1477,10 +1443,8 @@ export default function ChatSidebar({
               <Section
                 labelId={CHANNELS_LABEL_ID}
                 title="Canais"
-                collapsed={sectionPrefs.channels.collapsed}
+                collapsed={channelsCollapsed}
                 onToggleCollapse={() => toggleSectionCollapsed("channels")}
-                showUnreadOnly={sectionPrefs.channels.showUnreadOnly}
-                onToggleShowUnreadOnly={() => toggleSectionShowUnreadOnly("channels")}
                 badgeCount={unreadChannelsCount}
               >
                 {channelsSectionVisible && (
@@ -1491,7 +1455,7 @@ export default function ChatSidebar({
                     actions={rowActions}
                     collapsed={collapsedCategories}
                     onToggleCategory={toggleCategory}
-                    hideEmptyGroups={channelsShowUnreadOnly}
+                    hideEmptyGroups={channelsCollapsed}
                   />
                 )}
               </Section>
@@ -1502,8 +1466,6 @@ export default function ChatSidebar({
                 spaced
                 collapsed={sectionPrefs.directs.collapsed}
                 onToggleCollapse={() => toggleSectionCollapsed("directs")}
-                showUnreadOnly={sectionPrefs.directs.showUnreadOnly}
-                onToggleShowUnreadOnly={() => toggleSectionShowUnreadOnly("directs")}
                 badgeCount={unreadDirects.length}
               >
                 {directsSectionVisible && (
@@ -1524,8 +1486,6 @@ export default function ChatSidebar({
                 spaced
                 collapsed={sectionPrefs.groups.collapsed}
                 onToggleCollapse={() => toggleSectionCollapsed("groups")}
-                showUnreadOnly={sectionPrefs.groups.showUnreadOnly}
-                onToggleShowUnreadOnly={() => toggleSectionShowUnreadOnly("groups")}
                 badgeCount={unreadGroups.length}
               >
                 {groupsSectionVisible && (
