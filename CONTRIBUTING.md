@@ -61,6 +61,10 @@ docs(repo): document branch strategy
   acima.
 - Titulos de PR e commit subjects de trabalho devem seguir Conventional
   Commits; merge commits de sincronizacao com a branch base sao ignorados.
+- A promocao `release/* -> main` valida branch e titulo da PR, sem checar
+  subjects no intervalo com `main`: ele inclui historico herdado de `develop`,
+  ja governado na entrada da integracao. Commits de trabalho continuam sujeitos
+  a Conventional Commits.
 - PRs fora desses padroes nao podem ser mergeadas.
 - Automacoes aprovadas podem ter formato proprio de branch, mas continuam
   sujeitas aos gates aplicaveis e a revisao humana.
