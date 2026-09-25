@@ -676,7 +676,7 @@ func TestPGXMemberStore_SearchChannelMemberCandidates_ExcludesCurrentMembersInSQ
 	}
 	defer mock.Close()
 
-	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*EXISTS.*actor_channel\.is_general = false.*actor\.role IN \('owner', 'admin', 'moderator', 'member'\).*actor\.role = 'member'.*channel_visible_to_user\(actor_channel\.id, actor\.user_id\).*NOT EXISTS.*FROM chat\.channel_members cm.*cm\.channel_id = \$2::uuid`).
+	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*EXISTS.*actor\.role IN \('owner', 'admin', 'moderator', 'member'\).*actor\.role = 'member'.*channel_visible_to_user\(actor_channel\.id, actor\.user_id\).*NOT EXISTS.*FROM chat\.channel_members cm.*cm\.channel_id = \$2::uuid`).
 		WithArgs(msWorkspace, msChannel, msActor, "an", 20).
 		WillReturnRows(pgxmock.NewRows([]string{"user_id", "display_name"}).AddRow("u-1", "Ana"))
 

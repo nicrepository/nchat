@@ -1159,8 +1159,10 @@ func (s *PGXMemberStore) SearchDMCandidates(ctx context.Context, workspaceID, ca
 // Everything else mirrors SearchDMCandidates so the two searches cannot drift
 // about who counts as an eligible person: the workspace must be active, the
 // membership active, the account active and not deleted, and the caller must
-// still satisfy the complete #705 add policy (the EXISTS below).
-// The caller is also excluded from their own results.
+// still satisfy the #705 add role and channel-scope policy (the EXISTS below).
+// The caller is also excluded from their own results. #geral is not refused
+// here: MemberService refuses it for the add-members search, while the mention
+// popup's auto-add preview reads this query as-is (issue #882 owns that gap).
 //
 // Ordering is the same deterministic (lower(display_name), id) the rest of the
 // candidate surface uses, so paging is stable.
@@ -1188,7 +1190,6 @@ func (s *PGXMemberStore) SearchChannelMemberCandidates(
 		      WHERE actor_channel.id = $2::uuid
 		        AND actor_channel.workspace_id = $1::uuid
 		        AND actor_channel.status = 'active'
-		        AND actor_channel.is_general = false
 		        AND actor.role IN ('owner', 'admin', 'moderator', 'member')
 		        AND (
 		              actor.role IN ('owner', 'admin', 'moderator')

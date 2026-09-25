@@ -904,9 +904,9 @@ func TestPGXSearchChannelMemberCandidatesAuthorizationPostgreSQL(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := pool.Exec(ctx, `
 				DELETE FROM chat.channel_members
-				WHERE channel_id IN ($1, $2) AND user_id = $3`, amPrivate, amPublic, amActive3,
+				WHERE channel_id IN ($1, $2) AND user_id IN ($3, $4)`, amPrivate, amPublic, amActive3, amActive1,
 			); err != nil {
-				t.Fatalf("reset actor channel membership: %v", err)
+				t.Fatalf("reset channel memberships: %v", err)
 			}
 			if _, err := pool.Exec(ctx, `
 				UPDATE chat.workspace_members SET role = $3, status = 'active'
