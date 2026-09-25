@@ -14,6 +14,11 @@ misconfigurations:
       - runner-rbac.yaml
     statement: The namespace-scoped deploy runner must reconcile Services, Ingress and NetworkPolicies; remove if deployment is delegated to a narrower in-cluster controller.
     expired_at: 2027-01-16
+  - id: KSV-0056
+    paths:
+      - prod-bootstrap.yaml
+    statement: Pre-existing production deployer grants, scanned since issue 1000 moved the Role into the repository; Blue/Green applies Services and NetworkPolicies and cutover patches the named stable Service selectors. The lifecycle ConfigMap rule is not a KSV-0056 resource. Reassess when cutover moves to a narrower identity.
+    expired_at: 2027-01-16
   - id: KSV-0041
     paths:
       - controller.yaml

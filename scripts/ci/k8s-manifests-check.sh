@@ -30,6 +30,9 @@ else
     infra/k8s/overlays/k3s-prod/slots/green
     infra/k8s/overlays/k3s-prod/migrations
     infra/k8s/overlays/k3s-prod
+    # The deploy identity's RBAC (issue #1000): applied by an administrator,
+    # never by a release, and validated here like everything else it renders.
+    infra/k8s/bootstrap/nchat-prod
     infra/k8s/security/sealed-secrets/controller
   )
 fi

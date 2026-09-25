@@ -17,6 +17,7 @@ NCHAT_DEV_ROOT="$OUTPUT/tree/infra-k8s/overlays/nchat-dev-server"
 "$KUSTOMIZE_BIN" build "$NCHAT_DEV_ROOT" >"$OUTPUT/application.yaml"
 "$KUSTOMIZE_BIN" build "$NCHAT_DEV_ROOT/data" >"$OUTPUT/data.yaml"
 "$KUSTOMIZE_BIN" build "$NCHAT_DEV_ROOT/migrations" >"$OUTPUT/migrations.yaml"
+"$KUSTOMIZE_BIN" build "$ROOT/infra/k8s/bootstrap/nchat-prod" >"$OUTPUT/prod-bootstrap.yaml"
 cleanup_deploy_tree "$OUTPUT/tree"
 
 expected_controller_sha="$(<"$ROOT/infra/k8s/security/sealed-secrets/CONTROLLER_SHA256")"
