@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type TestInfo } from "@playwright/test";
 
 import {
   CURRENT_USER_ID,
@@ -15,6 +15,7 @@ import {
   makeMessage,
   messagesFor,
   uniqueId,
+  type MessagingScenario,
 } from "../helpers/messagingApi";
 
 /**
@@ -267,16 +268,10 @@ test.describe("sidebar — ordenação por atividade", () => {
     await openOrderedSidebar(page, testInfo);
 
     await page.getByRole("button", { name: "Nova conversa" }).focus();
-    // Since issue #779 the section's own collapse button and "show unread when
-    // collapsed" switch are the first two stops, ahead of its rows.
+    // Since issue #779 the section's own collapse button is the first stop,
+    // ahead of its rows (issue #1005 removed the "show unread" switch stop).
     await page.keyboard.press("Tab");
     await expect(page.getByRole("button", { name: "Canais", exact: true })).toBeFocused();
-    await page.keyboard.press("Tab");
-    await expect(
-      page.getByRole("switch", {
-        name: "Mostrar mensagens não lidas quando Canais estiver recolhida",
-      }),
-    ).toBeFocused();
     for (const expected of [OTHER_CHANNEL_NAME, "Canal Recente"]) {
       await page.keyboard.press("Tab");
       await expect(names(page, "Canais").filter({ hasText: expected })).toBeFocused();
@@ -841,187 +836,252 @@ test.describe("sidebar — sair da conversa", () => {
 });
 
 /**
- * ISSUE #779 — each section can be collapsed independently, and a collapsed
- * section can be told to show only conversations with unread. Expanded, the
- * preference has no filtering effect at all.
+ * ISSUE #1005 (sobre a #779) — cada seção tem um único controle: recolher.
+ * Expandida mostra a lista normal; recolhida mostra só as conversas com não
+ * lidas; recolhida sem não lidas é só o cabeçalho. Não existe mais a chave
+ * "Exibir não lidas quando a seção estiver recolhida".
+ *
+ * A #1005 era uma tela branca: com uma seção recolhida exibindo não lidas, a
+ * sidebar republicava sua navegação ao AppShell a cada render ("Maximum update
+ * depth exceeded"). Todo teste aqui recolhe seções com não lidas dentro do app
+ * real e falha em qualquer erro não tratado da página.
  */
-test.describe("sidebar — seções recolhíveis e filtro de não lidas", () => {
+test.describe("sidebar — seções recolhíveis mostram só não lidas", () => {
+  const SECTIONS_KEY = `nchat.sidebar.sections.v1:e2e-workspace:${CURRENT_USER_ID}`;
+  const pageErrors = new WeakMap<Page, string[]>();
+
+  test.beforeEach(async ({ page }) => {
+    const errors: string[] = [];
+    pageErrors.set(page, errors);
+    page.on("pageerror", (error) => errors.push(error.message));
+  });
+
+  test.afterEach(async ({ page }) => {
+    expect(pageErrors.get(page)).toEqual([]);
+  });
+
   function collapseButton(page: Page, title: string) {
     return page.getByRole("button", { name: title, exact: true });
   }
-  function unreadSwitch(page: Page, title: string) {
-    return page.getByRole("switch", {
-      name: `Mostrar mensagens não lidas quando ${title} estiver recolhida`,
+
+  /** A message from someone else, so opening the conversation reads it (#492). */
+  function seedIncoming(scenario: MessagingScenario, kind: "channel" | "dm", id: string) {
+    messagesFor(scenario, kind, id).push(
+      makeMessage({
+        id: `${id}-msg`,
+        sender_id: OTHER_USER_ID,
+        sender_display_name: OTHER_USER_NAME,
+        body_text: "mensagem não lida",
+      }),
+    );
+  }
+
+  async function emitIncoming(
+    page: Page,
+    scenario: MessagingScenario,
+    kind: "channel" | "dm",
+    id: string,
+  ) {
+    await emitMessageCreated(page, scenario, {
+      kind,
+      targetId: id,
+      message: makeMessage({
+        id: `${id}-incoming`,
+        sender_id: OTHER_USER_ID,
+        sender_display_name: OTHER_USER_NAME,
+        body_text: "chegou agora",
+        created_at: "2026-08-20T10:00:00Z",
+        updated_at: "2026-08-20T10:00:00Z",
+      }),
     });
   }
 
-  test("recolhe, filtra por não lidas, atualiza em tempo real e restaura ao expandir", async ({
-    page,
-  }, testInfo) => {
-    const { scenario } = await openChatWithAllThreeCategories(page, testInfo);
-    const readChannel = scenario.sidebarChannels[0];
-    const unreadChannelId = "e2e-channel-unread";
+  /**
+   * Opens a channel so the DM and group sections hold no active row, with one
+   * extra unread 1:1 and one extra unread group next to the fixture's read ones.
+   */
+  async function openWithUnreadConversations(page: Page, testInfo: TestInfo) {
+    const channelId = uniqueId(testInfo, "channel");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId: channelId,
+      targetName: "Canal Aberto",
+      messages: [makeMessage({ id: `${channelId}-msg`, body_text: "olá" })],
+    });
     scenario.sidebarChannels.push({
-      id: unreadChannelId,
+      id: "e2e-channel-unread",
       slug: "com-nao-lidas",
       display_name: "Canal Com Não Lidas",
       type: "public",
       can_write: true,
       unread_count: 1,
     });
-    // #492: the badge only clears once the real bottom is reached, not just
-    // from opening the route — one short message from someone else is what
-    // lets the channel land AT_BOTTOM immediately and send the receipt.
-    messagesFor(scenario, "channel", unreadChannelId).push(
-      makeMessage({
-        id: `${unreadChannelId}-msg`,
-        sender_id: OTHER_USER_ID,
-        sender_display_name: OTHER_USER_NAME,
-        body_text: "mensagem não lida",
-      }),
+    scenario.sidebarDMs.push(
+      {
+        id: "e2e-dm-unread",
+        type: "direct",
+        name: "Pessoa Com Não Lidas",
+        unread_count: 1,
+        counterpart: { user_id: `${OTHER_USER_ID}-unread`, display_name: "Pessoa Com Não Lidas" },
+      },
+      { id: "e2e-group-unread", type: "group", name: "Grupo Com Não Lidas", unread_count: 1 },
     );
-    await page.reload();
+    seedIncoming(scenario, "channel", "e2e-channel-unread");
+    seedIncoming(scenario, "dm", "e2e-dm-unread");
+    seedIncoming(scenario, "dm", "e2e-group-unread");
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/channel/${channelId}`);
     await expect(page.getByRole("heading", { name: "Canais" })).toBeVisible();
+    await expect(page.getByTestId("chat-composer-input")).toBeVisible();
+    return { scenario, channelId };
+  }
 
+  test("Canais: recolher deixa só as não lidas e expandir restaura a lista", async ({
+    page,
+  }, testInfo) => {
+    const { channelId } = await openWithUnreadConversations(page, testInfo);
     const collapse = collapseButton(page, "Canais");
-    const toggle = unreadSwitch(page, "Canais");
+
     await expect(collapse).toHaveAttribute("aria-expanded", "true");
-    await expect(toggle).toHaveAttribute("aria-checked", "false");
+    await expect(optionsIn(page, "Canais")).toHaveCount(3);
+    // Um só controle: a chave antiga não existe mais.
+    await expect(page.getByRole("switch")).toHaveCount(0);
 
-    // Expandida + unread ligado: a opção não filtra nada.
-    await toggle.click();
-    // O clique realmente alternou o estado — se o toggle voltar a ser no-op
-    // (por exemplo, workspaceId vazio no fixture), o teste falha aqui, no
-    // ponto exato da causa, em vez de mais adiante numa asserção de conteúdo.
-    await expect(toggle).toHaveAttribute("aria-checked", "true");
-    await expect(optionsIn(page, "Canais")).toHaveCount(2);
-
-    // Recolhida + unread ligado: só o canal com não lidas aparece.
     await collapse.click();
     await expect(collapse).toHaveAttribute("aria-expanded", "false");
-    await expect(optionsIn(page, "Canais")).toHaveCount(1);
     await expect(optionsIn(page, "Canais")).toHaveText([/Canal Com Não Lidas/]);
+    await expect(section(page, "Canais").getByLabel("1 conversa não lida")).toHaveText("1");
+    // Recolher é só apresentação: a conversa aberta continua aberta.
+    await expect(page).toHaveURL(new RegExp(`/chat/channel/${channelId}$`));
+    await expect(page.getByTestId("chat-composer-input")).toBeVisible();
 
-    // Abrir a conversa não lida funciona normalmente e ela some da seção
-    // recolhida assim que fica lida (#492: ao alcançar o final real da
-    // conversa, não apenas por abrir a rota) — sem navegação nem remontagem
-    // indevida.
-    await optionsIn(page, "Canais").first().click();
-    await expect(page).toHaveURL(new RegExp(`/chat/channel/${unreadChannelId}$`));
-    await expect(section(page, "Canais").getByRole("option")).toHaveCount(0);
-
-    // Mensagem em tempo real em outro canal o traz de volta à seção recolhida.
-    await emitMessageCreated(page, scenario, {
-      kind: "channel",
-      targetId: readChannel.id,
-      message: makeMessage({
-        id: `${readChannel.id}-incoming`,
-        sender_id: OTHER_USER_ID,
-        sender_display_name: OTHER_USER_NAME,
-        body_text: "chegou agora",
-        created_at: "2026-08-20T10:00:00Z",
-        updated_at: "2026-08-20T10:00:00Z",
-      }),
-    });
-    await expect(section(page, "Canais").getByRole("option")).toHaveText([
-      new RegExp(readChannel.display_name),
-    ]);
-
-    // Recolhida + unread desligado: nenhum item, e nenhuma mensagem de vazio.
-    await toggle.click();
-    await expect(section(page, "Canais").getByRole("option")).toHaveCount(0);
-    await expect(section(page, "Canais")).not.toContainText("Nenhum canal disponível");
-
-    // Expandir de novo restaura a visão completa, sem perder nenhum canal.
     await collapse.click();
-    await expect(optionsIn(page, "Canais")).toHaveCount(2);
+    await expect(collapse).toHaveAttribute("aria-expanded", "true");
+    await expect(optionsIn(page, "Canais")).toHaveCount(3);
   });
 
-  test("mantém o estado de cada seção independente e não navega ao recolher a conversa aberta", async ({
+  test("Mensagens diretas: recolhida acompanha não lidas em tempo real e na leitura", async ({
+    page,
+  }, testInfo) => {
+    const { scenario } = await openWithUnreadConversations(page, testInfo);
+    const collapse = collapseButton(page, "Mensagens diretas");
+
+    await collapse.click();
+    await expect(collapse).toHaveAttribute("aria-expanded", "false");
+    await expect(optionsIn(page, "Mensagens diretas")).toHaveText([/Pessoa Com Não Lidas/]);
+
+    // Nova DM não lida aparece sem expandir.
+    await emitIncoming(page, scenario, "dm", "e2e-dm-other");
+    await expect(
+      section(page, "Mensagens diretas").getByRole("option", {
+        name: new RegExp(`Mensagem direta com ${OTHER_USER_NAME}`),
+      }),
+    ).toBeVisible();
+    await expect(optionsIn(page, "Mensagens diretas")).toHaveCount(2);
+
+    // Abrir e ler tira a DM da seção recolhida; o app segue utilizável.
+    await section(page, "Mensagens diretas")
+      .getByRole("option", { name: /Pessoa Com Não Lidas/ })
+      .click();
+    await expect(page).toHaveURL(/\/chat\/dm\/e2e-dm-unread$/);
+    await expect(optionsIn(page, "Mensagens diretas")).toHaveText([new RegExp(OTHER_USER_NAME)]);
+    await expect(collapse).toHaveAttribute("aria-expanded", "false");
+    await expect(page.getByTestId("chat-composer-input")).toBeVisible();
+    await expect(page.getByTestId("chat-sidebar")).toBeVisible();
+  });
+
+  test("Grupos: recolhida acompanha não lidas em tempo real e na leitura", async ({
+    page,
+  }, testInfo) => {
+    const { scenario } = await openWithUnreadConversations(page, testInfo);
+    const collapse = collapseButton(page, "Grupos");
+
+    await collapse.click();
+    await expect(collapse).toHaveAttribute("aria-expanded", "false");
+    await expect(optionsIn(page, "Grupos")).toHaveText([/Grupo Com Não Lidas/]);
+
+    await emitIncoming(page, scenario, "dm", GROUP_DM_ID);
+    await expect(optionsIn(page, "Grupos")).toHaveCount(2);
+
+    await section(page, "Grupos")
+      .getByRole("option", { name: /Grupo Com Não Lidas/ })
+      .click();
+    await expect(page).toHaveURL(/\/chat\/dm\/e2e-group-unread$/);
+    await expect(optionsIn(page, "Grupos")).toHaveText([new RegExp(GROUP_DM_NAME)]);
+    await expect(page.getByTestId("chat-composer-input")).toBeVisible();
+
+    await collapse.click();
+    await expect(optionsIn(page, "Grupos")).toHaveCount(2);
+  });
+
+  test("recolhida sem não lidas mostra só o cabeçalho, sem falso vazio", async ({
     page,
   }, testInfo) => {
     const { targetId } = await openChatWithAllThreeCategories(page, testInfo);
 
-    // A conversa aberta é a DM do cenário — recolher Canais não deve mudar a rota.
-    await collapseButton(page, "Canais").click();
+    // A conversa aberta é a própria DM do cenário, lida: recolher a esconde,
+    // mas a rota e o composer ficam.
+    for (const title of ["Canais", "Mensagens diretas", "Grupos"]) {
+      await collapseButton(page, title).click();
+      await expect(collapseButton(page, title)).toHaveAttribute("aria-expanded", "false");
+      await expect(optionsIn(page, title)).toHaveCount(0);
+      await expect(section(page, title)).not.toContainText(/Nenhum|Nenhuma/);
+    }
+    await expect(page.locator(".chat-sidebar__section-unread-count")).toHaveCount(0);
     await expect(page).toHaveURL(new RegExp(`/chat/dm/${targetId}$`));
+    await expect(page.getByTestId("chat-composer-input")).toBeVisible();
+  });
+
+  test("mantém o estado recolhido após recarregar", async ({ page }, testInfo) => {
+    await openWithUnreadConversations(page, testInfo);
+
+    await collapseButton(page, "Canais").click();
+    await expect(optionsIn(page, "Canais")).toHaveCount(1);
+
+    await page.reload();
+    await expect(collapseButton(page, "Canais")).toHaveAttribute("aria-expanded", "false");
+    await expect(optionsIn(page, "Canais")).toHaveText([/Canal Com Não Lidas/]);
     await expect(collapseButton(page, "Mensagens diretas")).toHaveAttribute(
       "aria-expanded",
       "true",
     );
-    await expect(collapseButton(page, "Grupos")).toHaveAttribute("aria-expanded", "true");
-
-    // Mensagens diretas continua mostrando sua conversa normalmente.
-    await expect(optionsIn(page, "Mensagens diretas")).toHaveCount(1);
   });
 
-  /*
-   * ISSUE #787 — o refinamento visual do mesmo controle. A semântica da #779
-   * não muda: o que se verifica aqui é que a chave continua acionável por
-   * teclado, que o estado alterna na semântica e na classe modificadora, que a
-   * dica de hover não substitui o nome acessível e que o contador zero deixou
-   * de ser desenhado.
-   *
-   * A posição do polegar é deliberadamente CSS e não é medida aqui: depender de
-   * coordenadas atrás de uma transition testaria o motor de layout do
-   * navegador, não a aplicação, e varia com o timing da CI.
-   */
-  test("apresenta a preferência como chave visual, com dica e sem contador zero", async ({
+  test("aceita a preferência antiga da #779 sem derrubar a página", async ({ page }, testInfo) => {
+    await page.addInitScript(([key, value]) => localStorage.setItem(key, value), [
+      SECTIONS_KEY,
+      JSON.stringify({
+        channels: { collapsed: false, showUnreadOnly: true },
+        directs: { collapsed: true, showUnreadOnly: false },
+        groups: { collapsed: true, showUnreadOnly: true },
+      }),
+    ] as const);
+    await openWithUnreadConversations(page, testInfo);
+
+    await expect(collapseButton(page, "Canais")).toHaveAttribute("aria-expanded", "true");
+    await expect(optionsIn(page, "Canais")).toHaveCount(3);
+    // Recolhida vale "só não lidas", qualquer que fosse a chave antiga.
+    await expect(optionsIn(page, "Mensagens diretas")).toHaveText([/Pessoa Com Não Lidas/]);
+    await expect(optionsIn(page, "Grupos")).toHaveText([/Grupo Com Não Lidas/]);
+  });
+
+  test("opera pelo teclado e passa do cabeçalho direto às não lidas", async ({
     page,
   }, testInfo) => {
-    const { scenario } = await openChatWithAllThreeCategories(page, testInfo);
-    await expect(page.getByRole("heading", { name: "Canais" })).toBeVisible();
+    await openWithUnreadConversations(page, testInfo);
+    const collapse = collapseButton(page, "Grupos");
 
-    const toggle = unreadSwitch(page, "Canais");
-    const ON = /chat-sidebar__section-unread-toggle--on/;
-
-    // Sem não lidas em nenhuma seção do cenário: nenhum "0" no cabeçalho.
-    await expect(page.locator(".chat-sidebar__section-unread-count")).toHaveCount(0);
-
-    // A dica de hover é o title do próprio botão, e nunca substitui o nome
-    // acessível — que continua dizendo de qual seção esta chave é.
-    await expect(toggle).toHaveAttribute(
-      "title",
-      "Exibir não lidas quando a seção estiver recolhida",
-    );
-    await expect(toggle).toHaveAccessibleName(
-      "Mostrar mensagens não lidas quando Canais estiver recolhida",
-    );
-
-    // Desligada: a semântica e a classe modificadora concordam. O polegar é
-    // desenhado à esquerda pelo CSS; aqui basta saber que o estado é o "off".
-    await expect(toggle).toHaveAttribute("aria-checked", "false");
-    await expect(toggle).not.toHaveClass(ON);
-
-    // A chave continua acionável pelo teclado, nos dois sentidos.
-    await toggle.focus();
+    await collapse.focus();
     await page.keyboard.press("Enter");
-    await expect(toggle).toHaveAttribute("aria-checked", "true");
-    await expect(toggle).toHaveClass(ON);
+    await expect(collapse).toHaveAttribute("aria-expanded", "false");
+    await page.keyboard.press("Tab");
+    await expect(
+      section(page, "Grupos").getByRole("option", { name: /Grupo Com Não Lidas/ }),
+    ).toBeFocused();
 
+    await collapse.focus();
     await page.keyboard.press(" ");
-    await expect(toggle).toHaveAttribute("aria-checked", "false");
-    await expect(toggle).not.toHaveClass(ON);
-
-    // Uma não lida chegando em tempo real acende o contador — que some de novo
-    // quando a conversa é lida. A fonte do número continua sendo o estado
-    // canônico; a #787 só decidiu quando ele é desenhado.
-    const target = scenario.sidebarChannels[0];
-    await emitMessageCreated(page, scenario, {
-      kind: "channel",
-      targetId: target.id,
-      message: makeMessage({
-        id: `${target.id}-787`,
-        sender_id: OTHER_USER_ID,
-        sender_display_name: OTHER_USER_NAME,
-        body_text: "chegou agora",
-        created_at: "2026-08-20T10:00:00Z",
-        updated_at: "2026-08-20T10:00:00Z",
-      }),
-    });
-    await expect(section(page, "Canais").getByLabel("1 conversa não lida")).toHaveText("1");
-
-    await optionsIn(page, "Canais").filter({ hasText: target.display_name }).click();
-    await expect(page.locator(".chat-sidebar__section-unread-count")).toHaveCount(0);
+    await expect(collapse).toHaveAttribute("aria-expanded", "true");
+    await expect(optionsIn(page, "Grupos")).toHaveCount(2);
   });
 });

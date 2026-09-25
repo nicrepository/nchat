@@ -1,7 +1,8 @@
 /**
- * Persists only the sidebar's per-section presentation state (issue #779):
- * whether Canais / Mensagens diretas / Grupos is collapsed, and whether a
- * collapsed section shows its unread conversations. Never message content,
+ * Persists only the sidebar's per-section presentation state: whether Canais /
+ * Mensagens diretas / Grupos is collapsed. A collapsed section always keeps its
+ * unread conversations visible (issue #1005), so there is no second
+ * preference to remember. Never message content,
  * never a token, never anything server-authoritative — scoped by
  * (workspace, user) exactly like sidebarUnreadPersistence, so a different
  * account on the same browser never sees another one's layout choice.
@@ -17,14 +18,13 @@ export type SidebarSectionKind = "channels" | "directs" | "groups";
 
 export interface SidebarSectionPref {
   collapsed: boolean;
-  showUnreadOnly: boolean;
 }
 
 export type SidebarSectionPrefs = Record<SidebarSectionKind, SidebarSectionPref>;
 
 const SECTION_KINDS: readonly SidebarSectionKind[] = ["channels", "directs", "groups"];
 
-const DEFAULT_PREF: SidebarSectionPref = { collapsed: false, showUnreadOnly: false };
+const DEFAULT_PREF: SidebarSectionPref = { collapsed: false };
 
 export const DEFAULT_SECTION_PREFS: SidebarSectionPrefs = {
   channels: { ...DEFAULT_PREF },
@@ -36,10 +36,14 @@ function storageKey(userId: string, workspaceId: string): string {
   return `nchat.sidebar.sections.v1:${encodeURIComponent(workspaceId)}:${encodeURIComponent(userId)}`;
 }
 
+/**
+ * Only `collapsed` is read. Issue #779 also stored `showUnreadOnly` under this
+ * same key; issue #1005 folded it into collapsing, so a legacy entry keeps its
+ * `collapsed` value and the rest is dropped on the next save.
+ */
 function isValidPref(raw: unknown): raw is SidebarSectionPref {
   if (typeof raw !== "object" || raw === null) return false;
-  const pref = raw as Record<string, unknown>;
-  return typeof pref.collapsed === "boolean" && typeof pref.showUnreadOnly === "boolean";
+  return typeof (raw as Record<string, unknown>).collapsed === "boolean";
 }
 
 /** Never throws. Returns safe defaults for missing, corrupt, or partial data. */
@@ -54,7 +58,7 @@ export function loadSectionPrefs(userId: string, workspaceId: string): SidebarSe
     for (const kind of SECTION_KINDS) {
       const candidate = source[kind];
       if (isValidPref(candidate)) {
-        result[kind] = { collapsed: candidate.collapsed, showUnreadOnly: candidate.showUnreadOnly };
+        result[kind] = { collapsed: candidate.collapsed };
       }
     }
     return result;
@@ -79,7 +83,6 @@ export function saveSectionPrefs(
 export interface UseSidebarSectionPreferencesResult {
   prefs: SidebarSectionPrefs;
   toggleCollapsed: (kind: SidebarSectionKind) => void;
-  toggleShowUnreadOnly: (kind: SidebarSectionKind) => void;
 }
 
 /**
@@ -95,8 +98,8 @@ export interface UseSidebarSectionPreferencesResult {
  * made in. Reading it is a plain comparison (`override.scopeKey === scopeKey`),
  * so a scope change — a different user or workspace — makes a stale override
  * stop matching automatically, and `loaded` (freshly computed for the new
- * scope) takes back over. `setOverride` only ever runs from `toggleCollapsed`/
- * `toggleShowUnreadOnly`, i.e. in response to a click — never during render.
+ * scope) takes back over. `setOverride` only ever runs from `toggleCollapsed`,
+ * i.e. in response to a click — never during render.
  *
  * `userId`/`workspaceId` are `undefined` before the sidebar is ready; the
  * hook then always returns `DEFAULT_SECTION_PREFS` and every toggle is a
@@ -118,17 +121,12 @@ export function useSidebarSectionPreferences(
   );
   const prefs = override && override.scopeKey === scopeKey ? override.prefs : loaded;
 
-  function updatePref(kind: SidebarSectionKind, change: Partial<SidebarSectionPref>) {
+  function toggleCollapsed(kind: SidebarSectionKind) {
     if (!scopeKey || !userId || !workspaceId) return;
-    const next: SidebarSectionPrefs = { ...prefs, [kind]: { ...prefs[kind], ...change } };
+    const next: SidebarSectionPrefs = { ...prefs, [kind]: { collapsed: !prefs[kind].collapsed } };
     saveSectionPrefs(userId, workspaceId, next);
     setOverride({ scopeKey, prefs: next });
   }
 
-  return {
-    prefs,
-    toggleCollapsed: (kind) => updatePref(kind, { collapsed: !prefs[kind].collapsed }),
-    toggleShowUnreadOnly: (kind) =>
-      updatePref(kind, { showUnreadOnly: !prefs[kind].showUnreadOnly }),
-  };
+  return { prefs, toggleCollapsed };
 }
