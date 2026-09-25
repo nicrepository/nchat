@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useCallback, useState } from "react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -1364,21 +1365,18 @@ describe("ChatSidebar — section classification", () => {
 
     // Since issue #527 the second stop on every row is the actions menu's
     // trigger, not a pin: the pin is state and no longer takes a tab stop.
-    // Since issue #779 each section adds two stops of its own before its
-    // rows: the collapse button, then the "show unread when collapsed" switch.
+    // Since issue #779 each section adds its collapse button as a stop before
+    // its rows (issue #1005 removed the second, "show unread" switch stop).
     const expected = [
       ["button", "Canais"],
-      ["switch", "Mostrar mensagens não lidas quando Canais estiver recolhida"],
       ["option", "Canal geral"],
       ["button", "Mais opções para canal geral"],
       ["option", "Canal privado projetos"],
       ["button", "Mais opções para canal projetos"],
       ["button", "Mensagens diretas"],
-      ["switch", "Mostrar mensagens não lidas quando Mensagens diretas estiver recolhida"],
       ["option", "Mensagem direta com Juliane Lino"],
       ["button", "Mais opções para conversa com Juliane Lino"],
       ["button", "Grupos"],
-      ["switch", "Mostrar mensagens não lidas quando Grupos estiver recolhida"],
       ["option", "Grupo Equipe Infra"],
       ["button", "Mais opções para grupo Equipe Infra"],
     ] as const;
@@ -1730,13 +1728,11 @@ describe("ChatSidebar — activity ordering", () => {
 
     for (const [role, label] of [
       ["button", "Canais"],
-      ["switch", "Mostrar mensagens não lidas quando Canais estiver recolhida"],
       ["option", "Canal canal-novo"],
       ["button", "Mais opções para canal canal-novo"],
       ["option", "Canal canal-antigo"],
       ["button", "Mais opções para canal canal-antigo"],
       ["button", "Mensagens diretas"],
-      ["switch", "Mostrar mensagens não lidas quando Mensagens diretas estiver recolhida"],
       ["option", "Mensagem direta com Juliane"],
     ] as const) {
       await user.tab();
@@ -2568,12 +2564,12 @@ describe("ChatSidebar — collapsible categories", () => {
   });
 });
 
-// ── Collapsible sections + "show unread when collapsed" (ISSUE #779) ────────
+// ── Collapsible sections (ISSUE #779, unified by ISSUE #1005) ───────────────
 //
-// Each of the three product sections owns two independent controls: a
-// collapse/expand toggle and a "show unread when collapsed" preference. The
-// preference is never a filter while expanded — only while collapsed does it
-// decide between showing nothing and showing only conversations with unread.
+// Each of the three product sections has one control: collapse/expand.
+// Expanded shows the whole list; collapsed shows only the conversations with
+// unread, and nothing but the header when there are none. There is no second
+// "show unread when collapsed" switch any more.
 
 describe("ChatSidebar — collapsible sections with unread filter", () => {
   const channel = (id: string, overrides: Partial<Channel> = {}): Channel => ({
@@ -2613,12 +2609,22 @@ describe("ChatSidebar — collapsible sections with unread filter", () => {
     dms: DMConversation[],
     categories: ChannelCategory[] = [],
     path = "/chat",
+    markRead?: (target: { kind: "channel" | "dm"; targetId: string }) => void,
   ) {
-    return render(
+    const ui = (nextChannels: Channel[], nextDms: DMConversation[]) => (
       <MemoryRouter initialEntries={[path]}>
-        <ChatSidebar state={readyState(channels, dms, categories)} retry={() => {}} />
-      </MemoryRouter>,
+        <ChatSidebar
+          state={readyState(nextChannels, nextDms, categories)}
+          retry={() => {}}
+          markRead={markRead}
+        />
+      </MemoryRouter>
     );
+    const view = render(ui(channels, dms));
+    // The same update path realtime events use: new canonical state.
+    const update = (nextChannels: Channel[], nextDms: DMConversation[]) =>
+      view.rerender(ui(nextChannels, nextDms));
+    return { ...view, update };
   }
 
   const section = (name: string) => screen.getByRole("region", { name });
@@ -2627,66 +2633,185 @@ describe("ChatSidebar — collapsible sections with unread filter", () => {
       .queryAllByRole("option")
       .map((option) => option.getAttribute("aria-label"));
   const collapseButton = (title: string) => screen.getByRole("button", { name: title });
-  const unreadSwitch = (title: string) =>
-    screen.getByRole("switch", {
-      name: `Mostrar mensagens não lidas quando ${title} estiver recolhida`,
-    });
 
   afterEach(() => {
     localStorage.clear();
   });
 
-  it.each([
+  const matrix = [
     {
       title: "Canais",
-      build: () => ({ channels: [channel("a"), channel("b", { unreadCount: 2 })], dms: [] }),
+      channels: [channel("a"), channel("b", { unreadCount: 2 })],
+      dms: [],
+      names: ["Canal a", "Canal b"],
     },
     {
       title: "Mensagens diretas",
-      build: () => ({
-        channels: [],
-        dms: [dm("a", "1:1"), dm("b", "1:1", { unreadCount: 2 })],
-      }),
+      channels: [],
+      dms: [dm("a", "1:1"), dm("b", "1:1", { unreadCount: 2 })],
+      names: ["Mensagem direta com a", "Mensagem direta com b"],
     },
     {
       title: "Grupos",
-      build: () => ({
-        channels: [],
-        dms: [dm("a", "group"), dm("b", "group", { unreadCount: 2 })],
-      }),
+      channels: [],
+      dms: [dm("a", "group"), dm("b", "group", { unreadCount: 2 })],
+      names: ["Grupo a", "Grupo b"],
     },
-  ])("$title — walks the full expand/collapse × unread-only matrix", async ({ title, build }) => {
+  ];
+
+  it.each(matrix)(
+    "$title — collapsing alone keeps only unread conversations, expanding restores the list",
+    async ({ title, channels, dms, names }) => {
+      const user = userEvent.setup();
+      renderState(channels, dms);
+
+      expect(collapseButton(title)).toHaveAttribute("aria-expanded", "true");
+      expect(optionNamesIn(title)).toEqual(names);
+
+      await user.click(collapseButton(title));
+      expect(collapseButton(title)).toHaveAttribute("aria-expanded", "false");
+      expect(optionNamesIn(title)).toEqual([names[1]]);
+      // The header count still reports the unread conversation.
+      expect(within(section(title)).getByLabelText("1 conversa não lida")).toHaveTextContent("1");
+
+      await user.click(collapseButton(title));
+      expect(collapseButton(title)).toHaveAttribute("aria-expanded", "true");
+      expect(optionNamesIn(title)).toEqual(names);
+    },
+  );
+
+  it.each([
+    { title: "Canais", channels: [channel("a")], dms: [], empty: "Nenhum canal disponível." },
+    {
+      title: "Mensagens diretas",
+      channels: [],
+      dms: [dm("a", "1:1")],
+      empty: "Nenhuma mensagem direta.",
+    },
+    { title: "Grupos", channels: [], dms: [dm("a", "group")], empty: "Nenhum grupo." },
+  ])(
+    "$title — collapsed with nothing unread renders only the header",
+    async ({ title, channels, dms, empty }) => {
+      const user = userEvent.setup();
+      renderState(channels, dms);
+
+      await user.click(collapseButton(title));
+
+      expect(collapseButton(title)).toBeInTheDocument();
+      expect(within(section(title)).queryByRole("listbox")).not.toBeInTheDocument();
+      expect(optionNamesIn(title)).toEqual([]);
+      expect(within(section(title)).queryByText(empty)).not.toBeInTheDocument();
+      expect(within(section(title)).queryByLabelText(/conversas? não lidas?$/)).toBeNull();
+    },
+  );
+
+  // Issue #1005 — the white screen. AppShell stores the sidebar's
+  // relative-navigation handler in state, so every publish re-renders it. A
+  // collapsed section's unread list rebuilt on every render made the sidebar
+  // republish on every render: "Maximum update depth exceeded", root unmounted.
+  // The storage here is the #779 shape, so this is also the legacy upgrade path.
+  it("stays rendered when a collapsed section with unread sits under a shell that stores its navigation handler", () => {
+    localStorage.setItem(
+      "nchat.sidebar.sections.v1:workspace-1:user-a",
+      JSON.stringify({
+        channels: { collapsed: true, showUnreadOnly: true },
+        directs: { collapsed: true, showUnreadOnly: true },
+        groups: { collapsed: true, showUnreadOnly: true },
+      }),
+    );
+    // Like AppShell's reducer state: the same reference across shell re-renders.
+    const state = readyState(
+      [channel("c-read"), channel("c-new", { unreadCount: 1 })],
+      [
+        dm("d-read", "1:1"),
+        dm("d-new", "1:1", { unreadCount: 2 }),
+        dm("g-read", "group"),
+        dm("g-new", "group", { unreadCount: 3 }),
+      ],
+    );
+    function ShellLikeHost() {
+      const [, setNavigate] = useState<(direction: -1 | 1) => void>(() => () => {});
+      const publish = useCallback((handler: (direction: -1 | 1) => void) => {
+        setNavigate(() => handler);
+      }, []);
+      return <ChatSidebar state={state} retry={() => {}} onNavigateRelativeChange={publish} />;
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/d-read"]}>
+        <ShellLikeHost />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId("chat-sidebar")).toBeInTheDocument();
+    expect(optionNamesIn("Canais")).toEqual(["Canal c-new"]);
+    expect(optionNamesIn("Mensagens diretas")).toEqual(["Mensagem direta com d-new"]);
+    expect(optionNamesIn("Grupos")).toEqual(["Grupo g-new"]);
+  });
+
+  it("offers no separate 'show unread when collapsed' switch", () => {
+    renderState([channel("a", { unreadCount: 1 })], [dm("d", "1:1"), dm("g", "group")]);
+
+    expect(screen.queryByRole("switch")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/Mostrar mensagens não lidas quando/)).not.toBeInTheDocument();
+    expect(screen.queryByTitle(/Exibir não lidas/)).not.toBeInTheDocument();
+  });
+
+  it("keeps every unread conversation of a collapsed section, in activity order", async () => {
     const user = userEvent.setup();
-    const { channels, dms } = build();
-    renderState(channels, dms);
-    const allNames =
-      title === "Canais"
-        ? ["Canal a", "Canal b"]
-        : title === "Mensagens diretas"
-          ? ["Mensagem direta com a", "Mensagem direta com b"]
-          : ["Grupo a", "Grupo b"];
-    const unreadOnlyName = allNames[1];
+    renderState(
+      [],
+      [
+        dm("old", "1:1", { unreadCount: 1, lastMessageAt: "2026-07-01T00:00:00Z" }),
+        dm("read", "1:1", { lastMessageAt: "2026-07-03T00:00:00Z" }),
+        dm("new", "1:1", { unreadCount: 4, lastMessageAt: "2026-07-02T00:00:00Z" }),
+      ],
+    );
 
-    // Expandida + unread off (default) = todos.
-    expect(collapseButton(title)).toHaveAttribute("aria-expanded", "true");
-    expect(unreadSwitch(title)).toHaveAttribute("aria-checked", "false");
-    expect(optionNamesIn(title)).toEqual(allNames);
+    await user.click(collapseButton("Mensagens diretas"));
 
-    // Expandida + unread on = todos (não é filtro quando expandida).
-    await user.click(unreadSwitch(title));
-    expect(unreadSwitch(title)).toHaveAttribute("aria-checked", "true");
-    expect(optionNamesIn(title)).toEqual(allNames);
+    expect(optionNamesIn("Mensagens diretas")).toEqual([
+      "Mensagem direta com new",
+      "Mensagem direta com old",
+    ]);
+    expect(
+      within(section("Mensagens diretas")).getByLabelText("2 conversas não lidas"),
+    ).toHaveTextContent("2");
+  });
 
-    // Recolhida + unread on = somente as com unread.
-    await user.click(collapseButton(title));
-    expect(collapseButton(title)).toHaveAttribute("aria-expanded", "false");
-    expect(optionNamesIn(title)).toEqual([unreadOnlyName]);
+  it.each([
+    { title: "Mensagens diretas", type: "1:1" as const, name: "Mensagem direta com a" },
+    { title: "Grupos", type: "group" as const, name: "Grupo a" },
+  ])(
+    "$title — a collapsed section gains and loses rows as canonical unread changes",
+    async ({ title, type, name }) => {
+      const user = userEvent.setup();
+      const { update } = renderState([], [dm("a", type)]);
+      await user.click(collapseButton(title));
+      expect(optionNamesIn(title)).toEqual([]);
 
-    // Recolhida + unread off = nenhum item, e nenhuma mensagem de "vazio".
-    await user.click(unreadSwitch(title));
-    expect(unreadSwitch(title)).toHaveAttribute("aria-checked", "false");
-    expect(optionNamesIn(title)).toEqual([]);
-    expect(within(section(title)).queryByText(/nenhum|nenhuma/i)).not.toBeInTheDocument();
+      update([], [dm("a", type, { unreadCount: 1 })]);
+      expect(optionNamesIn(title)).toEqual([name]);
+      expect(within(section(title)).getByLabelText("1 conversa não lida")).toBeInTheDocument();
+
+      update([], [dm("a", type, { unreadCount: 0 })]);
+      expect(optionNamesIn(title)).toEqual([]);
+      expect(collapseButton(title)).toHaveAttribute("aria-expanded", "false");
+    },
+  );
+
+  it("shows a newly-unread channel and drops it once read, while Canais stays collapsed", async () => {
+    const user = userEvent.setup();
+    const { update } = renderState([channel("a")], []);
+    await user.click(collapseButton("Canais"));
+    expect(optionNamesIn("Canais")).toEqual([]);
+
+    update([channel("a", { unreadCount: 1 })], []);
+    expect(optionNamesIn("Canais")).toEqual(["Canal a"]);
+
+    update([channel("a", { unreadCount: 0 })], []);
+    expect(optionNamesIn("Canais")).toEqual([]);
+    expect(collapseButton("Canais")).toHaveAttribute("aria-expanded", "false");
   });
 
   it("counts conversations with unread in the header, never a sum of message counts", () => {
@@ -2699,10 +2824,7 @@ describe("ChatSidebar — collapsible sections with unread filter", () => {
     expect(screen.getByLabelText("2 conversas não lidas")).toHaveTextContent("2");
   });
 
-  // ── Issue #787 — header refinements ────────────────────────────────────────
-  // A visual pass over the #779 controls. The source of the count, the realtime
-  // updates and the preference behind the switch are all unchanged; what
-  // changes is that a zero is not drawn and the switch is a switch.
+  // ── Issue #787 — header count ──────────────────────────────────────────────
 
   it("renders no count at all for a section with nothing unread", () => {
     renderState([channel("a"), channel("b")], []);
@@ -2735,159 +2857,79 @@ describe("ChatSidebar — collapsible sections with unread filter", () => {
     expect(within(section("Grupos")).queryByLabelText(/conversas? não lidas?$/)).toBeNull();
   });
 
-  it("appears and disappears from the header as unread arrives and is cleared", () => {
-    const read = channel("a");
-    const unread = channel("a", { unreadCount: 3 });
-
-    const { rerender } = render(
-      <MemoryRouter initialEntries={["/chat"]}>
-        <ChatSidebar state={readyState([read], [])} retry={() => {}} />
-      </MemoryRouter>,
-    );
-    expect(within(section("Canais")).queryByLabelText(/conversas? não lidas?$/)).toBeNull();
-
-    // The same update path the realtime events already use: new canonical state.
-    rerender(
-      <MemoryRouter initialEntries={["/chat"]}>
-        <ChatSidebar state={readyState([unread], [])} retry={() => {}} />
-      </MemoryRouter>,
-    );
-    expect(within(section("Canais")).getByLabelText("1 conversa não lida")).toHaveTextContent("1");
-
-    rerender(
-      <MemoryRouter initialEntries={["/chat"]}>
-        <ChatSidebar state={readyState([read], [])} retry={() => {}} />
-      </MemoryRouter>,
-    );
-    expect(within(section("Canais")).queryByLabelText(/conversas? não lidas?$/)).toBeNull();
-  });
-
-  it("draws the unread-only control as a switch whose thumb moves, not by colour alone", async () => {
-    const user = userEvent.setup();
-    renderState([channel("a", { unreadCount: 1 })], []);
-
-    const toggle = unreadSwitch("Canais");
-    // The semantics of issue #779 are untouched.
-    expect(toggle).toHaveAttribute("role", "switch");
-    expect(toggle).toHaveAttribute("aria-checked", "false");
-    expect(toggle).toHaveAccessibleName(
-      "Mostrar mensagens não lidas quando Canais estiver recolhida",
-    );
-
-    // The visual is a rail with a thumb, and the "on" class is what moves it.
-    expect(toggle.querySelector(".chat-sidebar__section-unread-track")).not.toBeNull();
-    expect(toggle.querySelector(".chat-sidebar__section-unread-thumb")).not.toBeNull();
-    expect(toggle.className).not.toContain("chat-sidebar__section-unread-toggle--on");
-
-    await user.click(toggle);
-    expect(unreadSwitch("Canais")).toHaveAttribute("aria-checked", "true");
-    expect(unreadSwitch("Canais").className).toContain("chat-sidebar__section-unread-toggle--on");
-  });
-
-  it("hints at the switch on hover without letting the hint become its name", () => {
-    renderState([channel("a")], []);
-
-    for (const title of ["Canais", "Mensagens diretas", "Grupos"]) {
-      const toggle = unreadSwitch(title);
-      // The hover affordance is the browser's own tooltip — one attribute, no
-      // element of ours inside the sidebar's scrollport.
-      expect(toggle).toHaveAttribute("title", "Exibir não lidas quando a seção estiver recolhida");
-      // The generic hint must never displace the name that says *which*
-      // section this switch belongs to.
-      expect(toggle).toHaveAttribute(
-        "aria-label",
-        `Mostrar mensagens não lidas quando ${title} estiver recolhida`,
-      );
-      expect(toggle).toHaveAccessibleName(
-        `Mostrar mensagens não lidas quando ${title} estiver recolhida`,
-      );
-      expect(toggle).toHaveAttribute("role", "switch");
-      expect(toggle).toHaveAttribute("aria-checked", "false");
-    }
-  });
-
-  it("keeps the three sections' collapse and unread-only state fully independent", async () => {
+  it("keeps the three sections' collapse state fully independent", async () => {
     const user = userEvent.setup();
     renderState(
-      [channel("ch", { unreadCount: 1 })],
-      [dm("d", "1:1", { unreadCount: 1 }), dm("g", "group", { unreadCount: 1 })],
+      [channel("ch", { unreadCount: 1 }), channel("ch-read")],
+      [
+        dm("d", "1:1", { unreadCount: 1 }),
+        dm("d-read", "1:1"),
+        dm("g", "group", { unreadCount: 1 }),
+        dm("g-read", "group"),
+      ],
     );
 
     await user.click(collapseButton("Canais"));
-    await user.click(unreadSwitch("Canais"));
 
-    // Mensagens diretas and Grupos remain expanded and unaffected.
     expect(collapseButton("Mensagens diretas")).toHaveAttribute("aria-expanded", "true");
     expect(collapseButton("Grupos")).toHaveAttribute("aria-expanded", "true");
-    expect(optionNamesIn("Mensagens diretas")).toEqual(["Mensagem direta com d"]);
-    expect(optionNamesIn("Grupos")).toEqual(["Grupo g"]);
-    // Canais alone shows its (only, unread) channel while collapsed.
+    expect(optionNamesIn("Mensagens diretas")).toEqual([
+      "Mensagem direta com d",
+      "Mensagem direta com d-read",
+    ]);
+    expect(optionNamesIn("Grupos")).toEqual(["Grupo g", "Grupo g-read"]);
     expect(optionNamesIn("Canais")).toEqual(["Canal ch"]);
   });
 
-  it("removes a conversation from the collapsed+unread view once it is marked read", () => {
-    const { rerender } = render(
-      <MemoryRouter initialEntries={["/chat"]}>
-        <ChatSidebar state={readyState([channel("a", { unreadCount: 3 })], [])} retry={() => {}} />
-      </MemoryRouter>,
-    );
-
-    fireEvent.click(collapseButton("Canais"));
-    fireEvent.click(unreadSwitch("Canais"));
-    expect(optionNamesIn("Canais")).toEqual(["Canal a"]);
-
-    // The server-authoritative unreadCount drops to 0 (mark read / realtime
-    // reconciliation) — the same canonical array the badges already render.
-    rerender(
-      <MemoryRouter initialEntries={["/chat"]}>
-        <ChatSidebar state={readyState([channel("a", { unreadCount: 0 })], [])} retry={() => {}} />
-      </MemoryRouter>,
-    );
-
-    expect(optionNamesIn("Canais")).toEqual([]);
-  });
-
-  it("shows a newly-unread conversation the instant its canonical unreadCount arrives", () => {
-    const { rerender } = render(
-      <MemoryRouter initialEntries={["/chat"]}>
-        <ChatSidebar state={readyState([channel("a")], [])} retry={() => {}} />
-      </MemoryRouter>,
-    );
-
-    fireEvent.click(collapseButton("Canais"));
-    fireEvent.click(unreadSwitch("Canais"));
-    expect(optionNamesIn("Canais")).toEqual([]);
-
-    // A realtime message bumped the canonical unread count.
-    rerender(
-      <MemoryRouter initialEntries={["/chat"]}>
-        <ChatSidebar state={readyState([channel("a", { unreadCount: 1 })], [])} retry={() => {}} />
-      </MemoryRouter>,
-    );
-
-    expect(optionNamesIn("Canais")).toEqual(["Canal a"]);
-  });
-
-  it("keeps the open conversation's route unchanged when its section is collapsed", async () => {
+  it("keeps the open conversation's route and read-state untouched when its section is collapsed", async () => {
     const user = userEvent.setup();
+    const markRead = vi.fn();
     function LocationProbe({ onPath }: { onPath: (path: string) => void }) {
       onPath(useLocation().pathname);
       return null;
     }
     let path = "";
     render(
-      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+      <MemoryRouter initialEntries={["/chat/dm/open"]}>
         <LocationProbe onPath={(p) => (path = p)} />
-        <ChatSidebar state={readyState([channel("geral")], [])} retry={() => {}} />
+        <ChatSidebar
+          state={readyState([], [dm("open", "1:1"), dm("other", "1:1", { unreadCount: 1 })])}
+          retry={() => {}}
+          markRead={markRead}
+        />
       </MemoryRouter>,
+    );
+
+    await user.click(collapseButton("Mensagens diretas"));
+
+    // The open, read DM left the collapsed list; the route never moved and
+    // collapsing is not a read.
+    expect(optionNamesIn("Mensagens diretas")).toEqual(["Mensagem direta com other"]);
+    expect(path).toBe("/chat/dm/open");
+    expect(markRead).not.toHaveBeenCalled();
+
+    await user.click(collapseButton("Mensagens diretas"));
+    expect(screen.getByRole("option", { name: "Mensagem direta com open" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
+  it("keeps an open conversation with unread selected inside its collapsed section", async () => {
+    const user = userEvent.setup();
+    renderState(
+      [channel("geral", { unreadCount: 2 }), channel("outro")],
+      [],
+      [],
+      "/chat/channel/geral",
     );
 
     await user.click(collapseButton("Canais"));
 
-    // The active channel disappeared from the list (no unread, section
-    // collapsed with the toggle off) but the route never moved.
-    expect(screen.queryByRole("option", { name: "Canal geral" })).not.toBeInTheDocument();
-    expect(path).toBe("/chat/channel/geral");
+    expect(screen.getByRole("option", { name: "Canal geral" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
   });
 
   it("does not force visibility from a pin alone — only unreadCount decides", async () => {
@@ -2901,29 +2943,29 @@ describe("ChatSidebar — collapsible sections with unread filter", () => {
     );
 
     await user.click(collapseButton("Canais"));
-    await user.click(unreadSwitch("Canais"));
 
     expect(optionNamesIn("Canais")).toEqual(["Canal has-unread"]);
   });
 
-  it("keeps a muted conversation's unread following the canonical count", async () => {
+  it("keeps muted and mentioned conversations following the canonical unread count", async () => {
     const user = userEvent.setup();
-    renderState([channel("muted-unread", { unreadCount: 2, muted: true })], []);
+    renderState(
+      [
+        channel("muted-unread", { unreadCount: 2, muted: true }),
+        channel("mentioned", { unreadCount: 1, hasMentionUnread: true }),
+      ],
+      [],
+    );
 
     await user.click(collapseButton("Canais"));
-    await user.click(unreadSwitch("Canais"));
 
-    expect(optionNamesIn("Canais")).toEqual(["Canal muted-unread"]);
-  });
-
-  it("keeps a mentioned conversation eligible for the unread filter", async () => {
-    const user = userEvent.setup();
-    renderState([channel("mentioned", { unreadCount: 1, hasMentionUnread: true })], []);
-
-    await user.click(collapseButton("Canais"));
-    await user.click(unreadSwitch("Canais"));
-
-    expect(optionNamesIn("Canais")).toEqual(["Canal mentioned"]);
+    expect(optionNamesIn("Canais")).toHaveLength(2);
+    expect(optionNamesIn("Canais")).toEqual(
+      expect.arrayContaining(["Canal muted-unread", "Canal mentioned"]),
+    );
+    expect(
+      screen.getByLabelText("1 não lidas, incluindo menção", { exact: true }),
+    ).toBeInTheDocument();
   });
 
   it("shows the genuinely-empty message only while expanded, never while collapsed", async () => {
@@ -2936,26 +2978,17 @@ describe("ChatSidebar — collapsible sections with unread filter", () => {
     expect(
       within(section("Canais")).queryByText("Nenhum canal disponível."),
     ).not.toBeInTheDocument();
-
-    await user.click(unreadSwitch("Canais"));
-    expect(
-      within(section("Canais")).queryByText("Nenhum canal disponível."),
-    ).not.toBeInTheDocument();
-    // The header is still there — its switch proves it — but since issue #787
-    // an empty section shows no count at all rather than a literal "0".
-    expect(unreadSwitch("Canais")).toBeInTheDocument();
-    expect(within(section("Canais")).queryByLabelText(/conversas? não lidas?$/)).toBeNull();
+    expect(collapseButton("Canais")).toBeInTheDocument();
   });
 
   it("persists per (user, workspace) and restores across a remount", () => {
-    const { unmount } = renderState([channel("a")], []);
+    const { unmount } = renderState([channel("a"), channel("b", { unreadCount: 1 })], []);
     fireEvent.click(collapseButton("Canais"));
-    fireEvent.click(unreadSwitch("Canais"));
     unmount();
 
-    renderState([channel("a")], []);
+    renderState([channel("a"), channel("b", { unreadCount: 1 })], []);
     expect(collapseButton("Canais")).toHaveAttribute("aria-expanded", "false");
-    expect(unreadSwitch("Canais")).toHaveAttribute("aria-checked", "true");
+    expect(optionNamesIn("Canais")).toEqual(["Canal b"]);
   });
 
   it("falls back to defaults when the persisted section preference is corrupted", () => {
@@ -2964,7 +2997,24 @@ describe("ChatSidebar — collapsible sections with unread filter", () => {
     renderState([channel("a")], []);
 
     expect(collapseButton("Canais")).toHaveAttribute("aria-expanded", "true");
-    expect(unreadSwitch("Canais")).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("upgrades a legacy collapsed section whose old switch was off to show its unread", () => {
+    localStorage.setItem(
+      "nchat.sidebar.sections.v1:workspace-1:user-a",
+      JSON.stringify({
+        channels: { collapsed: true, showUnreadOnly: false },
+        directs: { collapsed: "yes", showUnreadOnly: true },
+        groups: "garbage",
+      }),
+    );
+
+    renderState([channel("a"), channel("b", { unreadCount: 1 })], [dm("d", "1:1")]);
+
+    expect(collapseButton("Canais")).toHaveAttribute("aria-expanded", "false");
+    expect(optionNamesIn("Canais")).toEqual(["Canal b"]);
+    expect(collapseButton("Mensagens diretas")).toHaveAttribute("aria-expanded", "true");
+    expect(collapseButton("Grupos")).toHaveAttribute("aria-expanded", "true");
   });
 
   // Code review (issue #779): the section preference hook must never reuse an
@@ -2988,9 +3038,9 @@ describe("ChatSidebar — collapsible sections with unread filter", () => {
     localStorage.setItem(
       "nchat.sidebar.sections.v1:workspace-2:user-b",
       JSON.stringify({
-        channels: { collapsed: true, showUnreadOnly: false },
-        directs: { collapsed: false, showUnreadOnly: false },
-        groups: { collapsed: false, showUnreadOnly: false },
+        channels: { collapsed: true },
+        directs: { collapsed: false },
+        groups: { collapsed: false },
       }),
     );
 
@@ -3010,10 +3060,6 @@ describe("ChatSidebar — collapsible sections with unread filter", () => {
         <ChatSidebar state={stateFor("workspace-2", "user-b", [channel("a")])} retry={() => {}} />
       </MemoryRouter>,
     );
-
-    // The new scope's own persisted state — collapsed — not a stale carry-over
-    // of the first scope's in-session edit (which was also collapsed, so this
-    // alone would not distinguish the bug; the switch back below does).
     expect(collapseButton("Canais")).toHaveAttribute("aria-expanded", "false");
 
     // A third, never-before-seen scope must not inherit either earlier
@@ -3027,29 +3073,23 @@ describe("ChatSidebar — collapsible sections with unread filter", () => {
     expect(collapseButton("Canais")).toHaveAttribute("aria-expanded", "true");
   });
 
-  it("exposes the collapse control and the unread toggle as distinct, keyboard-operable elements", async () => {
+  it("operates the collapse button by keyboard and tabs from it straight to the unread rows", async () => {
     const user = userEvent.setup();
-    renderState([channel("a", { unreadCount: 1 })], []);
+    renderState([channel("a"), channel("b", { unreadCount: 1 })], []);
 
     const collapse = collapseButton("Canais");
-    const toggle = unreadSwitch("Canais");
-    // Two independent controls — not a button nested in a button.
-    expect(collapse).not.toContainElement(toggle);
-    expect(toggle).not.toContainElement(collapse);
-    expect(toggle.tagName).toBe("BUTTON");
-    expect(toggle).toHaveAttribute("role", "switch");
-
     collapse.focus();
     await user.keyboard("{Enter}");
     expect(collapse).toHaveAttribute("aria-expanded", "false");
+
+    // No switch between the header and its rows any more.
+    await user.tab();
+    expect(screen.getByRole("option", { name: "Canal b" })).toHaveFocus();
+
+    collapse.focus();
     await user.keyboard(" ");
     expect(collapse).toHaveAttribute("aria-expanded", "true");
-
-    toggle.focus();
-    await user.keyboard("{Enter}");
-    expect(toggle).toHaveAttribute("aria-checked", "true");
-    await user.keyboard(" ");
-    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(optionNamesIn("Canais")).toEqual(["Canal a", "Canal b"]);
   });
 
   it("hides only the categories that became empty after the unread filter, without disturbing category collapse state", async () => {
@@ -3070,7 +3110,6 @@ describe("ChatSidebar — collapsible sections with unread filter", () => {
     expect(screen.getByRole("button", { name: /Categoria B/i })).toBeInTheDocument();
 
     await user.click(collapseButton("Canais"));
-    await user.click(unreadSwitch("Canais"));
 
     // Only the category that still has an unread channel is shown.
     expect(screen.getByRole("button", { name: /Categoria A/i })).toBeInTheDocument();
