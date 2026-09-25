@@ -14,6 +14,16 @@ assert SPEC and SPEC.loader
 git_conventions_check = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(git_conventions_check)
 
+RELEASE_PR_ENV = {
+    "GITHUB_EVENT_NAME": "pull_request",
+    "PR_AUTHOR": "djalv",
+    "PR_BASE_REF": "main",
+    "PR_BASE_SHA": "a" * 40,
+    "PR_HEAD_REF": "release/0.1.5",
+    "PR_HEAD_SHA": "b" * 40,
+    "PR_TITLE": "chore(release): NChat 0.1.5",
+}
+
 
 class GitConventionsCheckTest(unittest.TestCase):
     def test_accepts_documented_human_branch_names(self) -> None:
@@ -141,6 +151,18 @@ class GitConventionsCheckTest(unittest.TestCase):
 
         self.assertEqual(errors, ['Invalid commit subjects: fix(repo): add "; id; #'])
 
+    def test_regular_pr_rejects_github_squash_suffix(self) -> None:
+        errors = git_conventions_check.validate_pull_request(
+            actor="alvaro-neto",
+            branch="fix/chat-123-example",
+            title="fix(chat): example",
+            subjects=("fix(chat): example (#123)",),
+        )
+
+        self.assertEqual(
+            errors, ["Invalid commit subjects: fix(chat): example (#123)"]
+        )
+
     def test_rejects_non_dependabot_actor_on_dependabot_branch(self) -> None:
         errors = git_conventions_check.validate_pull_request(
             actor="dependabot-bot",
@@ -243,6 +265,7 @@ class GitConventionsCheckTest(unittest.TestCase):
         environment = {
             "GITHUB_EVENT_NAME": "pull_request",
             "PR_AUTHOR": "alvaro-neto",
+            "PR_BASE_REF": "develop",
             "PR_BASE_SHA": "a" * 40,
             "PR_HEAD_SHA": "b" * 40,
             "PR_HEAD_REF": "chore/repo-520-git-governance",
@@ -260,6 +283,7 @@ class GitConventionsCheckTest(unittest.TestCase):
         environment = {
             "GITHUB_EVENT_NAME": "pull_request",
             "PR_AUTHOR": "alvaro-neto",
+            "PR_BASE_REF": "develop",
             "PR_BASE_SHA": "a" * 40,
             "PR_HEAD_SHA": "b" * 40,
             "PR_HEAD_REF": "invalid",
@@ -275,6 +299,7 @@ class GitConventionsCheckTest(unittest.TestCase):
         environment = {
             "GITHUB_EVENT_NAME": "pull_request",
             "PR_AUTHOR": "alvaro-neto",
+            "PR_BASE_REF": "develop",
             "PR_BASE_SHA": "a" * 40,
             "PR_HEAD_SHA": "b" * 40,
             "PR_HEAD_REF": "chore/repo-520-git-governance",
@@ -287,6 +312,85 @@ class GitConventionsCheckTest(unittest.TestCase):
             side_effect=OSError("git unavailable"),
         ):
             self.assertEqual(git_conventions_check.main(), 2)
+
+    def test_main_accepts_release_promotion_with_inherited_history(self) -> None:
+        inherited_subjects = (
+            "fix(chat): prevent sidebar collapse render loop (#1007)",
+            "fix(cd): support rollback compatibility attestations (#1009)",
+            "Feature/chat 17 agrupa categorias sidebar (#518)",
+            "[TASK-79] Implementar deleção com placeholder (#343)",
+        )
+
+        with patch.dict(os.environ, RELEASE_PR_ENV, clear=True), patch.object(
+            git_conventions_check,
+            "pull_request_subjects",
+            return_value=inherited_subjects,
+        ):
+            self.assertEqual(git_conventions_check.main(), 0)
+
+    def test_main_rejects_invalid_release_title_and_branch(self) -> None:
+        for key, invalid_value in (
+            ("PR_TITLE", "Release 0.1.5"),
+            ("PR_HEAD_REF", "release/0.1.5/invalid"),
+        ):
+            with self.subTest(key=key), patch.dict(
+                os.environ, {**RELEASE_PR_ENV, key: invalid_value}, clear=True
+            ), patch.object(
+                git_conventions_check,
+                "pull_request_subjects",
+                return_value=("fix(chat): example (#123)",),
+            ):
+                self.assertEqual(git_conventions_check.main(), 1)
+
+    def test_main_checks_release_commits_for_other_base(self) -> None:
+        with patch.dict(
+            os.environ, {**RELEASE_PR_ENV, "PR_BASE_REF": "develop"}, clear=True
+        ), patch.object(
+            git_conventions_check,
+            "pull_request_subjects",
+            return_value=("fix(chat): example (#123)",),
+        ):
+            self.assertEqual(git_conventions_check.main(), 1)
+
+    def test_main_checks_regular_commits_targeting_main(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                **RELEASE_PR_ENV,
+                "PR_HEAD_REF": "fix/chat-123-example",
+                "PR_TITLE": "fix(chat): example",
+            },
+            clear=True,
+        ), patch.object(
+            git_conventions_check,
+            "pull_request_subjects",
+            return_value=("fix(chat): example (#123)",),
+        ):
+            self.assertEqual(git_conventions_check.main(), 1)
+
+    def test_main_does_not_exempt_dependabot_release_branch(self) -> None:
+        with patch.dict(
+            os.environ, {**RELEASE_PR_ENV, "PR_AUTHOR": "dependabot[bot]"}, clear=True
+        ), patch.object(
+            git_conventions_check,
+            "pull_request_subjects",
+            return_value=("fix(chat): example (#123)",),
+        ):
+            self.assertEqual(git_conventions_check.main(), 1)
+
+    def test_main_requires_base_ref_for_pull_requests(self) -> None:
+        environment = {
+            key: value for key, value in RELEASE_PR_ENV.items() if key != "PR_BASE_REF"
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(git_conventions_check.main(), 2)
+
+    def test_main_skips_push_and_dispatch_without_pr_metadata(self) -> None:
+        for event_name in ("push", "workflow_dispatch"):
+            with self.subTest(event_name=event_name), patch.dict(
+                os.environ, {"GITHUB_EVENT_NAME": event_name}, clear=True
+            ):
+                self.assertEqual(git_conventions_check.main(), 0)
 
 
 if __name__ == "__main__":
