@@ -32,8 +32,16 @@ export function formatDayLabel(iso: string): string {
   return formatLongDate(iso);
 }
 
-export function senderLabel(msg: Message): string {
-  return msg.senderDisplayName || msg.senderEmail || msg.senderId.slice(0, 8);
+/**
+ * Who wrote a message: display name, else e-mail, else `fallback`.
+ *
+ * Without a fallback the last resort is a fragment of the sender id — the
+ * historical behaviour every existing caller keeps. A surface that must never
+ * show an identifier (the details panel's pin list, issue #896, which also
+ * builds accessible names from it) passes a human fallback instead.
+ */
+export function senderLabel(msg: Message, fallback?: string): string {
+  return msg.senderDisplayName || msg.senderEmail || (fallback ?? msg.senderId.slice(0, 8));
 }
 
 /**

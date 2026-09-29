@@ -50,6 +50,8 @@ export interface ConversationTimelineProps {
   emojiUsage: EmojiUsage;
   onEmojiToneChange: (tone: number) => void;
   focusMessageId: string;
+  /** Issue #896: see MessageListProps. */
+  focusRequest?: string;
   /** #492: see MessageListProps. */
   conversationKey: string;
   unreadCountAtOpen: number;
@@ -115,6 +117,7 @@ export default function ConversationTimeline(props: ConversationTimelineProps) {
       emojiUsage={props.emojiUsage}
       onEmojiToneChange={props.onEmojiToneChange}
       focusMessageId={props.focusMessageId}
+      focusRequest={props.focusRequest}
       conversationKey={props.conversationKey}
       unreadCountAtOpen={props.unreadCountAtOpen}
       initialAnchor={props.initialAnchor}

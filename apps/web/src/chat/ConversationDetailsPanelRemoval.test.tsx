@@ -115,7 +115,6 @@ function renderChannel(
       kind="channel"
       state={channelState(details, rosterSection, reload)}
       currentUserId={currentUserId}
-      latestPin={null}
       onClose={vi.fn()}
     />,
   );
@@ -134,7 +133,6 @@ function renderGroup(details = groupDetails()) {
         reload,
       }}
       currentUserId={currentUserId}
-      latestPin={null}
       onClose={vi.fn()}
     />,
   );
@@ -345,7 +343,6 @@ describe("a removal that finishes after the reader moved on", () => {
         kind="channel"
         state={channelState(channelDetails(), { status: "ready", data: roster }, reloadA)}
         currentUserId={currentUserId}
-        latestPin={null}
         onClose={vi.fn()}
       />,
     );
@@ -367,7 +364,6 @@ describe("a removal that finishes after the reader moved on", () => {
         kind="channel"
         state={channelState(otherChannel, { status: "ready", data: otherRoster }, reloadB)}
         currentUserId={currentUserId}
-        latestPin={null}
         onClose={vi.fn()}
       />,
     );

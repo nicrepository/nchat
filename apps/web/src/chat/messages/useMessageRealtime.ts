@@ -51,6 +51,12 @@ export interface RealtimeListeners {
   onConversationEvent?: (event: WSConversationEventMessage) => void;
   onAttachmentStatus?: (event: WSAttachmentStatusEvent) => void;
   onTypingUpdated?: (event: WSTypingUpdatedEvent) => void;
+  /**
+   * Issue #896: called when the subscription comes back ready — the resync
+   * point below — so state kept outside the timeline (the pins) re-reads what a
+   * disconnect may have hidden from it.
+   */
+  onSubscriptionReady?: () => void;
 }
 
 export interface MessageRealtime {
@@ -290,6 +296,7 @@ export function useMessageRealtime({
   );
 
   const { reconcilePendingLinkScans, refreshAuthoritativeMessageSecurity } = reconciliation;
+  const { onSubscriptionReady } = listeners;
   const handleSubscribed = useCallback(() => {
     dispatch({ type: "ws_subscription_ready" });
     reconcilePendingLinkScans();
@@ -300,8 +307,10 @@ export function useMessageRealtime({
     // mechanism the two calls above already use; nothing new was invented for
     // acknowledgement, and no event was added to the protocol.
     reconcileAcknowledgements?.();
+    onSubscriptionReady?.();
   }, [
     dispatch,
+    onSubscriptionReady,
     reconcileAcknowledgements,
     reconcilePendingLinkScans,
     refreshAuthoritativeMessageSecurity,

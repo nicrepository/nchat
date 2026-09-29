@@ -9,9 +9,9 @@
  *
  * Deliberately a thin host: it owns no data of its own, calls the same
  * useConversationDetails every other caller does, and renders the same panel
- * component. The one thing it does not carry is the pinned-message selection,
- * which belongs to the conversation you are reading rather than to one you are
- * inspecting from the sidebar.
+ * component. The one thing it does not carry is the pin collection, which is
+ * held for the conversation you are reading rather than for one you are
+ * inspecting from the sidebar — so this panel draws no pin section at all.
  */
 
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
@@ -104,7 +104,6 @@ export default function SidebarDetailsPanel({
       kind={target.kind}
       state={state}
       currentUserId={currentUserId}
-      latestPin={null}
       onRename={onRename}
       openDM={access}
       onClose={onClose}

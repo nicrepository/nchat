@@ -106,6 +106,8 @@ interface UseMessagesOptions {
    * caller for reactions rather than dropped here.
    */
   onTypingUpdated?: (event: WSTypingUpdatedEvent) => void;
+  /** Issue #896: called when the subscription is (re)established, to resync. */
+  onSubscriptionReady?: () => void;
   onMessageRemoved?: () => void;
 }
 
@@ -187,6 +189,7 @@ export function useMessages({
   onConversationEvent,
   onAttachmentStatus,
   onTypingUpdated,
+  onSubscriptionReady,
   onMessageRemoved,
 }: UseMessagesOptions): UseMessagesResult {
   const [state, dispatch] = useReducer(reducer, initialState);
@@ -288,6 +291,7 @@ export function useMessages({
       onConversationEvent,
       onAttachmentStatus,
       onTypingUpdated,
+      onSubscriptionReady,
     },
   });
 

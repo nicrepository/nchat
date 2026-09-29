@@ -52,6 +52,18 @@ import { conversationNameMaxCodePoints } from "./conversationRename";
 import { ApiRequestError } from "../lib/api";
 import type { ConversationDetailsState } from "./useConversationDetails";
 import type { DirectMessageAccess } from "./directMessage";
+import type { PinnedMessages } from "./PinnedMessagesSection";
+import type { PinMutationOutcome } from "./usePins";
+
+/** A loaded, empty pin collection with inert actions (issue #896). */
+const noPins: PinnedMessages = {
+  conversationKey: "channel:c-1",
+  collection: { status: "ready", pins: [] },
+  pendingIds: new Set(),
+  onNavigate: () => {},
+  onUnpin: () => Promise.resolve("persisted"),
+  onRetry: () => {},
+};
 
 const currentUserId = "user-me";
 
@@ -163,7 +175,7 @@ function renderPanel(overrides: Partial<Parameters<typeof ConversationDetailsPan
       kind="channel"
       state={state()}
       currentUserId={currentUserId}
-      latestPin={null}
+      pins={noPins}
       onClose={onClose}
       {...overrides}
     />,
@@ -323,7 +335,7 @@ describe("ConversationDetailsPanel — canal: seção Sobre", () => {
         kind="channel"
         state={state({ details: { status: "loading" } })}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -335,7 +347,7 @@ describe("ConversationDetailsPanel — canal: seção Sobre", () => {
         kind="channel"
         state={state({ details: { status: "error" } })}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -454,7 +466,7 @@ describe("ConversationDetailsPanel — canal: membros", () => {
         kind="channel"
         state={state({ details: { status: "error" } })}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -633,7 +645,7 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
         kind="channel"
         state={expanded}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -659,7 +671,7 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
           },
         })}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -700,7 +712,11 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
   });
 });
 
-describe("ConversationDetailsPanel — canal: mensagem fixada", () => {
+describe("ConversationDetailsPanel — canal: mensagens fixadas", () => {
+  function withPins(...items: PinnedItem[]): PinnedMessages {
+    return { ...noPins, collection: { status: "ready", pins: items } };
+  }
+
   it("shows an empty state when nothing is pinned", () => {
     renderPanel();
 
@@ -709,27 +725,119 @@ describe("ConversationDetailsPanel — canal: mensagem fixada", () => {
     );
   });
 
-  it("shows the selected pin's body and author", () => {
-    renderPanel({ latestPin: pin() });
+  it("lists the conversation's pins, not just the latest one", () => {
+    renderPanel({
+      pins: withPins(
+        pin({ id: "m-1", bodyText: "primeiro" }),
+        pin({ id: "m-2", bodyText: "segundo" }),
+      ),
+    });
 
-    const card = screen.getByTestId("chat-details-pin");
-    expect(card).toHaveTextContent("Procedimento de deploy atualizado.");
-    expect(card).toHaveTextContent("Juliane Lino");
-  });
-
-  it("renders a removed pin without pretending it still has a body", () => {
-    renderPanel({ latestPin: pin({ isRemoved: true, bodyText: "", status: "deleted" }) });
-
-    expect(screen.getByTestId("chat-details-pin")).toHaveTextContent("Mensagem removida.");
+    const list = screen.getByRole("list", { name: "Mensagens fixadas" });
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveTextContent("primeiro");
+    expect(rows[1]).toHaveTextContent("segundo");
+    expect(rows[0]).toHaveTextContent("Juliane Lino");
   });
 
   it("renders pin content as text, never as markup", () => {
-    renderPanel({ latestPin: pin({ bodyText: "<img src=x onerror=alert(1)>" }) });
+    renderPanel({ pins: withPins(pin({ bodyText: "<img src=x onerror=alert(1)>" })) });
 
-    expect(screen.getByTestId("chat-details-pin")).toHaveTextContent(
+    expect(screen.getByRole("list", { name: "Mensagens fixadas" })).toHaveTextContent(
       "<img src=x onerror=alert(1)>",
     );
     expect(document.querySelector("img[src='x']")).toBeNull();
+  });
+
+  it("keeps the pins' expansion apart from other sections and ends it with the conversation", async () => {
+    const six = Array.from({ length: 6 }, (_, index) =>
+      pin({ id: `m-${index}`, bodyText: `fixada ${index}` }),
+    );
+    const { rerender } = render(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={state({
+          files: {
+            status: "ready",
+            data: [1, 2, 3, 4, 5, 6].map((n) => attachment({ id: `a-${n}` })),
+          },
+        })}
+        currentUserId={currentUserId}
+        pins={withPins(...six)}
+        onClose={vi.fn()}
+      />,
+    );
+    const pinsList = () => screen.getByRole("list", { name: "Mensagens fixadas" });
+
+    await userEvent.click(screen.getByRole("button", { name: /Ver todos Mensagens fixadas/ }));
+    expect(within(pinsList()).getAllByRole("listitem")).toHaveLength(6);
+    expect(screen.getByRole("button", { name: /Ver todos Arquivos recentes/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+
+    rerender(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={state()}
+        currentUserId={currentUserId}
+        pins={{ ...withPins(...six), conversationKey: "channel:c-2" }}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(within(pinsList()).getAllByRole("listitem")).toHaveLength(5);
+    expect(screen.getByRole("button", { name: /Ver todos Mensagens fixadas/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  it("never moves focus into another conversation's pins after a switch mid-unpin", async () => {
+    const onUnpin = vi.fn(() => Promise.resolve<PinMutationOutcome>("persisted"));
+    const first = { ...withPins(pin({ id: "m-1" }), pin({ id: "m-2" })), onUnpin };
+    const { rerender } = render(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={state()}
+        currentUserId={currentUserId}
+        pins={first}
+        onClose={vi.fn()}
+      />,
+    );
+    const list = () => screen.getByRole("list", { name: "Mensagens fixadas" });
+
+    await userEvent.click(
+      within(list()).getAllByRole("button", { name: /^Desafixar mensagem de / })[0],
+    );
+    expect(onUnpin).toHaveBeenCalledWith("m-1");
+
+    // The reader switches conversations; the new one has a row where the
+    // successor would have been.
+    rerender(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={state()}
+        currentUserId={currentUserId}
+        pins={{
+          ...withPins(pin({ id: "m-2" }), pin({ id: "m-9" })),
+          conversationKey: "channel:c-2",
+        }}
+        onClose={vi.fn()}
+      />,
+    );
+
+    for (const button of within(list()).getAllByRole("button")) {
+      expect(button).not.toHaveFocus();
+    }
+  });
+
+  it("draws no pin section for a host that does not hold the conversation's pins", () => {
+    renderPanel({ pins: undefined });
+
+    expect(screen.queryByRole("heading", { name: "Mensagens fixadas" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-pin-empty")).not.toBeInTheDocument();
   });
 });
 
@@ -837,7 +945,7 @@ describe("ConversationDetailsPanel — canal: arquivos recentes", () => {
         kind="channel"
         state={state({ files: { status: "loading" } })}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -849,7 +957,7 @@ describe("ConversationDetailsPanel — canal: arquivos recentes", () => {
         kind="channel"
         state={state({ files: { status: "error" } })}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -895,7 +1003,7 @@ function renderGroupPanel(
         reload,
       }}
       currentUserId={viewerId}
-      latestPin={null}
+      pins={noPins}
       openDM={openDM}
       onClose={onClose}
     />,
@@ -1132,7 +1240,7 @@ describe("ConversationDetailsPanel — grupo", () => {
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -1150,7 +1258,7 @@ describe("ConversationDetailsPanel — grupo", () => {
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -1187,7 +1295,7 @@ function renderProfilePanel(details: { kind: "direct" } & DirectDetails = direct
         reload: vi.fn(),
       }}
       currentUserId={currentUserId}
-      latestPin={null}
+      pins={noPins}
       onClose={onClose}
     />,
   );
@@ -1679,7 +1787,7 @@ describe("ConversationDetailsPanel — DM 1:1: estrutura e acessibilidade", () =
     // instead of the person.
     expect(screen.queryByRole("heading", { name: /Membros online/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: /Participantes/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Mensagem fixada" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Mensagens fixadas" })).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Arquivos recentes" })).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Sobre" })).not.toBeInTheDocument();
     expect(screen.queryByTestId("chat-details-description")).not.toBeInTheDocument();
@@ -1974,7 +2082,7 @@ describe("ConversationDetailsPanel — DM 1:1: ação e estados", () => {
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -1996,7 +2104,7 @@ describe("ConversationDetailsPanel — DM 1:1: ação e estados", () => {
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2018,7 +2126,7 @@ describe("ConversationDetailsPanel — DM 1:1: ação e estados", () => {
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2045,7 +2153,7 @@ describe("ConversationDetailsPanel — DM 1:1: variante divergente", () => {
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2093,7 +2201,7 @@ function renderChannelFor(state: ConversationDetailsState) {
       kind="channel"
       state={state}
       currentUserId={currentUserId}
-      latestPin={null}
+      pins={noPins}
       onClose={vi.fn()}
     />,
   );
@@ -2191,7 +2299,7 @@ describe("ConversationDetailsPanel — adicionar membros: permissão", () => {
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2248,7 +2356,7 @@ describe("ConversationDetailsPanel — adicionar membros: fluxo", () => {
         kind="group"
         state={readyGroup({ id: "dm-42" })}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2288,7 +2396,7 @@ describe("ConversationDetailsPanel — adicionar membros: fluxo", () => {
         kind="group"
         state={readyGroup({}, reload)}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2352,7 +2460,7 @@ describe("ConversationDetailsPanel — busca contextual de candidatos", () => {
         kind="group"
         state={readyGroup({ id: "dm-77" })}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2406,7 +2514,7 @@ describe("ConversationDetailsPanel — busca contextual de candidatos", () => {
           participants: [{ userId: "p-1", displayName: "Ana Lima", presence: "online" }],
         })}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2443,7 +2551,7 @@ describe("ConversationDetailsPanel — troca de conversa", () => {
         kind="channel"
         state={readyChannel({ id: "ch-B" })}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2466,7 +2574,7 @@ describe("ConversationDetailsPanel — troca de conversa", () => {
         kind="channel"
         state={readyChannel({ id: "ch-B" })}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2495,7 +2603,7 @@ describe("ConversationDetailsPanel — troca de conversa", () => {
         kind="channel"
         state={readyChannel({ id: "ch-B" })}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2520,7 +2628,7 @@ describe("ConversationDetailsPanel — troca de conversa", () => {
         kind="channel"
         state={readyChannel({ id: "ch-B" })}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2548,7 +2656,7 @@ describe("ConversationDetailsPanel — troca de conversa", () => {
         kind="channel"
         state={readyChannel({ id: "ch-2" })}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2604,7 +2712,7 @@ function renderRenamePanel(
       kind="channel"
       state={state({ reload })}
       currentUserId={currentUserId}
-      latestPin={null}
+      pins={noPins}
       onRename={onRename}
       onClose={vi.fn()}
       {...overrides}
@@ -3110,7 +3218,7 @@ describe("ConversationDetailsPanel — renomear inline: pendente, erro e submit 
         kind="channel"
         state={state({ reload })}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onRename={onRename}
         onClose={vi.fn()}
       />,
@@ -3134,7 +3242,7 @@ describe("ConversationDetailsPanel — renomear inline: pendente, erro e submit 
           reload,
         })}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onRename={onRename}
         onClose={vi.fn()}
       />,
@@ -3162,7 +3270,7 @@ describe("ConversationDetailsPanel — renomear inline: pendente, erro e submit 
         kind="channel"
         state={state()}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onRename={onRename}
         onClose={vi.fn()}
       />,
@@ -3183,7 +3291,7 @@ describe("ConversationDetailsPanel — renomear inline: pendente, erro e submit 
           },
         })}
         currentUserId={currentUserId}
-        latestPin={null}
+        pins={noPins}
         onRename={onRename}
         onClose={vi.fn()}
       />,

@@ -32,6 +32,7 @@ export function useMessageJump(
   { scrollToMessage, hasRow }: MessageJumpCommands,
   messages: Message[],
   focusMessageId?: string,
+  focusRequest = "",
 ): MessageJumpState {
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   const highlightTimerRef = useRef<number | null>(null);
@@ -58,20 +59,28 @@ export function useMessageJump(
     jumpRef.current = jumpToMessage;
   });
 
-  const focusedMessageRef = useRef("");
+  // What was last followed: the message, and the request that asked for it
+  // (issue #896). A link is followed once, so a re-render never re-travels —
+  // but a *new* explicit request for the same message does, which is what
+  // activating "Ir para a mensagem" twice means. An unmarked request ("")
+  // never counts as new: it is how a navigation that only keeps the query
+  // arrives.
+  const followedRef = useRef({ messageId: "", request: "" });
   useEffect(() => {
     if (!focusMessageId) {
-      focusedMessageRef.current = "";
+      followedRef.current = { messageId: "", request: "" };
       return;
     }
-    if (focusedMessageRef.current === focusMessageId) return;
+    const followed = followedRef.current;
+    const repeatRequested = focusRequest !== "" && focusRequest !== followed.request;
+    if (followed.messageId === focusMessageId && !repeatRequested) return;
     // Loaded is enough — mounted is the virtualizer's business, not this
     // effect's. A message no page has reached yet is still skipped, and the
     // bounded backward search in useOpenPosition is what brings it in.
     if (!hasRow(focusMessageId)) return;
-    focusedMessageRef.current = focusMessageId;
+    followedRef.current = { messageId: focusMessageId, request: focusRequest };
     jumpRef.current(focusMessageId);
-  }, [hasRow, focusMessageId, messages]);
+  }, [hasRow, focusMessageId, focusRequest, messages]);
 
   useEffect(() => {
     return () => {

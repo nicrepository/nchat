@@ -1,5 +1,6 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page, type TestInfo } from "@playwright/test";
 
+import { captureBrowserErrors, expectNoUnexpectedBrowserErrors } from "../helpers/browserErrors";
 import {
   CURRENT_USER_ID,
   CURRENT_USER_NAME,
@@ -11,8 +12,10 @@ import {
   channelRosterFixture,
   createScenario,
   emitConversationUpdated,
+  emitPinUpdated,
   installMessagingMocks,
   makeMessage,
+  messageBubble,
   setServerChannelName,
   uniqueId,
 } from "../helpers/messagingApi";
@@ -132,7 +135,7 @@ test.describe("painel de detalhes do canal", () => {
     await expect(members.getByText("Você")).toBeVisible();
     await expect(members.getByText(OTHER_USER_NAME)).toBeVisible();
     await expect(members.getByText("Pessoa Offline 01")).toBeVisible();
-    await expect(panel.getByRole("heading", { name: "Mensagem fixada" })).toBeVisible();
+    await expect(panel.getByRole("heading", { name: "Mensagens fixadas" })).toBeVisible();
     await expect(
       panel.getByRole("list", { name: "Arquivos recentes" }).getByText("relatorio-backup.pdf"),
     ).toBeVisible();
@@ -847,5 +850,326 @@ test.describe("renomeação inline do canal no painel", () => {
         ),
       )
       .toBe(true);
+  });
+});
+
+/**
+ * Mensagens fixadas no painel (issue #896).
+ *
+ * The collection comes from the same GET .../pins the pinned bar uses, and the
+ * mutations are the same POST/DELETE, so every assertion below is about what
+ * the panel does with the authoritative list — never about a copy of it.
+ */
+test.describe("mensagens fixadas no painel de detalhes do canal", () => {
+  const minuteMs = 60_000;
+
+  /** A channel with `total` messages, the first `pinned` of them pinned. */
+  function pinnedChannel(
+    testInfo: TestInfo,
+    label: string,
+    options: { total?: number; pinned: number; removed?: boolean },
+  ) {
+    const targetId = uniqueId(testInfo, label);
+    const start = Date.UTC(2026, 6, 15, 9, 0);
+    const messages = Array.from({ length: options.total ?? options.pinned }, (_, index) =>
+      makeMessage({
+        id: `${targetId}-m${String(index + 1).padStart(2, "0")}`,
+        sender_id: OTHER_USER_ID,
+        sender_display_name: OTHER_USER_NAME,
+        body_text: `Mensagem número ${index + 1}`,
+        created_at: new Date(start + index * minuteMs).toISOString(),
+        is_removed: options.removed && index === 0 ? true : undefined,
+      }),
+    );
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Canal Fixadas",
+      messages,
+    });
+    for (const channel of scenario.sidebarChannels) {
+      scenario.channelDetails.set(
+        channel.id,
+        channelDetailsFixture(
+          channel,
+          [
+            {
+              user_id: CURRENT_USER_ID,
+              display_name: CURRENT_USER_NAME,
+              role: "member",
+              presence: "online",
+            },
+          ],
+          1,
+        ),
+      );
+      scenario.channelRosters.set(
+        channel.id,
+        channelRosterFixture(
+          [{ user_id: CURRENT_USER_ID, display_name: CURRENT_USER_NAME, role: "member" }],
+          1,
+        ),
+      );
+    }
+    scenario.pinnedIds.set(
+      `channel:${targetId}`,
+      new Set(messages.slice(0, options.pinned).map((message) => message.id)),
+    );
+    return { targetId, scenario, messages };
+  }
+
+  async function openPins(page: Page, targetId: string) {
+    await page.goto(`/chat/channel/${targetId}`);
+    await expect(page.getByTestId("chat-composer-input")).toBeVisible();
+    await page.getByRole("button", { name: "Detalhes do canal", exact: true }).click();
+    const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
+    await expect(panel.getByRole("heading", { name: "Mensagens fixadas" })).toBeVisible();
+    return { panel, list: panel.getByRole("list", { name: "Mensagens fixadas" }) };
+  }
+
+  test("mostra cinco no compacto, expande para todas e recolhe de volta", async ({
+    page,
+  }, testInfo) => {
+    const { targetId, scenario } = pinnedChannel(testInfo, "pins-compact", { pinned: 7 });
+    await installMessagingMocks(page, scenario);
+    const { panel, list } = await openPins(page, targetId);
+
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    const toggle = panel.getByRole("button", { name: /Ver todos Mensagens fixadas/ });
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    await toggle.click();
+    await expect(list.getByRole("listitem")).toHaveCount(7);
+    await expect(list.getByText("Mensagem número 7")).toBeAttached();
+    const collapse = panel.getByRole("button", { name: /Mostrar menos Mensagens fixadas/ });
+    await expect(collapse).toHaveAttribute("aria-expanded", "true");
+    // The primitive's bounded region: expanding scrolls inside the section.
+    await expect(list).toHaveCSS("overflow-y", "auto");
+    await expect(panel).toBeVisible();
+    await expect(page).toHaveURL(`/chat/channel/${targetId}`);
+
+    await collapse.click();
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+  });
+
+  test("navega até a mensagem fixada pelo deep link da conversa, de novo a cada ativação", async ({
+    page,
+  }, testInfo) => {
+    const { targetId, scenario, messages } = pinnedChannel(testInfo, "pins-navigate", {
+      total: 60,
+      pinned: 1,
+    });
+    await installMessagingMocks(page, scenario);
+    const { panel, list } = await openPins(page, targetId);
+    const oldest = messages[0];
+    // The conversation opens at its newest message; the pinned one is far above.
+    await expect(messageBubble(page, messages.at(-1)!.id)).toBeVisible();
+    await expect(messageBubble(page, oldest.id)).not.toBeInViewport();
+
+    const highlightOf = (id: string) =>
+      page.waitForFunction(
+        (messageId) =>
+          document
+            .querySelector(`[data-message-id="${messageId}"]`)
+            ?.classList.contains("chat-msg-area__msg--highlight") === true,
+        id,
+      );
+    const openPinned = list.getByRole("button", { name: /^Ir para a mensagem de / });
+    const deepLink = `/chat/channel/${targetId}?message=${encodeURIComponent(oldest.id)}`;
+
+    const firstJump = highlightOf(oldest.id);
+    await openPinned.click();
+    await expect(page).toHaveURL(deepLink);
+    await firstJump;
+    await expect(messageBubble(page, oldest.id)).toBeInViewport();
+    await expect(panel).toBeVisible();
+
+    // The reader goes back down with the conversation's own control; the URL
+    // still names the pinned message.
+    await page.getByTitle("Ir para o final").click();
+    await expect(messageBubble(page, messages.at(-1)!.id)).toBeInViewport();
+    await expect(messageBubble(page, oldest.id)).not.toBeInViewport();
+    await expect(page).toHaveURL(deepLink);
+
+    // Same pin, same URL: a new request all the same.
+    const secondJump = highlightOf(oldest.id);
+    await openPinned.click();
+    await secondJump;
+    await expect(messageBubble(page, oldest.id)).toBeInViewport();
+    await expect(page).toHaveURL(deepLink);
+  });
+
+  test("desafixa sem navegar, com progresso no item e convergência sem recarregar", async ({
+    page,
+  }, testInfo) => {
+    const { targetId, scenario, messages } = pinnedChannel(testInfo, "pins-unpin", { pinned: 3 });
+    await installMessagingMocks(page, scenario);
+    let releaseDelete!: () => void;
+    const deleteGate = new Promise<void>((resolve) => {
+      releaseDelete = resolve;
+    });
+    await page.route(`**/api/chat/channels/${targetId}/messages/*/pin`, async (route) => {
+      if (route.request().method() === "DELETE") await deleteGate;
+      await route.fallback();
+    });
+    const { list } = await openPins(page, targetId);
+    await page.evaluate(() => {
+      (window as unknown as { __pinsE2EMarker: boolean }).__pinsE2EMarker = true;
+    });
+    const second = list.getByRole("listitem").filter({ hasText: "Mensagem número 2" });
+
+    await second.getByRole("button", { name: /^Desafixar mensagem de / }).click();
+
+    const pending = second.getByRole("button", { name: /^Desafixando mensagem de / });
+    await expect(pending).toHaveAttribute("aria-disabled", "true");
+    await expect(list.getByRole("listitem")).toHaveCount(3);
+    await expect(page).toHaveURL(`/chat/channel/${targetId}`);
+
+    releaseDelete();
+    await expect(list.getByRole("listitem")).toHaveCount(2);
+    await expect(list.getByText("Mensagem número 2")).toHaveCount(0);
+    expect(scenario.requests.pins).toEqual([
+      { messageId: messages[1].id, targetId, action: "remove" },
+    ]);
+    await expect(page).toHaveURL(`/chat/channel/${targetId}`);
+    expect(
+      await page.evaluate(
+        () => (window as unknown as { __pinsE2EMarker?: boolean }).__pinsE2EMarker,
+      ),
+    ).toBe(true);
+  });
+
+  test("não rouba o foco de volta quando o leitor clica em texto durante o desafixar", async ({
+    page,
+  }, testInfo) => {
+    const { targetId, scenario } = pinnedChannel(testInfo, "pins-focus-away", { pinned: 3 });
+    await installMessagingMocks(page, scenario);
+    let releaseDelete!: () => void;
+    const deleteGate = new Promise<void>((resolve) => {
+      releaseDelete = resolve;
+    });
+    await page.route(`**/api/chat/channels/${targetId}/messages/*/pin`, async (route) => {
+      if (route.request().method() === "DELETE") await deleteGate;
+      await route.fallback();
+    });
+    const { panel, list } = await openPins(page, targetId);
+    const rowOf = (n: number) =>
+      list.getByRole("listitem").filter({ hasText: `Mensagem número ${n}` });
+
+    await rowOf(2)
+      .getByRole("button", { name: /^Desafixar mensagem de / })
+      .click();
+    const pending = rowOf(2).getByRole("button", { name: /^Desafixando mensagem de / });
+    await expect(pending).toBeFocused();
+
+    // Plain text: the click drops focus with no destination while the row is
+    // still on screen — the reader let go, the removal did not take it.
+    await panel.getByRole("heading", { name: "Mensagens fixadas" }).click();
+    await expect(pending).not.toBeFocused();
+    await expect(pending).toBeVisible();
+
+    releaseDelete();
+    await expect(list.getByRole("listitem")).toHaveCount(2);
+
+    for (const button of await list.getByRole("button").all()) {
+      await expect(button).not.toBeFocused();
+    }
+  });
+
+  test("funciona por teclado: navega, desafixa e mantém o foco previsível", async ({
+    page,
+  }, testInfo) => {
+    const { targetId, scenario, messages } = pinnedChannel(testInfo, "pins-keyboard", {
+      pinned: 3,
+    });
+    await installMessagingMocks(page, scenario);
+    const { list } = await openPins(page, targetId);
+    const rows = list.getByRole("listitem");
+    const firstOpen = rows.nth(0).getByRole("button", { name: /^Ir para a mensagem de / });
+
+    // Tab from the panel's first control until the first pin is reached.
+    for (let step = 0; step < 40; step += 1) {
+      if (await firstOpen.evaluate((element) => element === document.activeElement)) break;
+      await page.keyboard.press("Tab");
+    }
+    await expect(firstOpen).toBeFocused();
+    await page.keyboard.press("Enter");
+    const deepLink = `/chat/channel/${targetId}?message=${encodeURIComponent(messages[0].id)}`;
+    await expect(page).toHaveURL(deepLink);
+
+    await page.keyboard.press("Tab");
+    const firstUnpin = rows.nth(0).getByRole("button", { name: /^Desafixar mensagem de / });
+    await expect(firstUnpin).toBeFocused();
+    await page.keyboard.press("Enter");
+
+    await expect(rows).toHaveCount(2);
+    await expect(page).toHaveURL(deepLink);
+    // The row that took the removed one's place has focus, not <body>.
+    await expect(
+      rows.nth(0).getByRole("button", { name: /^Ir para a mensagem de / }),
+    ).toBeFocused();
+    await expect(rows.nth(0)).toContainText("Mensagem número 2");
+  });
+
+  test("mostra o estado vazio real para um canal sem mensagens fixadas", async ({
+    page,
+  }, testInfo) => {
+    captureBrowserErrors(page);
+    const { targetId, scenario } = pinnedChannel(testInfo, "pins-empty", { total: 1, pinned: 0 });
+    await installMessagingMocks(page, scenario);
+    const { panel } = await openPins(page, targetId);
+
+    await expect(panel.getByTestId("chat-details-pin-empty")).toHaveText(
+      "Nenhuma mensagem fixada neste canal.",
+    );
+    await expect(panel.getByRole("list", { name: "Mensagens fixadas" })).toHaveCount(0);
+    await expect(panel.getByRole("button", { name: /Ver todos Mensagens fixadas/ })).toHaveCount(0);
+    expectNoUnexpectedBrowserErrors(page);
+  });
+
+  test("mostra o marcador de mensagem removida para um pin cuja mensagem foi apagada", async ({
+    page,
+  }, testInfo) => {
+    captureBrowserErrors(page);
+    const { targetId, scenario } = pinnedChannel(testInfo, "pins-removed", {
+      pinned: 2,
+      removed: true,
+    });
+    await installMessagingMocks(page, scenario);
+    const { list } = await openPins(page, targetId);
+
+    await expect(list.getByRole("listitem")).toHaveCount(2);
+    await expect(list.getByRole("listitem").nth(0)).toContainText("Mensagem removida.");
+    await expect(list.getByRole("listitem").nth(1)).toContainText("Mensagem número 2");
+    expectNoUnexpectedBrowserErrors(page);
+  });
+
+  test("converge em tempo real quando outra pessoa fixa e desafixa", async ({ page }, testInfo) => {
+    const { targetId, scenario, messages } = pinnedChannel(testInfo, "pins-realtime", {
+      total: 3,
+      pinned: 1,
+    });
+    await installMessagingMocks(page, scenario);
+    const { list } = await openPins(page, targetId);
+    await expect(list.getByRole("listitem")).toHaveCount(1);
+
+    await emitPinUpdated(page, scenario, {
+      kind: "channel",
+      targetId,
+      messageId: messages[2].id,
+      pinned: true,
+    });
+    await expect(list.getByRole("listitem")).toHaveCount(2);
+    await expect(list.getByText("Mensagem número 3")).toBeVisible();
+
+    await emitPinUpdated(page, scenario, {
+      kind: "channel",
+      targetId,
+      messageId: messages[0].id,
+      pinned: false,
+    });
+    await expect(list.getByRole("listitem")).toHaveCount(1);
+    await expect(list.getByText("Mensagem número 1")).toHaveCount(0);
   });
 });

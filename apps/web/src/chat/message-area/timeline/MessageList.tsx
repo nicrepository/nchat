@@ -62,6 +62,8 @@ export interface MessageListProps {
   emojiUsage: EmojiUsage;
   onEmojiToneChange: (tone: number) => void;
   focusMessageId?: string;
+  /** Issue #896: which request asked for focusMessageId. */
+  focusRequest?: string;
   /** #492: `${kind}:${targetId}` — keys the per-conversation viewport anchor. */
   conversationKey: string;
   /** #492: the sidebar's unread_count for this target as of opening it. */
@@ -87,6 +89,7 @@ export default function MessageList(props: MessageListProps) {
     unreadCountAtOpen,
     initialAnchor,
     focusMessageId,
+    focusRequest,
     onCaptureAnchor,
     onReachedBottom,
   } = props;
@@ -116,6 +119,7 @@ export default function MessageList(props: MessageListProps) {
     unreadCountAtOpen,
     initialAnchor,
     focusMessageId,
+    focusRequest,
     onLoadMore,
     onCaptureAnchor,
     onReachedBottom,

@@ -45,6 +45,8 @@ export interface ConversationViewportInput {
   initialAnchor: ViewportAnchor | null;
   /** A `?message=` deep link. */
   focusMessageId?: string;
+  /** Which request asked for it, so asking again travels again (issue #896). */
+  focusRequest?: string;
   onLoadMore: () => void;
   onCaptureAnchor: (key: string, anchor: ViewportAnchor) => void;
   onReachedBottom: () => void;
@@ -177,6 +179,7 @@ export function useConversationViewport(input: ConversationViewportInput): Conve
     core,
     input.messages,
     input.focusMessageId,
+    input.focusRequest,
   );
 
   useInfiniteTop(core, input.hasMore, input.onLoadMore);
