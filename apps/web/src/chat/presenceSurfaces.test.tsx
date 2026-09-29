@@ -288,7 +288,6 @@ function renderDetails() {
         kind="channel"
         state={detailsState()}
         currentUserId="user-self"
-        latestPin={null}
         onClose={() => {}}
       />
     </MemoryRouter>,
@@ -386,7 +385,6 @@ describe("group participant roster follows presence", () => {
             reload: () => {},
           }}
           currentUserId="user-self"
-          latestPin={null}
           openDM={openDM}
           onClose={() => {}}
         />
@@ -492,7 +490,6 @@ describe("one presence for one person", () => {
           kind="channel"
           state={detailsStateFor("user-juliane")}
           currentUserId="user-self"
-          latestPin={null}
           onClose={() => {}}
         />
         <HeaderDM

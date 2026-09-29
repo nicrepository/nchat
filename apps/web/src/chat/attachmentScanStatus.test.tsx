@@ -105,7 +105,6 @@ function renderPanel(files: ChannelAttachment[]) {
       kind="channel"
       state={panelState(files)}
       currentUserId={currentUserId}
-      latestPin={null}
       onClose={vi.fn()}
     />,
   );
@@ -250,7 +249,6 @@ function LivePanel({ onReady }: { onReady: (reload: () => void) => void }) {
       kind="channel"
       state={state}
       currentUserId={currentUserId}
-      latestPin={null}
       onClose={vi.fn()}
     />
   );

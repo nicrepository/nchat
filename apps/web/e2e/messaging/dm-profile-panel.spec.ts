@@ -102,7 +102,7 @@ test.describe("painel de perfil em DM 1:1", () => {
     await expect(panel.getByRole("heading", { name: /Participantes/ })).toHaveCount(0);
     await expect(panel.getByRole("heading", { name: /Membros online/ })).toHaveCount(0);
     await expect(panel.getByRole("heading", { name: "Arquivos recentes" })).toHaveCount(0);
-    await expect(panel.getByRole("heading", { name: "Mensagem fixada" })).toHaveCount(0);
+    await expect(panel.getByRole("heading", { name: "Mensagens fixadas" })).toHaveCount(0);
     await expect(panel.getByText("nao-deve-aparecer.pdf")).toHaveCount(0);
     await expect(panel.getByText(/Canal público/)).toHaveCount(0);
     await expect(panel.getByTestId("chat-details-group-name")).toHaveCount(0);

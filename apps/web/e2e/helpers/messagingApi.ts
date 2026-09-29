@@ -1075,6 +1075,52 @@ export async function emitConversationEvent(
 }
 
 /**
+ * Simulates the server's pin.updated broadcast (RF-05, issue #896): somebody
+ * else pinned or unpinned a message. The scenario's pin store is changed
+ * first, so the client's authoritative refetch of GET .../pins finds exactly
+ * what the real backend would have persisted before publishing.
+ */
+export async function emitPinUpdated(
+  page: Page,
+  scenario: MessagingScenario,
+  options: { kind: TargetKind; targetId: string; messageId: string; pinned: boolean },
+) {
+  const key = targetKey(options.kind, options.targetId);
+  const pinned = scenario.pinnedIds.get(key) ?? new Set<string>();
+  scenario.pinnedIds.set(key, pinned);
+  if (options.pinned) pinned.add(options.messageId);
+  else pinned.delete(options.messageId);
+  await page.waitForFunction(
+    ({ kind, targetId }) =>
+      (
+        window as unknown as {
+          __e2eHasSubscription?: (kind: string, targetId: string) => boolean;
+        }
+      ).__e2eHasSubscription?.(kind, targetId) === true,
+    { kind: options.kind, targetId: options.targetId },
+  );
+  await page.evaluate(
+    ({ kind, targetId, messageId, pinned }) => {
+      (
+        window as unknown as {
+          __e2eEmitWebSocketEvent: (event: Record<string, unknown>) => void;
+        }
+      ).__e2eEmitWebSocketEvent({
+        schema_version: 1,
+        type: "pin.updated",
+        workspace_id: "e2e-workspace",
+        target_type: kind,
+        target_id: targetId,
+        message_id: messageId,
+        pin: { message_id: messageId, actor_user_id: "e2e-other-actor", pinned },
+        event_id: `${messageId}-pin-${pinned}`,
+      });
+    },
+    { ...options },
+  );
+}
+
+/**
  * Makes a conversation subscribable for this session, as the server does once
  * the membership row is committed. Pair it with any fixture change that adds a
  * conversation after the mocks were installed.

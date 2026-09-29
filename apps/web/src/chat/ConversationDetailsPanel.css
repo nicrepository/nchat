@@ -619,12 +619,17 @@
   overflow-wrap: anywhere;
 }
 
-/* ── Pinned message ─────────────────────────────────────────────────────── */
+/* ── Pinned messages (issue #896) ──────────────────────────────────────── */
 
+/* The row is the positioning context for its navigation button's stretch
+   below, which is what makes the whole card activatable without putting the
+   body — possibly a list or a code block — inside a <button>. */
 .chat-details__pin {
+  position: relative;
   display: flex;
+  align-items: flex-start;
   gap: 10px;
-  margin-top: 10px;
+  min-width: 0;
   padding: 10px 12px;
   border: 1px solid var(--color-border, #e8e3f0);
   border-radius: var(--radius-md, 10px);
@@ -638,21 +643,109 @@
 }
 
 .chat-details__pin-text {
+  flex: 1;
   min-width: 0;
 }
 
+/* A compact preview: three lines at most, and long unbroken content wraps
+   inside the panel instead of widening it. */
 .chat-details__pin-body {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
   font-size: 13px;
   line-height: 1.45;
   color: var(--color-ink, #16121f);
-  /* Long unbroken content must wrap inside the panel, never widen it. */
   overflow-wrap: anywhere;
 }
 
-.chat-details__pin-by {
+.chat-details__pin-body pre {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.chat-details__pin-open {
+  display: block;
   margin-top: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
   font-size: 11px;
   color: var(--color-muted, #7c7390);
+  text-align: start;
+  cursor: pointer;
+}
+
+/* The stretch: the button's hit area and focus ring cover the whole row. The
+   ring is drawn inside the row so the expanded list's scroll container never
+   clips it. */
+.chat-details__pin-open::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: var(--radius-md, 10px);
+}
+
+.chat-details__pin-open:hover::after {
+  box-shadow: inset 0 0 0 1px var(--color-primary, #6d28d9);
+}
+
+.chat-details__pin-open:focus-visible {
+  outline: none;
+}
+
+.chat-details__pin-open:focus-visible::after {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: -2px;
+}
+
+/* Above the stretch, so a press here unpins and never navigates. Same box as
+   the member removal control: 36px drawn, inside a row taller than 44px. */
+.chat-details__pin-unpin {
+  position: relative;
+  z-index: 1;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  margin: -6px -6px -6px 0;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  color: var(--color-muted, #7c7390);
+  cursor: pointer;
+}
+
+.chat-details__pin-unpin .material-symbols-outlined {
+  font-size: 20px;
+}
+
+.chat-details__pin-unpin:hover:not([aria-disabled="true"]) {
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary, #6d28d9);
+}
+
+.chat-details__pin-unpin:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+/* In flight. Not `disabled`, which would drop focus to <body> mid-request. */
+.chat-details__pin-unpin[aria-disabled="true"] {
+  cursor: progress;
+  opacity: 0.72;
+}
+
+/* The empty state takes focus when the last pin is unpinned; it is text, so the
+   ring is the UA's and only for keyboard focus. */
+.chat-details__empty:focus:not(:focus-visible) {
+  outline: none;
 }
 
 /* ── Files ──────────────────────────────────────────────────────────────── */

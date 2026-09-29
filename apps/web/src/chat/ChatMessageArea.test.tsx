@@ -8787,12 +8787,16 @@ describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
 
     await userEvent.click(detailsToggle());
 
+    // One usePins instance: the bar shows its latest pin, the panel the whole
+    // collection in the server's order (issue #896).
     const bar = await screen.findByTestId("chat-pins");
-    const card = await screen.findByTestId("chat-details-pin");
+    const list = await screen.findByRole("list", { name: "Mensagens fixadas" });
     expect(bar).toHaveTextContent("pin recente");
-    expect(card).toHaveTextContent("pin recente");
     expect(bar).not.toHaveTextContent("pin antigo");
-    expect(card).not.toHaveTextContent("pin antigo");
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveTextContent("pin antigo");
+    expect(rows[1]).toHaveTextContent("pin recente");
   });
 
   it("updates the bar and the panel together after an unpin", async () => {
@@ -8809,7 +8813,7 @@ describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
     renderChannelAreaForUser();
     await screen.findByTestId("chat-msg-bubble");
     await userEvent.click(detailsToggle());
-    await screen.findByTestId("chat-details-pin");
+    await screen.findByRole("list", { name: "Mensagens fixadas" });
 
     await userEvent.click(
       within(screen.getByTestId("chat-pins")).getByRole("button", { name: "Desafixar mensagem" }),
@@ -8834,6 +8838,273 @@ describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
       expect.any(Number),
       expect.any(AbortSignal),
     );
+  });
+});
+
+// ── Mensagens fixadas no painel de detalhes (issue #896) ─────────────────────
+
+describe("ChatMessageArea — mensagens fixadas no painel (#896)", () => {
+  function LocationProbe() {
+    const location = useLocation();
+    return <span data-testid="location">{`${location.pathname}${location.search}`}</span>;
+  }
+
+  function renderWithLocation() {
+    return render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <>
+                <ParentWithContext ctx={{ currentUserId: "me-123", channels: [], dms: [] }} />
+                <LocationProbe />
+              </>
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  function pinned(id: string, bodyText: string, pinnedAt = "2026-07-15T12:00:00.000Z") {
+    return {
+      message: makeMessage({ id, senderDisplayName: "Bruno", bodyText }),
+      pinnedByUserId: "u2",
+      pinnedAt,
+    };
+  }
+
+  function pinsList() {
+    return screen.findByRole("list", { name: "Mensagens fixadas" });
+  }
+
+  function lastWSOptions() {
+    const call = vi.mocked(useChatWebSocket).mock.lastCall;
+    if (!call) throw new Error("useChatWebSocket was never called");
+    return call[0];
+  }
+
+  it("opens the panel from the pins already loaded, without fetching them again", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchPins.mockResolvedValue([pinned("m-a", "primeiro")]);
+    renderWithLocation();
+    await screen.findByTestId("chat-pins");
+    const requestsBefore = mockFetchPins.mock.calls.length;
+
+    await userEvent.click(detailsToggle());
+
+    expect(await pinsList()).toHaveTextContent("primeiro");
+    expect(mockFetchPins.mock.calls.length).toBe(requestsBefore);
+  });
+
+  it("navigates to the pinned message through the conversation's deep link", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchPins.mockResolvedValue([pinned("m/a b", "primeiro")]);
+    renderWithLocation();
+    await screen.findByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+    const list = await pinsList();
+
+    await userEvent.click(
+      within(list).getByRole("button", { name: /^Ir para a mensagem de Bruno/ }),
+    );
+
+    expect(screen.getByTestId("location")).toHaveTextContent("/chat/channel/geral?message=m%2Fa+b");
+    // Same conversation, panel still open: navigating is not closing.
+    expect(screen.getByTestId("chat-conversation-details")).toBeInTheDocument();
+  });
+
+  it("travels to the same pinned message again on a second activation", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m-a", bodyText: "fixada" }), makeMessage({ id: "m-b" })]),
+    );
+    mockFetchPins.mockResolvedValue([pinned("m-a", "fixada")]);
+    renderWithLocation();
+    await screen.findAllByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+    const list = await pinsList();
+    const target = () => document.querySelector('[data-message-id="m-a"]');
+    const open = () => within(list).getByRole("button", { name: /^Ir para a mensagem de Bruno/ });
+
+    await userEvent.click(open());
+    await waitFor(() => expect(target()).toHaveClass("chat-msg-area__msg--highlight"));
+    // The highlight ends; the URL still names m-a.
+    await waitFor(() => expect(target()).not.toHaveClass("chat-msg-area__msg--highlight"), {
+      timeout: 3_000,
+    });
+    expect(screen.getByTestId("location")).toHaveTextContent("?message=m-a");
+
+    await userEvent.click(open());
+
+    await waitFor(() => expect(target()).toHaveClass("chat-msg-area__msg--highlight"));
+    expect(screen.getByTestId("location")).toHaveTextContent("/chat/channel/geral?message=m-a");
+  });
+
+  it("does not move focus when a pin whose unpin was refused later leaves by realtime", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockUnpinMessage.mockRejectedValueOnce(new Error("forbidden"));
+    mockFetchPins
+      .mockResolvedValueOnce([pinned("m-a", "primeiro"), pinned("m-b", "segundo")])
+      .mockResolvedValue([pinned("m-b", "segundo")]);
+    renderWithLocation();
+    await screen.findByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+    const list = await pinsList();
+    const unpinFirst = () =>
+      within(within(list).getAllByRole("listitem")[0]).getByRole("button", {
+        name: /^Desafixar mensagem de Bruno/,
+      });
+
+    await userEvent.click(within(list).getAllByRole("button", { name: /^Desafixar mensagem/ })[0]);
+
+    // Refused: said so, released, still listed, focus where the reader left it.
+    expect(await screen.findByText("Não foi possível desafixar a mensagem.")).toBeVisible();
+    await waitFor(() => expect(unpinFirst()).not.toHaveAttribute("aria-disabled"));
+    expect(list).toHaveTextContent("primeiro");
+    expect(unpinFirst()).toHaveFocus();
+
+    // Someone else unpins it; the realtime reload removes the row under focus.
+    act(() =>
+      lastWSOptions().onPinUpdated?.({
+        type: "pin.updated",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m-a",
+        pin: { message_id: "m-a", actor_user_id: "u2", pinned: false },
+      }),
+    );
+    await waitFor(() => expect(within(list).getAllByRole("listitem")).toHaveLength(1));
+
+    for (const button of within(list).getAllByRole("button")) {
+      expect(button).not.toHaveFocus();
+    }
+    expect(mockUnpinMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the list and offers a retry when the read after an unpin fails", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchPins
+      .mockResolvedValueOnce([pinned("m-a", "primeiro")])
+      .mockRejectedValueOnce(new Error("pins indisponível"))
+      .mockResolvedValue([]);
+    renderWithLocation();
+    await screen.findByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+    const list = await pinsList();
+
+    await userEvent.click(
+      within(list).getByRole("button", { name: /^Desafixar mensagem de Bruno/ }),
+    );
+
+    expect(
+      await screen.findByText("Não foi possível atualizar as mensagens fixadas."),
+    ).toBeVisible();
+    expect(list).toHaveTextContent("primeiro");
+    // Not reported as a failed unpin, and not left pending.
+    expect(screen.queryByText("Não foi possível desafixar a mensagem.")).not.toBeInTheDocument();
+    expect(
+      within(list).getByRole("button", { name: /^Desafixar mensagem de Bruno/ }),
+    ).not.toHaveAttribute("aria-disabled");
+
+    await userEvent.click(screen.getByRole("button", { name: "Tentar novamente" }));
+
+    expect(await screen.findByTestId("chat-details-pin-empty")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Não foi possível atualizar as mensagens fixadas."),
+    ).not.toBeInTheDocument();
+    expect(mockUnpinMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("unpins without navigating and converges on the authoritative reload", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchPins
+      .mockResolvedValueOnce([pinned("m-a", "primeiro"), pinned("m-b", "segundo")])
+      .mockResolvedValue([pinned("m-b", "segundo")]);
+    renderWithLocation();
+    await screen.findByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+    const list = await pinsList();
+
+    const unpin = within(list).getAllByRole("button", { name: /^Desafixar mensagem de Bruno/ });
+    await userEvent.click(unpin[0]);
+
+    expect(mockUnpinMessage).toHaveBeenCalledWith({ kind: "channel", id: "geral" }, "m-a");
+    await waitFor(() => expect(within(list).getAllByRole("listitem")).toHaveLength(1));
+    expect(list).toHaveTextContent("segundo");
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/chat\/channel\/geral$/);
+  });
+
+  it("converges on a pin.updated event without a page reload", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchPins
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([pinned("m-a", "fixado por outra pessoa")]);
+    renderWithLocation();
+    await screen.findByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+    expect(await screen.findByTestId("chat-details-pin-empty")).toBeInTheDocument();
+
+    act(() =>
+      lastWSOptions().onPinUpdated?.({
+        type: "pin.updated",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m-a",
+        pin: { message_id: "m-a", actor_user_id: "u2", pinned: true },
+      }),
+    );
+
+    expect(await pinsList()).toHaveTextContent("fixado por outra pessoa");
+  });
+
+  it("re-reads the pins when the subscription comes back after a reconnect", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchPins
+      .mockResolvedValueOnce([pinned("m-a", "antes da queda")])
+      .mockResolvedValue([pinned("m-b", "depois da queda")]);
+    renderWithLocation();
+    await screen.findByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+    expect(await pinsList()).toHaveTextContent("antes da queda");
+
+    act(() =>
+      wsMockState.capturedSubscribed?.({
+        type: "subscribed",
+        operation: "subscribe",
+        target_type: "channel",
+        target_id: "geral",
+      }),
+    );
+
+    await waitFor(async () => expect(await pinsList()).toHaveTextContent("depois da queda"));
+    expect(await pinsList()).not.toHaveTextContent("antes da queda");
+  });
+
+  it("never shows the previous channel's pins after a switch, even when they answer late", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    let resolveGeral!: (value: unknown[]) => void;
+    mockFetchPins.mockImplementation((target: { id: string }) =>
+      target.id === "geral"
+        ? new Promise<unknown[]>((resolve) => {
+            resolveGeral = resolve;
+          })
+        : Promise.resolve([pinned("m-outro", "pin do outro canal")]),
+    );
+    renderChannelSwitcher();
+    await screen.findByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+    expect(await screen.findByText("Carregando mensagens fixadas…")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "ir para outro canal" }));
+    expect(await pinsList()).toHaveTextContent("pin do outro canal");
+
+    await act(async () => resolveGeral([pinned("m-geral", "pin do geral")]));
+
+    expect(screen.queryByText("pin do geral")).not.toBeInTheDocument();
+    expect(await pinsList()).toHaveTextContent("pin do outro canal");
   });
 });
 
@@ -9081,12 +9352,13 @@ describe("ChatMessageArea — painel de detalhes do grupo (#441)", () => {
 
     await userEvent.click(groupToggle());
 
-    // One usePins instance, one selectLatestPin result, shared by both surfaces.
+    // One usePins instance shared by both surfaces: the bar's latest pin, the
+    // panel's collection (issue #896).
     const bar = await screen.findByTestId("chat-pins");
-    const card = await screen.findByTestId("chat-details-pin");
+    const list = await screen.findByRole("list", { name: "Mensagens fixadas" });
     expect(bar).toHaveTextContent("pin recente");
-    expect(card).toHaveTextContent("pin recente");
-    expect(card).not.toHaveTextContent("pin antigo");
+    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
+    expect(list).toHaveTextContent("pin recente");
   });
 
   it("keeps the group section rendered when only the files request fails", async () => {

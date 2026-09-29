@@ -39,7 +39,7 @@ import type { MessagePriorityIntent } from "./messagePriority";
 import type { MentionType } from "./richTextMarkers";
 import { fetchAllowedReactionEmojis } from "./chatApi";
 import { usePendingReference } from "./usePendingReference";
-import { useConversationTarget } from "./useConversationTarget";
+import { useConversationTarget, withMessageJump } from "./useConversationTarget";
 import { useEmojiUsage } from "./emoji/useEmojiUsage";
 import { useMessages, type SendResult } from "./useMessages";
 import { useLatestRef } from "./messages/useLatestRef";
@@ -157,11 +157,43 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   );
 
   const pinTarget = useMemo(() => (targetId ? { kind, id: targetId } : null), [kind, targetId]);
-  const { pins, pinnedIds, error: pinError, togglePin, reload: reloadPins } = usePins(pinTarget);
-  // One selector, one list, one result: the bar above the conversation and the
-  // details panel are handed the same object, so a pin/unpin updates both at
-  // once and neither can show a message the other does not.
+  const {
+    collection: pinCollection,
+    pins,
+    pinnedIds,
+    pendingIds: pendingPinIds,
+    error: pinError,
+    togglePin,
+    reload: reloadPins,
+  } = usePins(pinTarget);
+  // One list, one instance: the bar shows its latest pin, the details panel the
+  // whole collection (issue #896), so a pin/unpin updates both at once.
   const latestPin = useMemo(() => selectLatestPin(pins), [pins]);
+  // A pinned row opens its message through the RF-09 deep link — the same
+  // `?message=` the timeline already follows, loading history when needed —
+  // on this conversation's own path, keeping any other query and the state.
+  // Marked as a jump request, so opening the same pin again travels again.
+  const openPinnedMessage = useCallback(
+    (messageId: string) => {
+      const search = new URLSearchParams(location.search);
+      search.set("message", messageId);
+      navigate(`${location.pathname}?${search.toString()}`, {
+        state: withMessageJump(location.state),
+      });
+    },
+    [location.pathname, location.search, location.state, navigate],
+  );
+  const pinnedMessages = useMemo(
+    () => ({
+      conversationKey: `${kind}:${targetId}`,
+      collection: pinCollection,
+      pendingIds: pendingPinIds,
+      onNavigate: openPinnedMessage,
+      onUnpin: (messageId: string) => togglePin(messageId, false),
+      onRetry: reloadPins,
+    }),
+    [kind, targetId, pinCollection, pendingPinIds, openPinnedMessage, togglePin, reloadPins],
+  );
 
   const detailsToggleRef = useRef<HTMLButtonElement>(null);
   const details = useConversationDetailsPanel({
@@ -226,6 +258,8 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     focusMessageId,
     onOwnReactionConfirmed: rememberReaction,
     onPinUpdated: reloadPins,
+    // A pin.updated missed while disconnected is recovered here (issue #896).
+    onSubscriptionReady: reloadPins,
     onTypingUpdated: handleTypingUpdatedFromMessages,
     // Someone added participants to the open conversation (issue #398). The
     // event names nobody, so the only correct response is to refetch — which is
@@ -573,6 +607,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           emojiUsage={emojiUsage}
           onEmojiToneChange={changeEmojiTone}
           focusMessageId={focusMessageId}
+          focusRequest={target.focusRequest}
           conversationKey={anchors.conversationKey}
           unreadCountAtOpen={anchors.unreadCountAtOpen}
           initialAnchor={anchors.initialAnchor}
@@ -648,7 +683,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           kind={details.detailsKind ?? "channel"}
           state={details.detailsState}
           currentUserId={ctx.currentUserId}
-          latestPin={latestPin}
+          pins={pinnedMessages}
           onRename={renameConversation}
           // The very flow a mention and a message author already use, and the
           // very same instance, so the roster cannot acquire a second way — or a

@@ -59,11 +59,43 @@ function conversationName(
   return activeDM?.name ?? "";
 }
 
+/**
+ * Marks a navigation as a request to travel to its `?message=` (issue #896).
+ *
+ * The message id says *where*; this says *that the reader asked again*. Going
+ * to the same message twice leaves the URL identical, so without a mark the
+ * timeline cannot tell a second request from a re-render of the first. The
+ * mark is merged into the state, never replacing it, so a pending reference
+ * the composer holds survives the trip.
+ */
+export function withMessageJump(state: unknown): Record<string, unknown> {
+  const base = typeof state === "object" && state !== null ? state : {};
+  return { ...base, messageJump: true };
+}
+
+/**
+ * The identity of the request behind the current `?message=`: the history
+ * entry's own key when that entry was marked by withMessageJump, "" otherwise.
+ *
+ * "" for an external link and for any navigation that merely keeps the query —
+ * sending a message replaces the entry without the mark — so only a reader's
+ * explicit request can make the timeline travel to a message it already did.
+ */
+function messageJumpRequest(state: unknown, key: string): string {
+  const marked =
+    typeof state === "object" &&
+    state !== null &&
+    (state as Record<string, unknown>).messageJump === true;
+  return marked ? key : "";
+}
+
 export interface ConversationTarget {
   ctx: ChatOutletContext;
   targetId: string;
   /** RF-09 deep link: the message the route asks the timeline to reveal. */
   focusMessageId: string;
+  /** Which request asked for it; see messageJumpRequest. */
+  focusRequest: string;
   /** The sidebar's row for this DM; undefined for a channel or an unknown id. */
   activeDM: DMConversation | undefined;
   resolvedName: string;
@@ -93,6 +125,7 @@ export function useConversationTarget(kind: "channel" | "dm"): ConversationTarge
     ctx,
     targetId,
     focusMessageId,
+    focusRequest: messageJumpRequest(location.state, location.key),
     activeDM,
     resolvedName,
     isChannel,

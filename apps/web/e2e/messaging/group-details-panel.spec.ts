@@ -11,6 +11,7 @@ import {
   groupDetailsFixture,
   installMessagingMocks,
   makeMessage,
+  messageBubble,
   uniqueId,
 } from "../helpers/messagingApi";
 
@@ -520,6 +521,67 @@ test.describe("painel de detalhes do grupo", () => {
     // fluxo real, e esta fixture não concede a permissão, então a ação fica
     // ausente — o padrão seguro. O fluxo em si é coberto por add-members.spec.ts.
     await expect(panel.getByTestId("chat-details-add-members")).toHaveCount(0);
+  });
+
+  // ── ISSUE #896: mensagens fixadas do grupo ─────────────────────────────
+  //
+  // O grupo usa os mesmos endpoints de pin de uma DM e a mesma seção do canal;
+  // o que se prova aqui é que a coleção, o deep link e o desafixar operam sobre
+  // a conversa de grupo (rota /chat/dm/...), não sobre um canal.
+  test("lista as mensagens fixadas do grupo, navega pelo deep link e desafixa", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "grupo-fixadas");
+    const messages = Array.from({ length: 6 }, (_, index) =>
+      makeMessage({
+        id: `${targetId}-m${index + 1}`,
+        sender_id: OTHER_USER_ID,
+        sender_display_name: OTHER_USER_NAME,
+        body_text: `Fixada do grupo ${index + 1}`,
+        created_at: new Date(Date.UTC(2026, 6, 15, 9, index)).toISOString(),
+      }),
+    );
+    const scenario = createScenario({
+      kind: "dm",
+      conversationType: "group",
+      targetId,
+      targetName: "Grupo com Fixadas",
+      messages,
+    });
+    scenario.groupDetails.set(
+      targetId,
+      groupDetailsFixture({ id: targetId, name: "Grupo com Fixadas" }, [
+        { user_id: CURRENT_USER_ID, display_name: CURRENT_USER_NAME, presence: "online" },
+      ]),
+    );
+    scenario.pinnedIds.set(`dm:${targetId}`, new Set(messages.map((message) => message.id)));
+
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/dm/${targetId}`);
+    await page.getByRole("button", { name: "Detalhes do grupo", exact: true }).click();
+    const panel = page.getByRole("complementary", { name: "Detalhes do grupo" });
+    const list = panel.getByRole("list", { name: "Mensagens fixadas" });
+
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    await panel.getByRole("button", { name: /Ver todos Mensagens fixadas/ }).click();
+    await expect(list.getByRole("listitem")).toHaveCount(6);
+
+    const third = list.getByRole("listitem").filter({ hasText: "Fixada do grupo 3" });
+    await third.getByRole("button", { name: /^Ir para a mensagem de / }).click();
+    await expect(page).toHaveURL(
+      `/chat/dm/${targetId}?message=${encodeURIComponent(messages[2].id)}`,
+    );
+    await expect(messageBubble(page, messages[2].id)).toBeInViewport();
+
+    await third.getByRole("button", { name: /^Desafixar mensagem de / }).click();
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    await expect(list.getByText("Fixada do grupo 3")).toHaveCount(0);
+    expect(scenario.requests.pins).toEqual([
+      { messageId: messages[2].id, targetId, action: "remove" },
+    ]);
+    await expect(page).toHaveURL(
+      `/chat/dm/${targetId}?message=${encodeURIComponent(messages[2].id)}`,
+    );
   });
 
   // ── ISSUE #893: renomeação inline do grupo no painel ────────────────────

@@ -57,7 +57,6 @@ import ExpandableDetailsSection, {
   type ExpandableSectionContent,
 } from "./ExpandableDetailsSection";
 import type { ConversationRenameAction } from "./conversationRename";
-import RichTextRenderer from "./RichTextRenderer";
 import type {
   AddMembersResult,
   ChannelAttachment,
@@ -65,9 +64,9 @@ import type {
   ChannelRoster,
   DirectDetails,
   GroupDetails,
-  PinnedItem,
 } from "./chatTypes";
 import ParticipantRow, { type ParticipantRemoval } from "./ParticipantRow";
+import PinnedMessagesSection, { type PinnedMessages } from "./PinnedMessagesSection";
 import RemoveMemberDialog from "./RemoveMemberDialog";
 import { useMemberRemoval, type MemberRemovalFlow } from "./useMemberRemoval";
 import {
@@ -83,7 +82,6 @@ import {
   formatLongDate,
   formatTime,
   initialsFrom,
-  senderLabel,
 } from "./messageDisplay";
 import PresenceDot from "./PresenceDot";
 import { presenceLabel, presenceTargetKey, usePresence, usePresenceTarget } from "./presence";
@@ -972,51 +970,6 @@ function AboutSection({
   );
 }
 
-/** The one pinned message the panel and the bar above the conversation share. */
-function PinnedMessageSection({
-  latestPin,
-  emptyText,
-}: {
-  latestPin: PinnedItem | null;
-  emptyText: string;
-}) {
-  return (
-    <section className="chat-details__section" aria-labelledby="chat-details-pin">
-      <h3 id="chat-details-pin" className="chat-details__label">
-        Mensagem fixada
-      </h3>
-      {latestPin === null ? (
-        <p className="chat-details__empty" data-testid="chat-details-pin-empty">
-          {emptyText}
-        </p>
-      ) : (
-        <div className="chat-details__pin" data-testid="chat-details-pin">
-          <span className="material-symbols-outlined chat-details__pin-icon" aria-hidden="true">
-            push_pin
-          </span>
-          <div className="chat-details__pin-text">
-            <div className="chat-details__pin-body">
-              {latestPin.message.isRemoved ? (
-                <em>Mensagem removida.</em>
-              ) : (
-                <RichTextRenderer
-                  text={latestPin.message.bodyText}
-                  bodyFormat={latestPin.message.bodyFormat}
-                />
-              )}
-            </div>
-            <div className="chat-details__pin-by">
-              {senderLabel(latestPin.message)}
-              {latestPin.pinnedAt &&
-                ` · ${formatDayLabel(latestPin.pinnedAt)}, ${formatTime(latestPin.pinnedAt)}`}
-            </div>
-          </div>
-        </div>
-      )}
-    </section>
-  );
-}
-
 /**
  * The conversation currently described and what this caller may do to it.
  *
@@ -1426,7 +1379,7 @@ function PeopleSection({
 }
 
 /**
- * The body of a channel or group panel: about, people, pin and files.
+ * The body of a channel or group panel: about, people, pins and files.
  *
  * Extracted so the direct variant can be a sibling rather than a set of
  * conditionals threaded through four sections. The conversation vocabulary and
@@ -1442,7 +1395,7 @@ function ConversationBody({
   files,
   roster,
   currentUserId,
-  latestPin,
+  pins,
   reload,
   onRename,
   openDM,
@@ -1453,7 +1406,7 @@ function ConversationBody({
   /** The channel's administrable membership (issue #469). */
   roster: ConversationDetailsState["roster"];
   currentUserId: string;
-  latestPin: PinnedItem | null;
+  pins?: PinnedMessages;
   reload: () => void;
   onRename?: ConversationRenameAction;
   openDM?: DirectMessageAccess;
@@ -1484,7 +1437,15 @@ function ConversationBody({
         reload={reload}
         openDM={openDM}
       />
-      <PinnedMessageSection latestPin={latestPin} emptyText={copy.pinEmpty} />
+      {/* Keyed by the conversation, like the other sections: its expansion and
+          its focus bookkeeping are statements about one conversation's pins. */}
+      {pins && (
+        <PinnedMessagesSection
+          key={`pins-${pins.conversationKey}`}
+          pins={pins}
+          emptyText={copy.pinEmpty}
+        />
+      )}
       <ExpandableDetailsSection
         key={`files-${manageableTarget(details).id}`}
         title="Arquivos recentes"
@@ -1507,11 +1468,15 @@ interface ConversationDetailsPanelProps {
   /** Identifies the viewer by ID; a display name would be ambiguous. */
   currentUserId: string;
   /**
-   * The result of the one pin selector, shared with the bar above the
-   * conversation. Passing the selected item (rather than the list) is what makes
-   * "the bar and the panel show the same message" structural.
+   * The conversation's pins (issue #896): the collection of the one usePins
+   * instance the pinned bar and the timeline also read, plus the actions on it.
+   * The panel never fetches pins itself, so opening it costs no request.
+   *
+   * Absent means the host does not hold this conversation's pins — the
+   * sidebar's row-menu panel — and the section is not drawn at all, rather than
+   * claiming a collection nobody loaded is empty.
    */
-  latestPin: PinnedItem | null;
+  pins?: PinnedMessages;
   /**
    * Renames the conversation this panel describes (issue #893).
    *
@@ -1553,7 +1518,7 @@ export default function ConversationDetailsPanel({
   kind,
   state,
   currentUserId,
-  latestPin,
+  pins,
   onRename,
   openDM,
   onClose,
@@ -1626,7 +1591,7 @@ export default function ConversationDetailsPanel({
             files={files}
             roster={roster}
             currentUserId={currentUserId}
-            latestPin={latestPin}
+            pins={pins}
             reload={state.reload}
             onRename={onRename}
             openDM={openDM}
