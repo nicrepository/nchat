@@ -284,7 +284,6 @@ test.describe("rascunho com anexo", () => {
   test("uma falha preserva reply + texto + anexo para retry sem novo upload", async ({
     page,
   }, testInfo) => {
-    test.fixme(true, "#1003: o ACK do retry atualiza AppShell durante o render de ChatComposer");
     captureBrowserErrors(page, [allowsServiceUnavailable("/api/chat/channels/")]);
     const { scenario, targetId, original, originalText } = await openScenario(
       page,
@@ -323,6 +322,19 @@ test.describe("rascunho com anexo", () => {
     await expect(pendingAttachment(page)).toContainText("retry.pdf");
     expect(scenario.requests.attachmentUploads).toHaveLength(1);
 
+    await surface.otherRow(page).click();
+    await expect(surface.row(page, targetName)).toHaveAttribute("aria-selected", "false");
+    await expect(composerInput(page)).toHaveText("");
+    await expect(composerQuote(page)).toHaveCount(0);
+    await expect(pendingAttachment(page)).toHaveCount(0);
+    await surface.row(page, targetName).click();
+    await expect(surface.row(page, targetName)).toHaveAttribute("aria-selected", "true");
+
+    await expect(composerQuote(page)).toContainText(originalText);
+    await expect(composerInput(page)).toHaveText(draftText);
+    await expect(pendingAttachment(page)).toContainText("retry.pdf");
+    expect(scenario.requests.attachmentUploads).toHaveLength(1);
+
     await sendAndAwaitAck(page, surface, targetId);
 
     expect(postAttempts).toBe(2);
@@ -352,6 +364,7 @@ test.describe("envio em voo sobrevive ao remount do composer", () => {
   test("A → B → A durante o POST: não duplica e converge quando o servidor confirma", async ({
     page,
   }, testInfo) => {
+    captureBrowserErrors(page);
     const { scenario, targetId, original, originalText } = await openScenario(
       page,
       surface,
@@ -416,5 +429,6 @@ test.describe("envio em voo sobrevive ao remount do composer", () => {
     await expect(messageBubble(page, reply!.id)).toContainText(draftText);
     await expectNothingLeftOf(page, surface, targetName, draftText);
     expect(posts).toBe(1);
+    expectNoUnexpectedBrowserErrors(page);
   });
 });

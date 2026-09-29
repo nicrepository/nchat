@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { useLayoutEffect } from "react";
+import { StrictMode, useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
@@ -130,17 +130,19 @@ function Shell({
   );
 }
 
-function mount(onSend: SendFn = async () => ({ status: "sent" })) {
+function mount(onSend: SendFn = async () => ({ status: "sent" }), strictMode = false) {
   let drafts!: ConversationDraftsApi;
   const shell = (conversation: keyof typeof targets) => (
     <Shell conversation={conversation} onSend={onSend} onDrafts={(d) => (drafts = d)} />
   );
-  const view = render(shell(keyA));
+  const renderShell = (conversation: keyof typeof targets) =>
+    strictMode ? <StrictMode>{shell(conversation)}</StrictMode> : shell(conversation);
+  const view = render(renderShell(keyA));
   return {
     getDrafts: () => drafts,
     /** A → B → A, each step a real unmount of the previous composer instance. */
     switchTo: async (conversation: keyof typeof targets) => {
-      view.rerender(shell(conversation));
+      view.rerender(renderShell(conversation));
       await screen.findByTestId("chat-composer-box");
     },
   };
@@ -250,6 +252,55 @@ afterEach(() => {
     configurable: true,
   });
   vi.unstubAllGlobals();
+});
+
+describe("a failed composite send survives the composer remount (issue #1003)", () => {
+  it("retries reply + text + attachment once, without React render-phase errors", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      mockUploadAttachment.mockResolvedValue({ id: "att-retry" });
+      const onSend = vi
+        .fn<SendFn>()
+        .mockRejectedValueOnce(new Error("temporary failure"))
+        .mockResolvedValue({ status: "sent" });
+      const { getDrafts, switchTo } = mount(onSend, true);
+      await screen.findByTestId("chat-composer-file-input");
+      act(() => getDrafts().setReply(keyA, "R1"));
+      await type("retry com o mesmo anexo");
+      const file = new File(["%PDF-1.4"], "retry.pdf", { type: "application/pdf" });
+      fireEvent.change(screen.getByTestId("chat-composer-file-input"), {
+        target: { files: [file] },
+      });
+      await waitFor(() =>
+        expect(screen.getByTestId("chat-composer-pending-attachment")).toHaveTextContent(
+          "Pronto para enviar",
+        ),
+      );
+
+      fireEvent.click(screen.getByTestId("chat-send-btn"));
+      await waitFor(() => expect(onSend).toHaveBeenCalledOnce());
+      await waitFor(() => expect(screen.getByTestId("chat-send-btn")).toBeEnabled());
+
+      await switchTo(keyB);
+      await switchTo(keyA);
+
+      expect(getDrafts().getDraft(keyA)).toMatchObject({ replyToMessageId: "R1" });
+      expect(screen.getByTestId("chat-composer-input")).toHaveTextContent(
+        "retry com o mesmo anexo",
+      );
+      expect(screen.getByTestId("chat-composer-pending-attachment")).toHaveTextContent("retry.pdf");
+
+      fireEvent.click(screen.getByTestId("chat-send-btn"));
+
+      await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(getDrafts().getDraft(keyA)).toBeUndefined());
+      expect(mockUploadAttachment).toHaveBeenCalledOnce();
+      expect(onSend).toHaveBeenLastCalledWith(expect.any(String), ["att-retry"], expect.anything());
+      expect(consoleError).not.toHaveBeenCalled();
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
 });
 
 describe("a finished voice message is draft state (issue #929)", () => {

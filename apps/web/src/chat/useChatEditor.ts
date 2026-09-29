@@ -207,6 +207,7 @@ export function useChatEditor({
 
   const editor = useEditor(
     {
+      immediatelyRender: false,
       extensions,
       editorProps: {
         attributes: {
