@@ -6,8 +6,16 @@ import {
   useRef,
   useState,
   type KeyboardEvent,
+  type RefObject,
 } from "react";
-import { Outlet, useLocation, useNavigate } from "react-router";
+import {
+  Outlet,
+  useLocation,
+  useNavigate,
+  useNavigationType,
+  type NavigateFunction,
+  type NavigationType,
+} from "react-router";
 
 import "./AppShell.css";
 import ChatSidebar, { chatNavigationId } from "./ChatSidebar";
@@ -88,11 +96,12 @@ function detailsTargetName(
 }
 
 /**
- * Hands focus back to whatever opened the sidebar's details panel
- * (issue #467, code quality review).
+ * Hands focus back to whatever opened a surface the shell owns — the sidebar's
+ * details panel (issue #467, code quality review) or the global search
+ * (issue #550).
  *
- * The opener is a sidebar row's "…" trigger, and whether it can still take
- * focus depends on the composition the panel was closed in:
+ * The opener is a control inside the sidebar, and whether it can still take
+ * focus depends on the composition the surface was closed in:
  *
  *  - a column sidebar: the row is right there and takes it;
  *  - a drawer: the row is still mounted and still connected, but the drawer was
@@ -105,10 +114,66 @@ function detailsTargetName(
  * `<body>`. `focus()` on a detached or hidden element is a no-op, never a
  * throw, so neither step needs a guard of its own.
  */
-function restoreDetailsFocus(opener: HTMLElement | null, fallback: HTMLElement | null) {
+function restoreOpenerFocus(opener: HTMLElement | null, fallback: HTMLElement | null) {
   if (opener?.isConnected) opener.focus();
   if (opener && document.activeElement === opener) return;
   fallback?.focus();
+}
+
+/**
+ * Opening the global search and handing focus back when it closes (issue #550).
+ *
+ * The returned function opens the search. What has focus right before is
+ * recorded from the DOM rather than passed in, so the sidebar button and
+ * Ctrl/Cmd+K stay one command with one action. Leaving the search settles it:
+ * only a history pop — Escape or the browser's back — is "closing" the search
+ * and hands focus back; picking a result pushes a new entry, and focus then
+ * belongs to where that result leads.
+ *
+ * Two decisions are taken from shell state, never from timing:
+ *  - already on the search, opening again replaces the entry instead of
+ *    stacking a second one, so a single Escape still leaves; the first opener
+ *    is kept;
+ *  - opened while the drawer is modal, the opener is inside a drawer that the
+ *    navigation itself closes, so focus returns straight to the fallback — even
+ *    while the drawer is still mid-transition and technically focusable.
+ *
+ * Both are read through a ref kept current by an effect, so the function stays
+ * stable and the command registry is not rebuilt on every navigation.
+ */
+function useSearchOpener(
+  { pathname, navigationType, navModal }: SearchShellState,
+  navigate: NavigateFunction,
+  fallbackRef: RefObject<HTMLElement | null>,
+) {
+  // `undefined` means no search is pending; `null`, one whose focus goes to the fallback.
+  const openerRef = useRef<HTMLElement | null | undefined>(undefined);
+  const shellRef = useRef({ pathname, navModal });
+  useEffect(() => {
+    shellRef.current = { pathname, navModal };
+  }, [pathname, navModal]);
+  useEffect(() => {
+    if (pathname === SEARCH_PATH || openerRef.current === undefined) return;
+    const opener = openerRef.current;
+    openerRef.current = undefined;
+    if (navigationType === "POP") restoreOpenerFocus(opener, fallbackRef.current);
+  }, [pathname, navigationType, fallbackRef]);
+  return useCallback(() => {
+    const alreadyOpen = shellRef.current.pathname === SEARCH_PATH;
+    if (!alreadyOpen) openerRef.current = searchOpener(shellRef.current.navModal);
+    navigate(SEARCH_PATH, { replace: alreadyOpen });
+  }, [navigate]);
+}
+
+interface SearchShellState {
+  pathname: string;
+  navigationType: NavigationType;
+  navModal: boolean;
+}
+
+function searchOpener(navModal: boolean): HTMLElement | null {
+  const active = document.activeElement;
+  return !navModal && active instanceof HTMLElement ? active : null;
 }
 
 /**
@@ -258,6 +323,7 @@ function DirectMessageError({ coordinator }: { coordinator: DirectMessageCoordin
 const EMPTY_CHANNELS: Channel[] = [];
 const EMPTY_DMS: DMConversation[] = [];
 const GLOBAL_SHORTCUT_SCOPE = ["global"] as const;
+const SEARCH_PATH = "/chat/search";
 
 /** "/profile" or "/profile/..." gets the settings label; everything else (today, only "/chat/...") gets the chat one. */
 function mainAriaLabel(pathname: string): string {
@@ -319,6 +385,7 @@ export default function AppShell() {
   // here rather than in ChatMessageArea because the target may be a
   // conversation other than the open one, and opening it must not navigate.
   const { pathname } = useLocation();
+  const navigationType = useNavigationType();
   const navigate = useNavigate();
   /*
     Owned here, but deliberately *not* given a lifetime here. The shell outlives
@@ -414,7 +481,11 @@ export default function AppShell() {
     },
     [dismissInAppAlert, navigate],
   );
-  const openSearch = useCallback(() => navigate("/chat/search"), [navigate]);
+  const openSearch = useSearchOpener(
+    { pathname, navigationType, navModal },
+    navigate,
+    navToggleRef,
+  );
   const commandRegistry = useMemo(
     () =>
       createCommandRegistry({
@@ -446,7 +517,7 @@ export default function AppShell() {
   // whichever gesture closed it.
   const closeSidebarDetails = useCallback(() => {
     setSidebarDetails(null);
-    restoreDetailsFocus(detailsOpenerRef.current, navToggleRef.current);
+    restoreOpenerFocus(detailsOpenerRef.current, navToggleRef.current);
     detailsOpenerRef.current = null;
   }, []);
 

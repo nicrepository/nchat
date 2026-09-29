@@ -33,13 +33,49 @@
 
 /* ── Brand ──────────────────────────────────────────────────────────────────── */
 
+/* Brand and the global search share one row (issue #550). The row carries the
+   14px the brand used to own below it, so the CTA underneath does not move. */
+.chat-sidebar__top {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-bottom: 14px;
+}
+
 .chat-sidebar__brand {
+  flex: 1;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 4px 8px 14px;
+  padding: 4px 8px;
   text-decoration: none;
   color: inherit;
+}
+
+/* Icon-only, fixed box: rendering it never reflows the brand beside it. */
+.chat-sidebar__search {
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--cs-sidebar-text);
+  cursor: pointer;
+}
+
+.chat-sidebar__search:hover {
+  background: var(--cs-sidebar-hover);
+  color: #fff;
+}
+
+.chat-sidebar__search:focus-visible {
+  outline: 2px solid var(--cs-primary-soft);
+  outline-offset: 2px;
 }
 
 .chat-sidebar__brand-img {

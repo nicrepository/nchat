@@ -1392,20 +1392,34 @@ export default function ChatSidebar({
         aria-label="Navegação do workspace Nchat"
         data-testid="chat-sidebar"
       >
-        {/* ── Brand ── */}
-        <Link to="/chat" className="chat-sidebar__brand" aria-label="Nchat — Workspace Nic-Labs">
-          <img
-            src="/assets/icononly_transparent.png"
-            alt=""
-            width={30}
-            height={34}
-            className="chat-sidebar__brand-img"
-          />
-          <div className="chat-sidebar__brand-copy">
-            <p className="chat-sidebar__brand-title">Nchat</p>
-            <p className="chat-sidebar__brand-sub">Workspace Nic-Labs</p>
-          </div>
-        </Link>
+        {/* ── Top: brand + global search (issue #550) ──
+          Global actions live at the top. The search button is the brand's
+          sibling, never nested inside its link, and runs the shell's single
+          "search.open" command — the same one Ctrl/Cmd+K runs. */}
+        <div className="chat-sidebar__top">
+          <Link to="/chat" className="chat-sidebar__brand" aria-label="Nchat — Workspace Nic-Labs">
+            <img
+              src="/assets/icononly_transparent.png"
+              alt=""
+              width={30}
+              height={34}
+              className="chat-sidebar__brand-img"
+            />
+            <div className="chat-sidebar__brand-copy">
+              <p className="chat-sidebar__brand-title">Nchat</p>
+              <p className="chat-sidebar__brand-sub">Workspace Nic-Labs</p>
+            </div>
+          </Link>
+          <button
+            type="button"
+            className="chat-sidebar__search"
+            aria-label="Buscar no NChat"
+            title="Buscar"
+            onClick={onOpenSearch}
+          >
+            <IconSearch />
+          </button>
+        </div>
 
         {/* ── New conversation CTA ──
           The sidebar's single creation entry point: the dialog behind it is
@@ -1510,15 +1524,6 @@ export default function ChatSidebar({
 
         {/* ── Footer ── */}
         <div className="chat-sidebar__footer">
-          <button
-            type="button"
-            className="chat-sidebar__footer-item"
-            aria-label="Buscar"
-            onClick={onOpenSearch}
-          >
-            <IconSearch />
-            <span>Buscar</span>
-          </button>
           <Link
             to="/chat/favorites"
             className="chat-sidebar__footer-item"
