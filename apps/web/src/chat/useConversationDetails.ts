@@ -12,6 +12,10 @@
  * (issue #443), and requesting attachments nobody will render would be a
  * request for data the user did not ask for.
  *
+ * The files section is also paginated (issue #897): the first request asks for
+ * the compact preview only, and older pages are fetched on demand through the
+ * same listing, never ahead of time.
+ *
  * Correctness properties this hook owns:
  *  - every request is keyed by the *pair* (kind, id), not by the id alone: a
  *    channel and a conversation are separate id spaces, so keying on the id
@@ -37,7 +41,7 @@ import {
   fetchDirectProfile,
   fetchGroupDetails,
 } from "./chatApi";
-import { fetchConversationAttachments } from "./filesApi";
+import { fetchConversationAttachmentPage, type AttachmentPage } from "./filesApi";
 import { canShowPreview, isPreviewWorkPending } from "./useAttachmentPreview";
 import type { ChannelAttachment, ChannelRoster, ConversationDetails } from "./chatTypes";
 
@@ -56,6 +60,13 @@ export interface ConversationDetailsTarget {
 
 /** How many files the panel previews. The server clamps anything larger. */
 export const channelFilesPreviewLimit = 5;
+
+/**
+ * How many older files one "load more" asks for (issue #897). The listing's own
+ * default: large enough that expanding usually shows a scrolling list at once,
+ * small enough that nobody downloads a channel's history to glance at it.
+ */
+export const filesPageLimit = 20;
 
 // ── Preview reconciliation policy (RF-31, issue #464) ────────────────────────
 //
@@ -137,9 +148,33 @@ export type AsyncSection<T> =
   | { status: "ready"; data: T }
   | { status: "error" };
 
+/** Where the next page of files stands. */
+export type NextPageStatus = "idle" | "loading" | "error";
+
+/**
+ * A next page of files the server says exists (issue #897).
+ *
+ * Present only when the listing returned a cursor, so "there is more" and "here
+ * is how to get it" can never disagree. `load` is a no-op while a request for
+ * this page is already in flight, and a retry after "error".
+ */
+export interface NextFilesPage {
+  status: NextPageStatus;
+  load: () => void;
+}
+
+/**
+ * The recent-files section: `data` is every row loaded so far, newest first,
+ * across however many pages; `next` is absent once nothing older exists.
+ */
+export type FilesSection =
+  | { status: "loading" }
+  | { status: "error" }
+  | { status: "ready"; data: ChannelAttachment[]; next?: NextFilesPage };
+
 export interface ConversationDetailsState {
   details: AsyncSection<ConversationDetails>;
-  files: AsyncSection<ChannelAttachment[]>;
+  files: FilesSection;
   /**
    * A channel's administrable membership (issue #469), loaded only for a
    * caller the server says may change it.
@@ -177,18 +212,35 @@ type Action =
   | { type: "reset" }
   | { type: "details_ready"; details: ConversationDetails }
   | { type: "details_error" }
-  | { type: "files_ready"; files: ChannelAttachment[] }
+  | { type: "files_ready"; page: AttachmentPage }
   | { type: "files_error" }
+  | { type: "files_more_loading"; cursor: string }
+  | { type: "files_more_ready"; cursor: string; page: AttachmentPage }
+  | { type: "files_more_error"; cursor: string }
   | { type: "roster_ready"; roster: ChannelRoster }
   | { type: "roster_error" };
 
 /**
- * The reducer owns the sections only; `reload` is attached by the hook.
- *
- * Keeping the callback out of reducer state is what stops a dispatch from ever
- * replacing it with a stale identity.
+ * The files section as the reducer holds it: the cursor itself, where the public
+ * shape carries the loader built from it.
  */
-type Sections = Omit<ConversationDetailsState, "reload">;
+type FilesState =
+  | { status: "loading" }
+  | { status: "error" }
+  | {
+      status: "ready";
+      data: ChannelAttachment[];
+      next?: { cursor: string; status: NextPageStatus };
+    };
+
+/**
+ * The reducer owns the sections only; `reload` and the files loader are
+ * attached by the hook.
+ *
+ * Keeping the callbacks out of reducer state is what stops a dispatch from ever
+ * replacing them with a stale identity.
+ */
+type Sections = Omit<ConversationDetailsState, "reload" | "files"> & { files: FilesState };
 
 const initialState: Sections = {
   details: { status: "loading" },
@@ -204,15 +256,199 @@ function reducer(state: Sections, action: Action): Sections {
       return { ...state, details: { status: "ready", data: action.details } };
     case "details_error":
       return { ...state, details: { status: "error" } };
-    case "files_ready":
-      return { ...state, files: { status: "ready", data: action.files } };
-    case "files_error":
-      return { ...state, files: { status: "error" } };
     case "roster_ready":
       return { ...state, roster: { status: "ready", data: action.roster } };
     case "roster_error":
       return { ...state, roster: { status: "error" } };
+    default:
+      return { ...state, files: filesReducer(state.files, action) };
   }
+}
+
+/** File transitions also update the request snapshot before React commits. */
+function filesReducer(files: FilesState, action: Action): FilesState {
+  switch (action.type) {
+    case "reset":
+      return initialState.files;
+    case "files_ready":
+      return replaceFiles(files, action.page);
+    case "files_error":
+      return { status: "error" };
+    case "files_more_loading":
+      return withNextStatus(files, action.cursor, "loading");
+    case "files_more_ready":
+      return appendFiles(files, action.cursor, action.page);
+    case "files_more_error":
+      return withNextStatus(files, action.cursor, "error");
+    default:
+      return files;
+  }
+}
+
+/**
+ * A whole list from the server: the first page, a reload or a poll.
+ *
+ * It replaces what was there, which is what lets a new file appear on top and a
+ * removed one disappear without any merging. When the new list ends where the
+ * old one did — the same cursor — the next page's progress is carried over, so a
+ * poll landing while "load more" is in flight neither re-offers that request nor
+ * hides its failure.
+ */
+function replaceFiles(previous: FilesState, page: AttachmentPage): FilesState {
+  const data = uniqueById(page.attachments);
+  if (page.nextCursor === null) return { status: "ready", data };
+  const carried =
+    previous.status === "ready" && previous.next?.cursor === page.nextCursor
+      ? previous.next.status
+      : "idle";
+  return { status: "ready", data, next: { cursor: page.nextCursor, status: carried } };
+}
+
+/**
+ * Keeps the first occurrence of every id, in the server's order.
+ *
+ * A defence of the UI only — the keyset cursor already makes a repeat
+ * impossible on the server — so the row already on screen, in its authoritative
+ * position, is the one kept, and a repeat inside one page is caught as well as
+ * one across pages.
+ */
+function uniqueById(files: readonly ChannelAttachment[]): ChannelAttachment[] {
+  const seen = new Set<string>();
+  return files.filter((file) => {
+    if (seen.has(file.id)) return false;
+    seen.add(file.id);
+    return true;
+  });
+}
+
+/** The loaded rows as a version: every list replacement or append is a new array. */
+function loadedRows(files: FilesState): ChannelAttachment[] | null {
+  return files.status === "ready" ? files.data : null;
+}
+
+/**
+ * The only guard an older page needs: it must continue *this* list.
+ *
+ * A page is requested for one cursor. If the list has since been replaced — a
+ * target switch, or a reload that moved its end — that cursor no longer names
+ * the end of what is on screen, and appending there could repeat or misplace
+ * rows. So the answer is dropped and the current list's own next page is
+ * offered instead.
+ */
+function continuesList(
+  files: FilesState,
+  cursor: string,
+): files is Extract<FilesState, { status: "ready" }> {
+  return files.status === "ready" && files.next?.cursor === cursor;
+}
+
+function withNextStatus(files: FilesState, cursor: string, status: NextPageStatus): FilesState {
+  if (!continuesList(files, cursor)) return files;
+  return { ...files, next: { cursor, status } };
+}
+
+/** Appends an older page in the server's order, deduplicated by id. */
+function appendFiles(files: FilesState, cursor: string, page: AttachmentPage): FilesState {
+  if (!continuesList(files, cursor)) return files;
+  const data = uniqueById([...files.data, ...page.attachments]);
+  if (page.nextCursor === null) return { status: "ready", data };
+  return { status: "ready", data, next: { cursor: page.nextCursor, status: "idle" } };
+}
+
+/**
+ * How many rows a refresh re-reads: everything already on screen, never less
+ * than the compact preview.
+ *
+ * Re-reading the whole loaded window — rather than the first page merged into
+ * older ones — is what keeps a refresh from reinstating a file that was removed
+ * further down, and what lets its cursor describe the list it actually returned.
+ */
+function filesWindow(files: FilesState): number {
+  return files.status === "ready"
+    ? Math.max(channelFilesPreviewLimit, files.data.length)
+    : channelFilesPreviewLimit;
+}
+
+/** Rebuilds only the loaded window, respecting the server's ceiling per page. */
+async function fetchFilesWindow(
+  target: { kind: "channel" | "dm"; id: string },
+  window: number,
+  signal: AbortSignal,
+): Promise<AttachmentPage> {
+  const attachments: ChannelAttachment[] = [];
+  let nextCursor: string | null = null;
+  do {
+    const limit = Math.min(50, window - attachments.length);
+    const page = await fetchConversationAttachmentPage(
+      target,
+      { limit, before: nextCursor ?? undefined },
+      signal,
+    );
+    attachments.push(...page.attachments);
+    nextCursor = page.nextCursor;
+    if (signal.aborted || page.attachments.length < limit) break;
+  } while (nextCursor !== null && attachments.length < window);
+  return { attachments, nextCursor };
+}
+
+/**
+ * Re-reads the loaded window and applies it only if it is still the newest view.
+ *
+ * A snapshot is published only when no other list change — a "load more" that
+ * appended, another refresh or poll that replaced — landed while it travelled.
+ * Anything applied in between was requested before this read started, so a
+ * snapshot that passes is at least as fresh as what is on screen; one that
+ * fails is read again at the window the list has *now*, never applied stale. The
+ * loaded array's identity is the version: every data-changing transition makes
+ * a new one, and a mere next-page status change keeps it.
+ */
+async function fetchCurrentFilesWindow(
+  target: { kind: "channel" | "dm"; id: string },
+  currentFiles: () => FilesState,
+  signal: AbortSignal,
+  apply: (page: AttachmentPage) => void,
+): Promise<void> {
+  for (;;) {
+    const readFrom = currentFiles();
+    const page = await fetchFilesWindow(target, filesWindow(readFrom), signal);
+    if (signal.aborted) return;
+    if (loadedRows(currentFiles()) !== loadedRows(readFrom)) continue;
+    // Check and publish together: another Promise continuation can append a
+    // page before a caller awaiting this helper gets to apply the refresh.
+    apply(page);
+    return;
+  }
+}
+
+function isDetailsKind(kind: string): kind is ConversationDetailsTarget["kind"] {
+  return ["channel", "group", "direct"].includes(kind);
+}
+
+/** The authoritative projection for each kind of details target. */
+function fetchDetails(
+  target: ConversationDetailsTarget,
+  signal: AbortSignal,
+): Promise<ConversationDetails> {
+  if (target.kind === "channel") {
+    return fetchChannelDetails(target.id, signal).then((channel) => ({
+      kind: "channel",
+      ...channel,
+    }));
+  }
+  if (target.kind === "group") {
+    return fetchGroupDetails(target.id, signal).then((group) => ({ kind: "group", ...group }));
+  }
+  return fetchDirectProfile(target.id, signal);
+}
+
+/** The kinds whose panel has a files section: a 1:1 profile has none (issue #443). */
+function listsFiles(kind: string): kind is "channel" | "group" {
+  return kind === "channel" || kind === "group";
+}
+
+/** A group's attachments live under the DM destination, never the channel one. */
+function attachmentTarget(kind: "channel" | "group", id: string) {
+  return { kind: kind === "channel" ? ("channel" as const) : ("dm" as const), id };
 }
 
 function isAbort(error: unknown): boolean {
@@ -257,6 +493,37 @@ const initialReconcile: ReconcileWindow = {
   target: "",
   progressKey: "",
 };
+
+/** Facts read from the same collection, never separately stored flags. */
+function previewFacts(files: FilesState) {
+  if (files.status !== "ready") {
+    return { progressKey: "", awaitingPreview: false, showingPreview: false };
+  }
+  return {
+    progressKey: attachmentProgressKey(files.data),
+    awaitingPreview: files.data.some(isPreviewWorkPending),
+    showingPreview: files.data.some(canShowPreview),
+  };
+}
+
+/** Generation takes priority; revocation remains active after its budget ends. */
+function previewPolicy(
+  facts: ReturnType<typeof previewFacts>,
+  reconcile: ReconcileWindow,
+  targetKey: string,
+) {
+  const attempt =
+    reconcile.target === targetKey && reconcile.progressKey === facts.progressKey
+      ? reconcile.attempt
+      : 0;
+  const mode =
+    facts.awaitingPreview && attempt < previewReconcileMaxAttempts
+      ? "generation"
+      : facts.showingPreview
+        ? "revocation"
+        : "idle";
+  return { attempt, mode };
+}
 
 function reconcileReducer(state: ReconcileWindow, action: ReconcileAction): ReconcileWindow {
   switch (action.type) {
@@ -316,8 +583,19 @@ function loadChannelRoster(
 export function useConversationDetails(
   target: ConversationDetailsTarget | null,
 ): ConversationDetailsState {
-  const [state, dispatch] = useReducer(reducer, initialState);
+  const [state, dispatchState] = useReducer(reducer, initialState);
+  // Requests must see enqueued file transitions too: two activations or two
+  // replies can arrive before a render/effect mirrors the committed state.
+  const filesRef = useRef(initialState.files);
+  const dispatch = useCallback((action: Action) => {
+    filesRef.current = filesReducer(filesRef.current, action);
+    dispatchState(action);
+  }, []);
   const abortRef = useRef<AbortController | null>(null);
+  // An older page has a lifecycle of its own (issue #897): a reload of the same
+  // conversation must not cancel it — the list it continues may well survive
+  // the reload — but a target switch and an unmount must.
+  const moreAbortRef = useRef<AbortController | null>(null);
 
   // The effect depends on the two primitives rather than on the object, so a
   // caller that rebuilds the target literal on every render does not refetch.
@@ -336,72 +614,65 @@ export function useConversationDetails(
    * including the control the user just activated, which drops keyboard focus
    * to <body> mid-flow.
    */
-  const load = useCallback((nextKind: string, nextID: string, reset = true) => {
-    abortRef.current?.abort();
-    if (reset) {
-      dispatch({ type: "reset" });
-    }
-    if (!nextID || (nextKind !== "channel" && nextKind !== "group" && nextKind !== "direct")) {
-      return;
-    }
+  const load = useCallback(
+    (nextKind: string, nextID: string, reset = true) => {
+      abortRef.current?.abort();
+      if (reset) {
+        moreAbortRef.current?.abort();
+        dispatch({ type: "reset" });
+      }
+      if (!nextID || !isDetailsKind(nextKind)) {
+        return;
+      }
 
-    const controller = new AbortController();
-    abortRef.current = controller;
+      const controller = new AbortController();
+      abortRef.current = controller;
 
-    // Each kind has its own endpoint because each names a different aggregate:
-    // a channel, a group conversation, and the person on the other end of a
-    // direct one.
-    //
-    // The direct client returns an already-discriminated value and this hook
-    // passes it through untouched. Re-tagging it here — or substituting the
-    // requested ID for the one the server sent — would overwrite the two things
-    // fetchDirectProfile validated, and a response for the wrong conversation
-    // would arrive labelled as the right one.
-    const details =
-      nextKind === "channel"
-        ? fetchChannelDetails(nextID, controller.signal).then(
-            (channel): ConversationDetails => ({ kind: "channel", ...channel }),
-          )
-        : nextKind === "group"
-          ? fetchGroupDetails(nextID, controller.signal).then(
-              (group): ConversationDetails => ({ kind: "group", ...group }),
-            )
-          : fetchDirectProfile(nextID, controller.signal);
+      // Each kind has its own endpoint because each names a different aggregate:
+      // a channel, a group conversation, and the person on the other end of a
+      // direct one.
+      //
+      // The direct client returns an already-discriminated value and this hook
+      // passes it through untouched. Re-tagging it here — or substituting the
+      // requested ID for the one the server sent — would overwrite the two things
+      // fetchDirectProfile validated, and a response for the wrong conversation
+      // would arrive labelled as the right one.
+      const details = fetchDetails({ kind: nextKind, id: nextID }, controller.signal);
 
-    details.then(
-      (resolved) => {
-        if (controller.signal.aborted) return;
-        dispatch({ type: "details_ready", details: resolved });
-        loadChannelRoster(resolved, controller, dispatch);
-      },
-      (error: unknown) => {
-        if (controller.signal.aborted || isAbort(error)) return;
-        dispatch({ type: "details_error" });
-      },
-    );
+      details.then(
+        (resolved) => {
+          if (controller.signal.aborted) return;
+          dispatch({ type: "details_ready", details: resolved });
+          loadChannelRoster(resolved, controller, dispatch);
+        },
+        (error: unknown) => {
+          if (controller.signal.aborted || isAbort(error)) return;
+          dispatch({ type: "details_error" });
+        },
+      );
 
-    // A 1:1 profile has no files section, so no attachment request is issued
-    // and `files` stays at its initial loading value, unread by the direct
-    // variant of the panel.
-    if (nextKind === "direct") return;
+      // A 1:1 profile has no files section, so no attachment request is issued
+      // and `files` stays at its initial loading value, unread by the direct
+      // variant of the panel.
+      if (nextKind === "direct") return;
 
-    // A group's attachments live under the DM destination, never the channel
-    // one: the two are separate resources with separate authorization.
-    fetchConversationAttachments(
-      { kind: nextKind === "channel" ? "channel" : "dm", id: nextID },
-      channelFilesPreviewLimit,
-      controller.signal,
-    ).then(
-      (files) => {
-        if (controller.signal.aborted) return;
-        dispatch({ type: "files_ready", files });
-      },
-      (error: unknown) => {
+      // A group's attachments live under the DM destination, never the channel
+      // one: the two are separate resources with separate authorization.
+      //
+      // A new target asks for the compact preview only; a refresh of the one on
+      // screen re-reads everything already loaded (see filesWindow).
+      fetchCurrentFilesWindow(
+        attachmentTarget(nextKind, nextID),
+        () => filesRef.current,
+        controller.signal,
+        (page) => dispatch({ type: "files_ready", page }),
+      ).catch((error: unknown) => {
         if (controller.signal.aborted || isAbort(error)) return;
         dispatch({ type: "files_error" });
-      },
-    );
-  }, []);
+      });
+    },
+    [dispatch],
+  );
 
   // The loaded target is mirrored into a ref, written by the same effect that
   // performs the load, so `reload` can read it without being re-created on every
@@ -433,8 +704,50 @@ export function useConversationDetails(
   useEffect(() => {
     targetRef.current = { kind, id };
     load(kind, id);
-    return () => abortRef.current?.abort();
+    return () => {
+      abortRef.current?.abort();
+      moreAbortRef.current?.abort();
+    };
   }, [kind, id, load]);
+
+  const loadedWindow = filesWindow(state.files);
+
+  /**
+   * Fetches the page after `cursor` for the conversation open now (issue #897).
+   *
+   * Reads the target from the ref, like `reload`, so a stored callback cannot
+   * load files for a conversation that has since closed; and the reducer drops
+   * the answer unless `cursor` still ends the list on screen.
+   */
+  const loadMoreFiles = useCallback(
+    (cursor: string) => {
+      const files = filesRef.current;
+      if (!continuesList(files, cursor) || files.next?.status === "loading") return;
+      const { kind: currentKind, id: currentID } = targetRef.current;
+      if (!currentID || !listsFiles(currentKind)) return;
+      moreAbortRef.current?.abort();
+      const controller = new AbortController();
+      moreAbortRef.current = controller;
+      dispatch({ type: "files_more_loading", cursor });
+      fetchConversationAttachmentPage(
+        attachmentTarget(currentKind, currentID),
+        { limit: filesPageLimit, before: cursor },
+        controller.signal,
+      ).then(
+        (page) => {
+          if (controller.signal.aborted) return;
+          dispatch({ type: "files_more_ready", cursor, page });
+        },
+        (error: unknown) => {
+          if (controller.signal.aborted || isAbort(error)) return;
+          // Only the next page failed: the rows already loaded stay exactly as
+          // they are, and `load` on the same page is the retry.
+          dispatch({ type: "files_more_error", cursor });
+        },
+      );
+    },
+    [dispatch],
+  );
 
   // ── Preview reconciliation (RF-31, issue #464) ─────────────────────────────
   //
@@ -481,34 +794,17 @@ export function useConversationDetails(
   // pending_scan becoming clean, pending becoming ready, an attachment leaving
   // the list — means the server made progress, which restarts the backoff. So a
   // long wait for the scan never eats the budget for the render after it.
-  const progressKey = state.files.status === "ready" ? attachmentProgressKey(state.files.data) : "";
-
-  // Both are recomputed from the rendered list rather than tracked separately,
-  // so neither can disagree with what is on screen. They are booleans, so a list
-  // rebuilt with identical contents does not restart the cycle.
-  const awaitingPreview =
-    state.files.status === "ready" && state.files.data.some(isPreviewWorkPending);
-
-  // Something whose *bytes* are being displayed, or are about to be. This is the
-  // same predicate AttachmentThumbnail loads on, so the set watched here is
-  // exactly the set that can have a live object URL behind it.
-  const showingPreview = state.files.status === "ready" && state.files.data.some(canShowPreview);
+  const facts = previewFacts(state.files);
+  const { progressKey } = facts;
 
   const targetKey = `${kind}:${id}`;
   // The attempt count only accumulates while the target *and* the observed
   // state stay the same; anything else is a fresh window at the base delay.
-  const attempt =
-    reconcile.target === targetKey && reconcile.progressKey === progressKey ? reconcile.attempt : 0;
 
   // Which job the single timer is doing right now. Generation falls through to
   // revocation once its budget is spent, so a stalled `pending_scan` sharing the
   // list with a displayed thumbnail cannot switch the watching off.
-  const reconcileMode: "generation" | "revocation" | "idle" =
-    awaitingPreview && attempt < previewReconcileMaxAttempts
-      ? "generation"
-      : showingPreview
-        ? "revocation"
-        : "idle";
+  const { attempt, mode: reconcileMode } = previewPolicy(facts, reconcile, targetKey);
 
   // A hidden tab shows nothing, so there is nothing on screen to take away and
   // no reason to keep asking.
@@ -527,37 +823,32 @@ export function useConversationDetails(
   useEffect(() => {
     // Nothing pending and nothing displayed: no timer exists at all.
     if (reconcileMode === "idle") return;
-    if (!id || (kind !== "channel" && kind !== "group")) return;
+    if (!id || !listsFiles(kind)) return;
     if (document.visibilityState === "hidden") return;
 
     const controller = new AbortController();
     const timer = window.setTimeout(
       () => {
-        fetchConversationAttachments(
-          { kind: kind === "channel" ? "channel" : "dm", id },
-          channelFilesPreviewLimit,
+        // The whole loaded window, like a reload, so an expanded list keeps
+        // its older pages while a scan or a render is being waited on.
+        fetchCurrentFilesWindow(
+          attachmentTarget(kind, id),
+          () => filesRef.current,
           controller.signal,
-        ).then(
-          (files) => {
-            // Aborted means the panel closed or the conversation changed while
-            // this was in flight: the answer describes a target nobody is looking
-            // at, and dispatching it would show the previous conversation's files
-            // under the current one's name.
-            if (controller.signal.aborted) return;
-            dispatch({ type: "files_ready", files });
+          (page) => {
+            dispatch({ type: "files_ready", page });
             // Recorded against the state this poll was made *against*, so the
             // next scheduling can tell "nothing changed" from "progress".
             dispatchReconcile({ type: "polled", target: targetKey, progressKey });
           },
-          (error: unknown) => {
-            if (controller.signal.aborted || isAbort(error)) return;
-            // A transient failure leaves the list exactly as it is. Replacing it
-            // with the error section would blank a working list because one
-            // background poll missed, and the user did not ask for anything. The
-            // retry is the next backoff step, never an immediate one.
-            dispatchReconcile({ type: "polled", target: targetKey, progressKey });
-          },
-        );
+        ).catch((error: unknown) => {
+          if (controller.signal.aborted || isAbort(error)) return;
+          // A transient failure leaves the list exactly as it is. Replacing it
+          // with the error section would blank a working list because one
+          // background poll missed, and the user did not ask for anything. The
+          // retry is the next backoff step, never an immediate one.
+          dispatchReconcile({ type: "polled", target: targetKey, progressKey });
+        });
       },
       reconcileMode === "generation"
         ? previewReconcileDelayMs(attempt)
@@ -568,7 +859,28 @@ export function useConversationDetails(
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [reconcileMode, attempt, kind, id, targetKey, progressKey, reconcile.round]);
+  }, [
+    reconcileMode,
+    attempt,
+    kind,
+    id,
+    targetKey,
+    progressKey,
+    loadedWindow,
+    reconcile.round,
+    dispatch,
+  ]);
 
-  return { ...state, reload };
+  // The public shape: the cursor stays in here, a loader bound to it goes out.
+  const nextPage = state.files.status === "ready" ? state.files.next : undefined;
+  const next = nextPage && {
+    status: nextPage.status,
+    load: () => loadMoreFiles(nextPage.cursor),
+  };
+  const files: FilesSection =
+    state.files.status === "ready"
+      ? { status: "ready", data: state.files.data, next }
+      : state.files;
+
+  return { ...state, files, reload };
 }

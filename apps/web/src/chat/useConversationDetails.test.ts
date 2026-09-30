@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   channelFilesPreviewLimit,
+  filesPageLimit,
   previewReconcileDelayMs,
   previewReconcileIntervalMs,
   previewReconcileMaxAttempts,
@@ -14,6 +15,7 @@ import {
   type ConversationDetailsTarget,
 } from "./useConversationDetails";
 import type { ChannelAttachment, ChannelDetails, DirectDetails, GroupDetails } from "./chatTypes";
+import type { AttachmentPage } from "./filesApi";
 
 const {
   mockFetchChannelDetails,
@@ -33,7 +35,8 @@ const {
         target: { kind: "channel" | "dm"; id: string },
         limit: number,
         signal?: AbortSignal,
-      ) => Promise<ChannelAttachment[]>
+        before?: string,
+      ) => Promise<ChannelAttachment[] | AttachmentPage>
     >(),
 }));
 
@@ -48,12 +51,22 @@ vi.mock("./chatApi", () => ({
     mockFetchDirectProfile(conversationId, signal),
 }));
 
+// The hook reads pages (issue #897). Most cases here are about one page, so the
+// mock may answer a bare list — read as a last page — or a whole AttachmentPage
+// when a case is about the cursor. `before` is passed only when there is one, so
+// a first-page assertion reads exactly as it did before pagination existed.
 vi.mock("./filesApi", () => ({
-  fetchConversationAttachments: (
+  fetchConversationAttachmentPage: (
     target: { kind: "channel" | "dm"; id: string },
-    limit: number,
+    page: { limit: number; before?: string },
     signal?: AbortSignal,
-  ) => mockFetchChannelAttachments(target, limit, signal),
+  ) =>
+    (page.before === undefined
+      ? mockFetchChannelAttachments(target, page.limit, signal)
+      : mockFetchChannelAttachments(target, page.limit, signal, page.before)
+    ).then((answer) =>
+      Array.isArray(answer) ? { attachments: answer, nextCursor: null } : answer,
+    ),
 }));
 
 function details(overrides: Partial<ChannelDetails> = {}): ChannelDetails {
@@ -88,6 +101,7 @@ function attachment(id: string): ChannelAttachment {
 }
 
 beforeEach(() => {
+  mockFetchChannelAttachments.mockReset();
   mockFetchChannelDetails.mockResolvedValue(details());
   mockFetchChannelAttachments.mockResolvedValue([]);
   mockFetchChannelMembers.mockResolvedValue({ memberCount: 0, members: [] });
@@ -1536,5 +1550,554 @@ describe("useConversationDetails channel roster", () => {
 
     await waitFor(() => expect(mockFetchChannelMembers).toHaveBeenCalledTimes(2));
     expect(mockFetchChannelDetails).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ── Pagination (issue #897) ──────────────────────────────────────────────────
+
+describe("useConversationDetails — files pagination", () => {
+  function page(ids: string[], nextCursor: string | null = null): AttachmentPage {
+    return { attachments: ids.map(attachment), nextCursor };
+  }
+
+  function ids(files: { status: string; data?: ChannelAttachment[] }) {
+    return files.status === "ready" ? (files.data ?? []).map((file) => file.id) : [];
+  }
+
+  /** Every file request the hook made, as (limit, before) pairs. */
+  function fileRequests() {
+    return mockFetchChannelAttachments.mock.calls.map(([, limit, , before]) => ({ limit, before }));
+  }
+
+  async function renderLoaded(first: AttachmentPage, target?: ConversationDetailsTarget) {
+    mockFetchChannelAttachments.mockResolvedValueOnce(first);
+    const rendered = renderHook(
+      (props: ConversationDetailsTarget) => useConversationDetails(props),
+      { initialProps: target ?? { kind: "channel", id: "ch-1" } },
+    );
+    await waitFor(() => expect(rendered.result.current.files.status).toBe("ready"));
+    return rendered;
+  }
+
+  function loadNext(result: { current: ReturnType<typeof useConversationDetails> }) {
+    const files = result.current.files;
+    if (files.status !== "ready" || !files.next) throw new Error("no next page offered");
+    const { load } = files.next;
+    act(() => load());
+  }
+
+  it("asks only for the compact preview and offers a next page only with a cursor", async () => {
+    const { result } = await renderLoaded(page(["a", "b", "c", "d", "e"], "c-1"));
+
+    expect(fileRequests()).toEqual([{ limit: channelFilesPreviewLimit, before: undefined }]);
+    expect(result.current.files).toMatchObject({ status: "ready", next: { status: "idle" } });
+  });
+
+  it("offers nothing more for a last page", async () => {
+    const { result } = await renderLoaded(page(["a", "b", "c", "d", "e"]));
+
+    expect(result.current.files.status === "ready" && result.current.files.next).toBeUndefined();
+  });
+
+  it("appends the next page in the server's order, without duplicates", async () => {
+    const { result } = await renderLoaded(page(["a", "b", "c", "d", "e"], "c-1"));
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(["e", "f", "f", "g"]));
+
+    loadNext(result);
+
+    await waitFor(() =>
+      expect(ids(result.current.files)).toEqual(["a", "b", "c", "d", "e", "f", "g"]),
+    );
+    expect(fileRequests()[1]).toEqual({ limit: filesPageLimit, before: "c-1" });
+    expect(result.current.files.status === "ready" && result.current.files.next).toBeUndefined();
+  });
+
+  it("walks more than two pages, each continuing from the cursor before it", async () => {
+    const { result } = await renderLoaded(page(["a"], "c-1"), { kind: "group", id: "g-1" });
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(["b"], "c-2"));
+    loadNext(result);
+    await waitFor(() => expect(ids(result.current.files)).toEqual(["a", "b"]));
+
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(["c"]));
+    loadNext(result);
+    await waitFor(() => expect(ids(result.current.files)).toEqual(["a", "b", "c"]));
+
+    expect(fileRequests().map(({ before }) => before)).toEqual([undefined, "c-1", "c-2"]);
+    // A group pages through its own destination, never the channel one.
+    for (const [target] of mockFetchChannelAttachments.mock.calls) {
+      expect(target).toEqual({ kind: "dm", id: "g-1" });
+    }
+  });
+
+  it("issues one request for a page however often it is asked for", async () => {
+    const { result } = await renderLoaded(page(["a"], "c-1"));
+    mockFetchChannelAttachments.mockReturnValueOnce(new Promise(() => {}));
+
+    loadNext(result);
+    expect(result.current.files).toMatchObject({ next: { status: "loading" } });
+    loadNext(result);
+    loadNext(result);
+
+    expect(fileRequests()).toHaveLength(2);
+  });
+
+  it("deduplicates activations before React commits the loading state", async () => {
+    const { result } = await renderLoaded(page(["a"], "c-1"));
+    mockFetchChannelAttachments.mockReturnValue(new Promise(() => {}));
+    const files = result.current.files;
+    if (files.status !== "ready" || !files.next) throw new Error("no next page");
+    const load = files.next.load;
+
+    act(() => {
+      load();
+      load();
+    });
+
+    expect(fileRequests()).toHaveLength(2);
+  });
+
+  it("ignores a retained loader after its cursor has been consumed", async () => {
+    const { result } = await renderLoaded(page(["a"], "c-1"));
+    const files = result.current.files;
+    if (files.status !== "ready" || !files.next) throw new Error("no next page");
+    const load = files.next.load;
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(["b"], "c-2"));
+    act(() => load());
+    await waitFor(() => expect(ids(result.current.files)).toEqual(["a", "b"]));
+
+    act(() => load());
+
+    expect(fileRequests()).toHaveLength(2);
+  });
+
+  it("re-reads the enlarged window when a refresh finishes after load-more", async () => {
+    const { result } = await renderLoaded(page(["a", "b", "c", "d", "e"], "c-1"));
+    let resolveRefresh: (value: AttachmentPage) => void = () => {};
+    mockFetchChannelAttachments.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveRefresh = resolve)),
+    );
+    act(() => result.current.reload());
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(["f", "g"], "c-2"));
+    loadNext(result);
+    await waitFor(() => expect(ids(result.current.files)).toHaveLength(7));
+    mockFetchChannelAttachments.mockResolvedValueOnce(
+      page(["new", "a", "b", "c", "d", "e", "f"], "new-end"),
+    );
+
+    await act(async () => resolveRefresh(page(["new", "a", "b", "c", "d"], "new-short-end")));
+
+    await waitFor(() =>
+      expect(ids(result.current.files)).toEqual(["new", "a", "b", "c", "d", "e", "f"]),
+    );
+    expect(fileRequests().at(-1)).toEqual({ limit: 7, before: undefined });
+  });
+
+  it("keeps a page that completes between refresh promise continuations", async () => {
+    const { result } = await renderLoaded(page(["a", "b", "c", "d", "e"], "c-1"));
+    let resolveRefresh: (value: AttachmentPage) => void = () => {};
+    let resolveMore: (value: AttachmentPage) => void = () => {};
+    mockFetchChannelAttachments.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveRefresh = resolve)),
+    );
+    act(() => result.current.reload());
+    mockFetchChannelAttachments.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveMore = resolve)),
+    );
+    loadNext(result);
+    await act(async () => {
+      resolveRefresh(page(["a", "b", "c", "d", "e"], "c-1"));
+      await Promise.resolve();
+      resolveMore(page(["f", "g"], "c-2"));
+    });
+
+    await waitFor(() => expect(ids(result.current.files)).toHaveLength(7));
+    expect(ids(result.current.files)).toEqual(["a", "b", "c", "d", "e", "f", "g"]);
+  });
+
+  it("refreshes more than 50 loaded files in bounded pages, with current metadata", async () => {
+    const all = Array.from({ length: 65 }, (_, i) => `f-${i}`);
+    const { result } = await renderLoaded(page(all.slice(0, 5), "c-5"));
+    for (const end of [25, 45, 65]) {
+      mockFetchChannelAttachments.mockResolvedValueOnce(page(all.slice(end - 20, end), `c-${end}`));
+      loadNext(result);
+      await waitFor(() => expect(ids(result.current.files)).toHaveLength(end));
+    }
+    const updated = page(all.slice(0, 50), "fresh-50");
+    updated.attachments[0] = { ...updated.attachments[0], filename: "updated.pdf" };
+    mockFetchChannelAttachments.mockResolvedValueOnce(updated);
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(all.slice(50), "fresh-65"));
+
+    act(() => result.current.reload());
+
+    await waitFor(() => expect(fileRequests()).toHaveLength(6));
+    expect(fileRequests().slice(-2)).toEqual([
+      { limit: 50, before: undefined },
+      { limit: 15, before: "fresh-50" },
+    ]);
+    await waitFor(() => expect(ids(result.current.files)).toEqual(all));
+    expect(result.current.files.status === "ready" && result.current.files.data[0].filename).toBe(
+      "updated.pdf",
+    );
+  });
+
+  it("keeps the loaded rows when a page fails, and retries that same page", async () => {
+    const { result } = await renderLoaded(page(["a", "b"], "c-1"));
+    mockFetchChannelAttachments.mockRejectedValueOnce(new Error("file-service down"));
+
+    loadNext(result);
+    await waitFor(() => expect(result.current.files).toMatchObject({ next: { status: "error" } }));
+    // A failed next page is not a failed section.
+    expect(result.current.files.status).toBe("ready");
+    expect(ids(result.current.files)).toEqual(["a", "b"]);
+
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(["c"]));
+    loadNext(result);
+    await waitFor(() => expect(ids(result.current.files)).toEqual(["a", "b", "c"]));
+    expect(
+      fileRequests()
+        .slice(1)
+        .map(({ before }) => before),
+    ).toEqual(["c-1", "c-1"]);
+  });
+
+  it("never shows a page of the previous conversation after a switch", async () => {
+    const { result, rerender } = await renderLoaded(page(["a-1"], "a-cursor"));
+    let resolveStale: (value: AttachmentPage) => void = () => {};
+    let staleSignal: AbortSignal | undefined;
+    mockFetchChannelAttachments.mockImplementationOnce((_target, _limit, signal) => {
+      staleSignal = signal;
+      return new Promise((resolve) => (resolveStale = resolve));
+    });
+    loadNext(result);
+
+    mockFetchChannelDetails.mockResolvedValueOnce(details({ id: "ch-2" }));
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(["b-1"], "b-cursor"));
+    rerender({ kind: "channel", id: "ch-2" });
+    await waitFor(() => expect(ids(result.current.files)).toEqual(["b-1"]));
+
+    expect(staleSignal?.aborted).toBe(true);
+    await act(async () => resolveStale(page(["a-2"])));
+
+    expect(ids(result.current.files)).toEqual(["b-1"]);
+    expect(result.current.files).toMatchObject({ next: { status: "idle" } });
+  });
+
+  it("aborts a page request on unmount", async () => {
+    const { result, unmount } = await renderLoaded(page(["a"], "c-1"));
+    let signal: AbortSignal | undefined;
+    mockFetchChannelAttachments.mockImplementationOnce((_target, _limit, requestSignal) => {
+      signal = requestSignal;
+      return new Promise(() => {});
+    });
+    loadNext(result);
+
+    unmount();
+
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("refreshes the whole loaded window in place, new files on top", async () => {
+    const { result } = await renderLoaded(page(["a", "b", "c", "d", "e"], "c-1"));
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(["f", "g", "h"], "c-2"));
+    loadNext(result);
+    await waitFor(() => expect(ids(result.current.files)).toHaveLength(8));
+
+    // A new upload landed and "d" was removed; the refresh sees both.
+    mockFetchChannelAttachments.mockResolvedValueOnce(
+      page(["new", "a", "b", "c", "e", "f", "g", "h"], "c-2"),
+    );
+    act(() => result.current.reload());
+
+    await waitFor(() =>
+      expect(ids(result.current.files)).toEqual(["new", "a", "b", "c", "e", "f", "g", "h"]),
+    );
+    expect(fileRequests()[2]).toEqual({ limit: 8, before: undefined });
+    expect(result.current.files).toMatchObject({ next: { status: "idle" } });
+  });
+
+  it("lets a refresh land during a page request, appending only if the list still ends there", async () => {
+    const { result } = await renderLoaded(page(["a", "b", "c", "d", "e"], "c-1"));
+    let resolvePage: (value: AttachmentPage) => void = () => {};
+    mockFetchChannelAttachments.mockImplementationOnce(
+      () => new Promise((resolve) => (resolvePage = resolve)),
+    );
+    loadNext(result);
+
+    // Same window, same end: the page in flight still continues this list, and
+    // the refresh must neither cancel it nor offer it a second time.
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(["a", "b", "c", "d", "e"], "c-1"));
+    act(() => result.current.reload());
+    await waitFor(() => expect(fileRequests()).toHaveLength(3));
+    await waitFor(() => expect(mockFetchChannelDetails).toHaveBeenCalledTimes(2));
+    expect(result.current.files).toMatchObject({ next: { status: "loading" } });
+
+    await act(async () => resolvePage(page(["f"])));
+    expect(ids(result.current.files)).toEqual(["a", "b", "c", "d", "e", "f"]);
+  });
+
+  it("drops a page whose cursor no longer ends the list after a refresh", async () => {
+    const { result } = await renderLoaded(page(["a", "b", "c", "d", "e"], "c-1"));
+    let resolvePage: (value: AttachmentPage) => void = () => {};
+    mockFetchChannelAttachments.mockImplementationOnce(
+      () => new Promise((resolve) => (resolvePage = resolve)),
+    );
+    loadNext(result);
+
+    // A new file shifted the window: the list now ends one row earlier.
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(["new", "a", "b", "c", "d"], "c-0"));
+    act(() => result.current.reload());
+    await waitFor(() => expect(ids(result.current.files)[0]).toBe("new"));
+
+    await act(async () => resolvePage(page(["f"])));
+    expect(ids(result.current.files)).toEqual(["new", "a", "b", "c", "d"]);
+    expect(result.current.files).toMatchObject({ next: { status: "idle" } });
+  });
+
+  it("starts a switched-to conversation at the compact preview again", async () => {
+    const { result, rerender } = await renderLoaded(page(["a", "b", "c", "d", "e"], "c-1"));
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(["f", "g"]));
+    loadNext(result);
+    await waitFor(() => expect(ids(result.current.files)).toHaveLength(7));
+
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(["x"]));
+    rerender({ kind: "channel", id: "ch-2" });
+    await waitFor(() => expect(ids(result.current.files)).toEqual(["x"]));
+
+    expect(fileRequests().at(-1)).toEqual({ limit: channelFilesPreviewLimit, before: undefined });
+  });
+
+  it("reconciles the whole loaded window, never a cursor", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const pending: ChannelAttachment = { ...attachment("a"), previewStatus: "pending" };
+      mockFetchChannelAttachments.mockResolvedValueOnce({
+        attachments: [pending, ...["b", "c", "d", "e"].map(attachment)],
+        nextCursor: "c-1",
+      });
+      const { result } = renderHook(() => useConversationDetails({ kind: "channel", id: "ch-1" }));
+      await waitFor(() => expect(result.current.files.status).toBe("ready"));
+      mockFetchChannelAttachments.mockResolvedValueOnce(page(["f", "g"], "c-2"));
+      loadNext(result);
+      await waitFor(() => expect(ids(result.current.files)).toHaveLength(7));
+
+      mockFetchChannelAttachments.mockResolvedValue(
+        page(["a", "b", "c", "d", "e", "f", "g"], "c-2"),
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(previewReconcileIntervalMs);
+      });
+
+      expect(fileRequests().at(-1)).toEqual({ limit: 7, before: undefined });
+      expect(ids(result.current.files)).toHaveLength(7);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ── Code-quality findings (issue #897) ───────────────────────────────────────
+
+describe("useConversationDetails — files window and races", () => {
+  function page(ids: string[], nextCursor: string | null = null): AttachmentPage {
+    return { attachments: ids.map(attachment), nextCursor };
+  }
+
+  function ids(files: { status: string; data?: ChannelAttachment[] }) {
+    return files.status === "ready" ? (files.data ?? []).map((file) => file.id) : [];
+  }
+
+  function fileRequests() {
+    return mockFetchChannelAttachments.mock.calls.map(([, limit, , before]) => ({ limit, before }));
+  }
+
+  /**
+   * A listing that behaves like file-service's: newest first, `before` continues
+   * strictly after the id it names, and a cursor only when more rows exist.
+   */
+  function serve(rows: ChannelAttachment[]) {
+    mockFetchChannelAttachments.mockImplementation((_target, limit, _signal, before) => {
+      const start = before === undefined ? 0 : rows.findIndex((row) => row.id === before) + 1;
+      const slice = rows.slice(start, start + limit);
+      const more = start + limit < rows.length;
+      return Promise.resolve({
+        attachments: slice,
+        nextCursor: more ? slice[slice.length - 1].id : null,
+      });
+    });
+  }
+
+  function names(count: number, prefix = "f") {
+    return Array.from({ length: count }, (_, index) => `${prefix}-${index}`);
+  }
+
+  async function renderWith(first: AttachmentPage) {
+    mockFetchChannelAttachments.mockResolvedValueOnce(first);
+    const rendered = renderHook(() => useConversationDetails({ kind: "channel", id: "ch-1" }));
+    await waitFor(() => expect(rendered.result.current.files.status).toBe("ready"));
+    return rendered;
+  }
+
+  function nextLoader(result: { current: ReturnType<typeof useConversationDetails> }) {
+    const files = result.current.files;
+    if (files.status !== "ready" || !files.next) throw new Error("no next page offered");
+    return files.next.load;
+  }
+
+  it.each([
+    [5, [5]],
+    [20, [20]],
+    [50, [50]],
+    [51, [50, 1]],
+    [65, [50, 15]],
+    [120, [50, 50, 20]],
+  ])(
+    "refreshes a window of %i rows in pages of at most 50 (%j), keeping it whole",
+    async (loaded, limits) => {
+      const all = names(loaded + 10);
+      const { result } = await renderWith(page(all.slice(0, loaded), all[loaded - 1]));
+      serve(all.map(attachment));
+      const before = fileRequests().length;
+
+      act(() => result.current.reload());
+
+      await waitFor(() => expect(fileRequests()).toHaveLength(before + limits.length));
+      expect(
+        fileRequests()
+          .slice(before)
+          .map(({ limit }) => limit),
+      ).toEqual(limits);
+      await waitFor(() => expect(ids(result.current.files)).toEqual(all.slice(0, loaded)));
+      // Rows remain beyond the window, so the rebuilt list still offers them.
+      expect(result.current.files).toMatchObject({ next: { status: "idle" } });
+    },
+  );
+
+  it("rebuilds a 65-row window with a new file on top and a removed one gone", async () => {
+    const all = names(80);
+    const { result } = await renderWith(page(all.slice(0, 65), all[64]));
+    const server = ["new", ...all.filter((id) => id !== "f-10")];
+    serve(server.map(attachment));
+
+    act(() => result.current.reload());
+
+    await waitFor(() => expect(ids(result.current.files)).toEqual(server.slice(0, 65)));
+    expect(ids(result.current.files)).not.toContain("f-10");
+    // The next page continues exactly where the rebuilt window ends.
+    serve(server.map(attachment));
+    act(() => nextLoader(result)());
+    await waitFor(() => expect(ids(result.current.files)).toEqual(server.slice(0, 80)));
+  });
+
+  it("never lets a refresh that started earlier overwrite a newer one of the same size", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const pending: ChannelAttachment = { ...attachment("a"), previewStatus: "pending" };
+      const fresh: ChannelAttachment = { ...attachment("a"), previewStatus: "available" };
+      const { result } = await renderWith({ attachments: [pending], nextCursor: null });
+
+      // A reload is in flight when the reconciliation poll fires and answers
+      // first, with newer metadata than the reload's own (older) read.
+      let resolveReload: (value: AttachmentPage) => void = () => {};
+      mockFetchChannelAttachments.mockImplementationOnce(
+        () => new Promise((resolve) => (resolveReload = resolve)),
+      );
+      act(() => result.current.reload());
+      mockFetchChannelAttachments.mockResolvedValueOnce({ attachments: [fresh], nextCursor: null });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(previewReconcileIntervalMs);
+      });
+      await waitFor(() =>
+        expect(result.current.files).toMatchObject({ data: [{ previewStatus: "available" }] }),
+      );
+
+      mockFetchChannelAttachments.mockResolvedValueOnce({ attachments: [fresh], nextCursor: null });
+      const before = fileRequests().length;
+      await act(async () => resolveReload({ attachments: [pending], nextCursor: null }));
+
+      // The late reload is read again instead of reinstating "pending".
+      await waitFor(() => expect(fileRequests()).toHaveLength(before + 1));
+      expect(result.current.files).toMatchObject({ data: [{ previewStatus: "available" }] });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("re-reads a refresh that started after load-more but finished after it", async () => {
+    const { result } = await renderWith(page(["a", "b", "c", "d", "e"], "e"));
+    let resolveMore: (value: AttachmentPage) => void = () => {};
+    let resolveRefresh: (value: AttachmentPage) => void = () => {};
+    mockFetchChannelAttachments.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveMore = resolve)),
+    );
+    act(() => nextLoader(result)());
+    mockFetchChannelAttachments.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveRefresh = resolve)),
+    );
+    act(() => result.current.reload());
+
+    await act(async () => resolveMore(page(["f", "g", "h", "i", "j"], "j")));
+    expect(ids(result.current.files)).toHaveLength(10);
+
+    mockFetchChannelAttachments.mockResolvedValueOnce(
+      page(["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"], "j"),
+    );
+    await act(async () => resolveRefresh(page(["a", "b", "c", "d", "e"], "e")));
+
+    await waitFor(() => expect(fileRequests().at(-1)).toEqual({ limit: 10, before: undefined }));
+    expect(ids(result.current.files)).toEqual(["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]);
+    expect(result.current.files).toMatchObject({ next: { status: "idle" } });
+  });
+
+  it("ignores a retained loader after the conversation changed", async () => {
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(["a"], "a"));
+    const { result, rerender } = renderHook(
+      (props: ConversationDetailsTarget) => useConversationDetails(props),
+      { initialProps: { kind: "channel", id: "ch-1" } as ConversationDetailsTarget },
+    );
+    await waitFor(() => expect(ids(result.current.files)).toEqual(["a"]));
+    const staleLoad = nextLoader(result);
+
+    mockFetchChannelDetails.mockResolvedValueOnce(details({ id: "ch-2" }));
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(["b-1"], "b-1"));
+    rerender({ kind: "channel", id: "ch-2" });
+    await waitFor(() => expect(ids(result.current.files)).toEqual(["b-1"]));
+    const before = fileRequests().length;
+
+    act(() => staleLoad());
+
+    expect(fileRequests()).toHaveLength(before);
+    expect(ids(result.current.files)).toEqual(["b-1"]);
+  });
+
+  it("ignores a retained loader once the collection has ended", async () => {
+    const { result } = await renderWith(page(["a"], "a"));
+    const load = nextLoader(result);
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(["b"]));
+    act(() => load());
+    await waitFor(() => expect(ids(result.current.files)).toEqual(["a", "b"]));
+    const before = fileRequests().length;
+
+    act(() => load());
+    act(() => load());
+
+    expect(fileRequests()).toHaveLength(before);
+  });
+
+  it("deduplicates repeats inside one page and across pages, keeping the server's order", async () => {
+    const { result } = await renderWith(page(["a", "b", "c"], "c"));
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(["c", "d", "d", "e", "c", "f"]));
+
+    act(() => nextLoader(result)());
+
+    await waitFor(() => expect(ids(result.current.files)).toEqual(["a", "b", "c", "d", "e", "f"]));
+  });
+
+  it("deduplicates a refreshed window that repeats a row", async () => {
+    const { result } = await renderWith(page(["a", "b", "c"]));
+    mockFetchChannelAttachments.mockResolvedValueOnce(page(["a", "d", "d", "e"]));
+
+    act(() => result.current.reload());
+
+    await waitFor(() => expect(ids(result.current.files)).toEqual(["a", "d", "e"]));
   });
 });

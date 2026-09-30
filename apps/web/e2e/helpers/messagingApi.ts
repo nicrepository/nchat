@@ -258,6 +258,12 @@ export interface MessagingScenario {
      * proves that merely rendering a timeline requested nothing.
      */
     attachmentContentFetches: string[];
+    /**
+     * Issue #897: every attachment listing the browser made, in order — which
+     * destination, what page size, and which cursor. It is how a spec proves
+     * the panel opened with the compact page only and fetched more on demand.
+     */
+    attachmentListings: Array<{ targetId: string; limit: number; before: string | null }>;
   };
   forwardedByIdempotencyKey: Map<
     string,
@@ -439,6 +445,25 @@ export interface AttachmentFixture {
   size: number;
   status: "pending_scan" | "clean" | "rejected";
   createdAt: string;
+  /** Wire value, as file-service sends it; absent means no preview. */
+  previewStatus?: "pending" | "ready" | "failed" | "unsupported";
+}
+
+/**
+ * `count` clean attachments, newest first as the listing serves them (issue
+ * #897), one minute apart. Ids and names are numbered from 1 so a spec can name
+ * the exact row that must, or must not, be on screen.
+ */
+export function attachmentFixtures(prefix: string, count: number): AttachmentFixture[] {
+  const newest = Date.parse("2026-07-15T12:00:00Z");
+  return Array.from({ length: count }, (_, index) => ({
+    id: `${prefix}-file-${index + 1}`,
+    filename: `${prefix}-arquivo-${String(index + 1).padStart(2, "0")}.bin`,
+    contentType: "application/octet-stream",
+    size: 20 * 1024,
+    status: "clean" as const,
+    createdAt: new Date(newest - index * 60_000).toISOString(),
+  }));
 }
 
 export function uniqueId(testInfo: TestInfo, suffix: string): string {
@@ -595,6 +620,7 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
       groupCreates: [],
       attachmentUploads: [],
       attachmentContentFetches: [],
+      attachmentListings: [],
     },
     forwardedByIdempotencyKey: new Map(),
     sidebarChannels,
@@ -1627,13 +1653,12 @@ async function installChannelDetailsMocks(
       await route.fulfill({ status: 404 });
       return;
     }
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        data: { attachments: scenario.conversationAttachments.get(conversationID) ?? [] },
-      }),
-    });
+    await fulfillAttachmentListing(
+      route,
+      scenario,
+      conversationID,
+      scenario.conversationAttachments.get(conversationID) ?? [],
+    );
   });
 
   await page.route("**/api/files/channels/*/attachments**", async (route) => {
@@ -1650,12 +1675,57 @@ async function installChannelDetailsMocks(
       await route.fulfill({ status: 404 });
       return;
     }
-    const attachments = scenario.channelAttachments.get(channelId) ?? [];
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({ data: { attachments } }),
-    });
+    await fulfillAttachmentListing(
+      route,
+      scenario,
+      channelId,
+      scenario.channelAttachments.get(channelId) ?? [],
+    );
+  });
+}
+
+/**
+ * GET /api/files/{collection}/{id}/attachments — one page, the way file-service
+ * serves it (issue #897).
+ *
+ * The fixture list is already newest first. `limit` is clamped like the server's
+ * (default 20, ceiling 50), `before` continues strictly after the row it names,
+ * and `next_cursor` is present only when at least one more row exists. Ignoring
+ * the query here would hand the panel everything on the first request and hide
+ * exactly the regression a spec is meant to catch.
+ *
+ * The cursor is the last served id rather than the server's base64 token: it is
+ * opaque to the client either way, and a readable one makes a failing spec
+ * easier to read. An unknown cursor answers 400, as the server does.
+ */
+async function fulfillAttachmentListing(
+  route: Route,
+  scenario: MessagingScenario,
+  targetId: string,
+  attachments: AttachmentFixture[],
+) {
+  const query = new URL(route.request().url()).searchParams;
+  const requested = Number.parseInt(query.get("limit") ?? "", 10);
+  const limit = Number.isNaN(requested) || requested <= 0 ? 20 : Math.min(requested, 50);
+  const before = query.get("before");
+  scenario.requests.attachmentListings.push({ targetId, limit, before });
+
+  const start = before === null ? 0 : attachments.findIndex((item) => item.id === before) + 1;
+  if (start === 0 && before !== null) {
+    await route.fulfill({ status: 400 });
+    return;
+  }
+  const page = attachments.slice(start, start + limit);
+  const hasMore = start + limit < attachments.length;
+  await route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({
+      data: {
+        attachments: page,
+        ...(hasMore ? { next_cursor: page[page.length - 1].id } : {}),
+      },
+    }),
   });
 }
 

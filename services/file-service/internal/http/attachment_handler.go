@@ -82,7 +82,7 @@ type AttachmentUseCases interface {
 	// DocumentPreviewPage returns page N (N >= 2) of a multi-page preview.
 	// Page 1 is served by Preview above, unchanged.
 	DocumentPreviewPage(ctx context.Context, input service.AttachmentAuthInput, page int) (service.Download, error)
-	ListDestinationAttachments(ctx context.Context, input service.ListDestinationAttachmentsInput) ([]service.AttachmentView, error)
+	ListDestinationAttachments(ctx context.Context, input service.ListDestinationAttachmentsInput) (service.AttachmentListPage, error)
 	CancelDraft(ctx context.Context, input service.CancelDraftInput) error
 	Ready() bool
 }
@@ -131,10 +131,13 @@ func (h *AttachmentHandler) CancelDraft(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// listAttachmentsResponse is the listing payload. The array is named rather
-// than returned bare so a cursor can be added later without breaking clients.
+// listAttachmentsResponse is the listing payload. The array was named rather
+// than returned bare precisely so the cursor could be added without breaking
+// clients (issue #897): next_cursor is absent when nothing older exists, and a
+// client that ignores it still reads the newest page exactly as before.
 type listAttachmentsResponse struct {
 	Attachments []service.AttachmentView `json:"attachments"`
+	NextCursor  string                   `json:"next_cursor,omitempty"`
 }
 
 // AttachmentHandler serves the RF-30 upload, metadata and download routes.
@@ -453,11 +456,14 @@ func (h *AttachmentHandler) listAttachments(
 	if !ok {
 		return
 	}
-	views, err := h.useCases.ListDestinationAttachments(r.Context(), service.ListDestinationAttachmentsInput{
+	// ?before= is opaque here: the service decodes it and answers a malformed
+	// one with ErrInvalidInput, which maps to 400 below.
+	page, err := h.useCases.ListDestinationAttachments(r.Context(), service.ListDestinationAttachmentsInput{
 		Destination: domain.Destination{Kind: kind, ID: destinationID},
 		UserID:      principal.UserID,
 		SessionID:   principal.SessionID,
 		Limit:       limit,
+		Before:      r.URL.Query().Get("before"),
 	})
 	if err != nil {
 		status, code := attachmentErrorStatus(err)
@@ -465,7 +471,10 @@ func (h *AttachmentHandler) listAttachments(
 		writeAttachmentError(w, err)
 		return
 	}
-	httputil.WriteJSON(w, http.StatusOK, listAttachmentsResponse{Attachments: views})
+	httputil.WriteJSON(w, http.StatusOK, listAttachmentsResponse{
+		Attachments: page.Attachments,
+		NextCursor:  page.NextCursor,
+	})
 }
 
 // parseListLimit reads the optional ?limit=. An absent value means "the

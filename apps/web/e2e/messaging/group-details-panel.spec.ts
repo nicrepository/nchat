@@ -7,6 +7,7 @@ import {
   GROUP_DM_NAME,
   OTHER_USER_ID,
   OTHER_USER_NAME,
+  attachmentFixtures,
   createScenario,
   groupDetailsFixture,
   installMessagingMocks,
@@ -667,5 +668,67 @@ test.describe("painel de detalhes do grupo", () => {
     const panel = page.getByRole("complementary", { name: "Perfil" });
     await expect(panel).toBeVisible();
     await expect(panel.getByRole("button", { name: /Renomear/ })).toHaveCount(0);
+  });
+});
+
+/**
+ * Arquivos recentes do grupo (issue #897): o mesmo comportamento do canal,
+ * sobre o destino de conversa — nunca o de canal —, com a mesma ação para um
+ * arquivo aprovado e nenhuma para um em análise.
+ */
+test.describe("arquivos recentes no painel do grupo", () => {
+  test("pagina pelo destino da conversa, baixa o aprovado e não oferece nada ao em análise", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "grupo-arquivos");
+    const scenario = createScenario({
+      kind: "dm",
+      conversationType: "group",
+      targetId,
+      targetName: "Grupo com Arquivos",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no grupo" })],
+    });
+    scenario.groupDetails.set(
+      targetId,
+      groupDetailsFixture({ id: targetId, name: "Grupo com Arquivos" }, [
+        { user_id: CURRENT_USER_ID, display_name: CURRENT_USER_NAME, presence: "online" },
+        { user_id: OTHER_USER_ID, display_name: OTHER_USER_NAME, presence: "offline" },
+      ]),
+    );
+    const files = attachmentFixtures("gr", 8);
+    files[1] = { ...files[1], filename: "em-analise.png", status: "pending_scan" };
+    scenario.conversationAttachments.set(targetId, files);
+    const listingsOf = () =>
+      scenario.requests.attachmentListings.filter((request) => request.targetId === targetId);
+
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/dm/${targetId}`);
+    await page.getByRole("button", { name: "Detalhes do grupo", exact: true }).click();
+    const panel = page.getByRole("complementary", { name: "Detalhes do grupo" });
+    const list = panel.getByRole("list", { name: "Arquivos recentes" });
+
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    expect(listingsOf()).toEqual([{ targetId, limit: 5, before: null }]);
+
+    // O arquivo em análise aparece com o status em texto e sem controle.
+    await expect(list.getByRole("listitem").nth(1)).toContainText("Em análise");
+    await expect(list.getByRole("listitem").nth(1).getByRole("button")).toHaveCount(0);
+
+    const toggle = panel.getByRole("button", {
+      name: /(Ver todos|Mostrar menos) Arquivos recentes/,
+    });
+    await toggle.click();
+    await expect(list.getByRole("listitem")).toHaveCount(8);
+    expect(listingsOf()[1]).toEqual({ targetId, limit: 20, before: files[4].id });
+    await expect(panel.getByRole("button", { name: "Carregar mais arquivos" })).toHaveCount(0);
+
+    const download = page.waitForEvent("download");
+    await list.getByRole("button", { name: `Baixar ${files[7].filename}` }).click();
+    expect((await download).suggestedFilename()).toBe(files[7].filename);
+    expect(scenario.requests.attachmentContentFetches).toEqual([files[7].id]);
+
+    await toggle.click();
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    expect(listingsOf()).toHaveLength(2);
   });
 });

@@ -1,4 +1,4 @@
-import { expect, test, type Page, type TestInfo } from "@playwright/test";
+import { expect, test, type Locator, type Page, type TestInfo } from "@playwright/test";
 
 import { captureBrowserErrors, expectNoUnexpectedBrowserErrors } from "../helpers/browserErrors";
 import {
@@ -8,9 +8,11 @@ import {
   OTHER_CHANNEL_NAME,
   OTHER_USER_ID,
   OTHER_USER_NAME,
+  attachmentFixtures,
   channelDetailsFixture,
   channelRosterFixture,
   createScenario,
+  emitConversationEvent,
   emitConversationUpdated,
   emitPinUpdated,
   installMessagingMocks,
@@ -1171,5 +1173,388 @@ test.describe("mensagens fixadas no painel de detalhes do canal", () => {
     });
     await expect(list.getByRole("listitem")).toHaveCount(1);
     await expect(list.getByText("Mensagem número 1")).toHaveCount(0);
+  });
+});
+
+/**
+ * Arquivos recentes (issue #897): compacto em cinco, "Ver todos" só quando o
+ * servidor diz que há mais, páginas buscadas sob demanda pela mesma listagem, e
+ * a linha de um arquivo aprovado executando a ação que o produto já tem.
+ */
+test.describe("arquivos recentes no painel do canal", () => {
+  async function openFiles(page: Page, targetId: string) {
+    await page.goto(`/chat/channel/${targetId}`);
+    await page.getByRole("button", { name: "Detalhes do canal", exact: true }).click();
+    const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
+    return { panel, list: panel.getByRole("list", { name: "Arquivos recentes" }) };
+  }
+
+  function filesToggle(panel: Locator) {
+    return panel.getByRole("button", { name: /(Ver todos|Mostrar menos) Arquivos recentes/ });
+  }
+
+  test("mostra 5, expande paginando sob demanda e recolhe sem refazer a busca", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "files-pages");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Arquivos Paginados",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
+    });
+    const files = attachmentFixtures("pg", 27);
+    scenario.channelAttachments.set(targetId, files);
+    const listingsOf = () =>
+      scenario.requests.attachmentListings.filter((request) => request.targetId === targetId);
+
+    await installMessagingMocks(page, scenario);
+    const { panel, list } = await openFiles(page, targetId);
+
+    // ── 1. compacto: só a página compacta foi pedida ──────────────────────
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    await expect(list.getByText(files[0].filename)).toBeVisible();
+    await expect(list.getByText(files[5].filename)).toHaveCount(0);
+    const toggle = filesToggle(panel);
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(listingsOf()).toEqual([{ targetId, limit: 5, before: null }]);
+
+    // ── 2. expandir busca a próxima página e mantém as cinco primeiras ────
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await expect(list.getByRole("listitem")).toHaveCount(25);
+    expect(listingsOf()[1]).toEqual({ targetId, limit: 20, before: files[4].id });
+    // A ordem é a do servidor, sem duplicatas na emenda das páginas.
+    await expect(list.getByRole("listitem").nth(4)).toContainText(files[4].filename);
+    await expect(list.getByRole("listitem").nth(5)).toContainText(files[5].filename);
+
+    const scroll = await list.evaluate((element) => ({
+      clientHeight: element.clientHeight,
+      scrollHeight: element.scrollHeight,
+      overflowY: getComputedStyle(element).overflowY,
+      tabIndex: element.tabIndex,
+    }));
+    expect(scroll.overflowY).toBe("auto");
+    expect(scroll.scrollHeight).toBeGreaterThan(scroll.clientHeight);
+    expect(scroll.tabIndex).toBe(0);
+
+    // ── 3. a última página vem pelo rodapé, e depois dela nada é oferecido ─
+    await panel.getByRole("button", { name: "Carregar mais arquivos" }).click();
+    await expect(list.getByRole("listitem")).toHaveCount(27);
+    await expect(panel.getByRole("button", { name: "Carregar mais arquivos" })).toHaveCount(0);
+    await expect(list).toBeFocused();
+    expect(listingsOf()[2]).toEqual({ targetId, limit: 20, before: files[24].id });
+
+    // ── 4. recolher e reexpandir não busca de novo nem duplica ─────────────
+    await toggle.click();
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    await toggle.click();
+    await expect(list.getByRole("listitem")).toHaveCount(27);
+    expect(listingsOf()).toHaveLength(3);
+  });
+
+  test("baixa um arquivo verificado pela ação existente e nada oferece aos não aprovados", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "files-action");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Arquivos e Estados",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
+    });
+    scenario.channelAttachments.set(targetId, [
+      {
+        id: `${targetId}-clean`,
+        filename: "relatorio.zip",
+        contentType: "application/zip",
+        size: 113 * 1024,
+        status: "clean",
+        createdAt: "2026-07-15T12:24:00Z",
+      },
+      {
+        id: `${targetId}-pending`,
+        filename: "analise.png",
+        contentType: "image/png",
+        size: 2048,
+        status: "pending_scan",
+        createdAt: "2026-07-15T12:20:00Z",
+      },
+      {
+        id: `${targetId}-rejected`,
+        filename: "virus.exe",
+        contentType: "application/octet-stream",
+        size: 4096,
+        status: "rejected",
+        createdAt: "2026-07-15T12:10:00Z",
+      },
+    ]);
+
+    await installMessagingMocks(page, scenario);
+    const { list } = await openFiles(page, targetId);
+
+    // Em análise e reprovado: status em texto, nenhum controle.
+    await expect(list.getByRole("listitem")).toHaveCount(3);
+    await expect(list.getByRole("listitem").nth(1)).toContainText("Em análise");
+    await expect(list.getByRole("listitem").nth(2)).toContainText("Reprovado");
+    await expect(list.getByRole("listitem").nth(1).getByRole("button")).toHaveCount(0);
+    await expect(list.getByRole("listitem").nth(2).getByRole("button")).toHaveCount(0);
+    await expect(list.getByRole("link")).toHaveCount(0);
+
+    // Verificado: a linha é o Baixar do produto, pela rota autenticada.
+    const action = list.getByRole("button", { name: "Baixar relatorio.zip" });
+    await expect(action).toContainText("Verificado");
+    const download = page.waitForEvent("download");
+    await action.click();
+    expect((await download).suggestedFilename()).toBe("relatorio.zip");
+    expect(scenario.requests.attachmentContentFetches).toEqual([`${targetId}-clean`]);
+  });
+
+  test("funciona por teclado: expande, ativa um arquivo e recolhe com foco visível", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "files-keyboard");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Arquivos Teclado",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
+    });
+    const files = attachmentFixtures("kb", 7);
+    scenario.channelAttachments.set(targetId, files);
+
+    await installMessagingMocks(page, scenario);
+    const { panel, list } = await openFiles(page, targetId);
+    const toggle = filesToggle(panel);
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+
+    await toggle.focus();
+    await page.keyboard.press("Enter");
+    await expect(list.getByRole("listitem")).toHaveCount(7);
+
+    // Controle → região rolável → primeiro arquivo, na ordem natural.
+    await page.keyboard.press("Tab");
+    await expect(list).toBeFocused();
+    await page.keyboard.press("Tab");
+    const first = list.getByRole("button", { name: `Baixar ${files[0].filename}` });
+    await expect(first).toBeFocused();
+    const outline = await first.evaluate((element) => getComputedStyle(element).outlineStyle);
+    expect(outline).not.toBe("none");
+
+    const download = page.waitForEvent("download");
+    await page.keyboard.press("Enter");
+    expect((await download).suggestedFilename()).toBe(files[0].filename);
+
+    await toggle.focus();
+    await page.keyboard.press(" ");
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(toggle).toBeFocused();
+  });
+
+  test("converge sem recarregar quando um arquivo novo chega, mantendo a lista expandida", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "files-realtime");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Arquivos ao Vivo",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
+    });
+    const files = attachmentFixtures("rt", 6);
+    scenario.channelAttachments.set(targetId, files);
+
+    await installMessagingMocks(page, scenario);
+    const { panel, list } = await openFiles(page, targetId);
+    const toggle = filesToggle(panel);
+    await toggle.click();
+    await expect(list.getByRole("listitem")).toHaveCount(6);
+
+    // Outra pessoa enviou um arquivo: o servidor passa a listá-lo primeiro e
+    // publica o evento da conversa, que é o sinal que o painel já segue.
+    const fresh = { ...attachmentFixtures("rt-new", 1)[0], filename: "chegou-agora.pdf" };
+    fresh.createdAt = "2026-07-16T09:00:00Z";
+    scenario.channelAttachments.set(targetId, [fresh, ...files]);
+    await emitConversationEvent(page, scenario, {
+      kind: "channel",
+      targetId,
+      message: makeMessage({ id: `${targetId}-m2`, body_text: "Arquivo enviado" }),
+    });
+
+    // O mesmo tamanho de janela, relido de uma vez: o novo no topo, a lista
+    // ainda expandida, e o mais antigo alcançável pela próxima página.
+    await expect(list.getByRole("listitem").first()).toContainText("chegou-agora.pdf");
+    await expect(list.getByRole("listitem")).toHaveCount(6);
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await panel.getByRole("button", { name: "Carregar mais arquivos" }).click();
+    await expect(list.getByRole("listitem")).toHaveCount(7);
+    await expect(list.getByRole("listitem").last()).toContainText(files[5].filename);
+  });
+
+  test("fecha o visualizador de documento ao trocar de conversa e não o restaura ao voltar", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "files-viewer");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Documentos do Canal",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
+    });
+    scenario.channelAttachments.set(targetId, [
+      {
+        id: `${targetId}-doc`,
+        filename: "contrato-do-canal-a.pdf",
+        contentType: "application/pdf",
+        size: 113 * 1024,
+        status: "clean",
+        previewStatus: "ready",
+        createdAt: "2026-07-15T12:24:00Z",
+      },
+    ]);
+    scenario.channelAttachments.set(OTHER_CHANNEL_ID, [
+      { ...attachmentFixtures("b", 1)[0], filename: "somente-do-canal-b.pdf" },
+    ]);
+    await installMessagingMocks(page, scenario);
+    // The viewer's own manifest: one page. Its bytes are not what this test is
+    // about, so the page itself answers 404 and the viewer shows its fallback.
+    await page.route("**/api/files/attachments/*/document-preview", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          data: { attachmentId: `${targetId}-doc`, kind: "pages", pageCount: 1, labels: ["1"] },
+        }),
+      }),
+    );
+    await page.route("**/api/files/attachments/*/document-preview/pages/*", (route) =>
+      route.fulfill({ status: 404 }),
+    );
+
+    // B first, then A through the sidebar, so the browser history can take the
+    // user back and forth without a reload — and without touching the modal
+    // backdrop, whose own click would close the viewer and prove nothing.
+    await page.goto(`/chat/channel/${OTHER_CHANNEL_ID}`);
+    await page.getByRole("option", { name: /Documentos do Canal/ }).click();
+    await page.getByRole("button", { name: "Detalhes do canal", exact: true }).click();
+    const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
+    const list = panel.getByRole("list", { name: "Arquivos recentes" });
+
+    await list.getByRole("button", { name: "Visualizar contrato-do-canal-a.pdf" }).click();
+    const viewer = page.getByRole("dialog", { name: "contrato-do-canal-a.pdf" });
+    await expect(viewer).toBeVisible();
+
+    // A → B: the panel now describes B, and A's document is gone with A.
+    await page.goBack();
+    await expect(list.getByText("somente-do-canal-b.pdf")).toBeVisible();
+    await expect(viewer).toHaveCount(0);
+
+    // B → A: A's files are back, its document is not reopened on its own.
+    await page.goForward();
+    await expect(
+      list.getByRole("button", { name: "Visualizar contrato-do-canal-a.pdf" }),
+    ).toBeVisible();
+    await expect(viewer).toHaveCount(0);
+  });
+
+  test("não mostra arquivos da conversa anterior quando a troca é mais rápida que a resposta", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "files-switch");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Arquivos Lentos",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
+    });
+    scenario.channelAttachments.set(targetId, [
+      { ...attachmentFixtures("a", 1)[0], filename: "somente-do-canal-a.pdf" },
+    ]);
+    scenario.channelAttachments.set(OTHER_CHANNEL_ID, [
+      { ...attachmentFixtures("b", 1)[0], filename: "somente-do-canal-b.pdf" },
+    ]);
+    await installMessagingMocks(page, scenario);
+
+    // A listagem do canal A fica retida até o canal B estar na tela. Registrada
+    // depois dos mocks, esta rota é consultada primeiro; ao ser liberada, segue
+    // para o mock normal, que responde com o arquivo de A.
+    let releaseA: () => void = () => {};
+    const aReleased = new Promise<void>((resolve) => (releaseA = resolve));
+    let aAnswered: () => void = () => {};
+    const aDone = new Promise<void>((resolve) => (aAnswered = resolve));
+    await page.route(`**/api/files/channels/${targetId}/attachments**`, async (route) => {
+      await aReleased;
+      await route.fallback().catch(() => {});
+      aAnswered();
+    });
+
+    await page.goto(`/chat/channel/${targetId}`);
+    await page.getByRole("button", { name: "Detalhes do canal", exact: true }).click();
+    const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
+    await expect(panel.getByText("Carregando arquivos…")).toBeVisible();
+
+    await page.getByRole("option", { name: new RegExp(OTHER_CHANNEL_NAME) }).click();
+    const list = panel.getByRole("list", { name: "Arquivos recentes" });
+    await expect(list.getByText("somente-do-canal-b.pdf")).toBeVisible();
+
+    releaseA();
+    await aDone;
+    await expect(list.getByRole("listitem")).toHaveCount(1);
+    await expect(panel.getByText("somente-do-canal-a.pdf")).toHaveCount(0);
+  });
+
+  test("continua utilizável e sem overflow horizontal em viewport estreito", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    const targetId = uniqueId(testInfo, "files-phone");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Arquivos Estreitos",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
+    });
+    const files = attachmentFixtures("ph", 8);
+    files[0] = {
+      ...files[0],
+      filename: `${"relatorio-trimestral-com-um-nome-muito-longo-".repeat(4)}final.pdf`,
+    };
+    scenario.channelAttachments.set(targetId, files);
+
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/channel/${targetId}`);
+    await page.getByTestId("chat-details-toggle").click();
+    const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
+    const list = panel.getByRole("list", { name: "Arquivos recentes" });
+    const toggle = filesToggle(panel);
+
+    await toggle.click();
+    await expect(list.getByRole("listitem")).toHaveCount(8);
+    await expect(toggle).toBeVisible();
+
+    const overflow = await page.evaluate(() => {
+      const aside = document.querySelector<HTMLElement>("[data-testid=chat-conversation-details]");
+      return {
+        document: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+        panel: aside ? aside.scrollWidth - aside.clientWidth : 0,
+      };
+    });
+    expect(overflow.document).toBeLessThanOrEqual(0);
+    expect(overflow.panel).toBeLessThanOrEqual(0);
+
+    // O nome longo é truncado dentro da linha, e a ação continua alcançável.
+    const longRow = list.getByRole("button", { name: `Baixar ${files[0].filename}` });
+    await expect(longRow).toBeVisible();
+    const [rowBox, listBox] = await Promise.all([longRow.boundingBox(), list.boundingBox()]);
+    expect((rowBox?.x ?? 0) + (rowBox?.width ?? 0)).toBeLessThanOrEqual(
+      (listBox?.x ?? 0) + (listBox?.width ?? 0) + 1,
+    );
+    const download = page.waitForEvent("download");
+    await longRow.click();
+    await download;
+
+    await toggle.click();
+    await expect(list.getByRole("listitem")).toHaveCount(5);
   });
 });

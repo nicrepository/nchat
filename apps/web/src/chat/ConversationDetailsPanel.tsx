@@ -31,7 +31,9 @@
  *   AttachmentThumbnail and AttachmentVideo fetch their bytes through the
  *   authenticated client and show them from an object URL scoped to this
  *   document, so there is still no address anyone could share or reuse, and
- *   neither is drawn for a file the scan has not cleared.
+ *   neither is drawn for a file the scan has not cleared. A clean file's row
+ *   action (issue #897) is the product's existing Baixar or document viewer,
+ *   over the same authenticated client; see RecentFileRow.
  *
  * The panel is a layout sibling of the conversation, never a modal and never a
  * route: it renders beside the messages so opening it cannot unmount the
@@ -40,6 +42,7 @@
 
 import {
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -49,8 +52,7 @@ import {
 import "./ConversationDetailsPanel.css";
 import AddMembersDialog from "./AddMembersDialog";
 import { fetchChannelMembers } from "./chatApi";
-import AttachmentThumbnail from "./AttachmentThumbnail";
-import AttachmentVideo from "./AttachmentVideo";
+import AttachmentViewerHost from "./AttachmentViewerHost";
 import ConversationNameField from "./ConversationNameField";
 import ExpandableDetailsSection, {
   SectionMessage,
@@ -59,7 +61,6 @@ import ExpandableDetailsSection, {
 import type { ConversationRenameAction } from "./conversationRename";
 import type {
   AddMembersResult,
-  ChannelAttachment,
   ChannelDetails,
   ChannelRoster,
   DirectDetails,
@@ -76,51 +77,23 @@ import {
   type RosterParticipant,
 } from "./participantRosterOrder";
 import type { DirectMessageAccess } from "./directMessage";
-import {
-  avatarColorFor,
-  formatDayLabel,
-  formatLongDate,
-  formatTime,
-  initialsFrom,
-} from "./messageDisplay";
+import { avatarColorFor, formatLongDate, initialsFrom } from "./messageDisplay";
 import PresenceDot from "./PresenceDot";
+import RecentFileRow from "./RecentFileRow";
 import { presenceLabel, presenceTargetKey, usePresence, usePresenceTarget } from "./presence";
-import type { ConversationDetailsState } from "./useConversationDetails";
+import type {
+  ConversationDetailsState,
+  FilesSection,
+  NextFilesPage,
+} from "./useConversationDetails";
 import {
   conversationDetailsPanelId,
   conversationDetailsTitleId,
-  formatFileSize,
   formatLocalTime,
   isValidTimeZone,
   localTimeRefreshMs,
   notInformedLabel,
 } from "./conversationDetailsDisplay";
-
-/** Material symbol name for a file, chosen from the *detected* type only. */
-function fileIconFor(contentType: string): string {
-  if (contentType.startsWith("image/")) return "image";
-  if (contentType.startsWith("video/")) return "movie";
-  if (contentType.startsWith("audio/")) return "graphic_eq";
-  if (contentType === "application/pdf") return "picture_as_pdf";
-  if (contentType.startsWith("text/")) return "description";
-  return "draft";
-}
-
-/**
- * The one place the three scan states get their words (RF-22).
- *
- * All three are drawn, including `clean`. The badge used to be suppressed for
- * an approved file on the theory that "no news is good news", which left the
- * only visible states meaning "wait" and "blocked" — so a user reading the list
- * could not tell an approved file from one whose badge they had simply missed,
- * and the approval this whole feature exists to establish was the one outcome
- * never shown.
- */
-const attachmentStatusLabel: Record<ChannelAttachment["status"], string> = {
-  pending_scan: "Em análise",
-  clean: "Verificado",
-  rejected: "Reprovado",
-};
 
 /**
  * Presence has exactly one authority in this client, and it is the realtime
@@ -732,48 +705,6 @@ const conversationCopy = {
 } as const;
 
 /**
- * One row of the recent-files list.
- *
- * Extracted so the files section hands the shared primitive a list of rows and
- * nothing else: the scan badge, the thumbnail and the player are this row's
- * concern and stay entirely inside it (RF-22, RF-31).
- */
-function FileRow({ file }: { file: ChannelAttachment }) {
-  return (
-    <li className="chat-details__file">
-      {/* The thumbnail owns its own fetch and object URL; the icon stays exactly
-          as it was and is what shows whenever there is no preview to show. */}
-      <AttachmentThumbnail
-        attachment={file}
-        fallback={
-          <span className="chat-details__file-icon" aria-hidden="true">
-            <span className="material-symbols-outlined">{fileIconFor(file.contentType)}</span>
-          </span>
-        }
-      />
-      <span className="chat-details__file-text">
-        {/* A filename is text. It is never a URL and never markup. */}
-        <span className="chat-details__file-name">{file.filename}</span>
-        <span className="chat-details__file-meta">
-          {file.createdAt && `${formatDayLabel(file.createdAt)}, ${formatTime(file.createdAt)} · `}
-          {formatFileSize(file.size)}
-          <span
-            className={`chat-details__file-status chat-details__file-status--${file.status}`}
-            data-testid={`chat-details-file-status-${file.id}`}
-          >
-            {attachmentStatusLabel[file.status]}
-          </span>
-        </span>
-      </span>
-      {/* The player is a sibling of the row's text rather than part of it, so it
-          wraps onto its own line and a file that is not a playable video renders
-          nothing at all — the row keeps its icon, its size and its status. */}
-      <AttachmentVideo attachment={file} />
-    </li>
-  );
-}
-
-/**
  * Everything the people section needs to decide what to draw.
  *
  * One value instead of five positional arguments, because the five are not
@@ -829,18 +760,13 @@ function peopleContent(view: PeopleView): ExpandableSectionContent {
 }
 
 /**
- * The recent-files section's content (issue #892).
+ * The recent-files section's content (issues #892, #897).
  *
- * No `count` and no `hasMore`: the list endpoint reports neither a total nor a
- * cursor, and the panel asks it for exactly `channelFilesPreviewLimit` rows. So
- * this section is structurally expandable and, with today's contract, never has
- * anything to expand to — which is why it shows no control at all rather than
- * one that would reveal nothing.
+ * `hasMore` is the listing's own cursor, not a guess from a full page: the
+ * server reads one row past every page to know. So "Ver todos" appears exactly
+ * when there is something older to show, and the section's loader fetches it.
  */
-function filesContent(
-  files: ConversationDetailsState["files"],
-  emptyText: string,
-): ExpandableSectionContent {
+function filesContent(files: FilesSection, emptyText: string): ExpandableSectionContent {
   if (files.status === "loading") {
     return { status: "loading", message: "Carregando arquivos…" };
   }
@@ -849,13 +775,103 @@ function filesContent(
   }
   return {
     status: "ready",
-    items: files.data.map((file) => <FileRow key={file.id} file={file} />),
+    items: files.data.map((file) => <RecentFileRow key={file.id} file={file} />),
+    hasMore: files.next !== undefined,
     empty: (
       <p className="chat-details__empty" data-testid="chat-details-files-empty">
         {emptyText}
       </p>
     ),
   };
+}
+
+/**
+ * What sits under the expanded file list: the state of the next page.
+ *
+ * Loading and failure are about the next page only, so they are lines *below*
+ * the rows already loaded, which stay exactly where they are. The retry and the
+ * "load more" are the same call — `next.load` asks for the page the list ends
+ * at, whichever of the two brought the user here.
+ */
+function NextFilesFooter({ next }: { next?: NextFilesPage }) {
+  if (!next) return null;
+  return (
+    <>
+      {next.status === "loading" && (
+        <SectionMessage role="status">Carregando mais arquivos…</SectionMessage>
+      )}
+      {next.status === "error" && (
+        <SectionMessage role="alert">Não foi possível carregar mais arquivos.</SectionMessage>
+      )}
+      <LoadMoreFilesButton next={next} />
+    </>
+  );
+}
+
+/**
+ * The one control for the next page, mounted for as long as there is one.
+ *
+ * It stays in place while its page travels — `aria-disabled`, since `load` is
+ * already a no-op then — so a keyboard user who pressed it keeps focus on it.
+ * When the last page arrives it has nothing left to offer and unmounts; if it
+ * held focus then, focus moves to the list it just grew rather than to <body>.
+ * The layout-effect cleanup runs before the button leaves the DOM, which is the
+ * only moment it can still tell it was focused.
+ */
+function LoadMoreFilesButton({ next }: { next: NextFilesPage }) {
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  useLayoutEffect(() => {
+    const button = buttonRef.current;
+    return () => {
+      if (button && button === document.activeElement) {
+        button.closest("section")?.querySelector<HTMLElement>("ul")?.focus();
+      }
+    };
+  }, []);
+  return (
+    <button
+      ref={buttonRef}
+      type="button"
+      className="chat-details__link-action"
+      aria-disabled={next.status === "loading" || undefined}
+      onClick={next.load}
+    >
+      {next.status === "error" ? "Tentar novamente" : "Carregar mais arquivos"}
+    </button>
+  );
+}
+
+/**
+ * The recent-files section (issue #897).
+ *
+ * The primitive owns expanding; this owns only what files add to it: the first
+ * expansion fetches the next page through `onExpand`, and every page after that
+ * through the footer. The viewer host is here because the panel is not inside
+ * the timeline's, and a document opened from a row needs one.
+ *
+ * A document opened from a row must end with the conversation it belongs to:
+ * nothing opened in A may survive into B, or come back on returning to A. The
+ * caller's key cannot guarantee that on its own — it is the *details'* id, and
+ * details and files are independent sections, so while details are loading or
+ * failed every conversation shares one key. The files carry their own boundary
+ * instead: useConversationDetails takes them out of "ready" on every
+ * conversation switch and never on a refresh of the same one, so the viewer host
+ * exists only while one conversation's list is loaded, and a switch unmounts it.
+ */
+function RecentFilesSection({ files, emptyText }: { files: FilesSection; emptyText: string }) {
+  const next = files.status === "ready" ? files.next : undefined;
+  const section = (
+    <ExpandableDetailsSection
+      title="Arquivos recentes"
+      listLabel="Arquivos recentes"
+      content={filesContent(files, emptyText)}
+      onExpand={next?.load}
+      expandedFooter={<NextFilesFooter next={next} />}
+    />
+  );
+  // Rows — the only thing that opens a viewer — exist only in the ready state.
+  if (files.status !== "ready") return section;
+  return <AttachmentViewerHost>{section}</AttachmentViewerHost>;
 }
 
 /**
@@ -1402,7 +1418,7 @@ function ConversationBody({
 }: {
   kind: "channel" | "group";
   details: ConversationDetailsState["details"];
-  files: ConversationDetailsState["files"];
+  files: FilesSection;
   /** The channel's administrable membership (issue #469). */
   roster: ConversationDetailsState["roster"];
   currentUserId: string;
@@ -1446,11 +1462,10 @@ function ConversationBody({
           emptyText={copy.pinEmpty}
         />
       )}
-      <ExpandableDetailsSection
-        key={`files-${manageableTarget(details).id}`}
-        title="Arquivos recentes"
-        listLabel="Arquivos recentes"
-        content={filesContent(files, copy.filesEmpty)}
+      <RecentFilesSection
+        key={`files-${kind}-${manageableTarget(details).id}`}
+        files={files}
+        emptyText={copy.filesEmpty}
       />
     </>
   );

@@ -107,8 +107,8 @@ func (s *gateStore) MarkFailed(_ context.Context, _, _ string) error { return ni
 
 func (s *gateStore) ListDestinationAttachments(
 	_ context.Context, _ service.ListDestinationAttachmentsQuery,
-) ([]service.ListedAttachment, error) {
-	return nil, nil
+) (service.ListedAttachmentPage, error) {
+	return service.ListedAttachmentPage{}, nil
 }
 
 // GetAuthorized answers the visibility question and returns the row as stored.

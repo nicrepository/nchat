@@ -92,9 +92,10 @@ type fakeUseCases struct {
 		page  int
 	}
 
-	listViews []service.AttachmentView
-	listErr   error
-	listInput service.ListDestinationAttachmentsInput
+	listViews      []service.AttachmentView
+	listNextCursor string
+	listErr        error
+	listInput      service.ListDestinationAttachmentsInput
 
 	cancelErr   error
 	cancelInput service.CancelDraftInput
@@ -134,14 +135,14 @@ func (f *fakeUseCases) authorizeCallCount() int {
 
 func (f *fakeUseCases) ListDestinationAttachments(
 	_ context.Context, input service.ListDestinationAttachmentsInput,
-) ([]service.AttachmentView, error) {
+) (service.AttachmentListPage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.listInput = input
 	if f.listErr != nil {
-		return nil, f.listErr
+		return service.AttachmentListPage{}, f.listErr
 	}
-	return f.listViews, nil
+	return service.AttachmentListPage{Attachments: f.listViews, NextCursor: f.listNextCursor}, nil
 }
 
 func (f *fakeUseCases) Upload(_ context.Context, input service.UploadInput) (service.AttachmentView, error) {
