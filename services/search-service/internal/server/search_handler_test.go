@@ -14,12 +14,19 @@ import (
 )
 
 type fakeSearchProvider struct {
+	legacy   domain.LegacyMessagePage
 	messages domain.MessagePage
 	users    domain.UserPage
 	channels domain.ChannelPage
+	groups   domain.GroupPage
+	files    domain.FilePage
+	userID   *string
 	err      error
 }
 
+func (f fakeSearchProvider) SearchLegacyMessages(context.Context, string, string, int, string) (domain.LegacyMessagePage, error) {
+	return f.legacy, f.err
+}
 func (f fakeSearchProvider) SearchMessages(context.Context, string, string, int, string) (domain.MessagePage, error) {
 	return f.messages, f.err
 }
@@ -28,6 +35,43 @@ func (f fakeSearchProvider) SearchUsers(context.Context, string, string, int, st
 }
 func (f fakeSearchProvider) SearchChannels(context.Context, string, string, int, string) (domain.ChannelPage, error) {
 	return f.channels, f.err
+}
+func (f fakeSearchProvider) SearchGroups(_ context.Context, userID, _ string, _ int, _ string) (domain.GroupPage, error) {
+	if f.userID != nil {
+		*f.userID = userID
+	}
+	return f.groups, f.err
+}
+func (f fakeSearchProvider) SearchFiles(_ context.Context, userID, _ string, _ int, _ string) (domain.FilePage, error) {
+	if f.userID != nil {
+		*f.userID = userID
+	}
+	return f.files, f.err
+}
+
+// The caller is the principal: user_id or workspace_id in the query string are
+// ignored, never forwarded as authority.
+func TestGroupsAndFilesUseOnlyThePrincipal(t *testing.T) {
+	for _, tc := range []struct {
+		path  string
+		serve func(*SearchHandler, http.ResponseWriter, *http.Request)
+	}{
+		{"/api/search/groups?q=projeto&user_id=attacker&workspace_id=other", (*SearchHandler).Groups},
+		{"/api/search/files?q=backup&user_id=attacker&workspace_id=other", (*SearchHandler).Files},
+	} {
+		var seen string
+		h := NewSearchHandler(fakeSearchProvider{userID: &seen, groups: domain.GroupPage{Items: []domain.GroupResult{{ID: "g1", Title: "Projeto"}}}, files: domain.FilePage{Items: []domain.FileResult{{ID: "f1", Filename: "backup.pdf"}}}})
+		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		req = req.WithContext(context.WithValue(req.Context(), principalKey{}, Principal{UserID: "user-1"}))
+		res := httptest.NewRecorder()
+		tc.serve(h, res, req)
+		if res.Code != http.StatusOK || seen != "user-1" {
+			t.Fatalf("%s status=%d caller=%q body=%s", tc.path, res.Code, seen, res.Body.String())
+		}
+		if strings.Contains(res.Body.String(), "storage") {
+			t.Fatalf("%s leaked storage detail: %s", tc.path, res.Body.String())
+		}
+	}
 }
 
 func TestSearchMessagesPublishesExistingPaginatedEnvelope(t *testing.T) {

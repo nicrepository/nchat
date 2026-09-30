@@ -24,7 +24,7 @@ const PHONE = { width: 390, height: 844 };
 
 const searchButton = (page: Page) => page.getByRole("button", { name: "Buscar no NChat" });
 const searchField = (page: Page) =>
-  page.getByRole("searchbox", { name: "Buscar mensagens, pessoas e canais" });
+  page.getByRole("searchbox", { name: "Buscar mensagens, pessoas, canais, grupos e arquivos" });
 const composerInput = (page: Page) => page.getByTestId("chat-composer-input");
 
 async function openConversation(page: Page, testInfo: Parameters<typeof uniqueId>[0]) {

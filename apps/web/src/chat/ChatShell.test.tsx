@@ -2069,7 +2069,9 @@ describe("ChatShell — ponto de entrada da busca global (#550)", () => {
 
   const searchButton = () => screen.getByRole("button", { name: "Buscar no NChat" });
   const searchField = () =>
-    screen.findByRole("searchbox", { name: "Buscar mensagens, pessoas e canais" });
+    screen.findByRole("searchbox", {
+      name: "Buscar mensagens, pessoas, canais, grupos e arquivos",
+    });
 
   beforeEach(() => {
     vi.mocked(fetchSidebarData).mockResolvedValue({

@@ -738,6 +738,10 @@ func TestChatMigration_DownDemotesModeratorsAndRestoresThePreviousPolicy(t *test
 	}
 }
 
+// Historical: pins the applied 000027 file, whose checksum must not change.
+// Chat migration 000059 (issue #900) supersedes this behaviour — every active
+// message is indexed and search-service authorizes at query time.
+//
 // RF-15 (issue #123, TASK-94): search_vector must only ever be computed for
 // active channel messages, gated on the *current* channel type and status
 // read from chat.channels — never a copy of DM/private/archived logic baked

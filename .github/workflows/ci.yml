@@ -272,7 +272,7 @@ jobs:
           POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
         run: |
           set -euo pipefail
-          for database in admin_test auth_test media_test; do
+          for database in admin_test auth_test media_test search_test; do
             docker exec "$POSTGRES_CONTAINER" createdb -U nchat "$database"
           done
       - name: Test against PostgreSQL
@@ -281,6 +281,7 @@ jobs:
           ADMIN_TEST_DATABASE_URL: postgresql://nchat:REPLACE_ME@localhost:5432/admin_test?sslmode=disable
           AUTH_TEST_DATABASE_URL: postgresql://nchat:REPLACE_ME@localhost:5432/auth_test?sslmode=disable
           MEDIA_TEST_DATABASE_URL: postgresql://nchat:REPLACE_ME@localhost:5432/media_test?sslmode=disable
+          SEARCH_TEST_DATABASE_URL: postgresql://nchat:REPLACE_ME@localhost:5432/search_test?sslmode=disable
         run: bash scripts/ci/go-integration-test.sh
 
   # Kept separate from Tests / Go Unit because it is a different measurement, not

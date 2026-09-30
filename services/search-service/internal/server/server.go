@@ -45,9 +45,13 @@ func NewHandlerWithDependencies(serviceName string, deps Dependencies) http.Hand
 			mux.Handle(publicPath, protected)
 			mux.Handle(strippedPath, protected)
 		}
-		register("/api/search/messages", "/messages", search.Messages)
+		// Deprecated, retained for rollout compatibility: pre-#900 web builds.
+		register("/api/search/messages", "/messages", search.LegacyMessages)
+		register("/api/search/v2/messages", "/v2/messages", search.Messages)
 		register("/api/search/users", "/users", search.Users)
 		register("/api/search/channels", "/channels", search.Channels)
+		register("/api/search/groups", "/groups", search.Groups)
+		register("/api/search/files", "/files", search.Files)
 	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")

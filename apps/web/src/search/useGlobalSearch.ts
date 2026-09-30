@@ -1,19 +1,29 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 
-import { searchChannels, searchMessages, searchUsers, classifySearchError } from "./searchApi";
-import type {
-  ChannelSearchResult,
-  MessageSearchResult,
-  SearchErrorKind,
-  SearchResultPage,
-  SearchTab,
-  UserSearchResult,
+import { classifySearchError, searchCategory } from "./searchApi";
+import {
+  SEARCH_CATEGORIES,
+  type SearchCategory,
+  type SearchErrorKind,
+  type SearchResultByCategory,
+  type SearchResultPage,
+  type SearchTab,
 } from "./searchTypes";
 
-const DEBOUNCE_MS = 300;
-const PAGE_LIMIT = 20;
+export const SEARCH_DEBOUNCE_MS = 300;
+export const PAGE_LIMIT = 20;
+/** How many results each section of "Tudo" shows. */
+export const OVERVIEW_LIMIT = 5;
 
-interface TabState<T> {
+/**
+ * Each category is loaded twice over, into separate slots: a small top-N for
+ * the "Tudo" overview and a paginated list for its own tab. They answer
+ * different requests (limit 5 vs 20 plus cursors), so neither is derived from
+ * the other.
+ */
+export type SearchScope = "overview" | "tabs";
+
+export interface ListState<T> {
   status: "idle" | "loading" | "ready" | "error";
   items: T[];
   cursor: string | null;
@@ -23,7 +33,52 @@ interface TabState<T> {
   loadMoreError: SearchErrorKind | null;
 }
 
-function idleTab<T>(): TabState<T> {
+export type SearchLists = { [C in SearchCategory]: ListState<SearchResultByCategory[C]> };
+
+export interface GlobalSearchState {
+  query: string;
+  activeQuery: string;
+  activeTab: SearchTab;
+  /**
+   * The debounce window: the field no longer says what activeQuery says, and
+   * the new query has not been committed yet. The old query's results were
+   * dropped the moment this became true — they are not the answer to what the
+   * field shows — and nothing is requested until the commit.
+   */
+  typing: boolean;
+  /**
+   * Bumped on every committed query and whenever the field leaves the
+   * committed one. Every response carries the generation it
+   * was requested under and is dropped when that is no longer current, so a
+   * late answer for an old query can never land on the new one — aborting is
+   * the fast path, this is the guarantee.
+   */
+  generation: number;
+  overview: SearchLists;
+  tabs: SearchLists;
+}
+
+export interface RestoredSearch {
+  query: string;
+  tab: SearchTab;
+}
+
+interface Slot {
+  scope: SearchScope;
+  category: SearchCategory;
+  generation: number;
+}
+
+type Action =
+  | { type: "SET_QUERY"; query: string }
+  | { type: "COMMIT_QUERY"; query: string }
+  | { type: "SET_ACTIVE_TAB"; tab: SearchTab }
+  | ({ type: "FETCH_START" | "MORE_START" } & Slot)
+  | ({ type: "FETCH_SUCCESS" | "MORE_SUCCESS"; page: SearchResultPage<{ id: string }> } & Slot)
+  | ({ type: "FETCH_ERROR" | "MORE_ERROR"; errorKind: SearchErrorKind } & Slot)
+  | { type: "RETRY"; scope: SearchScope; category: SearchCategory };
+
+function idleList<T>(): ListState<T> {
   return {
     status: "idle",
     items: [],
@@ -35,149 +90,175 @@ function idleTab<T>(): TabState<T> {
   };
 }
 
-export interface GlobalSearchState {
-  query: string;
-  activeQuery: string;
-  activeTab: SearchTab;
-  messages: TabState<MessageSearchResult>;
-  users: TabState<UserSearchResult>;
-  channels: TabState<ChannelSearchResult>;
-}
-
-type Action =
-  | { type: "SET_QUERY"; query: string }
-  | { type: "COMMIT_QUERY"; query: string }
-  | { type: "SET_ACTIVE_TAB"; tab: SearchTab }
-  | { type: "FETCH_START"; tab: SearchTab }
-  | { type: "FETCH_SUCCESS"; tab: SearchTab; page: SearchResultPage<unknown> }
-  | { type: "FETCH_ERROR"; tab: SearchTab; errorKind: SearchErrorKind }
-  | { type: "LOAD_MORE_START"; tab: SearchTab }
-  | { type: "LOAD_MORE_SUCCESS"; tab: SearchTab; page: SearchResultPage<unknown> }
-  | { type: "LOAD_MORE_ERROR"; tab: SearchTab; errorKind: SearchErrorKind }
-  | { type: "RETRY_TAB"; tab: SearchTab };
-
-function initialState(): GlobalSearchState {
+function idleLists(): SearchLists {
   return {
-    query: "",
-    activeQuery: "",
-    activeTab: "messages",
-    messages: idleTab(),
-    users: idleTab(),
-    channels: idleTab(),
+    messages: idleList(),
+    users: idleList(),
+    channels: idleList(),
+    groups: idleList(),
+    files: idleList(),
   };
 }
 
-function updateTab<T>(
+function initialState(restored: RestoredSearch | undefined): GlobalSearchState {
+  const query = restored?.query.trim() ?? "";
+  return {
+    query,
+    activeQuery: query,
+    activeTab: restored?.tab ?? "all",
+    typing: false,
+    generation: 0,
+    overview: idleLists(),
+    tabs: idleLists(),
+  };
+}
+
+type AnyList = ListState<{ id: string }>;
+
+function patchSlot(
   state: GlobalSearchState,
-  tab: SearchTab,
-  update: (current: TabState<T>) => TabState<T>,
+  slot: Omit<Slot, "generation"> & { generation?: number },
+  update: (list: AnyList) => AnyList,
 ): GlobalSearchState {
-  return { ...state, [tab]: update(state[tab] as TabState<T>) };
+  if (slot.generation !== undefined && slot.generation !== state.generation) return state;
+  const lists = state[slot.scope] as unknown as Record<SearchCategory, AnyList>;
+  return {
+    ...state,
+    [slot.scope]: { ...lists, [slot.category]: update(lists[slot.category]) },
+  };
+}
+
+/** Appends a page, skipping anything an earlier page already showed. */
+function appendPage(list: AnyList, page: SearchResultPage<{ id: string }>): AnyList {
+  const seen = new Set(list.items.map((item) => item.id));
+  return {
+    ...list,
+    loadingMore: false,
+    items: [...list.items, ...page.items.filter((item) => !seen.has(item.id))],
+    cursor: page.nextCursor,
+    hasMore: page.hasMore,
+    loadMoreError: null,
+  };
+}
+
+/** A cursor is never valid across queries, so every slot starts over. */
+function invalidated(state: GlobalSearchState): GlobalSearchState {
+  return { ...state, generation: state.generation + 1, overview: idleLists(), tabs: idleLists() };
 }
 
 function reducer(state: GlobalSearchState, action: Action): GlobalSearchState {
   switch (action.type) {
-    case "SET_QUERY":
-      return { ...state, query: action.query };
-
+    case "SET_QUERY": {
+      const typing = action.query.trim() !== state.activeQuery;
+      // Entering the window invalidates everything the old query produced;
+      // staying in it (another keystroke) changes nothing else. Leaving it by
+      // typing back to the committed query searches that query again.
+      if (typing === state.typing) return { ...state, query: action.query };
+      return { ...invalidated(state), query: action.query, typing };
+    }
     case "COMMIT_QUERY":
-      // A new committed query invalidates every tab atomically — a cursor is
-      // never valid across a query change, per the search-service contract.
-      return {
-        ...state,
-        activeQuery: action.query,
-        messages: idleTab(),
-        users: idleTab(),
-        channels: idleTab(),
-      };
-
+      return { ...invalidated(state), activeQuery: action.query, typing: false };
     case "SET_ACTIVE_TAB":
       return { ...state, activeTab: action.tab };
-
     case "FETCH_START":
-      return updateTab(state, action.tab, (current) => ({
-        ...current,
-        status: "loading",
-        errorKind: null,
-      }));
-
+      return patchSlot(state, action, (list) => ({ ...list, status: "loading", errorKind: null }));
     case "FETCH_SUCCESS":
-      return updateTab(state, action.tab, (current) => ({
-        ...current,
+      return patchSlot(state, action, (list) => ({
+        ...list,
         status: "ready",
         items: action.page.items,
         cursor: action.page.nextCursor,
         hasMore: action.page.hasMore,
-        errorKind: null,
       }));
-
     case "FETCH_ERROR":
-      return updateTab(state, action.tab, (current) => ({
-        ...current,
+      return patchSlot(state, action, (list) => ({
+        ...list,
         status: "error",
         errorKind: action.errorKind,
       }));
-
-    case "LOAD_MORE_START":
-      return updateTab(state, action.tab, (current) => ({
-        ...current,
+    case "MORE_START":
+      return patchSlot(state, action, (list) => ({
+        ...list,
         loadingMore: true,
         loadMoreError: null,
       }));
-
-    case "LOAD_MORE_SUCCESS":
-      return updateTab(state, action.tab, (current) => ({
-        ...current,
-        loadingMore: false,
-        items: [...current.items, ...action.page.items],
-        cursor: action.page.nextCursor,
-        hasMore: action.page.hasMore,
-        loadMoreError: null,
-      }));
-
-    case "LOAD_MORE_ERROR":
-      // Items and cursor are left untouched: a failed "load more" must never
-      // erase results already on screen.
-      return updateTab(state, action.tab, (current) => ({
-        ...current,
+    case "MORE_SUCCESS":
+      return patchSlot(state, action, (list) => appendPage(list, action.page));
+    case "MORE_ERROR":
+      // Items and cursor stay: a failed "load more" never erases what is shown.
+      return patchSlot(state, action, (list) => ({
+        ...list,
         loadingMore: false,
         loadMoreError: action.errorKind,
       }));
-
-    case "RETRY_TAB":
-      return updateTab(state, action.tab, () => idleTab());
-
-    default:
-      return state;
+    case "RETRY":
+      return patchSlot(state, action, () => idleList());
   }
 }
 
-const TAB_FETCHERS = {
-  messages: searchMessages,
-  users: searchUsers,
-  channels: searchChannels,
-} as const;
+/** The slots the current view needs; "Tudo" needs all five overviews. */
+function slotsInView(tab: SearchTab): Array<[SearchScope, SearchCategory]> {
+  return tab === "all"
+    ? SEARCH_CATEGORIES.map((category) => ["overview", category])
+    : [["tabs", tab]];
+}
 
 export interface UseGlobalSearchResult {
   state: GlobalSearchState;
   setQuery: (query: string) => void;
   setActiveTab: (tab: SearchTab) => void;
-  loadMore: (tab: SearchTab) => void;
-  retryTab: (tab: SearchTab) => void;
+  loadMore: (category: SearchCategory) => void;
+  retry: (scope: SearchScope, category: SearchCategory) => void;
 }
 
 /**
- * Orchestrates the global search page: debounced query commit, one fetch per
- * tab (lazy — only the active tab, and only once per committed query), abort
- * of superseded requests, and cursor-based "load more" pagination.
+ * Orchestrates the global search page: debounced query commit, lazy fetch of
+ * exactly the slots the visible view needs (only once per committed query),
+ * abort of superseded requests, and cursor pagination per category.
+ *
+ * Switching tabs does not abort anything: a request for the same query is
+ * still valid and simply fills its slot for when the reader comes back.
  */
-export function useGlobalSearch(): UseGlobalSearchResult {
-  const [state, dispatch] = useReducer(reducer, undefined, initialState);
-  const controllersRef = useRef<Record<SearchTab, AbortController | null>>({
-    messages: null,
-    users: null,
-    channels: null,
+export function useGlobalSearch(restored?: RestoredSearch): UseGlobalSearchResult {
+  const [state, dispatch] = useReducer(reducer, restored, initialState);
+  const stateRef = useRef(state);
+  const controllersRef = useRef(new Map<string, AbortController>());
+
+  useEffect(() => {
+    stateRef.current = state;
   });
+
+  const abortAll = useCallback(() => {
+    controllersRef.current.forEach((controller) => controller.abort());
+    controllersRef.current.clear();
+  }, []);
+
+  const run = useCallback((scope: SearchScope, category: SearchCategory, cursor: string | null) => {
+    const { activeQuery: query, generation } = stateRef.current;
+    const key = `${scope}:${category}`;
+    controllersRef.current.get(key)?.abort();
+    const controller = new AbortController();
+    controllersRef.current.set(key, controller);
+
+    const slot = { scope, category, generation };
+    const more = cursor !== null;
+    dispatch({ type: more ? "MORE_START" : "FETCH_START", ...slot });
+    searchCategory(category, query, {
+      limit: scope === "overview" ? OVERVIEW_LIMIT : PAGE_LIMIT,
+      cursor: cursor ?? undefined,
+      signal: controller.signal,
+    }).then(
+      (page) => {
+        if (controller.signal.aborted) return;
+        dispatch({ type: more ? "MORE_SUCCESS" : "FETCH_SUCCESS", ...slot, page });
+      },
+      (error: unknown) => {
+        if (controller.signal.aborted) return;
+        const errorKind = classifySearchError(error);
+        dispatch({ type: more ? "MORE_ERROR" : "FETCH_ERROR", ...slot, errorKind });
+      },
+    );
+  }, []);
 
   // ── Debounce: commit the trimmed query after the user pauses typing ──────────
   useEffect(() => {
@@ -185,76 +266,63 @@ export function useGlobalSearch(): UseGlobalSearchResult {
     if (trimmed === state.activeQuery) return;
 
     const timer = window.setTimeout(() => {
+      abortAll();
       dispatch({ type: "COMMIT_QUERY", query: trimmed });
-    }, DEBOUNCE_MS);
+    }, SEARCH_DEBOUNCE_MS);
 
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- activeQuery is read, not depended on: it must not restart the debounce timer while it's ticking.
   }, [state.query]);
 
-  // ── Lazy per-tab fetch: only the active tab, only when idle ─────────────────
-  // Depends on the active tab's own status (not just which tab/query is active)
-  // so that retryTab — which resets a tab back to "idle" without touching
-  // activeQuery/activeTab — reliably re-triggers this effect.
-  const activeTabStatus = state[state.activeTab].status;
+  // ── Lazy fetch: every idle slot the current view shows ──────────────────────
+  // Keyed on which of those slots are idle, so a retry (which resets a slot to
+  // idle) re-triggers this effect as reliably as a new query or tab does.
+  const idleSlots =
+    state.activeQuery && !state.typing
+      ? slotsInView(state.activeTab)
+          .filter(([scope, category]) => state[scope][category].status === "idle")
+          .map(([scope, category]) => `${scope}:${category}`)
+          .join(",")
+      : "";
   useEffect(() => {
-    if (!state.activeQuery) return;
-    const tab = state.activeTab;
-    if (activeTabStatus !== "idle") return;
+    if (!idleSlots) return;
+    for (const key of idleSlots.split(",")) {
+      const [scope, category] = key.split(":") as [SearchScope, SearchCategory];
+      run(scope, category, null);
+    }
+  }, [idleSlots, state.generation, run]);
 
-    controllersRef.current[tab]?.abort();
-    const controller = new AbortController();
-    controllersRef.current[tab] = controller;
+  useEffect(() => abortAll, [abortAll]);
 
-    dispatch({ type: "FETCH_START", tab });
-    TAB_FETCHERS[tab](state.activeQuery, { limit: PAGE_LIMIT, signal: controller.signal }).then(
-      (page) => {
-        if (controller.signal.aborted) return;
-        dispatch({ type: "FETCH_SUCCESS", tab, page });
-      },
-      (error: unknown) => {
-        if (controller.signal.aborted) return;
-        dispatch({ type: "FETCH_ERROR", tab, errorKind: classifySearchError(error) });
-      },
-    );
-  }, [state.activeQuery, state.activeTab, activeTabStatus]);
-
-  useEffect(() => {
-    const controllers = controllersRef.current;
-    return () => {
-      controllers.messages?.abort();
-      controllers.users?.abort();
-      controllers.channels?.abort();
-    };
-  }, []);
-
-  const setQuery = useCallback((query: string) => {
-    dispatch({ type: "SET_QUERY", query });
-  }, []);
-
-  const setActiveTab = useCallback((tab: SearchTab) => {
-    dispatch({ type: "SET_ACTIVE_TAB", tab });
-  }, []);
-
-  const loadMore = useCallback(
-    (tab: SearchTab) => {
-      const tabState = state[tab];
-      if (tabState.status !== "ready" || !tabState.hasMore || tabState.loadingMore) return;
-      if (!tabState.cursor) return;
-
-      dispatch({ type: "LOAD_MORE_START", tab });
-      TAB_FETCHERS[tab](state.activeQuery, { limit: PAGE_LIMIT, cursor: tabState.cursor }).then(
-        (page) => dispatch({ type: "LOAD_MORE_SUCCESS", tab, page }),
-        (error: unknown) =>
-          dispatch({ type: "LOAD_MORE_ERROR", tab, errorKind: classifySearchError(error) }),
-      );
+  // Aborting here, in the keystroke's own handler, is the earliest point the
+  // old query's requests can be stopped; the generation bump in the reducer
+  // then drops anything that answers regardless.
+  const setQuery = useCallback(
+    (query: string) => {
+      if (query.trim() !== stateRef.current.activeQuery) abortAll();
+      dispatch({ type: "SET_QUERY", query });
     },
-    [state],
+    [abortAll],
   );
 
-  const retryTab = useCallback((tab: SearchTab) => {
-    dispatch({ type: "RETRY_TAB", tab });
-  }, []);
+  const setActiveTab = useCallback(
+    (tab: SearchTab) => dispatch({ type: "SET_ACTIVE_TAB", tab }),
+    [],
+  );
 
-  return { state, setQuery, setActiveTab, loadMore, retryTab };
+  const loadMore = useCallback(
+    (category: SearchCategory) => {
+      const list = stateRef.current.tabs[category];
+      if (list.status !== "ready" || !list.hasMore || list.loadingMore || !list.cursor) return;
+      run("tabs", category, list.cursor);
+    },
+    [run],
+  );
+
+  const retry = useCallback(
+    (scope: SearchScope, category: SearchCategory) => dispatch({ type: "RETRY", scope, category }),
+    [],
+  );
+
+  return { state, setQuery, setActiveTab, loadMore, retry };
 }

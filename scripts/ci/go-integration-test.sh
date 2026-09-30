@@ -52,6 +52,7 @@ SUITES=(
   "services/admin-service|ADMIN_TEST_DATABASE_URL|./internal/storage|"
   "services/auth-service|AUTH_TEST_DATABASE_URL|./internal/storage|"
   "services/media-service|MEDIA_TEST_DATABASE_URL|./internal/storage|-tags integration"
+  "services/search-service|SEARCH_TEST_DATABASE_URL|./internal/storage|-run ^TestSearchAuthorizationPostgreSQL$"
 )
 
 for suite in "${SUITES[@]}"; do

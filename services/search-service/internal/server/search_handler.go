@@ -17,9 +17,12 @@ const (
 )
 
 type SearchProvider interface {
+	SearchLegacyMessages(context.Context, string, string, int, string) (domain.LegacyMessagePage, error)
 	SearchMessages(context.Context, string, string, int, string) (domain.MessagePage, error)
 	SearchUsers(context.Context, string, string, int, string) (domain.UserPage, error)
 	SearchChannels(context.Context, string, string, int, string) (domain.ChannelPage, error)
+	SearchGroups(context.Context, string, string, int, string) (domain.GroupPage, error)
+	SearchFiles(context.Context, string, string, int, string) (domain.FilePage, error)
 }
 
 type SearchHandler struct{ provider SearchProvider }
@@ -38,41 +41,47 @@ type pageResponse struct {
 	Pagination pagination `json:"pagination"`
 }
 
-func (h *SearchHandler) Messages(w http.ResponseWriter, r *http.Request) {
+type searchFunc[T any] func(context.Context, string, string, int, string) (domain.Page[T], error)
+
+// servePage is every search endpoint: the caller is the authenticated
+// principal and nothing else — no user or workspace is read from the request.
+func servePage[T any](w http.ResponseWriter, r *http.Request, search searchFunc[T]) {
 	q, limit, cursor, ok := parseSearchRequest(w, r)
 	if !ok {
 		return
 	}
-	p, err := h.provider.SearchMessages(r.Context(), authenticatedUserID(r), q, limit, cursor)
+	p, err := search(r.Context(), authenticatedUserID(r), q, limit, cursor)
 	if err != nil {
 		writeSearchError(w, err)
 		return
 	}
 	writePage(w, p.Items, limit, p.NextCursor)
+}
+
+// LegacyMessages is GET /api/search/messages as it was before #900: channel
+// messages in the channel-only shape. Deprecated, retained for rollout
+// compatibility — a web build from before #900 calls it and routes every row
+// to a channel. Not to be removed while such a build can still be served
+// (docs/api/search.md).
+func (h *SearchHandler) LegacyMessages(w http.ResponseWriter, r *http.Request) {
+	servePage(w, r, h.provider.SearchLegacyMessages)
+}
+
+// Messages is GET /api/search/v2/messages: every conversation kind.
+func (h *SearchHandler) Messages(w http.ResponseWriter, r *http.Request) {
+	servePage(w, r, h.provider.SearchMessages)
 }
 func (h *SearchHandler) Users(w http.ResponseWriter, r *http.Request) {
-	q, limit, cursor, ok := parseSearchRequest(w, r)
-	if !ok {
-		return
-	}
-	p, err := h.provider.SearchUsers(r.Context(), authenticatedUserID(r), q, limit, cursor)
-	if err != nil {
-		writeSearchError(w, err)
-		return
-	}
-	writePage(w, p.Items, limit, p.NextCursor)
+	servePage(w, r, h.provider.SearchUsers)
 }
 func (h *SearchHandler) Channels(w http.ResponseWriter, r *http.Request) {
-	q, limit, cursor, ok := parseSearchRequest(w, r)
-	if !ok {
-		return
-	}
-	p, err := h.provider.SearchChannels(r.Context(), authenticatedUserID(r), q, limit, cursor)
-	if err != nil {
-		writeSearchError(w, err)
-		return
-	}
-	writePage(w, p.Items, limit, p.NextCursor)
+	servePage(w, r, h.provider.SearchChannels)
+}
+func (h *SearchHandler) Groups(w http.ResponseWriter, r *http.Request) {
+	servePage(w, r, h.provider.SearchGroups)
+}
+func (h *SearchHandler) Files(w http.ResponseWriter, r *http.Request) {
+	servePage(w, r, h.provider.SearchFiles)
 }
 
 func parseSearchRequest(w http.ResponseWriter, r *http.Request) (string, int, string, bool) {

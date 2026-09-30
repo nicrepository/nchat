@@ -1,21 +1,7 @@
-import type { ReactNode } from "react";
-
-import type { SearchErrorKind } from "./searchTypes";
-
-interface SearchResultListProps<T> {
-  status: "idle" | "loading" | "ready" | "error";
-  items: T[];
-  errorKind: SearchErrorKind | null;
-  hasMore: boolean;
-  loadingMore: boolean;
-  loadMoreError: SearchErrorKind | null;
-  emptyMessage: string;
-  listLabel: string;
-  renderItem: (item: T) => ReactNode;
-  itemKey: (item: T) => string;
-  onRetry: () => void;
-  onLoadMore: () => void;
-}
+import SearchResultRow from "./SearchResultRow";
+import { resultCount, TAB_LABELS } from "./searchLabels";
+import type { SearchCategory, SearchErrorKind, SearchResultByCategory } from "./searchTypes";
+import type { ListState } from "./useGlobalSearch";
 
 function errorMessage(kind: SearchErrorKind | null): string {
   switch (kind) {
@@ -23,80 +9,100 @@ function errorMessage(kind: SearchErrorKind | null): string {
       return "Você não tem permissão para ver esses resultados.";
     case "bad_request":
       return "Não foi possível interpretar essa busca.";
-    case "server_error":
-      return "O servidor de busca está indisponível no momento.";
     default:
-      return "Não foi possível carregar os resultados.";
+      return "Não foi possível buscar agora.";
   }
 }
 
-export default function SearchResultList<T>({
-  status,
-  items,
-  errorKind,
-  hasMore,
-  loadingMore,
-  loadMoreError,
-  emptyMessage,
-  listLabel,
-  renderItem,
-  itemKey,
+/** Placeholder cards while a list loads. Decorative: the page announces loading once. */
+export function SearchSkeleton({ rows }: { rows: number }) {
+  return (
+    <ul className="global-search__list" aria-hidden="true" data-testid="global-search-skeleton">
+      {Array.from({ length: rows }, (_, index) => (
+        <li key={index} className="global-search__item global-search__item--skeleton" />
+      ))}
+    </ul>
+  );
+}
+
+export function SearchError({
+  kind,
+  onRetry,
+}: {
+  kind: SearchErrorKind | null;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="global-search__status" role="alert">
+      <span>{errorMessage(kind)}</span>
+      <button type="button" className="global-search__link-btn" onClick={onRetry}>
+        Tentar novamente
+      </button>
+    </div>
+  );
+}
+
+export function SearchEmpty({ query }: { query: string }) {
+  return (
+    <div className="global-search__empty" data-testid="global-search-empty">
+      <p className="global-search__empty-title">Nenhum resultado para “{query}”.</p>
+      <p>Tente outro termo ou selecione outra categoria.</p>
+    </div>
+  );
+}
+
+/**
+ * One category in its own tab: the whole list, paginated by cursor. The count
+ * is printed only when it is exact — the last page is here — because the
+ * server does not total a search, and a count of the rows on screen would
+ * understate one that has more.
+ */
+export default function SearchResultList<C extends SearchCategory>({
+  category,
+  list,
+  query,
   onRetry,
   onLoadMore,
-}: SearchResultListProps<T>) {
-  if (status === "idle") return null;
-
-  if (status === "loading") {
-    return (
-      <div className="global-search__status" role="status">
-        Buscando…
-      </div>
-    );
-  }
-
-  if (status === "error") {
-    return (
-      <div className="global-search__status" role="alert">
-        <span>{errorMessage(errorKind)}</span>
-        <button type="button" className="global-search__link-btn" onClick={onRetry}>
-          Tentar novamente
-        </button>
-      </div>
-    );
-  }
-
-  if (items.length === 0) {
-    return (
-      <div className="global-search__status" data-testid="global-search-empty">
-        {emptyMessage}
-      </div>
-    );
-  }
+}: {
+  category: C;
+  list: ListState<SearchResultByCategory[C]>;
+  query: string;
+  onRetry: () => void;
+  onLoadMore: () => void;
+}) {
+  if (list.status === "idle" || list.status === "loading") return <SearchSkeleton rows={4} />;
+  if (list.status === "error") return <SearchError kind={list.errorKind} onRetry={onRetry} />;
+  if (list.items.length === 0) return <SearchEmpty query={query} />;
 
   return (
     <>
-      <ul className="global-search__list" aria-label={listLabel}>
-        {items.map((item) => (
-          <li key={itemKey(item)} className="global-search__item">
-            {renderItem(item)}
+      {!list.hasMore && (
+        <p className="global-search__count">
+          {resultCount(list.items.length)} para “{query}”
+        </p>
+      )}
+      <ul className="global-search__list" aria-label={TAB_LABELS[category]}>
+        {list.items.map((item) => (
+          <li key={item.id} className="global-search__item">
+            <SearchResultRow category={category} result={item} query={query} />
           </li>
         ))}
       </ul>
 
-      {hasMore && (
+      {list.hasMore && (
         <button
           type="button"
           className="global-search__load-more"
           onClick={onLoadMore}
-          disabled={loadingMore}
+          disabled={list.loadingMore}
         >
-          {loadingMore ? "Carregando…" : "Carregar mais"}
+          {list.loadingMore ? "Carregando…" : "Carregar mais"}
         </button>
       )}
 
-      {loadMoreError && (
+      {list.loadMoreError && (
         <div className="global-search__status" role="alert">
-          {errorMessage(loadMoreError)}
+          {errorMessage(list.loadMoreError)}
         </div>
       )}
     </>
