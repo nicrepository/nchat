@@ -7,8 +7,8 @@
  * loading/error/empty/pagination state per tab.
  */
 
-import { type KeyboardEvent } from "react";
-import { useNavigate } from "react-router";
+import { useEffect, useRef, type KeyboardEvent } from "react";
+import { useLocation, useNavigate } from "react-router";
 
 import "./GlobalSearchPage.css";
 
@@ -28,6 +28,12 @@ const TABS: Array<{ id: SearchTab; label: string }> = [
 export default function GlobalSearchPage() {
   const { state, setQuery, setActiveTab, loadMore, retryTab } = useGlobalSearch();
   const navigate = useNavigate();
+  const { key: entryKey } = useLocation();
+  const inputRef = useRef<HTMLInputElement>(null);
+  // The field takes focus on every entry into the search: the first open, and
+  // a repeat open while already here — the shell replaces the history entry
+  // rather than stacking one (issue #550), which gives it a new key.
+  useEffect(() => inputRef.current?.focus(), [entryKey]);
 
   function closeSearch(event: KeyboardEvent<HTMLElement>) {
     if (event.key !== "Escape" || event.defaultPrevented) return;
@@ -50,7 +56,7 @@ export default function GlobalSearchPage() {
             id="global-search-input"
             type="search"
             autoComplete="off"
-            autoFocus
+            ref={inputRef}
             placeholder="Buscar mensagens, pessoas e canais"
             value={state.query}
             onChange={(event) => setQuery(event.target.value)}

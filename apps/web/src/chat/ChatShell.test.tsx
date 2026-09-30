@@ -11,6 +11,7 @@ import ChatShell, { type ChatOutletContext } from "./ChatShell";
 import CallSessionProvider from "../calls/CallSessionProvider";
 import { _resetChatSocket } from "./chatSocket";
 import { requestMediaPermission, type MediaPermissionResult } from "./mediaPermission";
+import GlobalSearchPage from "../search/GlobalSearchPage";
 import { NAV_DRAWER_QUERY } from "./useNavDrawer";
 import { useCallMedia } from "./useCallMedia";
 
@@ -1820,34 +1821,33 @@ describe("ChatShell — trava de rolagem do documento", () => {
   });
 });
 
+/**
+ * A MediaQueryList stand-in: jsdom does not implement matchMedia, so without
+ * this every query simply never matches — which is exactly the wide-viewport
+ * answer the tests that omit it rely on.
+ */
+function stubViewport(startsAsDrawer: boolean) {
+  let drawer = startsAsDrawer;
+  const listeners = new Set<() => void>();
+  window.matchMedia = ((query: string) => ({
+    get matches() {
+      return query === NAV_DRAWER_QUERY && drawer;
+    },
+    media: query,
+    addEventListener: (_event: string, callback: () => void) => void listeners.add(callback),
+    removeEventListener: (_event: string, callback: () => void) => void listeners.delete(callback),
+  })) as unknown as typeof window.matchMedia;
+  return {
+    resizeTo(nextIsDrawer: boolean) {
+      drawer = nextIsDrawer;
+      act(() => listeners.forEach((callback) => callback()));
+    },
+  };
+}
+
 describe("ChatShell — navegação responsiva", () => {
   const readingId = "00000000-0000-4000-8000-0000000005b1";
   const otherId = "00000000-0000-4000-8000-0000000005b2";
-
-  /**
-   * A MediaQueryList stand-in: jsdom does not implement matchMedia, so without
-   * this every query simply never matches — which is exactly the wide-viewport
-   * answer the tests that omit it rely on.
-   */
-  function stubViewport(startsAsDrawer: boolean) {
-    let drawer = startsAsDrawer;
-    const listeners = new Set<() => void>();
-    window.matchMedia = ((query: string) => ({
-      get matches() {
-        return query === NAV_DRAWER_QUERY && drawer;
-      },
-      media: query,
-      addEventListener: (_event: string, callback: () => void) => void listeners.add(callback),
-      removeEventListener: (_event: string, callback: () => void) =>
-        void listeners.delete(callback),
-    })) as unknown as typeof window.matchMedia;
-    return {
-      resizeTo(nextIsDrawer: boolean) {
-        drawer = nextIsDrawer;
-        act(() => listeners.forEach((callback) => callback()));
-      },
-    };
-  }
 
   function renderShellAt(path: string) {
     return render(
@@ -2031,5 +2031,145 @@ describe("ChatShell — navegação responsiva", () => {
       "aria-selected",
       "true",
     );
+  });
+});
+
+describe("ChatShell — ponto de entrada da busca global (#550)", () => {
+  const readingId = "00000000-0000-4000-8000-000000000551";
+  const otherId = "00000000-0000-4000-8000-000000000552";
+
+  // The real search page: its autoFocus and its Escape are part of the flow
+  // under test. With no query typed it requests nothing.
+  function renderShell() {
+    return render(
+      <MemoryRouter initialEntries={[`/chat/channel/${readingId}`]}>
+        <Routes>
+          <Route element={<AppShell />}>
+            <Route
+              path="/chat"
+              element={
+                <CallSessionProvider>
+                  <ChatShell />
+                </CallSessionProvider>
+              }
+            >
+              <Route path="channel/:channelId" element={<div>mensagens</div>} />
+              <Route path="search" element={<GlobalSearchPage />} />
+            </Route>
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  afterEach(() => {
+    // @ts-expect-error -- jsdom does not define this by default; restore that.
+    delete window.matchMedia;
+  });
+
+  const searchButton = () => screen.getByRole("button", { name: "Buscar no NChat" });
+  const searchField = () =>
+    screen.findByRole("searchbox", { name: "Buscar mensagens, pessoas e canais" });
+
+  beforeEach(() => {
+    vi.mocked(fetchSidebarData).mockResolvedValue({
+      currentUserId,
+      workspaceId: "workspace-1",
+      channels: [
+        { id: readingId, name: "Plataforma", type: "public", canWrite: true },
+        { id: otherId, name: "Infra", type: "public", canWrite: true },
+      ],
+      dms: [],
+      categories: [],
+    });
+  });
+
+  it("o botão abre a busca com o campo focado e Escape volta à conversa com o foco no botão", async () => {
+    const user = userEvent.setup();
+    renderShell();
+    await screen.findByRole("option", { name: /Plataforma/ });
+    const sockets = FakeWebSocket.instances.length;
+    const sidebarFetches = vi.mocked(fetchSidebarData).mock.calls.length;
+
+    await user.click(searchButton());
+    expect(await searchField()).toHaveFocus();
+    expect(screen.queryByText("mensagens")).not.toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+
+    expect(await screen.findByText("mensagens")).toBeInTheDocument();
+    expect(searchButton()).toHaveFocus();
+    expect(screen.getByRole("option", { name: /Plataforma/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    // Opening and closing the search is navigation only: no new connection,
+    // no sidebar refetch.
+    expect(FakeWebSocket.instances).toHaveLength(sockets);
+    expect(vi.mocked(fetchSidebarData).mock.calls).toHaveLength(sidebarFetches);
+  });
+
+  it("Ctrl+K abre a mesma busca e Escape devolve o foco a quem o tinha", async () => {
+    const user = userEvent.setup();
+    renderShell();
+    const newConversation = screen.getByRole("button", { name: "Nova conversa" });
+    await waitFor(() => expect(newConversation).toBeEnabled());
+    newConversation.focus();
+
+    await user.keyboard("{Control>}k{/Control}");
+    expect(await searchField()).toHaveFocus();
+
+    await user.keyboard("{Escape}");
+
+    expect(await screen.findByText("mensagens")).toBeInTheDocument();
+    expect(newConversation).toHaveFocus();
+  });
+
+  it("acionar Buscar com a busca já aberta não empilha outra entrada: Escape volta à conversa", async () => {
+    const user = userEvent.setup();
+    renderShell();
+    await screen.findByRole("option", { name: /Plataforma/ });
+
+    await user.click(searchButton());
+    await searchField();
+    await user.click(searchButton());
+    // Still the same search, handed straight back to its field.
+    expect(await searchField()).toHaveFocus();
+
+    await user.keyboard("{Escape}");
+
+    expect(await screen.findByText("mensagens")).toBeInTheDocument();
+    expect(searchButton()).toHaveFocus();
+  });
+
+  it("drawer: Escape logo após abrir a busca devolve o foco ao toggle, não ao botão do drawer", async () => {
+    stubViewport(true);
+    const user = userEvent.setup();
+    renderShell();
+    await screen.findByRole("option", { name: /Plataforma/ });
+
+    await user.click(screen.getByTestId("chat-nav-toggle"));
+    await user.click(searchButton());
+    expect(await searchField()).toHaveFocus();
+    await user.keyboard("{Escape}");
+
+    expect(await screen.findByText("mensagens")).toBeInTheDocument();
+    // The drawer closed when the search opened: its button is not where focus
+    // may land, whatever its visibility at this instant.
+    expect(screen.getByTestId("chat-nav-toggle")).toHaveFocus();
+  });
+
+  it("escolher outra conversa a partir da busca não devolve o foco ao botão", async () => {
+    const user = userEvent.setup();
+    renderShell();
+    await screen.findByRole("option", { name: /Infra/ });
+
+    await user.click(searchButton());
+    await searchField();
+    await user.click(screen.getByRole("option", { name: /Infra/ }));
+
+    expect(await screen.findByText("mensagens")).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Infra/ })).toHaveAttribute("aria-selected", "true");
+    expect(searchButton()).not.toHaveFocus();
   });
 });

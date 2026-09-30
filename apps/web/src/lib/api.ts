@@ -72,7 +72,18 @@ export async function apiFetch<T>(
   }
   try {
     response = await fetch(url, { ...init, headers });
-  } catch {
+  } catch (error) {
+    // Cancellation is control flow chosen by the caller, not a transport
+    // failure. Preserve AbortError so request registries can supersede stale
+    // reads without reporting an offline backend or an unstable socket.
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "name" in error &&
+      error.name === "AbortError"
+    ) {
+      throw error;
+    }
     throw new ApiRequestError(0, "network_error", "Network error");
   }
 

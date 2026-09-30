@@ -2208,9 +2208,31 @@ describe("ChatSidebar — footer", () => {
     const user = userEvent.setup();
     renderFooter(onOpenSearch);
 
-    await user.click(screen.getByRole("button", { name: "Buscar" }));
+    await user.click(screen.getByRole("button", { name: "Buscar no NChat" }));
 
     expect(onOpenSearch).toHaveBeenCalledOnce();
+  });
+
+  // Issue #550: search is a global action, so it sits with the brand at the
+  // top — before "Nova conversa" — and no longer beside Favoritos/profile.
+  it("offers exactly one global-search entry, at the top of the sidebar", () => {
+    renderFooter();
+
+    const [search, ...duplicates] = screen.getAllByRole("button", { name: /buscar/i });
+    expect(duplicates).toHaveLength(0);
+    expect(search).toHaveAccessibleName("Buscar no NChat");
+    expect(search).toHaveAttribute("title", "Buscar");
+
+    const brand = screen.getByRole("link", { name: "Nchat — Workspace Nic-Labs" });
+    const newConversation = screen.getByRole("button", { name: "Nova conversa" });
+    const favorites = screen.getByRole("link", { name: "Meus favoritos" });
+    const follows = (a: Element, b: Element) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    // A sibling of the brand link, never an interactive nested inside it.
+    expect(brand.contains(search)).toBe(false);
+    expect(follows(brand, search)).toBe(true);
+    expect(follows(search, newConversation)).toBe(true);
+    expect(follows(newConversation, favorites)).toBe(true);
   });
 
   it("keeps the profile link reachable", async () => {
