@@ -208,6 +208,18 @@ type ListDestinationAttachmentsQuery struct {
 	Kind          domain.DestinationKind
 	DestinationID string
 	Limit         int
+	// Before, when set, starts the page strictly after this position (issue
+	// #897). It only ever narrows a listing already bound to the authorized
+	// destination; it cannot select anything outside it.
+	Before *domain.AttachmentListCursor
+}
+
+// ListedAttachmentPage is one page of a listing. Next is set only when at
+// least one more listable row exists beyond it, so "no cursor" means "nothing
+// older", never "unknown".
+type ListedAttachmentPage struct {
+	Attachments []ListedAttachment
+	Next        *domain.AttachmentListCursor
 }
 
 // ListedAttachment is the row a listing loads. It deliberately omits the
@@ -324,7 +336,7 @@ type AttachmentStore interface {
 	MarkUploaded(ctx context.Context, update UploadedAttachment) error
 	MarkFailed(ctx context.Context, attachmentID, failureCode string) error
 	GetAuthorized(ctx context.Context, input AttachmentAuthInput) (StoredAttachment, error)
-	ListDestinationAttachments(ctx context.Context, query ListDestinationAttachmentsQuery) ([]ListedAttachment, error)
+	ListDestinationAttachments(ctx context.Context, query ListDestinationAttachmentsQuery) (ListedAttachmentPage, error)
 	// GetPreviewPage reads one preview page beyond the first (page >= 2).
 	// Page one is never read through this — it lives on the attachment row
 	// and is served by the existing Preview path. Implementations answer
@@ -358,6 +370,16 @@ type ListDestinationAttachmentsInput struct {
 	UserID      string
 	SessionID   string
 	Limit       int
+	// Before is the opaque cursor a previous page returned, or empty for the
+	// newest page.
+	Before string
+}
+
+// AttachmentListPage is what a listing answers: the page, and the cursor for
+// the next one when there is one.
+type AttachmentListPage struct {
+	Attachments []AttachmentView
+	NextCursor  string
 }
 
 // ObjectStore is the blob half. It is intentionally narrow so the service and
@@ -1039,24 +1061,32 @@ func (s *AttachmentService) RegenerateDocumentPreview(ctx context.Context, input
 // query returned, so a channel UUID can never select a conversation's rows and
 // a UUID from another tenant can never select that tenant's.
 //
-// The result is a preview, not an archive: the limit is clamped in the domain
-// and the order is fixed server-side, so a client cannot ask for an unbounded
-// scan or a different one.
+// The limit is clamped in the domain and the order is fixed server-side, so a
+// client cannot ask for an unbounded scan or a different one. Older rows are
+// reached page by page (issue #897): the cursor only moves the start of a page
+// inside the destination authorized above, never outside it.
 func (s *AttachmentService) ListDestinationAttachments(
 	ctx context.Context, input ListDestinationAttachmentsInput,
-) ([]AttachmentView, error) {
+) (AttachmentListPage, error) {
 	if !s.Ready() {
-		return nil, domain.ErrDependenciesUnavailable
+		return AttachmentListPage{}, domain.ErrDependenciesUnavailable
 	}
 	destination, err := domain.NewDestination(input.Destination.Kind, input.Destination.ID)
 	if err != nil {
 		// An unparseable or unknown destination is answered like an invisible
 		// one, so the route cannot be used to tell "malformed" from "not yours".
-		return nil, domain.ErrNotFound
+		return AttachmentListPage{}, domain.ErrNotFound
+	}
+	// Decoded before any database work: a malformed cursor is the caller's
+	// input error whatever the destination, so answering it first reveals
+	// nothing about whether that destination is reachable.
+	before, err := listCursor(input.Before)
+	if err != nil {
+		return AttachmentListPage{}, err
 	}
 	userID, sessionID, err := parsePrincipal(input.UserID, input.SessionID)
 	if err != nil {
-		return nil, err
+		return AttachmentListPage{}, err
 	}
 	authorized, err := s.authorizer.AuthorizeDestination(ctx, DestinationAuthInput{
 		Destination: destination,
@@ -1064,37 +1094,60 @@ func (s *AttachmentService) ListDestinationAttachments(
 		SessionID:   sessionID,
 	})
 	if err != nil {
-		return nil, err
+		return AttachmentListPage{}, err
 	}
-	records, err := s.store.ListDestinationAttachments(ctx, ListDestinationAttachmentsQuery{
+	page, err := s.store.ListDestinationAttachments(ctx, ListDestinationAttachmentsQuery{
 		WorkspaceID:   authorized.WorkspaceID,
 		Kind:          destination.Kind,
 		DestinationID: authorized.ID,
 		Limit:         domain.NormalizeAttachmentListLimit(input.Limit),
+		Before:        before,
 	})
+	if err != nil {
+		return AttachmentListPage{}, err
+	}
+	views := make([]AttachmentView, 0, len(page.Attachments))
+	for _, record := range page.Attachments {
+		views = append(views, listedAttachmentView(record, destination.Kind))
+	}
+	result := AttachmentListPage{Attachments: views}
+	if page.Next != nil {
+		result.NextCursor = domain.EncodeAttachmentListCursor(*page.Next)
+	}
+	return result, nil
+}
+
+// listCursor turns the optional ?before= token into a position. Empty means
+// the newest page.
+func listCursor(token string) (*domain.AttachmentListCursor, error) {
+	if token == "" {
+		return nil, nil
+	}
+	cursor, err := domain.DecodeAttachmentListCursor(token)
 	if err != nil {
 		return nil, err
 	}
-	views := make([]AttachmentView, 0, len(records))
-	for _, record := range records {
-		contentType := record.DetectedMIME
-		if contentType == "" {
-			contentType = domain.DefaultContentType
-		}
-		views = append(views, AttachmentView{
-			ID:              record.ID,
-			Filename:        record.Filename,
-			ContentType:     contentType,
-			Size:            record.Size,
-			Status:          string(record.Status),
-			PreviewStatus:   string(record.PreviewStatus),
-			DestinationKind: string(destination.Kind),
-			CreatedAt:       record.CreatedAt,
-			AudioKind:       string(record.AudioKind),
-			DurationMs:      int64(record.DeclaredDurationMs),
-		})
+	return &cursor, nil
+}
+
+// listedAttachmentView projects one listed row for the client.
+func listedAttachmentView(record ListedAttachment, kind domain.DestinationKind) AttachmentView {
+	contentType := record.DetectedMIME
+	if contentType == "" {
+		contentType = domain.DefaultContentType
 	}
-	return views, nil
+	return AttachmentView{
+		ID:              record.ID,
+		Filename:        record.Filename,
+		ContentType:     contentType,
+		Size:            record.Size,
+		Status:          string(record.Status),
+		PreviewStatus:   string(record.PreviewStatus),
+		DestinationKind: string(kind),
+		CreatedAt:       record.CreatedAt,
+		AudioKind:       string(record.AudioKind),
+		DurationMs:      int64(record.DeclaredDurationMs),
+	}
 }
 
 // Download re-authorises, refuses anything the scan has not cleared, and

@@ -255,6 +255,15 @@ vi.mock("./filesApi", () => ({
     limit: number,
     signal?: AbortSignal,
   ) => mockFetchChannelAttachments(target, limit, signal),
+  // The panel reads pages (issue #897); every fixture here is a single page.
+  fetchConversationAttachmentPage: (
+    target: { kind: "channel" | "dm"; id: string },
+    page: { limit: number },
+    signal?: AbortSignal,
+  ) =>
+    Promise.resolve(mockFetchChannelAttachments(target, page.limit, signal)).then(
+      (attachments) => ({ attachments, nextCursor: null }),
+    ),
   // The panel's file rows render a thumbnail and a video player. Neither is
   // exercised here — no fixture is previewable or a video — but both modules
   // read the export at render time, so it has to exist.

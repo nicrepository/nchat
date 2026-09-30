@@ -1,10 +1,12 @@
 package domain_test
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
@@ -328,5 +330,59 @@ func TestStatusListable(t *testing.T) {
 		if status.Listable() {
 			t.Fatalf("%q must not be listable", status)
 		}
+	}
+}
+
+// Issue #897: the codec preserves nanoseconds (even beyond PostgreSQL's
+// microsecond precision), normalises the timezone and keeps the token stable.
+func TestAttachmentListCursorRoundTrips(t *testing.T) {
+	want := domain.AttachmentListCursor{
+		CreatedAt: time.Date(2026, 7, 15, 12, 0, 0, 123456789, time.FixedZone("BRT", -3*3600)),
+		ID:        "0f9c4a61-5d1e-4c1b-9d7e-2a4b6c8d0e1f",
+	}
+	got, err := domain.DecodeAttachmentListCursor(domain.EncodeAttachmentListCursor(want))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !got.CreatedAt.Equal(want.CreatedAt) || got.CreatedAt.Location() != time.UTC || got.ID != want.ID {
+		t.Fatalf("round trip: got %+v, want %+v", got, want)
+	}
+	if token := domain.EncodeAttachmentListCursor(got); token != domain.EncodeAttachmentListCursor(want) {
+		t.Fatalf("cursor is not stable: %q", token)
+	}
+}
+
+func TestAttachmentListCursorCanonicalisesTheID(t *testing.T) {
+	id := uuid.New()
+	token := base64.RawURLEncoding.EncodeToString(
+		[]byte("2026-07-15T12:00:00Z|{" + strings.ToUpper(id.String()) + "}"))
+	got, err := domain.DecodeAttachmentListCursor(token)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.ID != id.String() {
+		t.Fatalf("expected the canonical id %q, got %q", id.String(), got.ID)
+	}
+}
+
+func TestAttachmentListCursorRejectsMalformedTokens(t *testing.T) {
+	encode := func(raw string) string { return base64.RawURLEncoding.EncodeToString([]byte(raw)) }
+	for name, token := range map[string]string{
+		"empty":               "",
+		"not base64":          "%%%",
+		"no separator":        encode("2026-07-15T12:00:00Z"),
+		"bad timestamp":       encode("yesterday|" + uuid.NewString()),
+		"bad id":              encode("2026-07-15T12:00:00Z|not-a-uuid"),
+		"extra separator":     encode("2026-07-15T12:00:00Z|" + uuid.NewString() + "|extra"),
+		"trailing data":       encode("2026-07-15T12:00:00Z|" + uuid.NewString() + "extra"),
+		"missing timestamp":   encode("|" + uuid.NewString()),
+		"missing id":          encode("2026-07-15T12:00:00Z|"),
+		"oversized timestamp": encode(strings.Repeat("1", 10000) + "|" + uuid.NewString()),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := domain.DecodeAttachmentListCursor(token); !errors.Is(err, domain.ErrInvalidInput) {
+				t.Fatalf("expected ErrInvalidInput, got %v", err)
+			}
+		})
 	}
 }

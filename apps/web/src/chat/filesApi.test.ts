@@ -11,6 +11,7 @@ vi.mock("../lib/authClient", () => ({
 import {
   deleteAttachmentDraft,
   fetchAttachmentContent,
+  fetchConversationAttachmentPage,
   fetchConversationAttachments,
   uploadAttachment,
 } from "./filesApi";
@@ -434,5 +435,90 @@ describe("deleteAttachmentDraft", () => {
       { method: "DELETE" },
       expect.any(Function),
     );
+  });
+});
+
+describe("fetchConversationAttachmentPage (issue #897)", () => {
+  const attachment = {
+    id: "a-1",
+    filename: "recente.pdf",
+    contentType: "application/pdf",
+    size: 2048,
+    status: "clean",
+    createdAt: "2026-07-15T12:00:00Z",
+  };
+
+  it("asks the same route for the first page, without a cursor", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { attachments: [] } });
+    const controller = new AbortController();
+
+    await fetchConversationAttachmentPage(
+      { kind: "channel", id: "ch 1" },
+      { limit: 5 },
+      controller.signal,
+    );
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/files/channels/ch%201/attachments?limit=5", {
+      method: "GET",
+      signal: controller.signal,
+    });
+  });
+
+  it("sends the cursor back encoded, on the conversation route for a group", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { attachments: [] } });
+
+    await fetchConversationAttachmentPage(
+      { kind: "dm", id: "dm/1" },
+      { limit: 20, before: "a+b/c=&x" },
+    );
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/files/dm/dm%2F1/attachments?limit=20&before=a%2Bb%2Fc%3D%26x",
+      { method: "GET", signal: undefined },
+    );
+  });
+
+  it("returns the server's cursor alongside the mapped page", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { attachments: [attachment, { id: "" }, null], next_cursor: "next-1" },
+    });
+
+    const page = await fetchConversationAttachmentPage({ kind: "channel", id: "c" }, { limit: 5 });
+
+    // Malformed rows are dropped exactly as the first-page listing drops them.
+    expect(page.attachments.map((item) => item.id)).toEqual(["a-1"]);
+    expect(page.nextCursor).toBe("next-1");
+  });
+
+  it.each([
+    ["absent", undefined],
+    ["null", null],
+    ["empty", ""],
+    ["a number", 42],
+    ["an object", { cursor: "x" }],
+  ])("reads a %s cursor as nothing older", async (_label, nextCursor) => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { attachments: [attachment], next_cursor: nextCursor },
+    });
+
+    const page = await fetchConversationAttachmentPage({ kind: "channel", id: "c" }, { limit: 5 });
+
+    expect(page.nextCursor).toBeNull();
+  });
+
+  it("reads a missing list as an empty page with nothing older", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: {} });
+
+    await expect(
+      fetchConversationAttachmentPage({ kind: "channel", id: "c" }, { limit: 5 }),
+    ).resolves.toEqual({ attachments: [], nextCursor: null });
+  });
+
+  it("propagates a failure instead of reading it as an empty page", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(400, "bad_request", "invalid cursor"));
+
+    await expect(
+      fetchConversationAttachmentPage({ kind: "channel", id: "c" }, { limit: 5, before: "x" }),
+    ).rejects.toBeInstanceOf(ApiRequestError);
   });
 });

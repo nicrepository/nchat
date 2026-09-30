@@ -218,6 +218,14 @@ export interface ExpandableDetailsSectionProps {
   onExpand?: () => void;
   /** Rendered after the content: a retry, an action, a "loading more" line. */
   children?: ReactNode;
+  /**
+   * Rendered after the content only while expanded (issue #897): the state of,
+   * and the control for, the rows beyond the one page `onExpand` loads — "load
+   * more", its progress line, its retry. They describe the expanded list, so
+   * they leave with it; kept in `children` they would sit under the compact
+   * preview offering to grow a list nobody can see.
+   */
+  expandedFooter?: ReactNode;
 }
 
 export default function ExpandableDetailsSection({
@@ -229,6 +237,7 @@ export default function ExpandableDetailsSection({
   collapseLabel = "Mostrar menos",
   onExpand,
   children,
+  expandedFooter,
 }: ExpandableDetailsSectionProps) {
   // Generated per instance, so two sections on screen collide neither in their
   // heading association nor in what their toggles control.
@@ -287,6 +296,7 @@ export default function ExpandableDetailsSection({
         collapsedLimit={collapsedLimit}
         expanded={expanded}
       />
+      {expanded && expandedFooter}
       {children}
     </section>
   );

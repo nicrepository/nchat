@@ -46,14 +46,24 @@ import { useAttachmentViewer } from "./attachmentViewer";
 import { AttachmentHydrationContext, useLazyAttachment } from "./lazyAttachment";
 import { isImageAttachment } from "./attachmentImageRules";
 import { isVoiceMessage } from "./attachmentAudioRules";
-import { fileIconFor, isDocumentAttachment } from "./attachmentKinds";
+import { isDocumentAttachment } from "./attachmentDocumentRules";
 import {
-  attachmentDownloadFilename,
   saveAttachmentToDisk,
+  useAttachmentDownload,
   voiceMessageFilename,
 } from "./attachmentDownload";
 import { formatFileSize } from "./conversationDetailsDisplay";
 import { isPreviewAvailable, type ChannelAttachment } from "./chatTypes";
+
+/** Same mapping the details panel uses, kept local so neither owns the other. */
+function fileIconFor(contentType: string): string {
+  if (contentType.startsWith("image/")) return "image";
+  if (contentType.startsWith("video/")) return "movie";
+  if (contentType.startsWith("audio/")) return "graphic_eq";
+  if (contentType === "application/pdf") return "picture_as_pdf";
+  if (contentType.startsWith("text/")) return "description";
+  return "draft";
+}
 
 /**
  * Downloads one approved attachment.
@@ -68,20 +78,7 @@ import { isPreviewAvailable, type ChannelAttachment } from "./chatTypes";
  * else — the row keeps its name, size and status.
  */
 function AttachmentDownloadButton({ attachment }: { attachment: ChannelAttachment }) {
-  const [state, setState] = useState<"idle" | "loading" | "failed">("idle");
-
-  const download = async () => {
-    if (state === "loading") return;
-    setState("loading");
-    try {
-      await saveAttachmentToDisk(attachment.id, attachmentDownloadFilename(attachment));
-      setState("idle");
-    } catch {
-      // No server text is surfaced: it may carry detail that does not belong
-      // in the UI, and every failure means the same thing here.
-      setState("failed");
-    }
-  };
+  const { state, download } = useAttachmentDownload(attachment);
 
   return (
     <>

@@ -449,7 +449,8 @@ Resposta `200` (mesma forma nas duas rotas; `destinationKind` reflete a rota):
         "destinationKind": "channel",
         "createdAt": "2026-07-28T12:00:00Z"
       }
-    ]
+    ],
+    "next_cursor": "<cursor opaco>"
   }
 }
 ```
@@ -466,6 +467,16 @@ scan), `previewStatus` (estado do preview, ver "Preview inline") e `createdAt`
 - `limit` e opcional, default 20 e teto 50, ambos aplicados no servidor; valor
   nao inteiro ou <= 0 responde `400 bad_request` em vez de virar o default
   silenciosamente;
+- paginacao (issue #897): `next_cursor` so aparece quando existe ao menos mais
+  um anexo listavel alem da pagina. Para a proxima pagina o cliente reenvia o
+  valor opaco, sem interpreta-lo ou modifica-lo, como `?before=<next_cursor>`.
+  A pagina continua estritamente depois da ultima linha servida na mesma ordem
+  de recencia, inclusive para anexos com o mesmo timestamp. Um upload novo no
+  topo nao desloca os anexos mais antigos entre paginas. O cursor so restringe
+  a consulta ao destino autorizado; malformado, responde `400 bad_request`.
+  `before` ausente ou vazio solicita a pagina mais recente; `next_cursor`
+  ausente significa que nao ha anexos mais antigos. O formato do cursor nao faz
+  parte do contrato e pode mudar;
 - so aparecem anexos com status `pending_scan`, `clean` ou `rejected` --
   `pending_upload`, `failed` e `deleted` sao uploads incompletos ou removidos,
   nunca arquivos do destino;

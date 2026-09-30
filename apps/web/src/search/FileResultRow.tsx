@@ -1,7 +1,8 @@
 import { useState, type MouseEvent } from "react";
 
 import { isImageAttachment } from "../chat/attachmentImageRules";
-import { fileIconFor, isDocumentAttachment } from "../chat/attachmentKinds";
+import { isDocumentAttachment } from "../chat/attachmentDocumentRules";
+import { fileIconFor } from "../chat/attachmentKinds";
 import { useAttachmentViewer } from "../chat/attachmentViewer";
 import { isPreviewAvailable, type ChannelAttachment } from "../chat/chatTypes";
 import { formatFileSize } from "../chat/conversationDetailsDisplay";
