@@ -1180,6 +1180,22 @@
   padding: 0 24px 18px;
 }
 
+/* One flow of the dialog (issue #1023). It takes the space left under the mode
+   switch and scrolls as a whole when that is not enough, so a short or narrow
+   viewport never clips a flow's submit button. Inactive flows stay mounted to
+   keep their draft; [hidden] must win over display:flex. */
+.new-dm-dialog__panel {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.new-dm-dialog__panel[hidden] {
+  display: none;
+}
+
 .new-dm-dialog__chips {
   display: flex;
   flex-wrap: wrap;
