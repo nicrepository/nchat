@@ -54,6 +54,7 @@ import AddMembersDialog from "./AddMembersDialog";
 import { fetchChannelMembers } from "./chatApi";
 import AttachmentViewerHost from "./AttachmentViewerHost";
 import ConversationNameField from "./ConversationNameField";
+import CopyableEmailRow from "./CopyableEmailRow";
 import ExpandableDetailsSection, {
   SectionMessage,
   type ExpandableSectionContent,
@@ -535,30 +536,32 @@ function ProfileMetaRow({ label, value }: { label: string; value: string }) {
 }
 
 /**
- * The "Horário local" row.
+ * The "Fuso horário" and "Horário local" rows, for a zone already validated.
  *
- * The clock is read from the browser but interpreted in the *profile's* zone,
- * never the viewer's: the instant is universal, the wall-clock reading is not.
- * A missing or unusable zone leaves the row absent rather than quietly
- * substituting the reader's own time, which would be a statement about the
- * wrong person.
+ * Unlike the other rows these are not "Não informado" when absent (issue #898):
+ * the caller mounts them only for a usable zone, so a missing or invalid one
+ * leaves no row and starts no timer. Nothing substitutes the reader's own zone,
+ * which would be a statement about the wrong person.
  *
- * The timer is what makes this a clock instead of a snapshot of when the panel
- * happened to open, and it is cleared on unmount and whenever the zone changes,
- * so switching conversations cannot leave one running.
+ * The clock is read from the browser but interpreted in the *profile's* zone:
+ * the instant is universal, the wall-clock reading is not. The timer is what
+ * makes this a clock instead of a snapshot of when the panel opened, and it is
+ * cleared on unmount and whenever the zone changes, so switching conversations
+ * cannot leave one running.
  */
-function ProfileLocalTimeRow({ timezone }: { timezone?: string }) {
+function ProfileTimeZoneRows({ timezone }: { timezone: string }) {
   const [now, setNow] = useState(() => new Date());
-  const valid = isValidTimeZone(timezone);
 
   useEffect(() => {
-    if (!valid) return;
     const timer = setInterval(() => setNow(new Date()), localTimeRefreshMs);
     return () => clearInterval(timer);
-  }, [valid, timezone]);
+  }, [timezone]);
 
   return (
-    <ProfileMetaRow label="Horário local" value={valid ? formatLocalTime(now, timezone) : ""} />
+    <>
+      <ProfileMetaRow label="Fuso horário" value={timezone} />
+      <ProfileMetaRow label="Horário local" value={formatLocalTime(now, timezone)} />
+    </>
   );
 }
 
@@ -625,15 +628,15 @@ function DirectProfileSection({
       <div className="chat-details__profile-meta" data-testid="chat-details-profile-meta">
         <ProfileMetaRow label="Cargo" value={profile.jobTitle ?? ""} />
         <ProfileMetaRow label="Departamento" value={profile.department ?? ""} />
-        <ProfileMetaRow
-          label="Fuso horário"
-          value={isValidTimeZone(profile.timezone) ? profile.timezone : ""}
-        />
-        <ProfileLocalTimeRow timezone={profile.timezone} />
-        {/* Text, never a mailto: link. Nothing in this issue asks for a compose
-            action, and turning an address into a target is a decision of its
-            own. */}
-        <ProfileMetaRow label="E-mail" value={profile.email ?? ""} />
+        {isValidTimeZone(profile.timezone) && <ProfileTimeZoneRows timezone={profile.timezone} />}
+        {/* Activating the address copies it — never a mailto: link (#898).
+            Keyed by person so copy feedback cannot outlive a DM switch, and no
+            button exists for an address there is nothing to copy from. */}
+        {profile.email ? (
+          <CopyableEmailRow key={`${profile.userId}:${profile.email}`} email={profile.email} />
+        ) : (
+          <ProfileMetaRow label="E-mail" value="" />
+        )}
       </div>
 
       <UnavailableAction

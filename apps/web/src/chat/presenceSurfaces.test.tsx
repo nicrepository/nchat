@@ -341,6 +341,52 @@ describe("channel details member list", () => {
   });
 });
 
+describe("DM 1:1 profile follows presence (issue #898)", () => {
+  function renderProfile() {
+    return render(
+      <ConversationDetailsPanel
+        kind="direct"
+        state={{
+          details: {
+            status: "ready",
+            data: {
+              kind: "direct",
+              conversationId: "dm-1",
+              // The fetched snapshot claims "online" and is deliberately not read.
+              profile: { userId: "user-juliane", displayName: "Juliane Lino", presence: "online" },
+            },
+          },
+          files: { status: "loading" },
+          roster: { status: "loading" },
+          reload: () => {},
+        }}
+        currentUserId="user-self"
+        workspaceId="workspace-1"
+        onClose={() => {}}
+      />,
+    );
+  }
+
+  it("renders the profile with no status while the server has said nothing", () => {
+    renderProfile();
+    openSocket();
+
+    expect(screen.getByTestId("chat-details-profile-name")).toHaveTextContent("Juliane Lino");
+    expect(screen.queryByTestId("chat-details-profile-status")).not.toBeInTheDocument();
+  });
+
+  it("states the live status in words once the socket answers", () => {
+    renderProfile();
+    openSocket();
+
+    deliver(presenceUpdate("user-juliane", "away", T1));
+    expect(screen.getByTestId("chat-details-profile-status")).toHaveTextContent("Ausente");
+
+    deliver(presenceUpdate("user-juliane", "online", T2));
+    expect(screen.getByTestId("chat-details-profile-status")).toHaveTextContent("Online");
+  });
+});
+
 // ── roster ordering (issue #895) ─────────────────────────────────────────────
 
 /**

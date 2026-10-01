@@ -1812,6 +1812,10 @@ describe("ConversationDetailsPanel — DM 1:1: estrutura e acessibilidade", () =
 });
 
 describe("ConversationDetailsPanel — DM 1:1: dados do perfil", () => {
+  afterEach(() => {
+    Reflect.deleteProperty(navigator, "clipboard");
+  });
+
   it("shows the other participant's name and role", () => {
     renderProfilePanel(
       directDetails({
@@ -1865,16 +1869,22 @@ describe("ConversationDetailsPanel — DM 1:1: dados do perfil", () => {
     expect(metaRow("E-mail")).toBe("juliane.lino@nic-labs.test");
   });
 
-  it("says Não informado for every field the domain does not record", () => {
-    // Today's real payload: an identity and nothing else. The card keeps its
-    // shape and states the absence rather than dropping rows.
+  it("says Não informado for every professional field the domain does not record", () => {
+    // Today's real payload: an identity and nothing else. The card states the
+    // absence of role, department and address rather than dropping those rows.
     renderProfilePanel(directDetails());
 
-    for (const label of ["Cargo", "Departamento", "Fuso horário", "Horário local", "E-mail"]) {
-      expect(metaRow(label)).toBe("Não informado");
+    const labels = Array.from(screen.getByTestId("chat-details-profile-meta").children).map(
+      (row) => row.firstElementChild?.textContent,
+    );
+    expect(labels).toEqual(["Cargo", "Departamento", "E-mail"]);
+    for (const label of labels) {
+      expect(metaRow(label ?? "")).toBe("Não informado");
     }
-    // An absent job title leaves no empty subtitle behind.
+    // An absent job title leaves no empty subtitle behind, and nothing falls
+    // back to the user id.
     expect(document.querySelector(".chat-details__profile-role")).toBeNull();
+    expect(screen.getByTestId("chat-details-profile-meta")).not.toHaveTextContent("user-other");
   });
 
   it("omits the presence badge when the server tracks nothing", () => {
@@ -1885,11 +1895,62 @@ describe("ConversationDetailsPanel — DM 1:1: dados do perfil", () => {
     expect(screen.queryByTestId("chat-details-profile-status")).not.toBeInTheDocument();
   });
 
-  it("shows the e-mail as text, never as a mailto link", () => {
+  it("offers the e-mail as a copy button, never as a mailto link", () => {
     renderProfilePanel(directDetails({ email: "juliane.lino@nic-labs.test" }));
 
+    const copy = screen.getByRole("button", { name: "juliane.lino@nic-labs.test" });
+    expect(copy).toHaveAttribute("type", "button");
+    expect(copy).toHaveAccessibleDescription("Copiar e-mail");
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
     expect(document.querySelector("a[href^='mailto:']")).toBeNull();
+  });
+
+  it("renders no copy button when there is no address to copy", () => {
+    renderProfilePanel(directDetails());
+
+    expect(metaRow("E-mail")).toBe("Não informado");
+    expect(document.querySelector(".chat-details__profile-copy")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Não informado/ })).not.toBeInTheDocument();
+  });
+
+  it("does not carry copy feedback from one person over to the next", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const { rerender } = renderProfilePanel(directDetails({ email: "juliane.lino@nic-labs.test" }));
+
+    await userEvent.click(screen.getByRole("button", { name: "juliane.lino@nic-labs.test" }));
+    expect(await screen.findByText("E-mail copiado")).toBeInTheDocument();
+
+    // The panel is not remounted on a DM switch; only the payload changes.
+    rerender(
+      <ConversationDetailsPanel
+        kind="direct"
+        state={{
+          details: {
+            status: "ready",
+            data: {
+              kind: "direct",
+              conversationId: "conv-dm-2",
+              profile: {
+                userId: "user-marcos",
+                displayName: "Marcos Prado",
+                email: "marcos.prado@nic-labs.test",
+              },
+            },
+          },
+          files: { status: "loading" },
+          roster: { status: "loading" },
+          reload: vi.fn(),
+        }}
+        currentUserId={currentUserId}
+        workspaceId="workspace-1"
+        pins={noPins}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "marcos.prado@nic-labs.test" })).toBeInTheDocument();
+    expect(screen.queryByText("E-mail copiado")).not.toBeInTheDocument();
   });
 
   it("renders name, job title and department as text, never as markup", () => {
@@ -1964,12 +2025,29 @@ describe("ConversationDetailsPanel — DM 1:1: fuso e horário local", () => {
     expect(metaRow("Horário local")).toBe("10:13");
   });
 
-  it("treats an invalid or hostile zone as absent, without breaking the panel", () => {
-    for (const timezone of ["Nao/Existe", "-03:00", "<script>alert(1)</script>", " "]) {
+  it("shows the zone itself beside the local time", () => {
+    renderProfilePanel(directDetails({ timezone: "America/Sao_Paulo" }));
+
+    expect(metaRow("Fuso horário")).toBe("America/Sao_Paulo");
+  });
+
+  it("renders neither row for a missing, invalid or hostile zone, without breaking the panel", () => {
+    // #898: the zone and the local time are shown only for a trustworthy zone —
+    // no "Não informado" row, and never the viewer's own zone in its place.
+    for (const timezone of [
+      undefined,
+      "",
+      "Nao/Existe",
+      "-03:00",
+      "<script>alert(1)</script>",
+      " ",
+    ]) {
       const { unmount } = renderProfilePanel(directDetails({ timezone }));
 
-      expect(metaRow("Fuso horário")).toBe("Não informado");
-      expect(metaRow("Horário local")).toBe("Não informado");
+      const meta = screen.getByTestId("chat-details-profile-meta");
+      expect(meta).not.toHaveTextContent("Fuso horário");
+      expect(meta).not.toHaveTextContent("Horário local");
+      expect(meta).not.toHaveTextContent(/\d{2}:\d{2}/);
       // The rest of the profile is unaffected.
       expect(screen.getByTestId("chat-details-profile-name")).toHaveTextContent("Juliane Lino");
       unmount();

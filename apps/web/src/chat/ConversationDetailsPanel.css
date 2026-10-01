@@ -277,7 +277,8 @@
    stated explicitly rather than left to the browser default over a tinted
    background. Deliberately not `outline: none`. */
 .chat-details__link-action:focus-visible,
-.chat-details__wide-action:focus-visible {
+.chat-details__wide-action:focus-visible,
+.chat-details__profile-copy:focus-visible {
   outline: 2px solid var(--color-primary, #6d28d9);
   outline-offset: 2px;
 }
@@ -617,6 +618,50 @@
   /* An e-mail or a zone name is one unbroken token; it must wrap rather than
      push the panel into a horizontal scroll. */
   overflow-wrap: anywhere;
+}
+
+/* The copyable e-mail (issue #898): the address stays the value, and its
+   feedback sits under it, so the row keeps the card's right-aligned column. */
+.chat-details__profile-copy-value {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+
+/* Reads as a link-like control in the primary colour — interactive, never a
+   destructive action — and wraps like any other value instead of widening the
+   panel with a long address. */
+.chat-details__profile-copy {
+  max-width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  font: inherit;
+  text-align: right;
+  color: var(--color-primary, #6d28d9);
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.chat-details__profile-copy:hover {
+  text-decoration-style: solid;
+}
+
+/* The words carry the outcome; colour only repeats it. */
+.chat-details__profile-copy-feedback {
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.chat-details__profile-copy-feedback--success {
+  color: var(--color-success-ink, #166534);
+}
+
+.chat-details__profile-copy-feedback--error {
+  color: var(--color-danger-ink, #991b1b);
 }
 
 /* ── Pinned messages (issue #896) ──────────────────────────────────────── */

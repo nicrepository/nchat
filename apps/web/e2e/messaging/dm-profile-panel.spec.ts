@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
 import {
   CURRENT_USER_ID,
@@ -16,13 +16,22 @@ import {
   uniqueId,
 } from "../helpers/messagingApi";
 
+/** O que a página consegue ler da área de transferência, depois de uma cópia. */
+async function readClipboard(page: Page): Promise<string> {
+  return page.evaluate(() => navigator.clipboard.readText());
+}
+
 /**
- * Painel de perfil em DM 1:1 (issue #443).
+ * Painel de perfil em DM 1:1 (issues #443 e #898).
  *
  * O ponto destes testes é que uma DM 1:1 não é um grupo pequeno: o painel mostra
  * o perfil da outra pessoa ("Perfil"), com o vocabulário de perfil e nenhuma
  * seção de conversa — sem participantes, sem arquivos, sem visibilidade. E o
  * perfil exibido é sempre o do outro participante, resolvido pelo servidor.
+ *
+ * job_title, department e timezone são valores de fixture do contrato: o
+ * backend ainda não persiste esses campos, e os fixtures exercitam apenas o
+ * caminho "quando disponível" do frontend.
  */
 test.describe("painel de perfil em DM 1:1", () => {
   test("abre pelo cabeçalho, mostra o perfil do outro participante, preserva a conversa e devolve o foco", async ({
@@ -91,12 +100,21 @@ test.describe("painel de perfil em DM 1:1", () => {
     const meta = panel.getByTestId("chat-details-profile-meta");
     await expect(meta).toContainText("Infraestrutura & Suporte");
     await expect(meta).toContainText("TI");
+    await expect(meta).toContainText("Fuso horário");
     await expect(meta).toContainText("America/Sao_Paulo");
-    await expect(meta).toContainText("juliane.lino@nic-labs.test");
     // Horário local derivado do fuso do perfil: hora e minuto, nunca vazio.
+    await expect(meta).toContainText("Horário local");
     await expect(meta).toContainText(/\d{2}:\d{2}/);
-    // O e-mail é texto: nada aqui vira link.
+
+    // ── 3b. o e-mail copia, e nunca vira mailto: ─────────────────────────
+    const email = meta.getByRole("button", { name: "juliane.lino@nic-labs.test", exact: true });
+    await expect(email).toBeVisible();
     await expect(panel.getByRole("link")).toHaveCount(0);
+    await email.click();
+    await expect(meta.getByRole("status")).toHaveText("E-mail copiado");
+    expect(await readClipboard(page)).toBe("juliane.lino@nic-labs.test");
+    // O endereço continua na tela ao lado do feedback.
+    await expect(email).toBeVisible();
 
     // ── 4. nada de vocabulário de grupo nem de canal ─────────────────────
     await expect(panel.getByRole("heading", { name: /Participantes/ })).toHaveCount(0);
@@ -183,9 +201,8 @@ test.describe("painel de perfil em DM 1:1", () => {
     await page.getByRole("button", { name: "Abrir perfil de Juliane Lino", exact: true }).click();
     const panel = page.getByRole("complementary", { name: "Perfil" });
     await expect(panel.getByTestId("chat-details-profile-name")).toHaveText("Juliane Lino");
-    await expect(panel.getByTestId("chat-details-profile-meta")).toContainText(
-      "juliane.lino@nic-labs.test",
-    );
+    await panel.getByRole("button", { name: "juliane.lino@nic-labs.test", exact: true }).click();
+    await expect(panel.getByRole("status")).toHaveText("E-mail copiado");
 
     // Trocar de DM com o painel aberto.
     await page.getByRole("option", { name: /Marcos Prado/ }).click();
@@ -199,6 +216,8 @@ test.describe("painel de perfil em DM 1:1", () => {
     await expect(meta).not.toContainText("juliane.lino@nic-labs.test");
     await expect(meta).not.toContainText("TI");
     await expect(panel.getByText("Juliane Lino")).toHaveCount(0);
+    // O feedback da cópia era sobre o e-mail da Juliane e não descreve o Marcos.
+    await expect(panel.getByText("E-mail copiado")).toHaveCount(0);
   });
 
   test("troca entre tipos usa o vocabulário de cada conversa", async ({ page }, testInfo) => {
@@ -277,7 +296,7 @@ test.describe("painel de perfil em DM 1:1", () => {
     await expect(page.getByRole("complementary", { name: "Detalhes do canal" })).toHaveCount(0);
   });
 
-  test("alcança 'Ver perfil completo' pelo teclado sem que a ação faça nada", async ({
+  test("copia o e-mail pelo teclado e alcança 'Ver perfil completo' sem que a ação faça nada", async ({
     page,
   }, testInfo) => {
     const targetId = uniqueId(testInfo, "dm-teclado");
@@ -311,14 +330,26 @@ test.describe("painel de perfil em DM 1:1", () => {
     const close = panel.getByRole("button", { name: "Fechar perfil" });
     await expect(close).toBeFocused();
 
-    const action = panel.getByRole("button", { name: "Ver perfil completo", exact: true });
     // Percorre a ordem real em vez de assumir um número fixo de paradas, e sem
-    // nunca chamar focus() — o que este passo prova é que o Tab chega lá.
-    for (let stop = 0; stop < 20; stop += 1) {
-      if (await action.evaluate((el) => el === document.activeElement)) break;
-      await page.keyboard.press("Tab");
+    // nunca chamar focus() — o que estes passos provam é que o Tab chega lá.
+    async function tabTo(target: ReturnType<typeof panel.getByRole>) {
+      for (let stop = 0; stop < 20; stop += 1) {
+        if (await target.evaluate((el) => el === document.activeElement)) break;
+        await page.keyboard.press("Tab");
+      }
+      await expect(target).toBeFocused();
     }
-    await expect(action).toBeFocused();
+
+    // ── o e-mail é um controle real: Tab chega, Space copia ──────────────
+    const email = panel.getByRole("button", { name: "juliane.lino@nic-labs.test", exact: true });
+    await tabTo(email);
+    await page.keyboard.press("Space");
+    await expect(panel.getByRole("status")).toHaveText("E-mail copiado");
+    expect(await readClipboard(page)).toBe("juliane.lino@nic-labs.test");
+    await expect(email).toBeFocused();
+
+    const action = panel.getByRole("button", { name: "Ver perfil completo", exact: true });
+    await tabTo(action);
 
     // Estado exposto semanticamente, nunca pelo atributo HTML disabled — que
     // tiraria o elemento da ordem de tabulação junto com o motivo.
@@ -386,7 +417,13 @@ test.describe("painel de perfil em DM 1:1", () => {
     const panel = page.getByRole("complementary", { name: "Perfil" });
     await expect(panel.getByTestId("chat-details-profile-name")).toHaveText("Juliane Lino");
     // Linhas presentes e honestas, nunca linhas vazias.
-    await expect(panel.getByTestId("chat-details-profile-meta")).toContainText("Não informado");
+    const meta = panel.getByTestId("chat-details-profile-meta");
+    await expect(meta).toContainText("Não informado");
+    // Sem fuso confiável, nem fuso nem horário local: nada é inferido.
+    await expect(meta).not.toContainText("Fuso horário");
+    await expect(meta).not.toContainText("Horário local");
+    // Sem e-mail, nada para copiar.
+    await expect(meta.getByRole("button")).toHaveCount(0);
     // RF-58: presença agora é afirmada pelo servidor em tempo real, e este
     // perfil não tem sessão alguma — "Offline" é o que o servidor respondeu,
     // não um palpite do cliente. O caso em que nada foi respondido ainda
