@@ -204,6 +204,13 @@ func TestOwnershipHandlerStrictInputAndErrorContract(t *testing.T) {
 		want                               int
 		called                             bool
 	}{
+		{"no-op", http.MethodPatch, "", `{"role":"member"}`, "", nil, 200, true},
+		{"reject workspace", http.MethodPatch, "", `{"role":"admin","workspace_id":"forged"}`, "", nil, 400, false},
+		{"reject current role", http.MethodPatch, "", `{"role":"admin","current_role":"owner"}`, "", nil, 400, false},
+		{"reject owner count", http.MethodPatch, "", `{"role":"admin","owner_count":2}`, "", nil, 400, false},
+		{"reject trailing JSON", http.MethodPatch, "", `{"role":"admin"}{}`, "", nil, 400, false},
+		{"reject missing role", http.MethodPatch, "", `{}`, "", nil, 400, false},
+		{"reject null role", http.MethodPatch, "", `{"role":null}`, "", nil, 400, false},
 		{"promotion", http.MethodPatch, "", `{"role":"owner"}`, "", nil, 200, true},
 		{"reject actor assignment", http.MethodPatch, "", `{"role":"owner","actor_user_id":"forged"}`, "", nil, 400, false},
 		{"reject unknown role", http.MethodPatch, "", `{"role":"moderator"}`, "", nil, 400, false},

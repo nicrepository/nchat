@@ -155,6 +155,10 @@ func (s *PGXOwnershipStore) Mutate(ctx context.Context, input OwnershipMutation)
 	if err := validateOwnershipMutation(input); err != nil {
 		return OwnershipMutationResult{}, err
 	}
+	if input.Operation == "role" {
+		result, err := conversationownership.Retry(ctx, func() (OwnershipMutationResult, error) { return s.mutateRoleOnce(ctx, input) })
+		return result, mapOwnershipError(err)
+	}
 	result, err := conversationownership.Retry(ctx, func() (OwnershipMutationResult, error) { return s.mutateOnce(ctx, input) })
 	return result, mapOwnershipError(err)
 }

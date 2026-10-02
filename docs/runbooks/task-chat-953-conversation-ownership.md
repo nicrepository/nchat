@@ -43,7 +43,7 @@ submit sempre revalida no banco. Menus e modais mantêm o composer montado.
 ## Blue/Green
 
 1. Publicar o release de compatibilidade nos serviços chat, auth e admin. Aplicar
-   migrações 60–63. `ownership_role` guarda o estado transitório; os valores
+   migrações 60–64. `ownership_role` guarda o estado transitório; os valores
    legados de `role` permanecem intactos. `chat.ownership_rollout.enabled` começa
    em `false`. A UI e os endpoints existentes continuam com o contrato anterior.
 2. Retirar explicitamente todos os binários incompatíveis, inclusive workers e
@@ -52,7 +52,10 @@ submit sempre revalida no banco. Menus e modais mantêm o composer montado.
 3. Executar, usando a conexão autorizada do ambiente:
 
    ```sh
-   psql -v ON_ERROR_STOP=1 -v legacy_retired=true -f scripts/db/ownership/activate.sql
+   psql -X -v legacy_retired=true \
+     -v rollback_target_sha=SHA_COMPLETO_DO_ARTEFATO_COMPATIVEL \
+     -v retirement_evidence=REFERENCIA_DO_REGISTRO_OPERACIONAL \
+     -f scripts/db/ownership/activate.sql
    ```
 
    A operação bloqueia as tabelas envolvidas, repete o backfill, recusa órfãos,
@@ -64,8 +67,11 @@ submit sempre revalida no banco. Menus e modais mantêm o composer montado.
    anterior à #953. Não remover `ownership_role` nesta task. A migration down de
    compatibilidade recusa um banco com ownership ativado.
 
-O backfill prefere criador elegível, preserva moderator de canal como ADMIN,
-depois prefere ADMIN e membro mais antigo. É idempotente; as atribuições ficam
+A #1043 endurece a ativação e registra o SHA exato do rollback target; consultar
+[o runbook de migrations](task-chat-1043-ownership-migrations.md) antes de executar.
+O backfill preserva owners existentes e prefere criador elegível. Canais mapeiam
+moderator para ADMIN e priorizam ADMIN como fallback; grupos usam diretamente o
+membro mais antigo. É idempotente; as atribuições ficam
 em `chat.ownership_audit` com motivo `backfill`.
 
 ## Transações, auditoria e realtime

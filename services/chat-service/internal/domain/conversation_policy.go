@@ -87,13 +87,19 @@ func (c ConversationPolicyContext) remaining(userID string) (members, owners int
 	return members, owners
 }
 
+// CanManageConversationRoles authorizes both changes and explicit no-ops.
+func CanManageConversationRoles(c ConversationPolicyContext, actorID, targetID string) bool {
+	actor, actorOK := c.participant(actorID)
+	_, targetOK := c.participant(targetID)
+	return actorOK && targetOK && actor.Role == ConversationOwner
+}
+
 // CanAssignConversationRole checks the intended role, including self-demotion.
 // A no-op is not a role change. Guests can be promoted manually; this does not
 // make them eligible for the separate legacy automatic succession policy.
 func CanAssignConversationRole(c ConversationPolicyContext, actorID, targetID string, role ConversationRole) bool {
-	actor, actorOK := c.participant(actorID)
-	target, targetOK := c.participant(targetID)
-	if !actorOK || !targetOK || actor.Role != ConversationOwner || !role.Valid() || target.Role == role {
+	target, _ := c.participant(targetID)
+	if !CanManageConversationRoles(c, actorID, targetID) || !role.Valid() || target.Role == role {
 		return false
 	}
 	if target.Role == ConversationOwner {

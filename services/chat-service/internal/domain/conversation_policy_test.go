@@ -139,3 +139,19 @@ func assertConversationPolicyBoundaries(t *testing.T, c domain.ConversationPolic
 		t.Fatal("missing actor accepted")
 	}
 }
+
+func TestCanManageConversationRolesIncludesAuthorizedNoop(t *testing.T) {
+	for _, role := range []domain.ConversationRole{domain.ConversationOwner, domain.ConversationAdmin, domain.ConversationMember} {
+		c := conversationPolicyFixture(role, domain.ConversationMember)
+		if got := domain.CanManageConversationRoles(c, "actor", "target"); got != (role == domain.ConversationOwner) {
+			t.Fatalf("role=%s manage=%v", role, got)
+		}
+		if domain.CanAssignConversationRole(c, "actor", "target", domain.ConversationMember) {
+			t.Fatal("no-op became a change")
+		}
+		c.Participants[1].HasAccess = false
+		if domain.CanManageConversationRoles(c, "actor", "target") {
+			t.Fatal("inaccessible target authorized")
+		}
+	}
+}

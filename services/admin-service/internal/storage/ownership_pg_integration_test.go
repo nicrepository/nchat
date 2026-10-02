@@ -28,16 +28,7 @@ func TestOwnershipAccountInvalidationPostgreSQL(t *testing.T) {
 	exec(`INSERT INTO chat.workspace_members(workspace_id,user_id) VALUES($1,$2),($1,$3)`, ws, a, b)
 	exec(`INSERT INTO chat.dm_conversations(id,workspace_id,type,created_by) VALUES($1,$2,'group',$3)`, conversation, ws, a)
 	exec(`INSERT INTO chat.dm_members(conversation_id,user_id) VALUES($1,$2),($1,$3)`, conversation, a, b)
-	raw, err := os.ReadFile("../../../../scripts/db/ownership/activate.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	sql := string(raw)
-	_, transaction, found := strings.Cut(sql, "BEGIN;")
-	if !found {
-		t.Fatal("activation transaction missing")
-	}
-	exec("BEGIN;" + transaction)
+	exec(ownershipActivationSQL(t))
 	store := storage.NewPGXUserDirectoryStore(pool)
 	if _, err := store.UpdateUserStatus(t.Context(), a, "suspended"); err != nil {
 		t.Fatal(err)
@@ -60,4 +51,25 @@ func TestOwnershipAccountInvalidationPostgreSQL(t *testing.T) {
 	if err := pool.QueryRow(t.Context(), `SELECT u.status,s.revoked_at IS NOT NULL FROM auth.users u JOIN auth.user_sessions s ON s.user_id=u.id WHERE u.id=$1 AND s.refresh_token_hash='ownership-session-953'`, b).Scan(&status, &revoked); err != nil || status != "active" || revoked {
 		t.Fatalf("partial invalidation status=%s revoked=%v error=%v", status, revoked, err)
 	}
+}
+
+// Parse the operator transaction with fixed test evidence.
+func ownershipActivationSQL(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile("../../../../scripts/db/ownership/activate.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(raw)
+	_, transaction, found := strings.Cut(sql, "BEGIN;")
+	if !found {
+		t.Fatal("activation transaction missing")
+	}
+	transaction = strings.NewReplacer(
+		":'legacy_retired'", "'true'",
+		":'rollback_target_sha'", "'1043000000000000000000000000000000000000'",
+		":'retirement_evidence'", "'test-1043'",
+		"\\gset", ";",
+	).Replace(transaction)
+	return "BEGIN;" + transaction
 }

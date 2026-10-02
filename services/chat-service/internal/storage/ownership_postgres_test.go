@@ -23,6 +23,11 @@ const ownershipC = "95300000-0000-4000-8000-00000000000c"
 
 func ownershipPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
+	return ownershipPoolAt(t, false)
+}
+
+func ownershipPoolAt(t *testing.T, legacy bool) *pgxpool.Pool {
+	t.Helper()
 	dsn := os.Getenv("OWNERSHIP_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("OWNERSHIP_TEST_DATABASE_URL is not set")
@@ -42,14 +47,20 @@ func ownershipPool(t *testing.T) *pgxpool.Pool {
 	ownershipExec(t, pool, `DROP SCHEMA IF EXISTS chat CASCADE; DROP SCHEMA IF EXISTS auth CASCADE;
  CREATE SCHEMA auth;
  CREATE TABLE auth.users (id UUID PRIMARY KEY,display_name TEXT,full_name TEXT,avatar_url TEXT,status TEXT NOT NULL DEFAULT 'active',deleted_at TIMESTAMPTZ);`)
-	ownershipExec(t, pool, readAllChatUpMigrations(t))
+	migrations := readAllChatUpMigrations(t)
+	if legacy {
+		migrations, _, _ = strings.Cut(migrations, readChatMigration(t, "000060_conversation_ownership_compatibility.up.sql"))
+	}
+	ownershipExec(t, pool, migrations)
 	ownershipExec(t, pool, `INSERT INTO auth.users(id,display_name) VALUES ($1,'A'),($2,'B'),($3,'C')`, ownershipA, ownershipB, ownershipC)
 	ownershipExec(t, pool, `INSERT INTO chat.workspace_members(workspace_id,user_id) VALUES ($1,$2),($1,$3),($1,$4)`, ownershipWS, ownershipA, ownershipB, ownershipC)
 	ownershipExec(t, pool, `INSERT INTO chat.dm_conversations(id,workspace_id,type,created_by) VALUES ($1,$2,'group',$3)`, ownershipDM, ownershipWS, ownershipA)
 	ownershipExec(t, pool, `INSERT INTO chat.dm_members(conversation_id,user_id,joined_at) VALUES ($1,$2,'2020-01-03'),($1,$3,'2020-01-02'),($1,$4,'2020-01-01')`, ownershipDM, ownershipA, ownershipB, ownershipC)
 	ownershipExec(t, pool, `INSERT INTO chat.channels(id,workspace_id,type,slug,display_name,created_by) VALUES ($1,$2,'private','private-953','Private',$3)`, ownershipChannel, ownershipWS, ownershipA)
 	ownershipExec(t, pool, `INSERT INTO chat.channel_members(channel_id,user_id,role,joined_at) VALUES ($1,$2,'member','2020-01-03'),($1,$3,'moderator','2020-01-02'),($1,$4,'member','2020-01-01') ON CONFLICT (channel_id,user_id) DO UPDATE SET joined_at=EXCLUDED.joined_at`, ownershipChannel, ownershipA, ownershipB, ownershipC)
-	ownershipExec(t, pool, `SELECT chat.backfill_conversation_ownership()`)
+	if !legacy {
+		ownershipExec(t, pool, `SELECT chat.backfill_conversation_ownership()`)
+	}
 	return pool
 }
 
@@ -412,5 +423,11 @@ func ownershipActivationTransaction(t *testing.T, sql string) string {
 	if !found {
 		t.Fatal("activation transaction missing")
 	}
+	transaction = strings.NewReplacer(
+		":'legacy_retired'", "'true'",
+		":'rollback_target_sha'", "'1043000000000000000000000000000000000000'",
+		":'retirement_evidence'", "'test-1043'",
+		"\\gset", ";",
+	).Replace(transaction)
 	return "BEGIN;" + transaction
 }
