@@ -10,7 +10,7 @@ require (
 	github.com/nicrepository/nchat/libs/go/platform v0.0.0
 	github.com/pashagolub/pgxmock/v2 v2.12.0
 	github.com/prometheus/client_golang v1.22.0
-	github.com/valkey-io/valkey-go v1.0.75
+	github.com/valkey-io/valkey-go v1.0.78
 )
 
 require (
@@ -24,7 +24,6 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/onsi/gomega v1.42.1 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.64.0 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
