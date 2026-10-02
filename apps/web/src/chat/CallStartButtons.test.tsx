@@ -68,7 +68,7 @@ it("a group with a resolved counterpart never happens, but resourceCall is ignor
 
 it('RF-24 "none" state: joins the channel\'s resource room via a single Chamada action', () => {
   const onCall = vi.fn();
-  render(<HeaderChannel name="geral" resourceCall={{ onCall }} />);
+  render(<HeaderChannel name="geral" isPrivate={false} resourceCall={{ onCall }} />);
 
   fireEvent.click(screen.getByRole("button", { name: "Iniciar chamada" }));
 
@@ -82,7 +82,7 @@ it('RF-24 "none" state: joins the channel\'s resource room via a single Chamada 
 });
 
 it("hides the channel call buttons entirely when resourceCall is absent (e.g. not yet resolvable)", () => {
-  render(<HeaderChannel name="geral" />);
+  render(<HeaderChannel name="geral" isPrivate={false} />);
   expect(
     screen.queryByRole("button", { name: /Iniciar chamada|Entrar na chamada/ }),
   ).not.toBeInTheDocument();

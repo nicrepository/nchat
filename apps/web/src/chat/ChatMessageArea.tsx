@@ -578,6 +578,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           kind={kind}
           workspaceId={ctx.workspaceId}
           name={resolvedName}
+          isPrivate={target.isPrivateChannel}
           counterpart={activeDM?.counterpart}
           presenceTarget={target.presenceTarget}
           // #673: once the direct call bar takes over presentation for this DM,

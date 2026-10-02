@@ -4053,3 +4053,97 @@ describe("ChatSidebar — renaming a channel", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 });
+
+// Issue #1024: a channel row is drawn by ChannelIcon — `#`, plus a lock when
+// private — and never by an avatar, initials or a colour of its own.
+describe("ChatSidebar — channel identity (#1024)", () => {
+  const PUBLIC: Channel = { id: "geral", name: "geral", type: "public", canWrite: true };
+  const PRIVATE: Channel = { id: "fin", name: "financeiro", type: "private", canWrite: true };
+
+  const tree = (channels: Channel[], path = "/chat") => (
+    <MemoryRouter initialEntries={[path]}>
+      <ChatSidebar
+        state={{
+          status: "ready",
+          currentUserId: "user-a",
+          workspaceId: "workspace-1",
+          channels,
+          dms: [],
+          categories: [],
+        }}
+        retry={() => {}}
+      />
+    </MemoryRouter>
+  );
+
+  const row = (name: string) => screen.getByRole("option", { name });
+  const iconOf = (option: HTMLElement) => option.querySelector("svg[data-channel-icon]");
+
+  it("draws a public channel as # and a private one as # + lock", () => {
+    render(tree([PUBLIC, PRIVATE]));
+
+    expect(iconOf(row("Canal geral"))).toHaveAttribute("data-channel-icon", "public");
+    expect(iconOf(row("Canal privado financeiro"))).toHaveAttribute("data-channel-icon", "private");
+    expect(row("Canal privado financeiro").querySelector("[data-channel-lock]")).not.toBeNull();
+    expect(row("Canal geral").querySelector("[data-channel-lock]")).toBeNull();
+  });
+
+  it("never gives a channel an avatar, initials or a colour of its own", () => {
+    render(tree([PUBLIC, PRIVATE]));
+
+    for (const option of [row("Canal geral"), row("Canal privado financeiro")]) {
+      // UserAvatar always renders an <img> (a photo or the Blobatar data URI).
+      expect(option.querySelector("img")).toBeNull();
+      expect(option.querySelectorAll("svg[data-channel-icon]")).toHaveLength(1);
+      expect(option.querySelector("[style*='background']")).toBeNull();
+      expect(option.textContent).toBe(
+        option.querySelector(".chat-sidebar__nav-item-name")?.textContent,
+      );
+    }
+  });
+
+  it("announces privacy once, in the row's accessible name", () => {
+    render(tree([PRIVATE]));
+
+    expect(row("Canal privado financeiro")).toBeInTheDocument();
+    expect(screen.queryAllByText(/privado/i)).toHaveLength(0);
+  });
+
+  it("keeps selection and unread state alongside the icon", () => {
+    render(
+      tree(
+        [
+          { ...PUBLIC, unreadCount: 2 },
+          { ...PRIVATE, unreadCount: 5, hasMentionUnread: true },
+        ],
+        "/chat/channel/fin",
+      ),
+    );
+
+    const privateRow = row("Canal privado financeiro");
+    expect(privateRow).toHaveAttribute("aria-selected", "true");
+    expect(privateRow).toHaveClass("chat-sidebar__nav-item--active");
+    expect(iconOf(privateRow)).toHaveAttribute("data-channel-icon", "private");
+    expect(within(privateRow).getByLabelText("5 não lidas, incluindo menção")).toBeInTheDocument();
+
+    const publicRow = row("Canal geral");
+    expect(publicRow).toHaveAttribute("aria-selected", "false");
+    expect(iconOf(publicRow)).toHaveAttribute("data-channel-icon", "public");
+    expect(within(publicRow).getByLabelText("2 não lidas")).toBeInTheDocument();
+  });
+
+  it("changes only the name on rename, never the identity", () => {
+    const { rerender } = render(tree([PUBLIC, PRIVATE]));
+
+    rerender(
+      tree([
+        { ...PUBLIC, name: "anuncios" },
+        { ...PRIVATE, name: "diretoria" },
+      ]),
+    );
+
+    expect(screen.queryByRole("option", { name: "Canal geral" })).not.toBeInTheDocument();
+    expect(iconOf(row("Canal anuncios"))).toHaveAttribute("data-channel-icon", "public");
+    expect(iconOf(row("Canal privado diretoria"))).toHaveAttribute("data-channel-icon", "private");
+  });
+});
