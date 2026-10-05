@@ -31,6 +31,7 @@ type routeSet struct {
 	forward       *UserRateLimiter
 	pinAction     *UserRateLimiter
 	mentionSearch *UserRateLimiter
+	presence      *UserRateLimiter
 }
 
 func newRouteSet(validator *TokenValidator, sessionValidator SessionValidator, antiSpam *AntiSpamGuard) *routeSet {
@@ -42,6 +43,7 @@ func newRouteSet(validator *TokenValidator, sessionValidator SessionValidator, a
 		forward:       NewUserRateLimiter(messageForwardRateLimit, time.Minute),
 		pinAction:     NewUserRateLimiter(pinActionRateLimit, time.Minute),
 		mentionSearch: NewUserRateLimiter(mentionSearchRateLimit, time.Minute),
+		presence:      NewUserRateLimiter(presenceRateLimit, time.Minute),
 	}
 }
 
@@ -287,4 +289,19 @@ func (r *routeSet) registerFavoriteAndPinRoutes(messages *MessageHandler) {
 	r.handle("POST "+RouteDMMessagePin, r.pinAction, messages.PinDMMessage)
 	r.handle("DELETE "+RouteDMMessagePin, r.pinAction, messages.UnpinDMMessage)
 	r.handle("GET "+RouteDMPins, r.list, messages.ListDMPins)
+}
+
+// registerPresenceRoutes: the caller's own manual presence (issue #798). Reads
+// and writes share one per-user budget; writes are also observed for latency
+// and failures. Registered only when wired, so a build without it answers 404.
+func (r *routeSet) registerPresenceRoutes(messages *MessageHandler) {
+	if messages == nil || messages.presence == nil {
+		return
+	}
+	presence := messages.presence
+	r.handle("GET "+RoutePresenceMe, r.presence, presence.Get)
+	r.mux.Handle("PUT "+RoutePresenceMe, r.auth(r.presence.Middleware(
+		presence.metrics.Middleware(http.HandlerFunc(presence.Put)))))
+	r.mux.Handle("DELETE "+RoutePresenceMe, r.auth(r.presence.Middleware(
+		presence.metrics.Middleware(http.HandlerFunc(presence.Delete)))))
 }

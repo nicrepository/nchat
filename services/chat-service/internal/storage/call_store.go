@@ -100,11 +100,47 @@ type TransitionCallResult struct {
 }
 
 type PGXCallStore struct {
-	pool Pool
+	pool     Pool
+	presence PresenceFacts
 }
 
 func NewPGXCallStore(pool Pool) *PGXCallStore {
 	return &PGXCallStore{pool: pool}
+}
+
+// PresenceFacts is how a call change tells presence that people's call
+// participation is about to change (issue #798): OpenPresenceFacts announces
+// the change for userIDs before it commits, and returns the context the rest
+// of the change runs under and the function that closes the announcement once
+// it committed or rolled back. An error means nothing may change.
+type PresenceFacts interface {
+	OpenPresenceFacts(ctx context.Context, workspaceID string, userIDs []string) (context.Context, func(), error)
+}
+
+// SetPresenceFacts makes every participation change announce itself. Set once,
+// before the store serves any call; a store without it (tests, tools) changes
+// participation without telling presence.
+func (s *PGXCallStore) SetPresenceFacts(facts PresenceFacts) { s.presence = facts }
+
+// commitAnnounced commits a transaction that changes the call participation
+// of userIDs, announcing it to presence first: the announcement opens while
+// the transaction still holds the locks that made that set of people final —
+// the call row, or the person's participant lock — and before anything it
+// wrote becomes visible, so a composition of their presence either reads the
+// change or cannot commit what it read (see ws.Hub.OpenPresenceFacts). The
+// commit runs under the announcement's deadline, and the announcement closes
+// once the commit is over. No announcement, no commit: the caller's deferred
+// rollback undoes everything.
+func (s *PGXCallStore) commitAnnounced(ctx context.Context, tx pgx.Tx, workspaceID string, userIDs ...string) error {
+	if s.presence == nil || len(userIDs) == 0 {
+		return tx.Commit(ctx)
+	}
+	commitCtx, closeFacts, err := s.presence.OpenPresenceFacts(ctx, workspaceID, userIDs)
+	if err != nil {
+		return err
+	}
+	defer closeFacts()
+	return tx.Commit(commitCtx)
 }
 
 func (s *PGXCallStore) CreateCall(ctx context.Context, input CreateCallInput) (domain.Call, bool, error) {
@@ -330,7 +366,7 @@ func (s *PGXCallStore) CreateResourceCall(ctx context.Context, input CreateResou
 			return domain.Call{}, false, "", "", err
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAnnounced(ctx, tx, input.WorkspaceID, input.CallerID); err != nil {
 		return domain.Call{}, false, "", "", fmt.Errorf("commit resource call: %w", err)
 	}
 	return active, active.RequestID == input.RequestID && active.CallerID == input.CallerID, participationID, eventMessageID, nil
@@ -463,14 +499,14 @@ func (s *PGXCallStore) RenewCallPresence(ctx context.Context, input RenewCallPre
 	// resurrect a row: it renews nothing, and the actor learns only that its
 	// claimed participation is no longer current, never anything about
 	// what — or who — actually holds the call now.
-	renewed, err := renewCallPresenceFenced(ctx, tx, call.ID, input.ActorID, input.ParticipationID, input.ExpiresAt)
+	renewal, err := renewCallPresenceFenced(ctx, tx, call.ID, input.ActorID, input.ParticipationID, input.ExpiresAt)
 	if err != nil {
 		return err
 	}
-	if !renewed {
+	if renewal == leaseNotRenewed {
 		return domain.ErrCallParticipationStale
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAnnounced(ctx, tx, input.WorkspaceID, renewal.moved(input.ActorID)...); err != nil {
 		return fmt.Errorf("commit call presence: %w", err)
 	}
 	return nil
@@ -572,7 +608,7 @@ func (s *PGXCallStore) JoinResourceCall(ctx context.Context, input JoinResourceC
 	if err != nil {
 		return domain.Call{}, "", err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAnnounced(ctx, tx, input.WorkspaceID, input.ActorID); err != nil {
 		return domain.Call{}, "", fmt.Errorf("commit join resource call: %w", err)
 	}
 	return call, participationID, nil
@@ -794,6 +830,48 @@ func admitCallPresence(ctx context.Context, tx pgx.Tx, callID, actorID string, e
 	return participationID, nil
 }
 
+// leaseRenewal is what renewCallPresenceFenced did.
+type leaseRenewal uint8
+
+const (
+	// leaseNotRenewed: no lease of this participation exists.
+	leaseNotRenewed leaseRenewal = iota
+	// leaseExtended: the lease was still live and now ends later.
+	leaseExtended
+	// leaseRevived: the lease had lapsed — the actor was not in the call any
+	// more — and is live again.
+	leaseRevived
+)
+
+// moved is whose participation a renewal changed. Extending a live lease
+// changes no fact: the actor was in the call and still is, and a composition
+// that counted the old lease is bounded by its end. Renewing a lapsed one puts
+// the actor back in the call — the same change as an admission, announced the
+// same way.
+func (r leaseRenewal) moved(actorID string) []string {
+	if r == leaseRevived {
+		return []string{actorID}
+	}
+	return nil
+}
+
+// renewCallPresenceSQL renews one participation's lease and reports, from the
+// row it locked, whether that lease had lapsed: the classification and the
+// update are one statement on one locked row, so no other writer can slip
+// between them. Lapsed is judged exactly as the presence context read judges
+// live — expires_at against clock_timestamp() — so the two never disagree on
+// which side of the end a renewal falls. $3 NULL claims the legacy, unfenced
+// identity.
+const renewCallPresenceSQL = `
+	WITH prior AS (
+		SELECT expires_at FROM chat.call_participant_leases
+		WHERE call_id = $1 AND user_id = $2 AND participation_id IS NOT DISTINCT FROM $3::uuid
+		FOR UPDATE)
+	UPDATE chat.call_participant_leases l SET expires_at = $4
+	FROM prior
+	WHERE l.call_id = $1 AND l.user_id = $2 AND l.participation_id IS NOT DISTINCT FROM $3::uuid
+	RETURNING prior.expires_at <= clock_timestamp()`
+
 // renewCallPresenceFenced renews an EXISTING lease's expiry, gated on
 // participationID still matching the lease's own current value (issue #622
 // round 3) — never an upsert: a heartbeat can only ever refresh a lease that
@@ -803,24 +881,29 @@ func admitCallPresence(ctx context.Context, tx pgx.Tx, callID, actorID string, e
 // claims the pre-fencing legacy identity and is matched only against a lease
 // whose own participation_id is NULL (see the migration's rollout doc
 // comment) — never against a fenced, non-NULL one, so an old client can never
-// renew a lease a new admission already rotated. Returns whether a row was
-// actually renewed; false is never an error on its own, only a fact for the
-// caller to act on.
-func renewCallPresenceFenced(ctx context.Context, tx pgx.Tx, callID, actorID, participationID string, expiresAt time.Time) (bool, error) {
-	var query string
-	var args []any
-	if participationID == "" {
-		query = `UPDATE chat.call_participant_leases SET expires_at = $3 WHERE call_id = $1 AND user_id = $2 AND participation_id IS NULL`
-		args = []any{callID, actorID, expiresAt}
-	} else {
-		query = `UPDATE chat.call_participant_leases SET expires_at = $4 WHERE call_id = $1 AND user_id = $2 AND participation_id = $3`
-		args = []any{callID, actorID, participationID, expiresAt}
+// renew a lease a new admission already rotated. It reports whether the lease
+// was extended while live or revived after it lapsed (issue #798); a lease
+// that is not there is never an error on its own, only a fact for the caller
+// to act on.
+func renewCallPresenceFenced(
+	ctx context.Context, tx pgx.Tx, callID, actorID, participationID string, expiresAt time.Time,
+) (leaseRenewal, error) {
+	var fence *string
+	if participationID != "" {
+		fence = &participationID
 	}
-	tag, err := tx.Exec(ctx, query, args...)
-	if err != nil {
-		return false, fmt.Errorf("renew call presence: %w", err)
+	var lapsed bool
+	err := tx.QueryRow(ctx, renewCallPresenceSQL, callID, actorID, fence, expiresAt).Scan(&lapsed)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return leaseNotRenewed, nil
+	case err != nil:
+		return leaseNotRenewed, fmt.Errorf("renew call presence: %w", err)
+	case lapsed:
+		return leaseRevived, nil
+	default:
+		return leaseExtended, nil
 	}
-	return tag.RowsAffected() > 0, nil
 }
 
 // currentParticipationID reads the participation_id an actor's own lease on
@@ -947,12 +1030,15 @@ func (s *PGXCallStore) LeaveResourceCall(ctx context.Context, input LeaveResourc
 		return TransitionCallResult{Call: call}, nil
 	}
 
+	// From here on the released lease ends actorID's participation, and
+	// nobody else's: an automatic end below happens only when no live lease is
+	// left.
 	if call.Status != domain.CallStatusActive {
 		// A real, currently-fenced lease existed and was released, so
 		// actorID was a genuine, current participant — no further
 		// authorization check needed to hand back this already-terminal
 		// call's state.
-		if err := tx.Commit(ctx); err != nil {
+		if err := s.commitAnnounced(ctx, tx, input.WorkspaceID, input.ActorID); err != nil {
 			return TransitionCallResult{}, fmt.Errorf("commit call leave: %w", err)
 		}
 		return TransitionCallResult{Call: call, Released: true}, nil
@@ -966,7 +1052,7 @@ func (s *PGXCallStore) LeaveResourceCall(ctx context.Context, input LeaveResourc
 		return TransitionCallResult{}, fmt.Errorf("check remaining call participants: %w", err)
 	}
 	if remaining {
-		if err := tx.Commit(ctx); err != nil {
+		if err := s.commitAnnounced(ctx, tx, input.WorkspaceID, input.ActorID); err != nil {
 			return TransitionCallResult{}, fmt.Errorf("commit call leave: %w", err)
 		}
 		return TransitionCallResult{Call: call, Released: true}, nil
@@ -976,7 +1062,7 @@ func (s *PGXCallStore) LeaveResourceCall(ctx context.Context, input LeaveResourc
 	if err != nil {
 		return TransitionCallResult{}, err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAnnounced(ctx, tx, input.WorkspaceID, input.ActorID); err != nil {
 		return TransitionCallResult{}, fmt.Errorf("commit call leave: %w", err)
 	}
 	return TransitionCallResult{Call: ended, Changed: true, Released: true}, nil
@@ -1053,10 +1139,44 @@ func (s *PGXCallStore) TransitionCall(ctx context.Context, input TransitionCallI
 			return TransitionCallResult{}, err
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitTransition(ctx, tx, input.WorkspaceID, call, next); err != nil {
 		return TransitionCallResult{}, fmt.Errorf("commit call transition: %w", err)
 	}
 	return TransitionCallResult{Call: updated, Changed: true, EventMessageID: eventMessageID}, nil
+}
+
+// commitTransition commits call's move to next, announced for everybody whose
+// participation it changes.
+func (s *PGXCallStore) commitTransition(ctx context.Context, tx pgx.Tx, workspaceID string, call domain.Call, next domain.CallStatus) error {
+	affected, err := participationChangedBy(ctx, tx, call, next)
+	if err != nil {
+		return err
+	}
+	return s.commitAnnounced(ctx, tx, workspaceID, affected...)
+}
+
+// participationChangedBy is everybody whose participation moving call to next
+// starts or ends, read under the call's row lock. A direct call is its two
+// parties, and only becoming or stopping being active moves them (ringing is
+// nobody's call yet). A resource call ending moves every lease holder: the row
+// lock keeps any admission, renewal or leave out until this transaction is
+// over, so the set read here is the set the end applies to.
+func participationChangedBy(ctx context.Context, tx pgx.Tx, call domain.Call, next domain.CallStatus) ([]string, error) {
+	if call.Status != domain.CallStatusActive && next != domain.CallStatusActive {
+		return nil, nil
+	}
+	if !call.IsResource() {
+		return []string{call.CallerID, call.CalleeID}, nil
+	}
+	rows, err := tx.Query(ctx, `SELECT user_id::text FROM chat.call_participant_leases WHERE call_id = $1`, call.ID)
+	if err != nil {
+		return nil, fmt.Errorf("read call participants: %w", err)
+	}
+	users, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("read call participants: %w", err)
+	}
+	return users, nil
 }
 
 func authorizeCallTransition(call domain.Call, actorID string, action CallAction) (domain.CallStatus, bool, error) {

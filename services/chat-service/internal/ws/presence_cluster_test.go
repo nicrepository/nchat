@@ -62,6 +62,26 @@ type fakeDirectory struct {
 	// mutations is every remote mutation in the order it took effect, so a test
 	// can assert on the sequence rather than only on what was left behind.
 	mutations []directoryMutation
+	// users and projections are the per-user half (issue #798): reach by
+	// instance, and the shared projection. failUsers makes every per-user
+	// operation fail until cleared.
+	users       map[presenceKey]map[string]DirectoryEntry
+	projections map[presenceKey]PresenceProjection
+	revisions   map[presenceKey]uint64
+	failUsers   error
+	// legacy names live instances from before issue #798: their liveness key
+	// lacks instanceCapability, so their roster entries come back Legacy.
+	legacy map[string]bool
+	// beforeProject, when set, runs at the start of every Project call without
+	// the lock held: a test parks a composition there to land another one first.
+	// beforeReach does the same for every reach write.
+	beforeProject func()
+	beforeReach   func()
+	// changing is every facts change in flight, by person; failOps fails one
+	// per-user operation by name ("assert", "withdraw", "read", "project",
+	// "begin", "end").
+	changing map[presenceKey]map[string]time.Time
+	failOps  map[string]error
 }
 
 // directoryMutation is one applied Record or Forget.
@@ -199,7 +219,7 @@ func (d *fakeDirectory) refreshedKeys() []string {
 
 // view returns a handle a single hub writes through, so entries carry that
 // hub's instance ID exactly as the real directory does.
-func (d *fakeDirectory) view(instanceID string) PresenceDirectory {
+func (d *fakeDirectory) view(instanceID string) *fakeDirectoryView {
 	d.mu.Lock()
 	d.live[instanceID] = true
 	d.mu.Unlock()
@@ -330,6 +350,9 @@ func (v *fakeDirectoryView) Present(_ context.Context, key string) ([]DirectoryE
 		delete(v.shared.rosters[key], field)
 	}
 	v.shared.reaped = append(v.shared.reaped, dead...)
+	for i := range kept {
+		kept[i].Legacy = kept[i].InstanceID != v.instanceID && v.shared.legacy[kept[i].InstanceID]
+	}
 	return kept, nil
 }
 
@@ -381,7 +404,7 @@ func newClusterNode(instanceID string, directory PresenceDirectory, tracker *Pre
 	// as app startup makes them agree on one generated value.
 	h.presenceInstanceID = instanceID
 	h.distributed = true
-	h.directory = directory
+	WithPresenceDirectory(directory)(h)
 	return h
 }
 
@@ -605,7 +628,8 @@ func TestPresenceCluster_DirectoryFailureFallsBackAndAdmitsIt(t *testing.T) {
 
 	local := newClient("c-local", "user-local", "ws-1", &fakeSender{})
 	registerInHub(t, node, local)
-	tracker.Connect(local.workspaceID, local.userID, local.id)
+	node.connectPresence(local)
+	drainPresenceEvents(t, node) // registered in the shared reach, as the register path does
 	subscribeInHubState(t, node, local, TargetTypeChannel, "chan-1")
 
 	snapshot := snapshotFor(t, node, local, TargetTypeChannel, "chan-1")
@@ -647,7 +671,8 @@ func TestPresenceCluster_SingleNodeIsComplete(t *testing.T) {
 
 	c := newClient("c-1", "user-1", "ws-1", &fakeSender{})
 	registerInHub(t, node, c)
-	tracker.Connect(c.workspaceID, c.userID, c.id)
+	node.connectPresence(c)
+	drainPresenceEvents(t, node) // registered in the shared reach, as the register path does
 	subscribeInHubState(t, node, c, TargetTypeChannel, "chan-1")
 
 	snapshot := snapshotFor(t, node, c, TargetTypeChannel, "chan-1")

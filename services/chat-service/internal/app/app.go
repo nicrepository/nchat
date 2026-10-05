@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/nicrepository/nchat/libs/go/platform/linkfetch"
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
 	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
@@ -22,6 +24,13 @@ import (
 // defaultPresenceAwayTimeout is the duration of connection inactivity after
 // which a user is considered away. Not configurable yet; adjust here if needed.
 const defaultPresenceAwayTimeout = 5 * time.Minute
+
+// defaultPresenceDisconnectGrace is how long a user whose last connection
+// dropped keeps their presence before becoming offline (issue #798). With the
+// transport heartbeat (30 s ping, 10 s pong wait) it makes the session lease:
+// a crashed or sleeping client converges to offline in about 85 s, while a
+// Wi-Fi switch, a proxy reconnect or a deploy never shows offline at all.
+const defaultPresenceDisconnectGrace = 45 * time.Second
 
 // dbBootstrapTimeout bounds the total retry window for the initial database
 // connection. Keep it below the Kubernetes startupProbe budget (60s) so a
@@ -461,13 +470,122 @@ func (r *appWSWorkspaceResolver) ResolveWorkspaceID(ctx context.Context) (string
 // declares, so httpapi never imports the ws package. A nil tracker answers no
 // online users, and the details payload then carries an empty online preview
 // rather than members whose presence nothing vouches for.
-type presenceReporter struct{ tracker *ws.PresenceTracker }
+//
+// It applies the one privacy rule REST must share with the realtime path
+// (issue #798): somebody who chose to appear offline is not online here either.
+// A failed read of that choice withholds the whole list rather than risk it.
+type presenceReporter struct {
+	tracker     *ws.PresenceTracker
+	store       presenceReporterStore
+	projections publicLastSeen
+}
+
+// publicLastSeen is the hub's answer about when a person was last shown
+// online: the instant their realtime offline carried.
+type publicLastSeen interface {
+	PublicLastSeen(ctx context.Context, workspaceID, userID string) (time.Time, bool, error)
+}
+
+// presenceReporterStore is what the reporter reads from chat.user_presence.
+type presenceReporterStore interface {
+	Contexts(ctx context.Context, workspaceID string, userIDs []string) (map[string]domain.PresenceContext, error)
+	LastSeen(ctx context.Context, workspaceID, userID string) (time.Time, bool, error)
+}
+
+// presenceReporterTimeout bounds the reporter's database reads; the lookup it
+// serves has no request context of its own.
+const presenceReporterTimeout = 2 * time.Second
 
 func (p presenceReporter) OnlineUserIDs(workspaceID string) []string {
 	if p.tracker == nil {
 		return nil
 	}
-	return p.tracker.OnlineUserIDs(workspaceID)
+	online := p.tracker.OnlineUserIDs(workspaceID)
+	if p.store == nil || len(online) == 0 {
+		return online
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), presenceReporterTimeout)
+	defer cancel()
+	contexts, err := p.store.Contexts(ctx, workspaceID, online)
+	if err != nil {
+		return nil
+	}
+	// The read returned only manual states in force on the database's clock;
+	// judging them again on this process's would let a clock running ahead
+	// reveal somebody who is appearing offline (issue #798).
+	visible := online[:0]
+	for _, userID := range online {
+		if contexts[userID].Override.State != domain.PresenceManualAppearOffline {
+			visible = append(visible, userID)
+		}
+	}
+	return visible
+}
+
+// LastSeen is when the user was last published as offline. The live
+// projection answers first, because it is exactly what the realtime event said
+// — also for somebody who is appearing offline and whose recorded departure is
+// older; the record answers once the projection has expired. A failed read is
+// "not known", which only omits a line of context.
+func (p presenceReporter) LastSeen(ctx context.Context, workspaceID, userID string) (time.Time, bool) {
+	readCtx, cancel := context.WithTimeout(ctx, presenceReporterTimeout)
+	defer cancel()
+	if p.projections != nil {
+		at, offline, err := p.projections.PublicLastSeen(readCtx, workspaceID, userID)
+		if err != nil {
+			return time.Time{}, false
+		}
+		if offline {
+			return at, true
+		}
+	}
+	if p.store == nil {
+		return time.Time{}, false
+	}
+	at, found, err := p.store.LastSeen(readCtx, workspaceID, userID)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return at, found
+}
+
+// hubPresenceMetrics adapts the hub's presence outcomes to Prometheus. Both
+// labels are closed sets.
+type hubPresenceMetrics struct {
+	transitions *prometheus.CounterVec
+	graces      *prometheus.CounterVec
+	deferred    *prometheus.CounterVec
+}
+
+func newHubPresenceMetrics(metrics *observability.Metrics) ws.PresenceMetrics {
+	transitions := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "chat_presence_transitions_total",
+		Help: "Published changes of effective presence, by resulting availability.",
+	}, []string{"availability"})
+	graces := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "chat_presence_disconnect_grace_total",
+		Help: "Disconnect graces by outcome: recovered (reconnected inside it) or expired (offline).",
+	}, []string{"outcome"})
+	deferred := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "chat_presence_deferred_total",
+		Help: "Presence publications deferred because a source did not answer, by reason; the context sweep retries them.",
+	}, []string{"reason"})
+	if !metrics.Register(transitions, graces, deferred) {
+		return nil
+	}
+	return hubPresenceMetrics{transitions: transitions, graces: graces, deferred: deferred}
+}
+
+func (m hubPresenceMetrics) PresenceTransition(availability string) {
+	m.transitions.WithLabelValues(availability).Inc()
+}
+
+func (m hubPresenceMetrics) DisconnectGrace(outcome string) {
+	m.graces.WithLabelValues(outcome).Inc()
+}
+
+func (m hubPresenceMetrics) PresenceDeferred(reason string) {
+	m.deferred.WithLabelValues(reason).Inc()
 }
 
 // hubBroadcaster adapts ws.Hub to service.MessageEventPublisher.

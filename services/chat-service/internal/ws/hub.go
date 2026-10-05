@@ -148,8 +148,14 @@ type presenceChange struct {
 	userID      string
 	status      PresenceStatus
 	at          time.Time
-	keys        []string
-	derive      bool
+	// generation is the tracker lifecycle the change belongs to; for an
+	// offline, the one it ended. It fences the shared reach write.
+	generation uint64
+	keys       []string
+	derive     bool
+	// announce is a subscriber joining a room: the room has not been told
+	// anything yet, so the publication is never deduplicated away.
+	announce bool
 }
 
 // mergeInto folds an older pending change into this newer one.
@@ -163,6 +169,7 @@ type presenceChange struct {
 func (c presenceChange) mergeInto(older presenceChange) presenceChange {
 	merged := c
 	merged.derive = c.derive || older.derive
+	merged.announce = c.announce || older.announce
 	if len(older.keys) > 0 {
 		seen := make(map[string]struct{}, len(c.keys)+len(older.keys))
 		keys := make([]string, 0, len(c.keys)+len(older.keys))
@@ -227,7 +234,20 @@ func WithPresence(p *PresenceTracker) HubOption {
 // The caller retains ownership and is responsible for closing it after
 // Hub.Shutdown returns.
 func WithPresenceDirectory(d PresenceDirectory) HubOption {
-	return func(h *Hub) { h.directory = d }
+	return func(h *Hub) {
+		h.directory = d
+		// The Valkey directory also holds per-user reach and the projection
+		// (issue #798); one client, one identity, one liveness for both.
+		if store, ok := d.(UserPresenceStore); ok && h.userStore == nil {
+			h.userStore = store
+		}
+	}
+}
+
+// WithLegacyPresenceBridge turns the rollout bridge to instances from before
+// issue #798 on or off. On unless a deployment turns it off.
+func WithLegacyPresenceBridge(enabled bool) HubOption {
+	return func(h *Hub) { h.legacyBridgeDisabled = !enabled }
 }
 
 // WithPresenceInstanceID hands the hub the same process-incarnation identity the
@@ -285,13 +305,33 @@ type Hub struct {
 	logger             *slog.Logger
 	busCancel          context.CancelFunc
 
-	presence        *PresenceTracker // optional; nil-safe throughout
-	reactionHandler ReactionHandler
-	reactionLimiter ReactionLimiter
-	callHandler     CallHandler
-	callLimiter     CallLimiter
-	callStartLimit  int
-	callStartWindow int
+	presence *PresenceTracker // optional; nil-safe throughout
+	// presenceContext supplies manual states and call activity (issue #798);
+	// nil means automatic presence only.
+	presenceContext PresenceContextSource
+	presenceMetrics PresenceMetrics
+	// publishedMu guards published, what this instance last told observers
+	// about each user it serves (see publishedPresence).
+	publishedMu sync.Mutex
+	published   map[presenceKey]publishedPresence
+	// lingerMu guards lingering, the rooms still covered by users inside their
+	// disconnect grace (see lingeringCover).
+	lingerMu  sync.Mutex
+	lingering map[presenceKey]lingeringCover
+	// userStore holds per-user reach and the effective projection (see
+	// UserPresenceStore); an in-memory store when there is no shared one.
+	userStore     UserPresenceStore
+	userStoreOnce sync.Once
+	// legacyBridgeDisabled turns off the reach bridge to instances from before
+	// issue #798 (see clusterReach). It is on during the rollout window and off
+	// once manual presence is enabled, which requires none to be left.
+	legacyBridgeDisabled bool
+	reactionHandler      ReactionHandler
+	reactionLimiter      ReactionLimiter
+	callHandler          CallHandler
+	callLimiter          CallLimiter
+	callStartLimit       int
+	callStartWindow      int
 
 	// typingStore is the Valkey ghost-state backstop; nil-safe (typing.go).
 	typingStore                  TypingStore
@@ -437,6 +477,8 @@ func NewHub(authorizer SubscriptionAuthorizer, logger *slog.Logger, bus Broadcas
 		presenceSignal:          make(chan struct{}, 1),
 		reconcileSignal:         make(chan struct{}, 1),
 		presencePending:         make(map[presenceKey]presenceChange),
+		published:               make(map[presenceKey]publishedPresence),
+		lingering:               make(map[presenceKey]lingeringCover),
 		deliveredRosters:        make(map[string]string),
 		asserted:                make(map[presenceKey]map[string]uint64),
 		assertionEpoch:          make(map[presenceKey]map[string]uint64),
@@ -1300,27 +1342,7 @@ func (h *Hub) run() {
 				)
 				req.client.close()
 			} else if h.presence != nil {
-				// Connect is called after addClient releases h.mu — no lock held.
-				//
-				// A new connection can change the user's aggregate state: someone
-				// who was away because every session had gone idle is online again
-				// the moment they open a new one. Presence is aggregated per user,
-				// so the people already watching them must be told immediately —
-				// waiting for this connection to subscribe would make the update
-				// depend on a step that has nothing to do with the transition.
-				//
-				// The audience is derived from the user's *existing* subscriptions,
-				// not from the new connection, which has none yet. A genuinely
-				// first connection therefore resolves to an empty audience and
-				// publishes nothing; the announcement for that case is what
-				// handleSubscribed does when a room finally exists to announce into.
-				change := h.presence.Connect(req.client.workspaceID, req.client.userID, req.client.id)
-				if change.Changed {
-					h.enqueuePresenceChange(presenceChange{
-						workspaceID: req.client.workspaceID, userID: req.client.userID,
-						status: change.Status, at: change.At, derive: true,
-					})
-				}
+				h.connectPresence(req.client)
 			}
 			req.ack <- registered
 
@@ -1376,6 +1398,38 @@ func (h *Hub) startBroadcastWorkers() {
 	}()
 }
 
+// connectPresence accounts a newly registered connection in the tracker and
+// announces whatever transition it causes.
+//
+// Connect is called after addClient releases h.mu — no lock held.
+//
+// A new connection can change the user's aggregate state: someone who was away
+// because every session had gone idle is online again the moment they open a
+// new one. Presence is aggregated per user, so the people already watching them
+// must be told immediately — waiting for this connection to subscribe would make
+// the update depend on a step that has nothing to do with the transition.
+//
+// The audience is derived from the user's *existing* subscriptions, not from the
+// new connection, which has none yet. A genuinely first connection therefore
+// resolves to an empty audience and publishes nothing; the announcement for that
+// case is what handleSubscribed does when a room finally exists to announce
+// into.
+//
+// A connection that arrives inside a disconnect grace (issue #798) resumes the
+// user: the grace ends in recovery and nothing was ever published about it.
+func (h *Hub) connectPresence(c *Client) {
+	change := h.presence.Connect(c.workspaceID, c.userID, c.id)
+	if h.resumeLingering(presenceKey{workspaceID: c.workspaceID, userID: c.userID}) {
+		h.metrics().DisconnectGrace("recovered")
+	}
+	if change.Changed {
+		h.enqueuePresenceChange(presenceChange{
+			workspaceID: c.workspaceID, userID: c.userID,
+			status: change.Status, at: change.At, derive: true, generation: change.Generation,
+		})
+	}
+}
+
 // attachPresenceObserver routes the tracker's own transitions into the same
 // queue the hub's own reports use, so there is exactly one fan-out path.
 //
@@ -1386,10 +1440,24 @@ func (h *Hub) attachPresenceObserver() {
 	if h.presence == nil {
 		return
 	}
-	h.presence.SetObserver(func(workspaceID, userID string, status PresenceStatus, at time.Time) {
-		h.enqueuePresenceChange(presenceChange{
-			workspaceID: workspaceID, userID: userID, status: status, at: at, derive: true,
-		})
+	h.presence.SetObserver(func(workspaceID, userID string, status PresenceStatus, at time.Time, generation uint64) {
+		change := presenceChange{
+			workspaceID: workspaceID, userID: userID, status: status, at: at, derive: true, generation: generation,
+		}
+		if !h.transitionCurrent(change) {
+			// Decided under the tracker's lock, reported after it was released:
+			// a connection that arrived in between already queued the current
+			// answer, and an expired grace it resumed must not take the cover
+			// that connection now relies on.
+			return
+		}
+		if status == PresenceOffline {
+			// A grace that ran out. The rooms the departed connection was in are
+			// where the offline is owed, and they stop being covered now.
+			change.keys = h.takeLingering(presenceKey{workspaceID: workspaceID, userID: userID})
+			h.metrics().DisconnectGrace("expired")
+		}
+		h.enqueuePresenceChange(change)
 	})
 }
 
@@ -1502,18 +1570,10 @@ func (h *Hub) publishPresence(change presenceChange) {
 	if change.workspaceID == "" || change.userID == "" {
 		return
 	}
-	// Copied rather than appended in place: the change's own slice must not be
-	// grown here, and the loop below de-duplicates whatever overlap the two
-	// sources produce.
-	keys := append([]string{}, change.keys...)
-	if change.derive {
-		keys = append(keys, h.subscribedTargetKeys(change.workspaceID, change.userID)...)
-	}
-	payload := PresencePayload{
-		UserID:    change.userID,
-		State:     string(change.status),
-		UpdatedAt: formatPresenceTime(change.at),
-	}
+	change = h.currentPresenceChange(change)
+	// The loop below de-duplicates whatever overlap the audience's sources
+	// produce.
+	keys := h.presenceAudience(change)
 	ctx := context.Background()
 
 	// Every target is settled before anything is written or sent, so the shared
@@ -1526,6 +1586,14 @@ func (h *Hub) publishPresence(change presenceChange) {
 	// different worlds. It is best-effort: a failure costs a later snapshot its
 	// completeness, never a delivery.
 	h.recordInDirectory(ctx, change, allowed)
+
+	// What observers are told is the composed public state, not this
+	// instance's reach (issue #798) — and nothing at all when it would not
+	// change what they already have.
+	payload, publish := h.publicPresence(ctx, change, allowed)
+	if !publish {
+		return
+	}
 
 	for _, parsed := range parsedKeys {
 		presence := payload
@@ -1683,10 +1751,8 @@ func (h *Hub) forgetSubject(ctx context.Context, change presenceChange, key stri
 	if !ok {
 		return
 	}
-	presence := PresencePayload{
-		UserID: change.userID, State: string(PresenceOffline),
-		UpdatedAt: formatPresenceTime(change.at),
-	}
+	presence := presencePayloadFor(change.userID,
+		domain.EffectivePresence{Availability: domain.PresenceOffline}, change.at)
 	evt := Event{
 		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypePresenceUpdated,
 		WorkspaceID: parsed.workspaceID, TargetType: parsed.targetType, TargetID: parsed.targetID,
@@ -2058,6 +2124,7 @@ func (h *Hub) heartbeatDirectory() {
 	// roster from expiring underneath them (CQ-2).
 	h.reconcileAllAssertions()
 	h.refreshAssertionLeases()
+	h.refreshUserPresenceLeases()
 }
 
 // handleSubscribed completes a subscribe with the two presence exchanges that
@@ -2103,7 +2170,7 @@ func (h *Hub) handleSubscribed(c *Client, targetType TargetType, targetID string
 	}
 	h.enqueuePresenceChange(presenceChange{
 		workspaceID: c.workspaceID, userID: c.userID,
-		status: status, at: at, keys: []string{key},
+		status: status, at: at, keys: []string{key}, announce: true,
 	})
 }
 
@@ -2230,7 +2297,8 @@ func (h *Hub) presenceRoster(c *Client, key string, target targetKey) (users []P
 		entries, err := h.directory.Present(ctx, key)
 		cancel()
 		if err == nil {
-			return h.authorizedRoster(c.workspaceID, target, aggregateRoster(entries))
+			users, complete := h.authorizedRoster(c.workspaceID, target, aggregateRoster(entries))
+			return h.composedRoster(c.ctx, c.workspaceID, users, entries, complete)
 		}
 		h.logger.WarnContext(context.Background(), "ws: presence directory read failed; local roster only",
 			"operation", "roster", "error", err,
@@ -2257,7 +2325,7 @@ func (h *Hub) localRoster(target targetKey, key string) (users []PresencePayload
 		return nil, false
 	}
 	users = make([]PresencePayload, 0, 8)
-	for _, userID := range h.subscriberUserIDs(key) {
+	for _, userID := range h.localRosterUserIDs(target.workspaceID, key) {
 		status, at := h.presence.StatusAt(target.workspaceID, userID)
 		if status == PresenceOffline {
 			continue
@@ -2267,7 +2335,39 @@ func (h *Hub) localRoster(target targetKey, key string) (users []PresencePayload
 		})
 	}
 	users, authorized := h.authorizedRoster(target.workspaceID, target, users)
-	return users, authorized && !h.distributed
+	return h.composedRoster(context.Background(), target.workspaceID, users, nil, authorized && !h.distributed)
+}
+
+// localRosterUserIDs is everyone this instance places in a target: its live
+// subscribers, plus users whose disconnect grace still covers it (issue #798).
+func (h *Hub) localRosterUserIDs(workspaceID, key string) []string {
+	userIDs := h.subscriberUserIDs(key)
+	seen := make(map[string]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		seen[userID] = struct{}{}
+	}
+	for _, pk := range h.lingeringUsersOn(key) {
+		if _, dup := seen[pk.userID]; dup || pk.workspaceID != workspaceID {
+			continue
+		}
+		seen[pk.userID] = struct{}{}
+		userIDs = append(userIDs, pk.userID)
+	}
+	return userIDs
+}
+
+// composedRoster turns an authorized roster of reach into the public roster
+// (issue #798). A context that cannot be read yields no roster and no claim of
+// completeness: the client keeps what it knows and infers nothing.
+func (h *Hub) composedRoster(
+	ctx context.Context, workspaceID string, users []PresencePayload, entries []DirectoryEntry, complete bool,
+) ([]PresencePayload, bool) {
+	composed, err := h.composeRoster(ctx, workspaceID, users, entries)
+	if err != nil {
+		h.logger.WarnContext(ctx, "ws: presence context unavailable; roster withheld", "error", err)
+		return nil, false
+	}
+	return composed, complete
 }
 
 // authorizedRoster removes anybody the domain no longer places in this target,
@@ -2589,6 +2689,17 @@ func (h *Hub) handleRemoteBusEvent(evt Event) {
 		h.deliverToLocalUserSessions(canonical, data)
 		return
 	}
+	// The hint names only its own recipient, who is also its subject: there is
+	// nothing to authorize beyond being that user's session (issue #798).
+	if canonical.Type == EventTypePresenceSettingsChanged {
+		h.applyPresenceSettingsChanged(canonical, data)
+		return
+	}
+	// A call lifecycle change on another replica can start or end a call for
+	// somebody this one serves; their presence follows it (issue #798).
+	if isCallEventType(canonical.Type) && canonical.TargetType == TargetTypeUser {
+		h.RefreshPresence(canonical.WorkspaceID, canonical.TargetID)
+	}
 
 	select {
 	case h.remoteBcast <- broadcastReq{event: canonical, data: data}:
@@ -2680,6 +2791,8 @@ var typedPayloadCanonicalizers = map[EventType]func(Event) (Event, bool){
 	EventTypeAttachmentStatus: canonicalizeAttachmentEvent,
 	EventTypePresenceUpdated:  canonicalizePresenceEvent,
 	EventTypeTypingUpdated:    canonicalizeTypingEvent,
+	// A user telling their own sessions to re-read their settings (#798).
+	EventTypePresenceSettingsChanged: canonicalizePresenceSettingsEvent,
 }
 
 func canonicalizeTypedPayload(evt Event) (Event, bool) {
@@ -2750,7 +2863,7 @@ func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 		EventTypeMessageCreated, EventTypeMessageUpdated, EventTypeReactionUpdated, EventTypePinUpdated,
 		EventTypeMembersAdded, EventTypeConversationAvailable, EventTypeConversationUpdated,
 		EventTypeConversationEvent, EventTypeAcknowledgementUpdated, EventTypeAttachmentStatus,
-		EventTypePresenceUpdated, EventTypeTypingUpdated,
+		EventTypePresenceUpdated, EventTypeTypingUpdated, EventTypePresenceSettingsChanged,
 		EventTypeCallRinging, EventTypeCallAccepted, EventTypeCallDeclined,
 		EventTypeCallCancelled, EventTypeCallTimedOut, EventTypeCallEnded:
 		// OK
@@ -2799,7 +2912,7 @@ func canonicalizeEventIDs(evt Event) (Event, bool) {
 	if !ok {
 		return Event{}, false
 	}
-	if evt.Type == EventTypeConversationAvailable {
+	if evt.Type == EventTypeConversationAvailable || evt.Type == EventTypePresenceSettingsChanged {
 		return canonicalizeRecipientScopedIDs(evt)
 	}
 	// No other event type may carry a recipient — that field is what makes
@@ -3114,6 +3227,9 @@ func canonicalizePresenceEvent(evt Event) (Event, bool) {
 	if _, known := presenceStateValues[evt.Presence.State]; !known {
 		return Event{}, false
 	}
+	if !validPresenceComposition(*evt.Presence) {
+		return Event{}, false
+	}
 	if len(evt.Presence.UpdatedAt) > presenceUpdatedAtMaxLen {
 		return Event{}, false
 	}
@@ -3165,6 +3281,15 @@ func (h *Hub) dropClient(c *Client) {
 	// accounting decides the user's aggregate state here; leaving a dead
 	// connection in it would keep them online forever.
 	change := h.presence.Disconnect(removed.workspaceID, removed.userID, removed.id)
+	if change.Lingering {
+		// The last connection here is gone but its grace has begun (issue #798).
+		// Its rooms stay covered — assertions included — until a connection comes
+		// back or the grace ends, which is when the offline is announced into
+		// them.
+		pk := presenceKey{workspaceID: removed.workspaceID, userID: removed.userID}
+		h.holdLingering(pk, append(keys, h.assertedTargetsList(removed.workspaceID, removed.userID)...))
+		return
+	}
 	if !change.Changed {
 		// The user is still online — another connection holds them up — but this
 		// one may have been the only local cover for some of their conversations.
@@ -3181,7 +3306,7 @@ func (h *Hub) dropClient(c *Client) {
 	keys = append(keys, h.assertedTargetsList(removed.workspaceID, removed.userID)...)
 	h.enqueuePresenceChange(presenceChange{
 		workspaceID: removed.workspaceID, userID: removed.userID,
-		status: change.Status, at: change.At, keys: keys,
+		status: change.Status, at: change.At, keys: keys, generation: change.Generation,
 	})
 }
 
@@ -3448,7 +3573,7 @@ func (h *Hub) handleClientMessage(ctx context.Context, c *Client, msg ClientMess
 		if change := h.presence.RecordActivity(c.workspaceID, c.userID, c.id); change.Changed {
 			h.enqueuePresenceChange(presenceChange{
 				workspaceID: c.workspaceID, userID: c.userID,
-				status: change.Status, at: change.At, derive: true,
+				status: change.Status, at: change.At, derive: true, generation: change.Generation,
 			})
 		}
 	}

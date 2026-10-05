@@ -34,12 +34,20 @@ func (c *fakeClock) Advance(d time.Duration) {
 // The done channel is pre-closed; Stop() is safe to call but is a no-op since
 // no background goroutine was started.
 func newTestPresenceTracker(awayTimeout time.Duration, clk *fakeClock) *PresenceTracker {
+	return newTestPresenceTrackerWithGrace(awayTimeout, 0, clk)
+}
+
+// newTestPresenceTrackerWithGrace is newTestPresenceTracker with a disconnect
+// grace; tests call expireGraces() directly.
+func newTestPresenceTrackerWithGrace(awayTimeout, grace time.Duration, clk *fakeClock) *PresenceTracker {
 	p := &PresenceTracker{
 		awayTimeout: awayTimeout,
+		grace:       grace,
 		now:         clk.Now,
 		conns:       make(map[presenceKey]map[string]time.Time),
 		status:      make(map[presenceKey]PresenceStatus),
 		changedAt:   make(map[presenceKey]time.Time),
+		lingering:   make(map[presenceKey]time.Time),
 		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
 	}
@@ -538,7 +546,7 @@ func TestPresence_Observer_ReportsAwayTransitions(t *testing.T) {
 		at          time.Time
 	}
 	var reports []report
-	p.SetObserver(func(workspaceID, userID string, status PresenceStatus, at time.Time) {
+	p.SetObserver(func(workspaceID, userID string, status PresenceStatus, at time.Time, _ uint64) {
 		reports = append(reports, report{workspaceID, userID, status, at})
 	})
 

@@ -99,14 +99,21 @@ func crowdedTarget(t *testing.T, auth SubscriptionAuthorizer, population int) (*
 	h.instanceID = "node-a"
 	h.presenceInstanceID = "node-a"
 	h.distributed = true
-	directory := shared.view("node-a")
-	h.directory = directory
+	WithPresenceDirectory(shared.view("node-a"))(h)
 
+	// The crowd is served by another live instance, which — like every
+	// instance since issue #798 — asserts them into the roster and into their
+	// own per-user records.
+	other := shared.view("node-b")
+	_ = other.Heartbeat(context.Background())
 	key := targetKey{workspaceID: "ws-1", targetType: TargetTypeChannel, targetID: "chan-big"}.String()
 	for i := range population {
-		err := directory.Record(context.Background(), DirectoryEntry{
-			UserID: fmt.Sprintf("user-%05d", i), State: PresenceOnline, At: clk.Now(),
-		}, []string{key})
+		userID := fmt.Sprintf("user-%05d", i)
+		_, assertErr := other.AssertReach(context.Background(), "ws-1", userID, PresenceOnline, clk.Now(), 1)
+		err := errors.Join(
+			other.Record(context.Background(), DirectoryEntry{UserID: userID, State: PresenceOnline, At: clk.Now()}, []string{key}),
+			assertErr,
+		)
 		if err != nil {
 			t.Fatalf("seed directory: %v", err)
 		}
@@ -248,13 +255,17 @@ func TestRosterBound_MultiInstanceSubjectCountsOnce(t *testing.T) {
 	h.instanceID = "node-a"
 	h.presenceInstanceID = "node-a"
 	h.distributed = true
-	h.directory = shared.view("node-a")
+	WithPresenceDirectory(shared.view("node-a"))(h)
 
 	key := targetKey{workspaceID: "ws-1", targetType: TargetTypeChannel, targetID: "chan-1"}.String()
-	for _, instance := range []string{"node-a", "node-b", "node-c"} {
-		err := shared.view(instance).Record(context.Background(), DirectoryEntry{
-			UserID: "user-many", State: PresenceOnline, At: clk.Now(),
-		}, []string{key})
+	for _, instance := range []string{"node-b", "node-c"} {
+		view := shared.view(instance)
+		_ = view.Heartbeat(context.Background())
+		_, assertErr := view.AssertReach(context.Background(), "ws-1", "user-many", PresenceOnline, clk.Now(), 1)
+		err := errors.Join(
+			view.Record(context.Background(), DirectoryEntry{UserID: "user-many", State: PresenceOnline, At: clk.Now()}, []string{key}),
+			assertErr,
+		)
 		if err != nil {
 			t.Fatalf("seed: %v", err)
 		}

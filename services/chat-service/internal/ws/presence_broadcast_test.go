@@ -119,12 +119,14 @@ func TestPresence_Subscribe_SendsSnapshotOfUsersAlreadyInTarget(t *testing.T) {
 
 	incumbent := newClient("c-incumbent", "user-incumbent", "ws-1", &fakeSender{})
 	registerInHub(t, h, incumbent)
-	tracker.Connect(incumbent.workspaceID, incumbent.userID, incumbent.id)
+	h.connectPresence(incumbent)
+	drainPresenceEvents(t, h) // registered in the shared reach, as the register path does
 	subscribeInHubState(t, h, incumbent, TargetTypeChannel, "chan-1")
 
 	joiner := newClient("c-joiner", "user-joiner", "ws-1", &fakeSender{})
 	registerInHub(t, h, joiner)
-	tracker.Connect(joiner.workspaceID, joiner.userID, joiner.id)
+	h.connectPresence(joiner)
+	drainPresenceEvents(t, h) // registered in the shared reach, as the register path does
 	subscribeInHubState(t, h, joiner, TargetTypeChannel, "chan-1")
 
 	h.handleSubscribed(joiner, TargetTypeChannel, "chan-1", 0)
@@ -188,12 +190,14 @@ func TestPresence_Subscribe_SnapshotIsWorkspaceScoped(t *testing.T) {
 
 	foreign := newClient("c-foreign", "user-foreign", "ws-2", &fakeSender{})
 	registerInHub(t, h, foreign)
-	tracker.Connect(foreign.workspaceID, foreign.userID, foreign.id)
+	h.connectPresence(foreign)
+	drainPresenceEvents(t, h) // registered in the shared reach, as the register path does
 	subscribeInHubState(t, h, foreign, TargetTypeChannel, "chan-1")
 
 	local := newClient("c-local", "user-local", "ws-1", &fakeSender{})
 	registerInHub(t, h, local)
-	tracker.Connect(local.workspaceID, local.userID, local.id)
+	h.connectPresence(local)
+	drainPresenceEvents(t, h) // registered in the shared reach, as the register path does
 	subscribeInHubState(t, h, local, TargetTypeChannel, "chan-1")
 
 	h.handleSubscribed(local, TargetTypeChannel, "chan-1", 0)
@@ -248,9 +252,10 @@ func TestPresence_ClosingOneOfTwoConnections_PublishesNothing(t *testing.T) {
 	second := newClient("c-2", "user-1", "ws-1", &fakeSender{})
 	for _, c := range []*Client{first, second} {
 		registerInHub(t, h, c)
-		tracker.Connect(c.workspaceID, c.userID, c.id)
+		h.connectPresence(c)
 		subscribeInHubState(t, h, c, TargetTypeChannel, "chan-1")
 	}
+	drainPresenceEvents(t, h)
 
 	h.dropClient(first)
 
@@ -279,9 +284,10 @@ func TestPresence_LastConnectionDrop_PublishesOfflineToItsRooms(t *testing.T) {
 
 	leaving := newClient("c-leaving", "user-leaving", "ws-1", &fakeSender{})
 	registerInHub(t, h, leaving)
-	tracker.Connect(leaving.workspaceID, leaving.userID, leaving.id)
+	h.connectPresence(leaving)
 	subscribeInHubState(t, h, leaving, TargetTypeChannel, "chan-1")
 	subscribeInHubState(t, h, leaving, TargetTypeDM, "dm-1")
+	drainPresenceEvents(t, h)
 
 	h.dropClient(leaving)
 
@@ -442,8 +448,11 @@ func TestPresence_PublishAddressesEverySubscribedTargetOnce(t *testing.T) {
 	registerInHub(t, h, stranger)
 	subscribeInHubState(t, h, stranger, TargetTypeChannel, "chan-stranger")
 
+	// A change is acted on only while the tracker agrees with it.
+	tracker.Connect("ws-1", "user-1", first.id)
+	tracker.Connect("ws-1", "user-1", second.id)
 	h.publishPresence(presenceChange{
-		workspaceID: "ws-1", userID: "user-1", status: PresenceAway, at: clk.Now(), derive: true,
+		workspaceID: "ws-1", userID: "user-1", status: PresenceOnline, at: clk.Now(), derive: true,
 	})
 
 	events := drainPresenceEvents(t, h)
@@ -659,6 +668,14 @@ func TestPresence_SaturatedFanout_ConvergesToTheFinalState(t *testing.T) {
 	subject := newClient("c-subject", "user-subject", "ws-1", &fakeSender{})
 	registerInHub(t, h, subject)
 	subscribeInHubState(t, h, subject, TargetTypeChannel, "chan-1")
+	// Observers have been told the subject is online (issue #798: an offline is
+	// only news to somebody who was shown something else).
+	tracker.Connect("ws-1", "user-subject", subject.id)
+	h.enqueuePresenceChange(presenceChange{
+		workspaceID: "ws-1", userID: "user-subject", status: PresenceOnline, at: clk.Now(), derive: true,
+	})
+	onlineEvents := drainPresenceEvents(t, h)
+	clk.Advance(time.Second)
 
 	// Nothing is draining: every one of these finds the fan-out behind.
 	base := clk.Now()
@@ -672,8 +689,9 @@ func TestPresence_SaturatedFanout_ConvergesToTheFinalState(t *testing.T) {
 	// The last thing that happened to this user, and the only state that must
 	// survive the pressure.
 	finalAt := base.Add(time.Hour)
+	gone := tracker.Disconnect("ws-1", "user-subject", subject.id)
 	h.enqueuePresenceChange(presenceChange{
-		workspaceID: "ws-1", userID: "user-subject",
+		workspaceID: "ws-1", userID: "user-subject", generation: gone.Generation,
 		status: PresenceOffline, at: finalAt, keys: []string{
 			targetKey{workspaceID: "ws-1", targetType: TargetTypeChannel, targetID: "chan-1"}.String(),
 		},
@@ -689,8 +707,10 @@ func TestPresence_SaturatedFanout_ConvergesToTheFinalState(t *testing.T) {
 	if states[0] != string(PresenceOffline) {
 		t.Fatalf("expected the final state to survive, got %q", states[0])
 	}
-	if events[0].Presence.UpdatedAt != formatPresenceTime(finalAt) {
-		t.Fatalf("expected the final instant, got %q", events[0].Presence.UpdatedAt)
+	// The instant is the projection's version (issue #798): newer than the one
+	// the observers hold, so the final state is applied rather than dropped.
+	if len(onlineEvents) != 1 || events[0].Presence.UpdatedAt <= onlineEvents[0].Presence.UpdatedAt {
+		t.Fatalf("expected a newer version than %+v, got %q", onlineEvents, events[0].Presence.UpdatedAt)
 	}
 }
 
@@ -705,16 +725,16 @@ func TestPresence_Coalescing_IsPerUser(t *testing.T) {
 	key := subscribeInHubState(t, h, watcher, TargetTypeChannel, "chan-1")
 
 	for _, userID := range []string{"user-a", "user-b"} {
+		tracker.Connect("ws-1", userID, "conn-"+userID)
 		h.enqueuePresenceChange(presenceChange{
 			workspaceID: "ws-1", userID: userID,
 			status: PresenceOnline, at: clk.Now(), keys: []string{key},
 		})
 	}
 	// user-a moves again; user-b must be untouched.
-	h.enqueuePresenceChange(presenceChange{
-		workspaceID: "ws-1", userID: "user-a",
-		status: PresenceAway, at: clk.Now().Add(time.Minute), keys: []string{key},
-	})
+	clk.Advance(6 * time.Minute)
+	tracker.RecordActivity("ws-1", "user-b", "conn-user-b")
+	tracker.checkAway()
 
 	events := drainPresenceEvents(t, h)
 
@@ -736,13 +756,20 @@ func TestPresence_Coalescing_UnionsAudiences(t *testing.T) {
 
 	channelKey := targetKey{workspaceID: "ws-1", targetType: TargetTypeChannel, targetID: "chan-1"}.String()
 	dmKey := targetKey{workspaceID: "ws-1", targetType: TargetTypeDM, targetID: "dm-1"}.String()
+	// The user was shown online first, so the offline below is news.
+	tracker.Connect("ws-1", "user-1", "conn-1")
+	h.enqueuePresenceChange(presenceChange{
+		workspaceID: "ws-1", userID: "user-1", status: PresenceOnline, at: clk.Now(),
+	})
+	drainPresenceEvents(t, h)
+	gone := tracker.Disconnect("ws-1", "user-1", "conn-1")
 
 	h.enqueuePresenceChange(presenceChange{
 		workspaceID: "ws-1", userID: "user-1",
 		status: PresenceAway, at: clk.Now(), keys: []string{channelKey},
 	})
 	h.enqueuePresenceChange(presenceChange{
-		workspaceID: "ws-1", userID: "user-1",
+		workspaceID: "ws-1", userID: "user-1", generation: gone.Generation,
 		status: PresenceOffline, at: clk.Now().Add(time.Minute), keys: []string{dmKey},
 	})
 
@@ -844,11 +871,17 @@ func TestPresence_Register_PublishesTheTransitionItCauses(t *testing.T) {
 
 	clk.Advance(awayTimeout + time.Second)
 	tracker.checkAway()
+	// The watcher has to have been told about the away: a reconnect that
+	// coalesced with it would rightly publish nothing, since the watcher would
+	// never have stopped seeing the user online (issue #798).
 	eventually(t, func() bool {
-		return tracker.Status("ws-1", "user-1") == PresenceAway
-	}, 2*time.Second, "user went away")
-
-	drainClientOutbox(watcher)
+		for _, state := range presenceStatesInOutbox(watcher, "user-1") {
+			if state == string(PresenceAway) {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, "watcher was told the user went away")
 
 	second := newClient("c-second", "user-1", "ws-1", &fakeSender{})
 	registerInRunningHub(t, hub, second)
@@ -965,7 +998,8 @@ func TestPresence_Snapshot_MarksItselfIncompleteWhenBounded(t *testing.T) {
 
 	viewer := newClient("c-viewer", "user-viewer", "ws-1", &fakeSender{})
 	registerInHub(t, h, viewer)
-	tracker.Connect(viewer.workspaceID, viewer.userID, viewer.id)
+	h.connectPresence(viewer)
+	drainPresenceEvents(t, h) // registered in the shared reach, as the register path does
 	key := subscribeInHubState(t, h, viewer, TargetTypeChannel, "chan-1")
 
 	// One more distinct user than the bound allows.
@@ -973,7 +1007,8 @@ func TestPresence_Snapshot_MarksItselfIncompleteWhenBounded(t *testing.T) {
 		id := fmt.Sprintf("user-%05d", i)
 		crowd := newClient("c-"+id, id, "ws-1", &fakeSender{})
 		registerInHub(t, h, crowd)
-		tracker.Connect(crowd.workspaceID, crowd.userID, crowd.id)
+		h.connectPresence(crowd)
+		drainPresenceEvents(t, h) // registered in the shared reach, as the register path does
 		subscribeInHubState(t, h, crowd, TargetTypeChannel, "chan-1")
 	}
 
@@ -1202,7 +1237,7 @@ func TestPresence_OverlappingRooms_ProduceNoDuplicate(t *testing.T) {
 	second := newClient("c-2", "user-1", "ws-1", &fakeSender{})
 	for _, c := range []*Client{first, second} {
 		registerInHub(t, h, c)
-		tracker.Connect(c.workspaceID, c.userID, c.id)
+		h.connectPresence(c)
 		subscribeInHubState(t, h, c, TargetTypeChannel, "chan-shared")
 	}
 	drainPresenceEvents(t, h)

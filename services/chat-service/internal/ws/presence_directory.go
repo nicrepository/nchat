@@ -61,6 +61,13 @@ type DirectoryEntry struct {
 	// whether anybody still stands behind it — and so that two instances
 	// asserting about the same person do not overwrite each other.
 	InstanceID string
+	// Legacy marks an assertion whose live instance predates issue #798: it
+	// keeps no per-user reach, so this roster entry is the only evidence of the
+	// sessions it serves (see Hub.legacyReach). Set by Present only.
+	Legacy bool
+	// Generation is the tracker lifecycle a per-user reach assertion belongs
+	// to (UserPresenceStore). Target rosters do not carry one.
+	Generation uint64
 }
 
 // aggregatePresence reduces every live assertion about one user to the state
@@ -150,6 +157,13 @@ const (
 	directoryKeyPrefix  = "nchat:chat:ws:presence:"
 	directoryLivePrefix = "nchat:chat:ws:instance:"
 )
+
+// instanceCapability is what an instance's liveness key holds (issue #798).
+// An instance from before #798 writes "1" there; one that keeps per-user reach
+// writes this, so a reader can tell, from the key it already reads for
+// liveness, whose roster assertions are the only evidence of a session and
+// whose merely repeat what the per-user record already says.
+const instanceCapability = "user-reach-v1"
 
 // ValkeyPresenceDirectory implements PresenceDirectory on Valkey.
 //
@@ -304,13 +318,16 @@ func (d *ValkeyPresenceDirectory) Present(ctx context.Context, key string) ([]Di
 		instances[entry.InstanceID] = struct{}{}
 	}
 
-	live, err := d.liveInstances(ctx, instances)
+	live, legacy, err := d.liveInstances(ctx, instances)
 	if err != nil {
 		return nil, err
 	}
 	kept, dead := partitionByLiveness(entries, live, d.instanceID)
 	if len(dead) > 0 {
 		d.reapDeadFields(ctx, key, dead)
+	}
+	for i := range kept {
+		_, kept[i].Legacy = legacy[kept[i].InstanceID]
 	}
 	return kept, nil
 }
@@ -371,7 +388,12 @@ func partitionByLiveness(
 	return kept, dead
 }
 
-func (d *ValkeyPresenceDirectory) liveInstances(ctx context.Context, instances map[string]struct{}) (map[string]struct{}, error) {
+// liveInstances resolves which of these instances are alive, and which of the
+// live ones predate per-user reach (their key does not hold
+// instanceCapability).
+func (d *ValkeyPresenceDirectory) liveInstances(
+	ctx context.Context, instances map[string]struct{},
+) (live, legacy map[string]struct{}, err error) {
 	ids := make([]string, 0, len(instances))
 	for id := range instances {
 		if id != "" && id != d.instanceID {
@@ -379,27 +401,38 @@ func (d *ValkeyPresenceDirectory) liveInstances(ctx context.Context, instances m
 		}
 	}
 	if len(ids) == 0 {
-		return map[string]struct{}{}, nil
+		return map[string]struct{}{}, map[string]struct{}{}, nil
 	}
 	values, err := d.client.Do(ctx, d.client.B().Mget().Key(ids...).Build()).ToArray()
 	if err != nil {
-		return nil, fmt.Errorf("ws: presence directory liveness: %w", err)
+		return nil, nil, fmt.Errorf("ws: presence directory liveness: %w", err)
 	}
-	live := make(map[string]struct{}, len(ids))
+	live, legacy = classifyLiveness(ids, values)
+	return live, legacy, nil
+}
+
+// classifyLiveness reads an MGET of liveness keys: present is alive, and alive
+// without instanceCapability is legacy.
+func classifyLiveness(ids []string, values []valkey.ValkeyMessage) (live, legacy map[string]struct{}) {
+	live, legacy = make(map[string]struct{}, len(ids)), map[string]struct{}{}
 	for index, value := range values {
 		if value.IsNil() {
 			continue
 		}
-		live[strings.TrimPrefix(ids[index], directoryLivePrefix)] = struct{}{}
+		id := strings.TrimPrefix(ids[index], directoryLivePrefix)
+		live[id] = struct{}{}
+		if capability, _ := value.ToString(); capability != instanceCapability {
+			legacy[id] = struct{}{}
+		}
 	}
-	return live, nil
+	return live, legacy
 }
 
 // Heartbeat renews this instance's liveness key.
 func (d *ValkeyPresenceDirectory) Heartbeat(ctx context.Context) error {
 	err := d.client.Do(ctx, d.client.B().Set().
 		Key(directoryLivePrefix+d.instanceID).
-		Value("1").
+		Value(instanceCapability).
 		ExSeconds(int64(instanceLivenessTTL.Seconds())).
 		Build()).Error()
 	if err != nil {
