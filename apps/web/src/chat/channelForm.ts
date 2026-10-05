@@ -104,3 +104,42 @@ export function validateChannelForm({ displayName, slug }: ChannelFormValues): s
   }
   return null;
 }
+
+/** The category select's "create a new one" option. */
+export const NEW_CATEGORY_OPTION = "__new__";
+
+/** What the channel form would create, as the user has it right now. */
+export interface ChannelDraft {
+  displayName: string;
+  slug: string;
+  type: ChannelFormType;
+  /** "", an existing category ID, or NEW_CATEGORY_OPTION. */
+  categoryId: string;
+  newCategoryName: string;
+  /** The private-channel selection; kept while Público is chosen, never sent then. */
+  memberIds: readonly string[];
+}
+
+/**
+ * Identifies one creation intent (issue #1025).
+ *
+ * Two drafts with the same fingerprint are the same request to the server, so
+ * a retry may reuse the same Idempotency-Key; any material edit changes it and
+ * earns a new key. It is shaped like the server's own normalization — trimmed,
+ * slug lowercased, invitees as a sorted set, invitees ignored for a public
+ * channel — so a cosmetic difference does not split one intent in two.
+ */
+export function channelDraftFingerprint(draft: ChannelDraft): string {
+  const category =
+    draft.categoryId === NEW_CATEGORY_OPTION
+      ? `new:${draft.newCategoryName.trim()}`
+      : draft.categoryId;
+  const members = draft.type === "private" ? [...new Set(draft.memberIds)].sort() : [];
+  return JSON.stringify([
+    draft.slug.trim().toLowerCase(),
+    draft.displayName.trim(),
+    draft.type,
+    category,
+    members,
+  ]);
+}

@@ -250,6 +250,12 @@ export interface MessagingScenario {
     reactions: Array<{ messageId: string; emoji: string; added: boolean }>;
     dmCreates: Array<{ otherUserId: string }>;
     groupCreates: Array<{ participantUserIds: string[]; title: string }>;
+    /**
+     * Issue #1025: every POST /api/chat/channels that reached the mock, in
+     * order, with its Idempotency-Key — so a spec can prove a retry reused it
+     * and a double click sent one request.
+     */
+    channelCreates: Array<{ idempotencyKey: string | null; body: Record<string, unknown> }>;
     /** Issue #516: what the composer actually uploaded, in order. */
     attachmentUploads: Array<{ targetId: string; filename: string; purpose: string }>;
     /**
@@ -303,6 +309,9 @@ export interface MessagingScenario {
   // click sent exactly one request.
   removeMemberRequests: Array<{ kind: TargetKind; targetId: string; userId: string }>;
   removeMemberStatus: number;
+  // Issue #1025: how many upcoming channel creations die as a network failure
+  // after the server committed them — the case an Idempotency-Key exists for.
+  channelCreateLostResponses: number;
   // Channel attachments per channel id, newest first, as the server returns them.
   channelAttachments: Map<string, AttachmentFixture[]>;
   // Group-details payload per conversation id (issue #441).
@@ -620,6 +629,7 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
       reactions: [],
       dmCreates: [],
       groupCreates: [],
+      channelCreates: [],
       attachmentUploads: [],
       attachmentContentFetches: [],
       attachmentListings: [],
@@ -638,6 +648,7 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
     addMembersStatus: 200,
     channelRosters: new Map(),
     removeMemberRequests: [],
+    channelCreateLostResponses: 0,
     removeMemberStatus: 204,
     directProfiles: new Map(),
     conversationAttachments: new Map(),
@@ -1313,6 +1324,7 @@ export async function installMessagingMocks(
   await installSidebarMocks(page, scenario);
   await installInteractionMocks(page, scenario, assertConversationAccess);
   await installConversationMocks(page, scenario);
+  await installChannelCreateMock(page, scenario);
   await installMessageMocks(page, scenario, expired, assertConversationAccess);
   await installChannelDetailsMocks(page, scenario, assertConversationAccess);
 }
@@ -2646,6 +2658,109 @@ async function installConversationMocks(page: Page, scenario: MessagingScenario)
       contentType: "application/json",
       body: JSON.stringify({ data: { conversation_id: conversationId } }),
     });
+  });
+}
+
+/**
+ * POST /api/chat/channels (issue #1025), modelling the server's contract: the
+ * same Idempotency-Key with the same body replays the channel it created (200)
+ * instead of creating another; a new key creates (201). A private channel
+ * appears in the creator's sidebar with them as its only reader here — the
+ * invitees' side is a separate page in the specs.
+ */
+interface ChannelCreateRequest {
+  idempotencyKey: string | null;
+  body: Record<string, unknown>;
+  serialized: string;
+}
+
+interface CreatedChannelRecord {
+  body: string;
+  id: string;
+}
+
+/** Reads one creation and records it exactly as the browser sent it. */
+function recordChannelCreate(scenario: MessagingScenario, route: Route): ChannelCreateRequest {
+  const request = route.request();
+  const idempotencyKey = request.headers()["idempotency-key"] ?? null;
+  const body = (request.postDataJSON() ?? {}) as Record<string, unknown>;
+  scenario.requests.channelCreates.push({ idempotencyKey, body });
+  return { idempotencyKey, body, serialized: JSON.stringify(body) };
+}
+
+/** The server's state change: the channel row and an empty timeline. */
+function createMockChannel(scenario: MessagingScenario, id: string, body: Record<string, unknown>) {
+  scenario.sidebarChannels.push({
+    id,
+    slug: String(body.slug),
+    display_name: String(body.display_name),
+    type: body.type === "private" ? "private" : "public",
+    can_write: true,
+    unread_count: 0,
+  });
+  scenario.messagesByTarget.set(targetKey("channel", id), []);
+}
+
+/**
+ * Answers a committed creation — or loses the answer, when the scenario asks
+ * for it, which is the case an Idempotency-Key exists for.
+ */
+async function respondToChannelCreate(
+  scenario: MessagingScenario,
+  route: Route,
+  created: { id: string; replayed: boolean; body: Record<string, unknown> },
+) {
+  if (scenario.channelCreateLostResponses > 0) {
+    scenario.channelCreateLostResponses -= 1;
+    await route.abort("failed");
+    return;
+  }
+  const { id, body } = created;
+  await route.fulfill({
+    status: created.replayed ? 200 : 201,
+    contentType: "application/json",
+    body: JSON.stringify({
+      data: { id, slug: body.slug, display_name: body.display_name, type: body.type },
+    }),
+  });
+}
+
+/**
+ * POST /api/chat/channels (issue #1025), modelling the server's contract: the
+ * same Idempotency-Key with the same body replays the channel it created (200);
+ * the same key with another body is 409 idempotency_key_reused; a new key
+ * creates (201). A private channel appears in the creator's sidebar with them
+ * as its only reader here — the invitees' side is a separate page in the specs.
+ */
+async function installChannelCreateMock(page: Page, scenario: MessagingScenario) {
+  const byKey = new Map<string, CreatedChannelRecord>();
+  await page.route("**/api/chat/channels", async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.fallback();
+      return;
+    }
+    const request = recordChannelCreate(scenario, route);
+    const previous = request.idempotencyKey ? byKey.get(request.idempotencyKey) : undefined;
+    if (previous && previous.body !== request.serialized) {
+      await route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: errorBody("idempotency_key_reused"),
+      });
+      return;
+    }
+    if (previous) {
+      await respondToChannelCreate(scenario, route, {
+        ...previous,
+        replayed: true,
+        body: request.body,
+      });
+      return;
+    }
+    const id = `e2e-channel-created-${byKey.size + 1}`;
+    if (request.idempotencyKey) byKey.set(request.idempotencyKey, { body: request.serialized, id });
+    createMockChannel(scenario, id, request.body);
+    await respondToChannelCreate(scenario, route, { id, replayed: false, body: request.body });
   });
 }
 

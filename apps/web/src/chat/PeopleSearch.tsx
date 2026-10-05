@@ -1,4 +1,4 @@
-import type { ReactNode, Ref } from "react";
+import type { KeyboardEvent, ReactNode, Ref } from "react";
 
 import { ApiRequestError } from "../lib/api";
 import type { DMCandidate } from "./chatTypes";
@@ -29,6 +29,8 @@ interface PeopleSearchFieldProps {
   inputRef?: Ref<HTMLInputElement>;
   /** Called after every edit, so the flow can clear a stale submit error. */
   onEdit: () => void;
+  /** Lets a flow inside a <form> keep Enter from submitting it. */
+  onKeyDown?: (event: KeyboardEvent<HTMLInputElement>) => void;
   /** Flow-specific fields rendered under the search box. */
   children?: ReactNode;
 }
@@ -38,6 +40,7 @@ export function PeopleSearchField({
   search,
   inputRef,
   onEdit,
+  onKeyDown,
   children,
 }: PeopleSearchFieldProps) {
   return (
@@ -55,6 +58,7 @@ export function PeopleSearchField({
           maxLength={64}
           placeholder="Digite um nome"
           value={search.query}
+          onKeyDown={onKeyDown}
           onChange={(event) => {
             search.setQuery(event.target.value);
             onEdit();

@@ -27,7 +27,7 @@
 # Local run (Docker):
 #   docker run -d --name nchat-int-pg -e POSTGRES_USER=nchat \
 #     -e POSTGRES_PASSWORD=REPLACE_ME -e POSTGRES_DB=nchat_test -p 55432:5432 postgres:16
-#   for db in admin_test auth_test media_test; do
+#   for db in admin_test auth_test media_test search_test channel_creation_test; do
 #     docker exec nchat-int-pg createdb -U nchat "$db"
 #   done
 #   base="postgresql://nchat:REPLACE_ME@localhost:55432"
@@ -43,12 +43,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
 # module | DSN variable | package | extra `go test` flags
 #
-# chat-service is the one entry restricted to a single family: the rest of its
-# PostgreSQL suites belong to Go Coverage or have no owner yet (see above).
+# chat-service entries are each restricted to a single family: the rest of its
+# PostgreSQL suites belong to Go Coverage or have no owner yet (see above). The
+# #1025 private-channel creation family resets the chat schema, so it gets a
+# database of its own through CHANNEL_CREATION_TEST_DATABASE_URL; it is not in
+# the Go Coverage profile (chat-service clears 90% without it).
 # media-service carries a `//go:build integration` tag, so without `-tags` its
 # suite is not even compiled.
 SUITES=(
   "services/chat-service|CHAT_TEST_DATABASE_URL|./internal/storage|-run ^TestChannelMembershipContractPostgreSQL_"
+  "services/chat-service|CHANNEL_CREATION_TEST_DATABASE_URL|./internal/storage|-run ^TestChannelCreationPostgreSQL_"
   "services/admin-service|ADMIN_TEST_DATABASE_URL|./internal/storage|"
   "services/auth-service|AUTH_TEST_DATABASE_URL|./internal/storage|"
   "services/media-service|MEDIA_TEST_DATABASE_URL|./internal/storage|-tags integration"
@@ -64,6 +68,22 @@ for suite in "${SUITES[@]}"; do
   fi
 
   read -r -a go_test_flags <<<"$flags"
+
+  # `go test -run` passes when the pattern matches nothing, so a renamed family
+  # would silently stop running. Refuse that before running it.
+  run_pattern=""
+  for index in "${!go_test_flags[@]}"; do
+    if [ "${go_test_flags[$index]}" = "-run" ]; then
+      run_pattern="${go_test_flags[$((index + 1))]}"
+    fi
+  done
+  if [ -n "$run_pattern" ]; then
+    matched="$(cd "$ROOT/$module" && go test -list "$run_pattern" "$package" | grep -c '^Test' || true)"
+    if [ "$matched" -eq 0 ]; then
+      echo "$module $package: -run $run_pattern matches no test." >&2
+      exit 1
+    fi
+  fi
 
   echo "==> go test integration $module $package"
   (cd "$ROOT/$module" && go test "${go_test_flags[@]}" -count=1 "$package")

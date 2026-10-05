@@ -651,10 +651,29 @@ export async function createGroupDM(
   return response.data.conversation_id;
 }
 
+export interface CreateChannelInput {
+  slug: string;
+  displayName: string;
+  type: "public" | "private";
+  categoryId?: string;
+  /**
+   * The invitees of a private channel (issue #1025): people, never roles. The
+   * creator is implicit and the server decides every role. Sent only when
+   * present, so a public creation carries no list the server would refuse.
+   */
+  initialMemberIds?: string[];
+  /**
+   * One key per creation intent, reused by every retry of that same intent so
+   * the server returns the channel it already created instead of a second one.
+   */
+  idempotencyKey?: string;
+}
+
 /**
  * Creates a channel (RF-01) and returns it as the sidebar models one.
  *
- * Only the three caller-owned fields are sent: the workspace, the creator, the
+ * Only caller-owned fields are sent — the channel fields and, for a private
+ * channel, the invitees: the workspace, the creator, the
  * general flag and the position are derived from the session server-side, and
  * the endpoint rejects a body that carries them. No role, actor or workspace is
  * ever sent from the browser. The slug is trimmed and lowercased here because
@@ -664,17 +683,21 @@ export async function createGroupDM(
  * than as a generic failure.
  */
 export async function createChannel(
-  input: { slug: string; displayName: string; type: "public" | "private"; categoryId?: string },
+  input: CreateChannelInput,
   signal?: AbortSignal,
 ): Promise<Channel> {
   const response = await authenticatedFetch<CreateChannelEnvelope>(`${CHAT_BASE}/channels`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(input.idempotencyKey ? { "Idempotency-Key": input.idempotencyKey } : {}),
+    },
     body: JSON.stringify({
       slug: input.slug.trim().toLowerCase(),
       display_name: input.displayName.trim(),
       type: input.type,
       category_id: input.categoryId || undefined,
+      initial_member_ids: input.initialMemberIds,
     }),
     signal,
   });

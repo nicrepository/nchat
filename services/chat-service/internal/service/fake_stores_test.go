@@ -51,6 +51,7 @@ type fakeChannelStore struct {
 	getCategoryErr         error
 	createdChannel         domain.Channel
 	createChanErr          error
+	createReplayed         bool
 	channel                domain.Channel
 	visibleChannel         domain.Channel
 	updatedChannel         domain.Channel
@@ -95,13 +96,13 @@ func (f *fakeChannelStore) CreateChannel(_ context.Context, input storage.Create
 // tell a public creation from a private one and see the actor it recorded. The
 // atomicity this method carries in the real store cannot be faked here; it is
 // proved against PostgreSQL in storage.
-func (f *fakeChannelStore) CreateChannelForActiveMember(_ context.Context, input storage.CreateChannelInput) (domain.Channel, error) {
+func (f *fakeChannelStore) CreateChannelForActiveMember(_ context.Context, input storage.CreateChannelInput) (storage.CreateChannelResult, error) {
 	f.lastCreateInput = input
 	if input.EnsureCreatorMemberRole != "" {
 		f.creatorMembershipSeeds++
 		f.lastSeededMemberUserID = input.CreatedBy
 	}
-	return f.createdChannel, f.createChanErr
+	return storage.CreateChannelResult{Channel: f.createdChannel, Replayed: f.createReplayed}, f.createChanErr
 }
 func (f *fakeChannelStore) GetCategoryByIDInWorkspace(_ context.Context, workspaceID, id string) (domain.ChannelCategory, error) {
 	if f.getCategoryErr != nil {

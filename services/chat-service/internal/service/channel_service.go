@@ -2,8 +2,12 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
@@ -22,6 +26,24 @@ type CreateChannelInput struct {
 	DisplayName string
 	Type        domain.ChannelType
 	Position    int
+	// InitialMemberIDs are the invitees of a private channel (issue #1025),
+	// raw from the request. A public channel accepts none: its membership is
+	// the workspace's, and a list there would have no meaning to honour.
+	InitialMemberIDs []string
+	// IdempotencyKey is the client's Idempotency-Key, already shape-checked by
+	// the handler. Empty means the request is not idempotent (older clients).
+	IdempotencyKey string
+}
+
+// CreateChannelResult is a committed — or replayed — channel creation.
+type CreateChannelResult struct {
+	Channel domain.Channel
+	// InitialMemberIDs are the invitees this call added, normalized. Empty on a
+	// replay: those people were already told when the channel was created.
+	InitialMemberIDs []string
+	// Replayed reports that the Idempotency-Key had already created Channel,
+	// so nothing was written and nothing new may be announced.
+	Replayed bool
 }
 
 // GetChannelInput supports lookup by either ChannelID or Slug.
@@ -73,28 +95,48 @@ func NewChannelService(workspaces storage.WorkspaceStore, channels storage.Chann
 // list included. The check below is the same predicate, not a second one: it
 // exists so a caller with no business in this workspace is refused before the
 // input validation can tell them whether a category ID exists in it.
-func (s *ChannelService) CreateChannel(ctx context.Context, input CreateChannelInput) (domain.Channel, error) {
+func (s *ChannelService) CreateChannel(ctx context.Context, input CreateChannelInput) (CreateChannelResult, error) {
 	member, err := s.requireActiveWorkspaceMember(ctx, input.WorkspaceID, input.CallerID)
 	if err != nil {
-		return domain.Channel{}, err
+		return CreateChannelResult{}, err
 	}
 	if !domain.CanCreateChannel(&member) {
-		return domain.Channel{}, domain.ErrForbidden
+		return CreateChannelResult{}, domain.ErrForbidden
 	}
+	createInput, err := s.channelCreation(ctx, input)
+	if err != nil {
+		return CreateChannelResult{}, err
+	}
+	result, err := s.channels.CreateChannelForActiveMember(ctx, createInput)
+	if err != nil {
+		return CreateChannelResult{}, err
+	}
+	if result.Replayed {
+		return CreateChannelResult{Channel: result.Channel, Replayed: true}, nil
+	}
+	return CreateChannelResult{Channel: result.Channel, InitialMemberIDs: createInput.InitialMemberIDs}, nil
+}
 
+// channelCreation validates and normalizes a creation request into the storage
+// input. Nothing here decides who is eligible: the store does, in the write.
+func (s *ChannelService) channelCreation(ctx context.Context, input CreateChannelInput) (storage.CreateChannelInput, error) {
 	slug, displayName, err := normalizeChannelFields(input.Slug, input.DisplayName)
 	if err != nil {
-		return domain.Channel{}, err
+		return storage.CreateChannelInput{}, err
 	}
 	if slug == generalChannelSlug {
-		return domain.Channel{}, fmt.Errorf("%w: geral is reserved", domain.ErrInvalidInput)
+		return storage.CreateChannelInput{}, fmt.Errorf("%w: geral is reserved", domain.ErrInvalidInput)
 	}
 	if err := validateChannelType(input.Type); err != nil {
-		return domain.Channel{}, err
+		return storage.CreateChannelInput{}, err
+	}
+	memberIDs, err := normalizeInitialMemberIDs(input.Type, input.CallerID, input.InitialMemberIDs)
+	if err != nil {
+		return storage.CreateChannelInput{}, err
 	}
 	categoryID := strings.TrimSpace(input.CategoryID)
 	if err := s.requireCategoryInWorkspace(ctx, input.WorkspaceID, categoryID); err != nil {
-		return domain.Channel{}, err
+		return storage.CreateChannelInput{}, err
 	}
 
 	createInput := storage.CreateChannelInput{
@@ -107,13 +149,59 @@ func (s *ChannelService) CreateChannel(ctx context.Context, input CreateChannelI
 		Position:                     input.Position,
 		CreatedBy:                    input.CallerID,
 		EnsurePublicWorkspaceMembers: input.Type == domain.ChannelTypePublic,
+		InitialMemberIDs:             memberIDs,
+		IdempotencyKey:               input.IdempotencyKey,
 	}
 	// A private channel starts with its creator. Public channels take the whole
 	// eligible workspace population above, which necessarily includes them.
 	if input.Type == domain.ChannelTypePrivate {
 		createInput.EnsureCreatorMemberRole = domain.ChannelRoleMember
 	}
-	return s.channels.CreateChannelForActiveMember(ctx, createInput)
+	if createInput.IdempotencyKey != "" {
+		createInput.RequestHash = channelCreationHash(createInput)
+	}
+	return createInput, nil
+}
+
+// normalizeInitialMemberIDs applies the add-members rules (issue #398) to the
+// invitees of a new channel (issue #1025): the cap on the raw list, trimming,
+// UUID parsing with the zero UUID refused, de-duplication and a sorted result.
+//
+// The creator is implicit — the store adds them with EnsureCreatorMemberRole —
+// so naming them is a no-op rather than an error or a second membership. An
+// empty list is valid for both types; a non-empty one on a public channel is
+// refused, because that membership is the whole workspace's and the list would
+// mean nothing.
+func normalizeInitialMemberIDs(channelType domain.ChannelType, callerID string, raw []string) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	if channelType != domain.ChannelTypePrivate {
+		return nil, fmt.Errorf("%w: initial_member_ids is accepted for private channels only", domain.ErrInvalidInput)
+	}
+	userIDs, err := normalizeAddMemberIDs(raw)
+	if err != nil {
+		return nil, err
+	}
+	creator, err := canonicalizeUserID(strings.TrimSpace(callerID))
+	if err != nil {
+		return nil, domain.ErrForbidden
+	}
+	return slices.DeleteFunc(userIDs, func(userID string) bool { return userID == creator }), nil
+}
+
+// channelCreationHash fingerprints a normalized creation for its
+// Idempotency-Key. It is computed after normalization, so two spellings of the
+// same intent — a reordered or duplicated invitee list, the creator named or
+// not, surrounding whitespace — hash the same, and any material difference
+// does not. The workspace and the actor are not in it: they scope the key.
+func channelCreationHash(input storage.CreateChannelInput) string {
+	fields := []string{
+		"channel-create/v1", input.Slug, input.DisplayName, string(input.Type),
+		input.CategoryID, strconv.Itoa(input.Position), strings.Join(input.InitialMemberIDs, ","),
+	}
+	sum := sha256.Sum256([]byte(strings.Join(fields, "\x00")))
+	return hex.EncodeToString(sum[:])
 }
 
 // ListChannels returns channels visible to callerID in workspaceID.

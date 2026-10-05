@@ -789,11 +789,15 @@ describe("NewConversationDialog — channel mode", () => {
 
     expect(props.onChannelCreated).toHaveBeenCalledWith("ch-1");
     expect(mockCreateChannel).toHaveBeenCalledTimes(1);
-    // Exactly the contract: no role, no actor, no workspace from the browser.
-    expect(mockCreateChannel.mock.calls[0][0]).toEqual({
+    // Exactly the contract: no role, no actor, no workspace from the browser,
+    // and no invitee list for a public channel (issue #1025).
+    expect(mockCreateChannel.mock.calls[0][0]).toStrictEqual({
       slug: "infraestrutura",
       displayName: "Infraestrutura",
       type: "public",
+      categoryId: undefined,
+      initialMemberIds: undefined,
+      idempotencyKey: expect.any(String),
     });
   });
 
@@ -1155,6 +1159,8 @@ describe("NewConversationDialog — independent drafts", () => {
       displayName: "Operações 🚀",
       type: "private",
       categoryId: "cat-1",
+      initialMemberIds: [],
+      idempotencyKey: expect.any(String),
     });
     expect(props.onChannelCreated).toHaveBeenCalledWith("ch-1");
   });

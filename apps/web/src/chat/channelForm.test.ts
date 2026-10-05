@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  type ChannelDraft,
+  channelDraftFingerprint,
   channelDisplayNameLength,
   MAX_CHANNEL_DISPLAY_NAME_CODE_POINTS,
   MAX_CHANNEL_SLUG_LENGTH,
+  NEW_CATEGORY_OPTION,
   slugifyChannelName,
   validateChannelDisplayName,
   validateChannelForm,
@@ -104,5 +107,79 @@ describe("channel display name length", () => {
 
   it("agrees with the server constant", () => {
     expect(MAX_CHANNEL_DISPLAY_NAME_CODE_POINTS).toBe(100);
+  });
+});
+
+describe("channelDraftFingerprint (issue #1025)", () => {
+  const draft: ChannelDraft = {
+    displayName: " Infra ",
+    slug: "Infra",
+    type: "private",
+    categoryId: "",
+    newCategoryName: "",
+    memberIds: ["b", "a"],
+  };
+
+  it("is the same for the same intent spelled differently", () => {
+    expect(channelDraftFingerprint(draft)).toBe(
+      channelDraftFingerprint({
+        ...draft,
+        displayName: "Infra",
+        slug: "infra",
+        memberIds: ["a", "b", "a"],
+      }),
+    );
+  });
+
+  it("ignores the kept selection of a public channel", () => {
+    const publicDraft = { ...draft, type: "public" as const };
+    expect(channelDraftFingerprint(publicDraft)).toBe(
+      channelDraftFingerprint({ ...publicDraft, memberIds: [] }),
+    );
+  });
+
+  it("changes with any material edit", () => {
+    const base = channelDraftFingerprint(draft);
+    for (const edit of [
+      { memberIds: ["a"] },
+      { displayName: "Infra 2" },
+      { categoryId: "cat-1" },
+      { categoryId: NEW_CATEGORY_OPTION, newCategoryName: "Projetos" },
+    ]) {
+      expect(channelDraftFingerprint({ ...draft, ...edit })).not.toBe(base);
+    }
+  });
+
+  it("changes with the slug", () => {
+    expect(channelDraftFingerprint({ ...draft, slug: "infra-2" })).not.toBe(
+      channelDraftFingerprint(draft),
+    );
+  });
+
+  it("changes with the type, even with no invitees", () => {
+    const noInvitees = { ...draft, memberIds: [] };
+    expect(channelDraftFingerprint({ ...noInvitees, type: "public" })).not.toBe(
+      channelDraftFingerprint(noInvitees),
+    );
+  });
+
+  it("changes with the category, existing or new", () => {
+    const fingerprints = new Set(
+      [
+        { categoryId: "" },
+        { categoryId: "cat-1" },
+        { categoryId: "cat-2" },
+        { categoryId: NEW_CATEGORY_OPTION, newCategoryName: "Projetos" },
+        { categoryId: NEW_CATEGORY_OPTION, newCategoryName: "Outros" },
+      ].map((edit) => channelDraftFingerprint({ ...draft, ...edit })),
+    );
+    expect(fingerprints.size).toBe(5);
+  });
+
+  it("changes with the set of invitee IDs, not with their order", () => {
+    const base = channelDraftFingerprint(draft);
+    expect(channelDraftFingerprint({ ...draft, memberIds: ["a", "b", "c"] })).not.toBe(base);
+    expect(channelDraftFingerprint({ ...draft, memberIds: ["a", "c"] })).not.toBe(base);
+    expect(channelDraftFingerprint({ ...draft, memberIds: ["a", "b"] })).toBe(base);
   });
 });

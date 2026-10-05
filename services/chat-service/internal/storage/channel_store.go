@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/nicrepository/nchat/libs/go/platform/channelmembership"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
@@ -40,6 +41,25 @@ type CreateChannelInput struct {
 	// represented in the authoritative roster. Honoured by
 	// CreateChannelForActiveMember only.
 	EnsureCreatorMemberRole domain.ChannelRole
+	// InitialMemberIDs are the invitees of a private channel (issue #1025),
+	// already normalized by the service and never containing CreatedBy. They
+	// are inserted with the ordinary member role in the creation transaction,
+	// through channelmembership.EligibleTargetsCTE; one ineligible ID rolls the
+	// whole creation back. Honoured by CreateChannelForActiveMember only.
+	InitialMemberIDs []string
+	// IdempotencyKey, when set, is claimed for (WorkspaceID, CreatedBy) in the
+	// creation transaction, bound to RequestHash. Honoured by
+	// CreateChannelForActiveMember only.
+	IdempotencyKey string
+	RequestHash    string
+}
+
+// CreateChannelResult is what CreateChannelForActiveMember produced. Replayed
+// is true when the Idempotency-Key had already created Channel: nothing was
+// written by this call, so nothing new may be announced for it.
+type CreateChannelResult struct {
+	Channel  domain.Channel
+	Replayed bool
 }
 
 // UpdateChannelInput holds the complete mutable channel state to persist.
@@ -95,8 +115,10 @@ type ChannelStore interface {
 	//
 	// Returns domain.ErrForbidden — without saying which condition failed — when
 	// the workspace is not active, or input.CreatedBy has no active membership in
-	// it at the moment of the INSERT.
-	CreateChannelForActiveMember(ctx context.Context, input CreateChannelInput) (domain.Channel, error)
+	// it at the moment of the INSERT, or when an initial member is not eligible.
+	// Returns domain.ErrIdempotencyKeyReused when input.IdempotencyKey was
+	// already used by the same actor for a request with another RequestHash.
+	CreateChannelForActiveMember(ctx context.Context, input CreateChannelInput) (CreateChannelResult, error)
 	GetCategoryByIDInWorkspace(ctx context.Context, workspaceID, id string) (domain.ChannelCategory, error)
 	GetChannelByID(ctx context.Context, id string) (domain.Channel, error)
 	// GetChannelByIDInWorkspace returns the channel only if it belongs to workspaceID.
@@ -219,32 +241,147 @@ func (s *PGXChannelStore) CreateChannel(ctx context.Context, input CreateChannel
 // workspace_id and created_by are read back out of the authorized context rather
 // than taken from the parameters, so the row can only ever record the workspace
 // and the actor the database itself authorized.
-func (s *PGXChannelStore) CreateChannelForActiveMember(ctx context.Context, input CreateChannelInput) (domain.Channel, error) {
+func (s *PGXChannelStore) CreateChannelForActiveMember(ctx context.Context, input CreateChannelInput) (CreateChannelResult, error) {
 	if input.CreatedBy == "" {
-		return domain.Channel{}, domain.ErrForbidden
+		return CreateChannelResult{}, domain.ErrForbidden
 	}
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return domain.Channel{}, fmt.Errorf("begin create channel for active member: %w", err)
+		return CreateChannelResult{}, fmt.Errorf("begin create channel for active member: %w", err)
 	}
 	committed := false
 	defer func() {
 		if !committed {
 			// Rolled back on every failure below, including a failed secondary
-			// insert, so a denied or broken creation never leaves a channel or a
-			// half-populated membership behind.
+			// insert, so a denied or broken creation never leaves a channel, a
+			// claimed idempotency key or a half-populated membership behind.
 			_ = tx.Rollback(ctx)
 		}
 	}()
 
+	result, err := createChannelInTx(ctx, tx, input)
+	if err != nil || result.Replayed {
+		// A replay wrote nothing; the deferred rollback ends its transaction.
+		return result, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return CreateChannelResult{}, fmt.Errorf("commit create channel for active member: %w", err)
+	}
+	committed = true
+	return result, nil
+}
+
+// createChannelInTx is the body of CreateChannelForActiveMember: the
+// idempotency claim (or its replay), the authorized INSERT and the rows that
+// belong to the new channel, all on tx.
+func createChannelInTx(ctx context.Context, tx pgx.Tx, input CreateChannelInput) (CreateChannelResult, error) {
+	var channelID *string
+	if input.IdempotencyKey != "" {
+		claimed, replay, err := claimChannelCreation(ctx, tx, input)
+		if err != nil {
+			return CreateChannelResult{}, err
+		}
+		if replay {
+			ch, err := getReplayedChannel(ctx, tx, input.WorkspaceID, claimed, input.CreatedBy)
+			return CreateChannelResult{Channel: ch, Replayed: err == nil}, err
+		}
+		channelID = &claimed
+	}
+
+	ch, err := insertAuthorizedChannel(ctx, tx, input, channelID)
+	if err != nil {
+		return CreateChannelResult{}, err
+	}
+	if err := populateCreatedChannel(ctx, tx, ch, input); err != nil {
+		return CreateChannelResult{}, err
+	}
+	return CreateChannelResult{Channel: ch}, nil
+}
+
+// claimChannelCreation binds input.IdempotencyKey to this transaction (issue
+// #1025), before anything else is written or locked.
+//
+// The primary key of chat.channel_creation_requests is the authority. A second
+// request with the same key blocks on this INSERT until the first one ends: if
+// it committed, ON CONFLICT DO NOTHING yields no row and the committed claim is
+// read back — the same channel for the same RequestHash, ErrIdempotencyKeyReused
+// for any other; if it rolled back, this claim simply succeeds. The channel ID
+// is allocated here, so the claim and the channel commit together or not at all
+// (the foreign key is deferred to commit for exactly that).
+//
+// The table is touched by nothing else, so taking it first adds no edge to the
+// canonical lock order of channel membership.
+func claimChannelCreation(ctx context.Context, tx pgx.Tx, input CreateChannelInput) (string, bool, error) {
+	var channelID string
+	err := tx.QueryRow(ctx, `
+		INSERT INTO chat.channel_creation_requests
+			(workspace_id, actor_user_id, idempotency_key, request_hash, channel_id)
+		VALUES ($1::uuid, $2::uuid, $3, $4, gen_random_uuid())
+		ON CONFLICT (workspace_id, actor_user_id, idempotency_key) DO NOTHING
+		RETURNING channel_id::text`,
+		input.WorkspaceID, input.CreatedBy, input.IdempotencyKey, input.RequestHash,
+	).Scan(&channelID)
+	if err == nil {
+		return channelID, false, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", false, fmt.Errorf("claim channel creation key: %w", err)
+	}
+
+	var requestHash string
+	if err := tx.QueryRow(ctx, `
+		SELECT request_hash, channel_id::text
+		FROM chat.channel_creation_requests
+		WHERE workspace_id = $1::uuid AND actor_user_id = $2::uuid AND idempotency_key = $3`,
+		input.WorkspaceID, input.CreatedBy, input.IdempotencyKey,
+	).Scan(&requestHash, &channelID); err != nil {
+		return "", false, fmt.Errorf("read channel creation key: %w", err)
+	}
+	if requestHash != input.RequestHash {
+		return "", false, domain.ErrIdempotencyKeyReused
+	}
+	return channelID, true, nil
+}
+
+// getReplayedChannel returns the channel an earlier request with the same key
+// created, provided the actor can still read it. A replay is not a back door:
+// an actor who has since lost access gets the same uniform ErrForbidden a
+// denied creation gets.
+func getReplayedChannel(ctx context.Context, tx pgx.Tx, workspaceID, channelID, actorID string) (domain.Channel, error) {
+	var ch domain.Channel
+	err := tx.QueryRow(ctx, `
+		SELECT id, workspace_id, COALESCE(category_id::text, ''), slug, display_name,
+		       type, status, is_general, position, COALESCE(created_by::text, ''),
+		       created_at, updated_at
+		FROM chat.channels c
+		WHERE c.id = $1::uuid AND c.workspace_id = $2::uuid AND c.status = 'active'
+		  AND chat.channel_visible_to_user(c.id, $3::uuid)`,
+		channelID, workspaceID, actorID,
+	).Scan(
+		&ch.ID, &ch.WorkspaceID, &ch.CategoryID, &ch.Slug, &ch.DisplayName,
+		(*string)(&ch.Type), (*string)(&ch.Status), &ch.IsGeneral, &ch.Position, &ch.CreatedBy,
+		&ch.CreatedAt, &ch.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Channel{}, domain.ErrForbidden
+	}
+	if err != nil {
+		return domain.Channel{}, fmt.Errorf("read replayed channel: %w", err)
+	}
+	return ch, nil
+}
+
+// insertAuthorizedChannel is the authorization-bearing INSERT. channelID is
+// the ID an idempotency claim allocated, or nil for the database default.
+func insertAuthorizedChannel(ctx context.Context, tx pgx.Tx, input CreateChannelInput, channelID *string) (domain.Channel, error) {
 	var categoryID *string
 	if input.CategoryID != "" {
 		categoryID = &input.CategoryID
 	}
 
 	var ch domain.Channel
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		WITH authorized_context AS (
 			SELECT w.id AS workspace_id, wm.user_id
 			FROM chat.workspaces w
@@ -264,60 +401,101 @@ func (s *PGXChannelStore) CreateChannelForActiveMember(ctx context.Context, inpu
 			FOR SHARE OF w, wm
 		)
 		INSERT INTO chat.channels
-			(workspace_id, category_id, slug, display_name, type, is_general, position, created_by)
-		SELECT ac.workspace_id, $2, $3, $4, $5, $6, $7, ac.user_id
+			(id, workspace_id, category_id, slug, display_name, type, is_general, position, created_by)
+		SELECT COALESCE($9::uuid, gen_random_uuid()), ac.workspace_id, $2, $3, $4, $5, $6, $7, ac.user_id
 		FROM authorized_context ac
 		RETURNING id, workspace_id, COALESCE(category_id::text, ''), slug, display_name,
 		          type, status, is_general, position, COALESCE(created_by::text, ''),
 		          created_at, updated_at`,
 		input.WorkspaceID, categoryID, input.Slug, input.DisplayName,
-		string(input.Type), input.IsGeneral, input.Position, input.CreatedBy,
+		string(input.Type), input.IsGeneral, input.Position, input.CreatedBy, channelID,
 	).Scan(
 		&ch.ID, &ch.WorkspaceID, &ch.CategoryID, &ch.Slug, &ch.DisplayName,
 		(*string)(&ch.Type), (*string)(&ch.Status), &ch.IsGeneral, &ch.Position, &ch.CreatedBy,
 		&ch.CreatedAt, &ch.UpdatedAt,
 	)
-	if err != nil {
-		// No row from the authorized context means no INSERT: the workspace was
-		// not active, or the membership was absent or no longer active. Which of
-		// them is deliberately not distinguished — the caller must not learn the
-		// workspace exists from a failure to create in it.
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.Channel{}, domain.ErrForbidden
-		}
-		if mapped := mapChannelWriteError(err); mapped != nil {
-			return domain.Channel{}, mapped
-		}
-		return domain.Channel{}, fmt.Errorf("create channel for active member: %w", err)
+	if err == nil {
+		return ch, nil
 	}
+	// No row from the authorized context means no INSERT: the workspace was
+	// not active, or the membership was absent or no longer active. Which of
+	// them is deliberately not distinguished — the caller must not learn the
+	// workspace exists from a failure to create in it.
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Channel{}, domain.ErrForbidden
+	}
+	if mapped := mapChannelWriteError(err); mapped != nil {
+		return domain.Channel{}, mapped
+	}
+	return domain.Channel{}, fmt.Errorf("create channel for active member: %w", err)
+}
 
+// populateCreatedChannel writes everything that belongs to the new channel in
+// its creation transaction: the creation event and the initial membership.
+func populateCreatedChannel(ctx context.Context, tx pgx.Tx, ch domain.Channel, input CreateChannelInput) error {
 	// issue #685: creation is a conversation event like a rename or a
 	// departure, in the same transaction as the row it describes. ch.CreatedBy
-	// is always set here — the authorized_context CTE above supplies it, never
-	// the caller — so there is always an actor to attribute it to.
+	// is always set here — the authorized_context CTE supplies it, never the
+	// caller — so there is always an actor to attribute it to.
 	if _, err := InsertConversationEvent(ctx, tx, ConversationEventInput{
 		WorkspaceID: ch.WorkspaceID, ChannelID: ch.ID,
 		ActorID: ch.CreatedBy, Event: domain.ConversationEventCreated,
 	}); err != nil {
-		return domain.Channel{}, err
+		return err
 	}
-
 	if input.EnsureCreatorMemberRole != "" {
 		if err := addChannelMember(ctx, tx, ch.ID, ch.CreatedBy, input.EnsureCreatorMemberRole); err != nil {
-			return domain.Channel{}, err
+			return err
 		}
+	}
+	if err := addInitialChannelMembers(ctx, tx, ch, input.InitialMemberIDs); err != nil {
+		return err
 	}
 	if input.EnsurePublicWorkspaceMembers {
-		if err := addPublicWorkspaceMembers(ctx, tx, ch.ID, ch.WorkspaceID); err != nil {
-			return domain.Channel{}, err
-		}
+		return addPublicWorkspaceMembers(ctx, tx, ch.ID, ch.WorkspaceID)
 	}
+	return nil
+}
 
-	if err := tx.Commit(ctx); err != nil {
-		return domain.Channel{}, fmt.Errorf("commit create channel for active member: %w", err)
+// addInitialChannelMembers inserts the invitees chosen in the creation wizard
+// (issue #1025), all or nothing.
+//
+// Eligibility is channelmembership.EligibleTargetsCTE, the very predicate
+// add-members and admin-service use, so who may be invited at creation cannot
+// drift from who may be added later. It locks the targets' workspace membership
+// and account FOR SHARE after the actor's, which is the canonical order: a
+// suspension, departure or deactivation that commits first makes the target
+// ineligible here; one that comes later waits for this commit. The channel row
+// itself is invisible to every other transaction until then.
+//
+// Fewer eligible rows than requested IDs is ErrForbidden — the same answer for
+// an unknown, cross-workspace, suspended or deleted user, so the error is not
+// an account oracle — and the caller's rollback leaves no channel behind.
+// Every invitee gets the ordinary channel role; the request carries no role.
+func addInitialChannelMembers(ctx context.Context, q channelQuerier, ch domain.Channel, userIDs []string) error {
+	if len(userIDs) == 0 {
+		return nil
 	}
-	committed = true
-	return ch, nil
+	var eligible int
+	err := q.QueryRow(ctx, `
+		WITH eligible AS (`+channelmembership.EligibleTargetsCTE+`
+		),
+		inserted AS (
+			INSERT INTO chat.channel_members (channel_id, user_id, role)
+			SELECT $2::uuid, user_id, $4
+			FROM eligible
+			ON CONFLICT (channel_id, user_id) DO NOTHING
+		)
+		SELECT count(*) FROM eligible`,
+		ch.WorkspaceID, ch.ID, userIDs, channelmembership.DefaultChannelRole,
+	).Scan(&eligible)
+	if err != nil {
+		return fmt.Errorf("add initial channel members: %w", err)
+	}
+	if eligible != len(userIDs) {
+		return domain.ErrForbidden
+	}
+	return nil
 }
 
 // addPublicWorkspaceMembers materializes the same population automatically

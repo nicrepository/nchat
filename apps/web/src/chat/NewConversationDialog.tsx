@@ -211,6 +211,8 @@ export default function NewConversationDialog({
         <KeptAlivePanel active={mode === "channel"}>
           <ChannelCreationForm
             categories={categories}
+            currentUserId={currentUserId}
+            workspaceId={workspaceId}
             onCreated={onChannelCreated}
             onPendingChange={setBusy}
           />

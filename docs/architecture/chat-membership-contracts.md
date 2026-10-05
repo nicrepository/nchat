@@ -269,6 +269,35 @@ roster vazio: e a divergencia de 1.4, nao uma decisao desta rota, e o dia em que
 Ordem canonica de locks: canal -> membership do ator -> linhas alvo -> mutacao
 -> contagem.
 
+### D2. Criacao de canal privado com membros — `POST /api/chat/channels` (issue #1025)
+
+`channel_handler.go Create` -> `ChannelService.CreateChannel` ->
+`PGXChannelStore.CreateChannelForActiveMember`.
+
+| Propriedade        | Comportamento                                                                                                                                                                                                                     |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| contrato           | `initial_member_ids` opcional (strict JSON). Somente IDs de pessoas: nenhum campo de role, owner, criador ou workspace existe no body                                                                                             |
+| publico            | lista nao vazia -> `400`; vazia/ausente -> caminho publico inalterado (`EnsurePublicWorkspaceMembers`)                                                                                                                            |
+| normalizacao       | a mesma do add-members (`normalizeAddMemberIDs`): limite de 25 sobre a lista **bruta**, trim, UUID valido, UUID zero invalido, dedup, ordenacao. O criador e implicito; se vier na lista, e removido (sem 2a linha)               |
+| elegibilidade      | `channelmembership.EligibleTargetsCTE`, a mesma de D, executada **depois** do INSERT do canal na mesma transacao. Guest e elegivel, como em D                                                                                     |
+| atomicidade        | `eligible != len(ids)` -> `ErrForbidden` e rollback de canal, evento de criacao, membership do criador, convidados e chave de idempotencia                                                                                        |
+| role               | convidados recebem `channelmembership.DefaultChannelRole` (`member`); a posse e decidida pelo bootstrap de ownership (criador preferido)                                                                                          |
+| idempotencia       | `Idempotency-Key` opcional, escopo (workspace, ator), PK de `chat.channel_creation_requests` (migration 000065) + hash do request normalizado; mesma chave+hash -> replay `200`; hash diferente -> `409` `idempotency_key_reused` |
+| concorrencia       | a chave e a primeira escrita; uma 2a requisicao com a mesma chave espera no indice e le o vencedor. Depois: workspace+ator `FOR SHARE` -> INSERT do canal -> alvos `FOR SHARE`                                                    |
+| eventos pos-commit | `conversation.available` apenas para os convidados efetivamente inseridos; replay nao publica nada                                                                                                                                |
+| nao-oraculo        | `403` unico para ator sem permissao e para qualquer convidado inexistente, de outro workspace, suspenso, removido ou com conta inativa/deletada                                                                                   |
+
+O canal recem-inserido e invisivel a qualquer outra transacao ate o commit, entao
+nao ha lock de canal a disputar; a ordem relativa ator -> alvos e a mesma de D,
+e a tabela de chaves nao e tocada por nenhum outro escritor, entao nao cria
+aresta nova no grafo de locks.
+
+O seletor do wizard usa `GET /api/chat/dm-candidates`: seu predicado de alvo
+(workspace ativo, membership ativa, conta ativa nao deletada, guest incluido,
+chamador excluido) e exatamente o de `EligibleTargetsCTE` para um canal que
+ainda nao tem membros. A rota contextual de C exige um canal existente. O
+resultado da busca nunca e confiado: a criacao revalida cada ID.
+
 ### E. Mentions — `GET /api/chat/{channels|dm}/{id}/mentions`
 
 `router.go:231` -> `MentionService.SearchMentions`:

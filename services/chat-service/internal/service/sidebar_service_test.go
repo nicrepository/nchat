@@ -604,8 +604,8 @@ func (c *capturingChannelStore) CreateCategory(_ context.Context, _ storage.Crea
 func (c *capturingChannelStore) CreateChannel(_ context.Context, _ storage.CreateChannelInput) (domain.Channel, error) {
 	return domain.Channel{}, nil
 }
-func (c *capturingChannelStore) CreateChannelForActiveMember(_ context.Context, _ storage.CreateChannelInput) (domain.Channel, error) {
-	return domain.Channel{}, nil
+func (c *capturingChannelStore) CreateChannelForActiveMember(_ context.Context, _ storage.CreateChannelInput) (storage.CreateChannelResult, error) {
+	return storage.CreateChannelResult{}, nil
 }
 func (c *capturingChannelStore) GetCategoryByIDInWorkspace(_ context.Context, _, _ string) (domain.ChannelCategory, error) {
 	return domain.ChannelCategory{}, nil
