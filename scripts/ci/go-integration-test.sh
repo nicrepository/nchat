@@ -43,12 +43,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
 # module | DSN variable | package | extra `go test` flags
 #
-# chat-service is the one entry restricted to a single family: the rest of its
-# PostgreSQL suites belong to Go Coverage or have no owner yet (see above).
+# chat-service is the one entry restricted to named families: the rest of its
+# PostgreSQL suites belong to Go Coverage or have no owner yet (see above). The
+# presence store and the call/presence orderings (issue #798) are the other
+# families; like the first they reset the chat schema per test and run
+# sequentially, so they cannot collide.
 # media-service carries a `//go:build integration` tag, so without `-tags` its
 # suite is not even compiled.
 SUITES=(
-  "services/chat-service|CHAT_TEST_DATABASE_URL|./internal/storage|-run ^TestChannelMembershipContractPostgreSQL_"
+  "services/chat-service|CHAT_TEST_DATABASE_URL|./internal/storage|-run ^(TestChannelMembershipContractPostgreSQL_|TestPresenceStorePostgreSQL_|TestCallPresencePG_)"
   "services/admin-service|ADMIN_TEST_DATABASE_URL|./internal/storage|"
   "services/auth-service|AUTH_TEST_DATABASE_URL|./internal/storage|"
   "services/media-service|MEDIA_TEST_DATABASE_URL|./internal/storage|-tags integration"

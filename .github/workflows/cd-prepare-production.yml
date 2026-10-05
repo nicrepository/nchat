@@ -183,6 +183,24 @@ jobs:
         with:
           name: capacity-evidence
           path: capacity-evidence
+      # Issue #798: the deploy control plane's own check, before the slot is
+      # reserved and before anything is applied. Every other script in this job
+      # comes from the release commit, and a release from before manual
+      # presence would bring scripts that do not know the rule -- so the
+      # default branch this YAML runs from is checked out a second time, beside
+      # the release, and its copy of the guard reads the RELEASE's manifests.
+      # Once manual presence has been enabled, a release whose chat-service or
+      # notification-service lacks the capability is refused here: started in
+      # the idle slot, its notification-service would already claim rows from
+      # the shared outbox and ignore Do Not Disturb, promoted or not.
+      - name: Check out the deploy control plane
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          path: control-plane
+          persist-credentials: false
+      - name: Refuse a release that cannot honour manual presence
+        run: control-plane/scripts/deploy/nchat-prod/require-release-capability.sh "$GITHUB_WORKSPACE"
       # One read of the cluster, used for everything that depends on it: the
       # snapshot the selector invariant is proved against, the slot the deploy
       # goes into, and the lifecycle decision about whether that slot may be

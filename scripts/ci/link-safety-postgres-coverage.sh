@@ -245,6 +245,8 @@ case "$MODULE" in
       TestNotificationSuppressionStampsNoAvailabilityPostgreSQL
       TestNotificationFutureRetryStaysUnclaimedPostgreSQL
       TestMuteResolutionPostgreSQL
+      # Issue #798. Do Not Disturb, read by the same batch statement.
+      TestDoNotDisturbResolutionPostgreSQL
       # Issue #745. The push subscription contract: two unique indexes deciding
       # identity and endpoint ownership under concurrency, the generation that
       # keeps a late delivery answer off the endpoint that replaced the one it
