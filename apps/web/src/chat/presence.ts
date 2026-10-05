@@ -26,24 +26,42 @@ import { getSessionGeneration, onAuthChange } from "../lib/authSession";
 import { acquireChatSocket, type ChatSocketHandle } from "./chatSocket";
 
 /**
- * What the UI may show for one person.
+ * What the UI may show for one person (RF-58, issue #798).
  *
- * `unknown` is not a fourth server state: it is "this tab has not been told
- * yet". It exists so a still-loading avatar can stay silent instead of claiming
- * the person is offline, which is a statement, not an absence of one.
+ * `online` is the effective "Disponível". The other server states are the
+ * issue #798 availabilities: `busy`, `dnd`, `brb` (Volto já) and `away`.
+ * Somebody who chose to appear offline arrives as `offline`, exactly like
+ * somebody who left — the server sends nothing that tells them apart.
+ *
+ * `unknown` is not a server state: it is "this tab has not been told yet". It
+ * exists so a still-loading avatar can stay silent instead of claiming the
+ * person is offline, which is a statement, not an absence of one.
  */
-export type PresenceState = "online" | "away" | "offline" | "unknown";
+export type PresenceState = "online" | "busy" | "dnd" | "brb" | "away" | "offline" | "unknown";
 
-/** The three states the server actually asserts. */
+/** The states the server actually asserts. */
 export type ServerPresenceState = Exclude<PresenceState, "unknown">;
 
+/** Public context for a busy or do-not-disturb state. */
+export type PresenceActivity = "in_call" | "in_meeting" | "presenting";
+
+/** The one place a presence state becomes words. */
 export const presenceLabels: Record<PresenceState, string> = {
-  online: "Online",
+  online: "Disponível",
+  busy: "Ocupado",
+  dnd: "Não perturbe",
+  brb: "Volto já",
   away: "Ausente",
   offline: "Offline",
   // Deliberately not "Offline": not knowing where someone is and knowing they
   // are gone are different facts, and only one of them has been established.
   unknown: "Status indisponível",
+};
+
+export const presenceActivityLabels: Record<PresenceActivity, string> = {
+  in_call: "Em chamada",
+  in_meeting: "Em reunião",
+  presenting: "Apresentando",
 };
 
 export function presenceLabel(state: PresenceState): string {
@@ -127,8 +145,10 @@ export function comparePresenceInstant(a: PresenceInstant, b: PresenceInstant): 
   return 0;
 }
 
-interface PresenceEntry {
+export interface PresenceEntry {
   state: ServerPresenceState;
+  /** Why a busy or do-not-disturb person is so, when the server said. */
+  activity?: PresenceActivity;
   /**
    * The server instant this state was decided, or `unstamped` when the server
    * sent none. Never a browser clock: it is only ever compared with another
@@ -205,23 +225,80 @@ export const emptyPresenceState: PresenceSnapshotState = {
 /** One user's presence as it arrives on the wire. */
 export interface PresenceWireEntry {
   user_id: string;
+  /** RF-58 reachability, always present: online, away or offline. */
   state: string;
+  /** Issue #798 effective presence; absent from servers that predate it. */
+  availability?: string;
+  activity?: string;
   updated_at?: string;
+}
+
+const legacyStates: Record<string, ServerPresenceState> = {
+  online: "online",
+  away: "away",
+  offline: "offline",
+};
+
+const availabilityStates: Record<string, ServerPresenceState> = {
+  available: "online",
+  busy: "busy",
+  dnd: "dnd",
+  brb: "brb",
+  away: "away",
+  offline: "offline",
+};
+
+const activities: Record<string, PresenceActivity> = {
+  in_call: "in_call",
+  in_meeting: "in_meeting",
+  presenting: "presenting",
+};
+
+/**
+ * The state a wire entry asserts.
+ *
+ * The availability wins when it is one this client knows; otherwise the legacy
+ * state, which every server sends and which is always a true projection of the
+ * availability. A future availability therefore degrades to something true —
+ * "online", "away" — rather than to a guess or to an invented offline.
+ */
+function wireState(raw: Record<string, unknown>): ServerPresenceState | undefined {
+  const legacy = typeof raw["state"] === "string" ? legacyStates[raw["state"]] : undefined;
+  if (!legacy) return undefined;
+  const availability = raw["availability"];
+  return (typeof availability === "string" && availabilityStates[availability]) || legacy;
+}
+
+/** Activity is only meaningful where it explains the state. */
+function wireActivity(
+  raw: Record<string, unknown>,
+  state: ServerPresenceState,
+): PresenceActivity | undefined {
+  if (state !== "busy" && state !== "dnd") return undefined;
+  const activity = raw["activity"];
+  return typeof activity === "string" ? activities[activity] : undefined;
 }
 
 function parseWireEntry(value: unknown): { userId: string; entry: PresenceEntry } | null {
   if (!value || typeof value !== "object") return null;
   const raw = value as Record<string, unknown>;
   const userId = raw["user_id"];
-  const state = raw["state"];
   if (typeof userId !== "string" || userId === "") return null;
-  if (state !== "online" && state !== "away" && state !== "offline") return null;
-  return {
-    userId,
-    // An unparseable or absent instant becomes the oldest possible value, so it
-    // can never displace an update that does carry one.
-    entry: { state, updatedAt: parsePresenceInstant(raw["updated_at"]) ?? unstamped },
+  const state = wireState(raw);
+  if (!state) return null;
+  // An unparseable or absent instant becomes the oldest possible value, so it
+  // can never displace an update that does carry one.
+  const entry: PresenceEntry = {
+    state,
+    updatedAt: parsePresenceInstant(raw["updated_at"]) ?? unstamped,
   };
+  const activity = wireActivity(raw, state);
+  if (activity) entry.activity = activity;
+  return { userId, entry };
+}
+
+function sameAssertion(a: PresenceEntry, b: PresenceEntry): boolean {
+  return a.state === b.state && a.activity === b.activity;
 }
 
 /**
@@ -254,7 +331,7 @@ export function applyPresenceUpdate(
     const order = comparePresenceInstant(entry.updatedAt, current.updatedAt);
     if (order < 0) return entries;
     if (order === 0) {
-      if (entry.state === current.state) return entries;
+      if (sameAssertion(entry, current)) return entries;
       if (!isUnstamped(current.updatedAt)) return entries;
     }
   }
@@ -407,17 +484,39 @@ export interface TargetPresence {
 export const emptyTargetPresence: TargetPresence = { entries: emptyTarget, covered: false };
 
 /**
+ * Everything the UI may say about one person: the state, the activity behind a
+ * busy or do-not-disturb, and the server instant the state was decided — which
+ * for an offline person is when they were last seen.
+ *
+ * It is the stored entry itself whenever there is one, so its identity only
+ * moves when the server said something new about this person.
+ */
+export interface PresenceDetail {
+  state: PresenceState;
+  activity?: PresenceActivity;
+  /** Absent when the state was inferred rather than stated. */
+  updatedAt?: PresenceInstant;
+}
+
+const unknownDetail: PresenceDetail = { state: "unknown" };
+const inferredOfflineDetail: PresenceDetail = { state: "offline" };
+
+/**
  * Resolves what to show for one user, inside one conversation.
  *
  * The rule, in one place: what the server said, or — when it described this
  * conversation completely and did not mention this person — offline. Anything
  * else is unknown, because nothing established an absence.
  */
-export function selectTargetPresence(target: TargetPresence, userId: string): PresenceState {
-  if (!userId) return "unknown";
+export function selectTargetPresenceDetail(target: TargetPresence, userId: string): PresenceDetail {
+  if (!userId) return unknownDetail;
   const entry = target.entries.get(userId);
-  if (entry) return entry.state;
-  return target.covered ? "offline" : "unknown";
+  if (entry) return entry;
+  return target.covered ? inferredOfflineDetail : unknownDetail;
+}
+
+export function selectTargetPresence(target: TargetPresence, userId: string): PresenceState {
+  return selectTargetPresenceDetail(target, userId).state;
 }
 
 /**
@@ -435,13 +534,13 @@ export function selectTargetPresence(target: TargetPresence, userId: string): Pr
  * from. The scan is over conversations this session is subscribed to, which is
  * the user's own list, not the workspace.
  */
-export function selectPresence(
+export function selectPresenceDetail(
   state: PresenceSnapshotState,
   userId: string,
   targetKey?: string,
-): PresenceState {
-  if (!userId) return "unknown";
-  if (targetKey) return selectTargetPresence(targetPresenceOf(state, targetKey), userId);
+): PresenceDetail {
+  if (!userId) return unknownDetail;
+  if (targetKey) return selectTargetPresenceDetail(targetPresenceOf(state, targetKey), userId);
   let best: PresenceEntry | undefined;
   for (const target of state.entries.values()) {
     const entry = target.get(userId);
@@ -449,7 +548,15 @@ export function selectPresence(
       best = entry;
     }
   }
-  return best ? best.state : "unknown";
+  return best ?? unknownDetail;
+}
+
+export function selectPresence(
+  state: PresenceSnapshotState,
+  userId: string,
+  targetKey?: string,
+): PresenceState {
+  return selectPresenceDetail(state, userId, targetKey).state;
 }
 
 // ── store ────────────────────────────────────────────────────────────────────
@@ -592,6 +699,20 @@ export function usePresence(userId: string | undefined, targetKey?: string): Pre
     subscribe,
     () => selectPresence(state, userId ?? "", targetKey),
     () => "unknown" as PresenceState,
+  );
+}
+
+/**
+ * The same answer as {@link usePresence}, with the activity and the instant
+ * that let a surface say "Ocupado · Em chamada" or "Offline · visto às 15:42".
+ * The snapshot is the stored entry, so a surface re-renders only when the
+ * server said something new about this person.
+ */
+export function usePresenceDetail(userId: string | undefined, targetKey?: string): PresenceDetail {
+  return useSyncExternalStore(
+    subscribe,
+    () => selectPresenceDetail(state, userId ?? "", targetKey),
+    () => unknownDetail,
   );
 }
 

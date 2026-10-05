@@ -84,7 +84,7 @@ describe("UserResultRow", () => {
   it("shows a known presence and hides an unknown one", () => {
     mockPresence.mockReturnValue("online");
     const { unmount } = renderRow(<UserResultRow result={userResult()} query="ju" />);
-    expect(screen.getByRole("button")).toHaveTextContent("Online");
+    expect(screen.getByRole("button")).toHaveTextContent("Disponível");
     expect(mockPresence).toHaveBeenCalledWith("u1");
     unmount();
 

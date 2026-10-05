@@ -1056,7 +1056,7 @@ describe("presence scope", () => {
 describe("PresenceDot", () => {
   it("carries the state as data, a class and a tooltip", () => {
     for (const [presence, label] of [
-      ["online", "Online"],
+      ["online", "Disponível"],
       ["away", "Ausente"],
       ["offline", "Offline"],
     ] as const) {

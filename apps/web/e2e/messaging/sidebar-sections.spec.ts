@@ -605,6 +605,10 @@ test.describe("sidebar — rodapé do usuário autenticado", () => {
     const trigger = page.getByRole("button", { name: /menu da conta/i });
 
     await userLink(page).focus();
+    // Issue #798: the status control sits between the profile link and the
+    // account menu, in reading order.
+    await page.keyboard.press("Tab");
+    await expect(page.getByRole("button", { name: /alterar status/i })).toBeFocused();
     await page.keyboard.press("Tab");
     await expect(trigger).toBeFocused();
     await page.keyboard.press("Enter");

@@ -561,28 +561,16 @@
   color: var(--color-success-ink, #166534);
 }
 
-.chat-details__profile-status--away {
+.chat-details__profile-status--busy,
+.chat-details__profile-status--dnd {
   background: var(--color-danger-tint, #fee2e2);
   color: var(--color-danger-ink, #991b1b);
 }
 
-/* The badge's own dot. Inline in a pill rather than pinned to an avatar, so it
-   is not PresenceDot — but it reads the same tokens, so the two can only ever
-   agree on what each state looks like. */
-.chat-details__status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex: none;
-  background: var(--presence-offline);
-}
-
-.chat-details__status-dot--online {
-  background: var(--presence-online);
-}
-
-.chat-details__status-dot--away {
-  background: var(--presence-away);
+.chat-details__profile-status--away,
+.chat-details__profile-status--brb {
+  background: var(--presence-away-tint);
+  color: var(--presence-away-ink);
 }
 
 .chat-details__profile-meta {

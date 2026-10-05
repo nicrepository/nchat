@@ -916,6 +916,9 @@ export async function emitLinkUpdated(
 export interface PresenceFixture {
   user_id: string;
   state: "online" | "away" | "offline";
+  /** Issue #798 effective presence; absent reads as the legacy state. */
+  availability?: "available" | "busy" | "dnd" | "brb" | "away" | "offline";
+  activity?: "in_call" | "in_meeting" | "presenting";
   updated_at: string;
 }
 
@@ -2191,6 +2194,17 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
       body: JSON.stringify({
         data: { id: CURRENT_USER_ID, display_name: CURRENT_USER_NAME },
       }),
+    }),
+  );
+
+  // The sidebar footer's status control reads the viewer's own manual presence
+  // (issue #798). Automatic unless a spec installs its own presence server
+  // (presenceSettingsMock.ts), whose route then takes precedence.
+  await page.route("**/api/chat/presence/me", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: { state: null, expires_at: null, writable: true } }),
     }),
   );
 

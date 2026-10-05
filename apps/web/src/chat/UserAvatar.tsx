@@ -20,6 +20,8 @@ export interface UserAvatarProps {
   imageClassName?: string;
   alt?: string;
   presenceRingColor?: string;
+  /** Hover text for the presence dot when there is more than the state's word. */
+  presenceTitle?: string;
 }
 
 /**
@@ -39,6 +41,7 @@ export function UserAvatar({
   imageClassName,
   alt = "",
   presenceRingColor,
+  presenceTitle,
 }: UserAvatarProps) {
   const usableAvatarUrl = safeAvatarUrl(avatarUrl);
   const imageClasses = ["user-avatar__image", imageClassName].filter(Boolean).join(" ");
@@ -73,7 +76,14 @@ export function UserAvatar({
   return (
     <>
       {content}
-      {presence ? <PresenceDot state={presence} size={size} ringColor={presenceRingColor} /> : null}
+      {presence ? (
+        <PresenceDot
+          state={presence}
+          size={size}
+          ringColor={presenceRingColor}
+          title={presenceTitle}
+        />
+      ) : null}
     </>
   );
 }

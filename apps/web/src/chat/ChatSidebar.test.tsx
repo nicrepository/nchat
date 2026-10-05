@@ -2240,14 +2240,17 @@ describe("ChatSidebar — footer", () => {
     expect(userLink()).toHaveAttribute("href", "/profile");
   });
 
-  it("reaches the profile link and account menu trigger by keyboard", async () => {
+  it("reaches the profile link, the status control and the account menu by keyboard", async () => {
     const user = userEvent.setup();
     renderFooter();
 
     await screen.findByText("Ana Souza");
+    const status = screen.getByRole("button", { name: /alterar status/i });
     const trigger = screen.getByRole("button", { name: /menu da conta/i });
     userLink().focus();
     expect(userLink()).toHaveFocus();
+    await user.tab();
+    expect(status).toHaveFocus();
     await user.tab();
     expect(trigger).toHaveFocus();
   });

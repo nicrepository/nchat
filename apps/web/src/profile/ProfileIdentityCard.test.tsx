@@ -7,7 +7,7 @@ import type { SelfProfile } from "./profileApi";
 
 vi.mock("../chat/presence", () => ({
   usePresence: () => "online",
-  presenceLabel: (state: string) => (state === "online" ? "Online" : state),
+  presenceLabel: (state: string) => (state === "online" ? "Disponível" : state),
 }));
 
 const profile: SelfProfile = {
@@ -25,7 +25,7 @@ describe("ProfileIdentityCard", () => {
     render(<ProfileIdentityCard profile={profile} onEdit={vi.fn()} onChangePhoto={vi.fn()} />);
     expect(screen.getByRole("heading", { name: "Ana Costa" })).toHaveProperty("tagName", "H3");
     expect(screen.getByText("Infraestrutura & Segurança")).toBeInTheDocument();
-    expect(screen.getByText("Online")).toBeInTheDocument();
+    expect(screen.getByText("Disponível")).toBeInTheDocument();
     expect(screen.getByText("America/Sao_Paulo")).toBeInTheDocument();
     expect(screen.getByText("Trabalho com plataforma.")).toBeInTheDocument();
     expect(screen.getByText("🚀 Focada no deploy")).toBeInTheDocument();

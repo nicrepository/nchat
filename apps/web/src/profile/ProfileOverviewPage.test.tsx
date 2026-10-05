@@ -6,7 +6,10 @@ import ProfileOverviewPage from "./ProfileOverviewPage";
 import * as selfProfile from "./selfProfile";
 
 vi.mock("./selfProfile");
-vi.mock("../chat/presence", () => ({ usePresence: () => "online", presenceLabel: () => "Online" }));
+vi.mock("../chat/presence", () => ({
+  usePresence: () => "online",
+  presenceLabel: () => "Disponível",
+}));
 
 describe("ProfileOverviewPage", () => {
   it("shows a loading state, then the identity card once ready", () => {

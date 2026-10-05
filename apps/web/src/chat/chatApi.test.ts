@@ -3577,11 +3577,35 @@ describe("fetchDirectProfile (issue #443)", () => {
         avatarUrl: "/media/juliane.png",
         email: "juliane@nic.test",
         presence: "online",
+        lastSeenAt: undefined,
         jobTitle: undefined,
         department: undefined,
         timezone: undefined,
       },
     });
+  });
+
+  it("reads the server's last seen for an offline person, and nothing it cannot parse (issue #798)", async () => {
+    for (const [raw, expected] of [
+      ["2026-10-01T15:42:00Z", Date.parse("2026-10-01T15:42:00Z")],
+      ["yesterday", undefined],
+      [42, undefined],
+    ] as const) {
+      mockAuthFetch.mockResolvedValueOnce({
+        data: {
+          kind: "direct",
+          conversation_id: "conv-1",
+          profile: {
+            user_id: "u-other",
+            display_name: "Juliane",
+            presence: "offline",
+            last_seen_at: raw,
+          },
+        },
+      });
+      const details = await fetchDirectProfile("conv-1");
+      expect(details.kind === "direct" && details.profile.lastSeenAt).toBe(expected ?? undefined);
+    }
   });
 
   it("reads the professional fields when the server sends them", async () => {

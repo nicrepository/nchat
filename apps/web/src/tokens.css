@@ -82,15 +82,19 @@
   --color-success-tint: #dcfce7;
   --color-success-ink: #166534;
 
-  /* Presence (RF-58).
+  /* Presence (RF-58, issue #798).
      One definition for every surface that draws a presence dot, so the sidebar,
      the details panel, the conversation header and the message list cannot
-     drift apart. The away colour is red by product decision, not by the usual
-     market convention of amber — do not "fix" it to amber.
-     Colour is never the only carrier: every indicator is accompanied by the
-     word Online / Ausente / Offline. */
+     drift apart. Issue #798 sets the taxonomy: green available, amber away and
+     "volto já", red busy and do-not-disturb, neutral offline — red now means
+     "do not interrupt", which is why away moved to amber.
+     Colour is never the only carrier: every indicator is accompanied by its
+     word, and do-not-disturb, volto já and offline also differ in shape. */
   --presence-online: var(--color-success);
-  --presence-away: var(--color-danger);
+  --presence-busy: var(--color-danger);
+  --presence-away: #b45309;
+  --presence-away-tint: #fef3c7;
+  --presence-away-ink: #92400e;
   --presence-offline: var(--color-muted-2);
 
   /* Radii */
