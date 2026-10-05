@@ -472,6 +472,9 @@ func normalizeOwnershipName(kind, name string) (string, error) {
 }
 
 func executeOwnershipMutation(ctx context.Context, tx pgx.Tx, input OwnershipMutation) (OwnershipMutationResult, error) {
+	if input.Operation == "transfer" {
+		return executeOwnershipTransfer(ctx, tx, input)
+	}
 	details, err := readOwnershipDetails(ctx, tx, input.Scope)
 	if err != nil {
 		return OwnershipMutationResult{}, err

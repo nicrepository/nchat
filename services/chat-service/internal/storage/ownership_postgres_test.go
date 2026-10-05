@@ -165,14 +165,7 @@ func TestOwnershipTransferIdempotencyPostgreSQL(t *testing.T) {
 	if result.Replayed {
 		t.Fatal("first mutation replayed")
 	}
-	result, err = store.Mutate(t.Context(), input)
-	if err != nil || !result.Replayed {
-		t.Fatalf("replay=%+v err=%v", result, err)
-	}
-	input.TargetUserID = ownershipC
-	if _, err = store.Mutate(t.Context(), input); !errors.Is(err, domain.ErrOwnershipConflict) {
-		t.Fatalf("key reuse=%v", err)
-	}
+	assertTransferReplay(t, pool, store, input, result)
 	assertOwnershipRole(t, pool, "dm", ownershipDM, ownershipA, "member")
 	assertOwnershipRole(t, pool, "dm", ownershipDM, ownershipB, "owner")
 	var count int
@@ -384,22 +377,10 @@ func TestOwnershipConcurrentMutationMatrixPostgreSQL(t *testing.T) {
 		{"promote-leave", storage.OwnershipMutation{Operation: "role", TargetUserID: ownershipB, Role: domain.ConversationOwner}, storage.OwnershipMutation{Operation: "leave"}},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
-			pool := ownershipPool(t)
-			enableOwnership(t, pool)
-			store := storage.NewPGXOwnershipStore(pool)
-			scope := storage.OwnershipScope{WorkspaceID: ownershipWS, Kind: "dm", ConversationID: ownershipDM, ActorID: ownershipA}
-			results := make(chan error, 2)
-			for _, input := range []storage.OwnershipMutation{scenario.first, scenario.second} {
-				input.Scope = scope
-				go func(input storage.OwnershipMutation) { _, err := store.Mutate(t.Context(), input); results <- err }(input)
+			pool := runOwnershipMutationRace(t, scenario.first, scenario.second)
+			if scenario.name == "transfer-remove" {
+				assertTransferRemoveState(t, pool)
 			}
-			for range 2 {
-				err := <-results
-				if err != nil && !errors.Is(err, domain.ErrForbidden) && !errors.Is(err, domain.ErrNotFound) {
-					t.Fatal(err)
-				}
-			}
-			assertNoOrphans(t, pool)
 		})
 	}
 }

@@ -216,6 +216,10 @@ func TestOwnershipHandlerStrictInputAndErrorContract(t *testing.T) {
 		{"reject unknown role", http.MethodPatch, "", `{"role":"moderator"}`, "", nil, 400, false},
 		{"transfer key required", http.MethodPost, "transfer", `{"new_owner_user_id":"95300000-0000-4000-8000-00000000000b","actor_new_role":"member"}`, "", nil, 400, false},
 		{"transfer", http.MethodPost, "transfer", `{"new_owner_user_id":"95300000-0000-4000-8000-00000000000b","actor_new_role":"admin"}`, "request", nil, 200, true},
+		{"transfer reject actor", http.MethodPost, "transfer", `{"new_owner_user_id":"95300000-0000-4000-8000-00000000000b","actor_new_role":"admin","actor_user_id":"forged"}`, "request", nil, 400, false},
+		{"transfer reject workspace", http.MethodPost, "transfer", `{"new_owner_user_id":"95300000-0000-4000-8000-00000000000b","actor_new_role":"admin","workspace_id":"forged"}`, "request", nil, 400, false},
+		{"transfer reject owner role", http.MethodPost, "transfer", `{"new_owner_user_id":"95300000-0000-4000-8000-00000000000b","actor_new_role":"owner"}`, "request", nil, 400, false},
+		{"transfer reject unknown role", http.MethodPost, "transfer", `{"new_owner_user_id":"95300000-0000-4000-8000-00000000000b","actor_new_role":"moderator"}`, "request", nil, 400, false},
 		{"unknown operation", http.MethodPost, "remove", `{}`, "request", nil, 404, false},
 		{"owner conflict", http.MethodPatch, "", `{"role":"member"}`, "", domain.ErrOwnershipConflict, 409, true},
 		{"private inaccessible", http.MethodPatch, "", `{"role":"owner"}`, "", domain.ErrNotFound, 404, true},
@@ -232,15 +236,20 @@ func TestOwnershipHandlerStrictInputAndErrorContract(t *testing.T) {
 			provider := &ownershipStub{err: tc.err}
 			response := httptest.NewRecorder()
 			handleOwnership(response, request, provider, scope, nil)
-			if response.Code != tc.want {
-				t.Fatalf("status %d body %s", response.Code, response.Body.String())
-			}
-			if (provider.calls > 0) != tc.called {
-				t.Fatalf("store called %d", provider.calls)
-			}
-			if tc.called && provider.input.Scope != scope {
-				t.Fatalf("actor/workspace replaced: %+v", provider.input.Scope)
-			}
+			assertOwnershipHTTPMutationResponse(t, response, provider, scope, tc.want, tc.called)
 		})
+	}
+}
+
+func assertOwnershipHTTPMutationResponse(t *testing.T, response *httptest.ResponseRecorder, provider *ownershipStub, scope storage.OwnershipScope, want int, called bool) {
+	t.Helper()
+	if response.Code != want {
+		t.Fatalf("status %d body %s", response.Code, response.Body.String())
+	}
+	if (provider.calls > 0) != called {
+		t.Fatalf("store called %d", provider.calls)
+	}
+	if called && provider.input.Scope != scope {
+		t.Fatalf("actor/workspace replaced: %+v", provider.input.Scope)
 	}
 }
