@@ -522,12 +522,9 @@ type dmQuerier interface {
 // the rest of this file acquires them, so two of these running concurrently
 // cannot deadlock against each other.
 //
-// Both locks are FOR SHARE. They exist to pin the *authorization context* while
-// the write happens — archiving the conversation or removing the actor are
-// UPDATEs that conflict with FOR SHARE and so are serialised against an add in
-// flight — and for nothing else. There is no participant ceiling to serialise,
-// so two people adding different users to the same large group proceed in
-// parallel rather than queueing behind each other.
+// The conversation is locked FOR UPDATE before membership rows, matching
+// ownership transfers, departures and account invalidation. Membership locks
+// retain authorization until commit.
 //
 // Two things are re-established under those locks, each here rather than in the
 // service because the service's copy would be a check the write could outrun:
@@ -579,7 +576,7 @@ func (s *PGXDMStore) AddGroupParticipants(
 		  AND dc.workspace_id = $2::uuid
 		  AND dc.status = 'active'
 		  AND dc.type = 'group'
-		FOR SHARE OF dc`,
+		FOR UPDATE OF dc`,
 		input.ConversationID, input.WorkspaceID,
 	).Scan(&conversationID)
 	if err != nil {
@@ -601,8 +598,8 @@ func (s *PGXDMStore) AddGroupParticipants(
 	// removing the actor from the group is an UPDATE of this row and conflicts
 	// with FOR SHARE, so a revocation is still serialised against this add,
 	// while two participants adding people concurrently do not block each other.
-	// Nothing here is taken FOR UPDATE: there is no ceiling to serialise, and the
-	// uniqueness of a membership is settled by the primary key at write time.
+	// The conversation lock already serializes writes to this group; the
+	// membership lock pins the actor until commit.
 	var actorParticipates bool
 	err = tx.QueryRow(ctx, `
 		SELECT true
@@ -756,6 +753,8 @@ func upsertEligibleDMMembers(
 			FROM eligible
 			ON CONFLICT (conversation_id, user_id)
 			DO UPDATE SET role = 'member',
+                          ownership_role = 'member',
+                          joined_at = now(),
 			              status = 'active',
 			              left_at = NULL
 			WHERE dm.status <> 'active'

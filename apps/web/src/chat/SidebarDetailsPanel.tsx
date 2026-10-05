@@ -18,7 +18,7 @@ import ConversationDetailsPanel from "./ConversationDetailsPanel";
 import type { ConversationRenameAction } from "./conversationRename";
 import { useDirectMessageAccess, type DirectMessageCoordinator } from "./directMessage";
 import { useConversationDetails } from "./useConversationDetails";
-import { useReloadOnRename } from "./useReloadOnRename";
+import { useReloadOnRename, projectedConversationName } from "./useReloadOnRename";
 
 export interface SidebarDetailsTarget {
   /** The panel's own vocabulary: a group and a 1:1 are both DM rows. */
@@ -84,6 +84,7 @@ export default function SidebarDetailsPanel({
     canonicalName,
     target !== null,
     state.reload,
+    projectedConversationName(state.details),
   );
   /*
     This panel's own lifetime, as the coordinator sees it (issue #895).

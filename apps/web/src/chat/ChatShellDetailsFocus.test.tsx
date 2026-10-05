@@ -302,11 +302,10 @@ describe("ChatShell — detalhes abertos pela sidebar convergem após rename (#8
     expect(detailsReads()).toBe(2);
   });
 
-  // The trigger is "the canonical name of this target moved", not "a frame
-  // arrived" — so any refetch of the canonical list converges the panel, which
-  // is what makes a reconnect work with no code of its own. And a refetch that
-  // finds the same name is not a reason to re-read anything.
-  it("converge por refetch autoritativo e não recarrega quando nada mudou", async () => {
+  // Roles and capabilities may change while the name stays the same. A frame
+  // therefore refreshes the open projection; a subsequent canonical name
+  // update must not repeat a projection that already has that name.
+  it("revalida capabilities mesmo quando o nome não mudou", async () => {
     const user = userEvent.setup();
     renderShell();
     await screen.findByRole("option", { name: /Infra/ });
@@ -314,8 +313,7 @@ describe("ChatShell — detalhes abertos pela sidebar convergem após rename (#8
     await openDetailsFromSidebar(user);
     await waitFor(() => expect(detailsReads()).toBe(1));
 
-    // A refresh of the canonical list that finds the conversation unchanged —
-    // a reconnect with nothing to report.
+    // The name is unchanged, but ownership may have moved.
     await act(async () => {
       sidebarSocketOptions().onConversationUpdated?.({
         type: "conversation.updated",
@@ -326,7 +324,7 @@ describe("ChatShell — detalhes abertos pela sidebar convergem após rename (#8
     await act(async () => {
       await Promise.resolve();
     });
-    expect(detailsReads()).toBe(1);
+    expect(detailsReads()).toBe(2);
 
     // The same refresh, once the server's own state has moved, does converge.
     setServerChannelName("Plataforma de Infra");
@@ -343,7 +341,7 @@ describe("ChatShell — detalhes abertos pela sidebar convergem após rename (#8
         "Plataforma de Infra",
       ),
     );
-    expect(detailsReads()).toBe(2);
+    expect(detailsReads()).toBe(3);
   });
 
   // The panel is closed: there is nothing on screen to keep in step, and a

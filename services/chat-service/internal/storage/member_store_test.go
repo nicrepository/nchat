@@ -667,6 +667,8 @@ func TestPGXMemberStore_ActivateWorkspaceMember_AddsGeneralInTransaction(t *test
 
 	now := time.Now()
 	mock.ExpectBegin()
+	mock.ExpectExec(`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`).WillReturnResult(pgxmock.NewResult("SET", 0))
+	mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(false))
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
@@ -703,6 +705,8 @@ func TestPGXMemberStore_ActivateWorkspaceMember_NotFoundRollsBack(t *testing.T) 
 	defer mock.Close()
 
 	mock.ExpectBegin()
+	mock.ExpectExec(`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`).WillReturnResult(pgxmock.NewResult("SET", 0))
+	mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(false))
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
@@ -732,6 +736,8 @@ func TestPGXMemberStore_ActivateWorkspaceMember_DisabledWorkspaceDenied(t *testi
 	defer mock.Close()
 
 	mock.ExpectBegin()
+	mock.ExpectExec(`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`).WillReturnResult(pgxmock.NewResult("SET", 0))
+	mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(false))
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-disabled").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("disabled"))
@@ -755,6 +761,8 @@ func TestPGXMemberStore_ActivateWorkspaceMember_MissingGeneralRollsBack(t *testi
 	defer mock.Close()
 
 	mock.ExpectBegin()
+	mock.ExpectExec(`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`).WillReturnResult(pgxmock.NewResult("SET", 0))
+	mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(false))
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
@@ -781,6 +789,8 @@ func TestPGXMemberStore_ActivateWorkspaceMember_UserIDScopedByWorkspace(t *testi
 	defer mock.Close()
 
 	mock.ExpectBegin()
+	mock.ExpectExec(`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`).WillReturnResult(pgxmock.NewResult("SET", 0))
+	mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(false))
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-b").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
@@ -811,6 +821,8 @@ func TestPGXMemberStore_ActivateWorkspaceMember_UpdateErrorRollsBack(t *testing.
 
 	want := errors.New("update failed")
 	mock.ExpectBegin()
+	mock.ExpectExec(`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`).WillReturnResult(pgxmock.NewResult("SET", 0))
+	mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(false))
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))

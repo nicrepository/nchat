@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/nicrepository/nchat/libs/go/platform/conversationownership"
 
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 )
@@ -270,11 +271,22 @@ func (s *PGXUserStore) GetUserByID(ctx context.Context, id string) (domain.User,
 }
 
 func (s *PGXUserStore) UpdateUserStatus(ctx context.Context, id, newStatus string) (domain.User, error) {
+	value, err := conversationownership.Retry(ctx, func() (domain.User, error) { return s.updateUserStatusOnce(ctx, id, newStatus) })
+	if conversationownership.SQLState(err) == "P0953" {
+		return domain.User{}, domain.ErrConversationOwnershipConflict
+	}
+	return value, err
+}
+
+func (s *PGXUserStore) updateUserStatusOnce(ctx context.Context, id, newStatus string) (domain.User, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return domain.User{}, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := prepareOwnershipInvalidation(ctx, tx, id); err != nil {
+		return domain.User{}, err
+	}
 
 	// Lock the user row and read current status to validate the transition atomically.
 	var currentStatus string
@@ -530,4 +542,19 @@ func (s *PGXUserStore) ListWorkspaceUsers(ctx context.Context, workspaceID strin
 		return nil, fmt.Errorf("iterate workspace users: %w", err)
 	}
 	return users, nil
+}
+
+func prepareOwnershipInvalidation(ctx context.Context, tx pgx.Tx, userID string) error {
+	if _, err := tx.Exec(ctx, conversationownership.SerializableSQL); err != nil {
+		return err
+	}
+	var available bool
+	if err := tx.QueryRow(ctx, conversationownership.AvailabilitySQL).Scan(&available); err != nil {
+		return err
+	}
+	if !available {
+		return nil
+	}
+	_, err := tx.Exec(ctx, conversationownership.LockUserSQL, userID)
+	return err
 }

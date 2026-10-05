@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/nicrepository/nchat/libs/go/platform/channelmembership"
+	"github.com/nicrepository/nchat/libs/go/platform/conversationownership"
 	"github.com/nicrepository/nchat/services/admin-service/internal/domain"
 )
 
@@ -538,10 +539,16 @@ const lockChannelQuery = `
 // a member afterwards, and no message becomes reachable from anywhere in this
 // service.
 func (s *PGXChannelDirectoryStore) AddChannelMembers(ctx context.Context, channelID string, userIDs []string) (domain.ChannelMembershipChange, error) {
+	return conversationownership.Retry(ctx, func() (domain.ChannelMembershipChange, error) {
+		return s.addChannelMembersOnce(ctx, channelID, userIDs)
+	})
+}
+
+func (s *PGXChannelDirectoryStore) addChannelMembersOnce(ctx context.Context, channelID string, userIDs []string) (domain.ChannelMembershipChange, error) {
 	if s == nil || s.pool == nil {
 		return domain.ChannelMembershipChange{}, domain.ErrUnavailable
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginMembershipTransaction(ctx)
 	if err != nil {
 		return domain.ChannelMembershipChange{}, fmt.Errorf("begin add channel members: %w", err)
 	}
@@ -601,28 +608,38 @@ func (s *PGXChannelDirectoryStore) AddChannelMembers(ctx context.Context, channe
 // construction; a console that could take somebody out of it would be a second
 // way around an invariant the chat domain maintains everywhere else.
 func (s *PGXChannelDirectoryStore) RemoveChannelMember(ctx context.Context, channelID, userID string) (domain.ChannelMembershipChange, error) {
+	return s.RemoveChannelMemberAs(ctx, channelID, userID, "")
+}
+
+// RemoveChannelMemberAs revalidates conversation authority independently of
+// console capabilities. A platform role does not grant private ownership.
+func (s *PGXChannelDirectoryStore) RemoveChannelMemberAs(ctx context.Context, channelID, userID, actorID string) (domain.ChannelMembershipChange, error) {
+	value, err := conversationownership.Retry(ctx, func() (domain.ChannelMembershipChange, error) {
+		return s.removeChannelMemberOnce(ctx, channelID, userID, actorID)
+	})
+	if conversationownership.SQLState(err) == "P0953" {
+		return domain.ChannelMembershipChange{}, domain.ErrConversationOwnershipConflict
+	}
+	return value, err
+}
+
+func (s *PGXChannelDirectoryStore) removeChannelMemberOnce(ctx context.Context, channelID, userID, actorID string) (domain.ChannelMembershipChange, error) {
 	if s == nil || s.pool == nil {
 		return domain.ChannelMembershipChange{}, domain.ErrUnavailable
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginMembershipTransaction(ctx)
 	if err != nil {
 		return domain.ChannelMembershipChange{}, fmt.Errorf("begin remove channel member: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var workspaceID string
-	var isGeneral bool
-	if err := tx.QueryRow(ctx, lockChannelQuery, channelID).Scan(&workspaceID, &isGeneral); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.ChannelMembershipChange{}, domain.ErrNotFound
-		}
-		return domain.ChannelMembershipChange{}, fmt.Errorf("lock channel for membership: %w", err)
+	workspaceID, err := lockChannelForOwnershipRemoval(ctx, tx, channelID)
+	if err != nil {
+		return domain.ChannelMembershipChange{}, err
 	}
-	// An archived channel still allows a removal, matching chat-service's
-	// RemoveChannelMember: taking somebody out of a channel nobody uses is not
-	// an operation that needs the channel to be live.
-	if isGeneral {
-		return domain.ChannelMembershipChange{}, domain.ErrForbidden
+
+	if err := authorizePrivateChannelRemoval(ctx, tx, channelID, userID, actorID); err != nil {
+		return domain.ChannelMembershipChange{}, err
 	}
 
 	tag, err := tx.Exec(ctx,
@@ -644,6 +661,20 @@ func (s *PGXChannelDirectoryStore) RemoveChannelMember(ctx context.Context, chan
 		return domain.ChannelMembershipChange{}, fmt.Errorf("commit remove channel member: %w", err)
 	}
 	return change, nil
+}
+
+// All membership writers use the same isolation so a waiter retries with a
+// fresh snapshot before reporting the total produced by the serialized write.
+func (s *PGXChannelDirectoryStore) beginMembershipTransaction(ctx context.Context) (pgx.Tx, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, conversationownership.SerializableSQL); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
+	return tx, nil
 }
 
 // listMemberCandidatesQuery offers the people who could be added to a channel.
@@ -728,4 +759,55 @@ func (s *PGXChannelDirectoryStore) ListMemberCandidates(ctx context.Context, cha
 		return nil, fmt.Errorf("read member candidates: %w", err)
 	}
 	return candidates, nil
+}
+
+func authorizePrivateChannelRemoval(ctx context.Context, tx pgx.Tx, channelID, targetID, actorID string) error {
+	var available bool
+	if err := tx.QueryRow(ctx, conversationownership.AvailabilitySQL).Scan(&available); err != nil {
+		return err
+	}
+	if !available {
+		return nil
+	}
+	var enabled bool
+	var actorRole, targetRole string
+	err := tx.QueryRow(ctx, `SELECT r.enabled AND c.type='private',
+ COALESCE((SELECT role FROM chat.active_ownership_participants WHERE kind='channel' AND conversation_id=c.id AND user_id=NULLIF($2,'')::uuid),''),
+ COALESCE((SELECT role FROM chat.active_ownership_participants WHERE kind='channel' AND conversation_id=c.id AND user_id=$3::uuid),'')
+ FROM chat.channels c CROSS JOIN chat.ownership_rollout r WHERE c.id=$1::uuid AND r.singleton`, channelID, actorID, targetID).Scan(&enabled, &actorRole, &targetRole)
+	if err != nil {
+		return err
+	}
+	if !enabled {
+		return nil
+	}
+	if actorRole == "" {
+		return domain.ErrNotFound
+	}
+	if !privateRemovalAllowed(actorRole, targetRole, actorID == targetID) {
+		return domain.ErrForbidden
+	}
+	return nil
+}
+
+func privateRemovalAllowed(actorRole, targetRole string, self bool) bool {
+	if self || targetRole == "owner" {
+		return false
+	}
+	return actorRole == "owner" || actorRole == "admin" && (targetRole == "member" || targetRole == "")
+}
+
+func lockChannelForOwnershipRemoval(ctx context.Context, tx pgx.Tx, channelID string) (string, error) {
+	var workspaceID string
+	var general bool
+	if err := tx.QueryRow(ctx, lockChannelQuery, channelID).Scan(&workspaceID, &general); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", domain.ErrNotFound
+		}
+		return "", err
+	}
+	if general {
+		return "", domain.ErrForbidden
+	}
+	return workspaceID, nil
 }

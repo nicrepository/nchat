@@ -9,6 +9,7 @@ import {
   type WSAcknowledgementUpdatedEvent,
   type WSConversationEventMessage,
   type WSMembersAddedEvent,
+  type WSConversationUpdatedEvent,
   type WSMessageBlockedEvent,
   type WSMessageCreatedEvent,
   type WSMessageLinkSafetyChangedEvent,
@@ -38,6 +39,7 @@ type MessageUpdate = NonNullable<WSMessageUpdatedEvent["message_update"]>;
 export interface RealtimeListeners {
   onPinUpdated?: (event: WSPinUpdatedEvent) => void;
   onMembersAdded?: (event: WSMembersAddedEvent) => void;
+  onConversationUpdated?: (event: WSConversationUpdatedEvent) => void;
   /**
    * Issue #469: called on a conversation.event for the active target, after
    * the timeline has reconciled it.
@@ -333,6 +335,10 @@ export function useMessageRealtime({
 
   const target = { kind, targetId };
   const handlePinUpdated = useForwardedTargetEvent(target, listeners.onPinUpdated);
+  const handleConversationUpdated = useForwardedTargetEvent(
+    target,
+    listeners.onConversationUpdated,
+  );
   const handleMembersAdded = useForwardedTargetEvent(target, listeners.onMembersAdded);
   const handleTypingUpdated = useForwardedTargetEvent(target, listeners.onTypingUpdated);
   const handleAttachmentStatus = useForwardedTargetEvent(
@@ -380,6 +386,7 @@ export function useMessageRealtime({
     onTypingUpdated: handleTypingUpdated,
     onPinUpdated: handlePinUpdated,
     onMembersAdded: handleMembersAdded,
+    onConversationUpdated: handleConversationUpdated,
     onAttachmentStatus: handleAttachmentStatus,
     onConversationEvent: handleConversationEvent,
     onAcknowledgementUpdated: handleAcknowledgementUpdated,

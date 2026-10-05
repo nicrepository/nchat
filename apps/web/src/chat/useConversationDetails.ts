@@ -1,3 +1,4 @@
+import { listenDetailsInvalidation } from "./detailsInvalidation";
 /**
  * useConversationDetails — data for the details panel of a channel (issue #435),
  * an ad-hoc group (issue #441) or a 1:1 DM's profile (issue #443).
@@ -882,5 +883,13 @@ export function useConversationDetails(
       ? { status: "ready", data: state.files.data, next }
       : state.files;
 
+  useEffect(
+    () =>
+      listenDetailsInvalidation((event) => {
+        if (event.target_type === (kind === "channel" ? "channel" : "dm") && event.target_id === id)
+          reload();
+      }),
+    [kind, id, reload],
+  );
   return { ...state, files, reload };
 }

@@ -35,3 +35,5 @@ var (
 	// request changed first, or an invariant the change would break.
 	ErrConflict = errors.New("conflict")
 )
+
+var ErrConversationOwnershipConflict = errors.New("conversation ownership conflict")

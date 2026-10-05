@@ -11,6 +11,8 @@ import {
 import { Link, useLocation, useNavigate } from "react-router";
 
 import "./ChatSidebar.css";
+import ChannelIcon from "./ChannelIcon";
+import { channelAccessibleName } from "./channelIdentity";
 import { useSelfProfile } from "../profile/selfProfile";
 import { partitionDMs, type Channel, type ChannelCategory, type DMConversation } from "./chatTypes";
 import ConversationActionsMenu from "./ConversationActionsMenu";
@@ -67,44 +69,6 @@ function PinnedIndicator() {
 }
 
 // ── Inline SVG icons ─────────────────────────────────────────────────────────
-
-function IconHash() {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className="chat-sidebar__icon"
-      aria-hidden="true"
-    >
-      <line x1="10" y1="4" x2="8" y2="20" />
-      <line x1="16" y1="4" x2="14" y2="20" />
-      <line x1="4" y1="9" x2="20" y2="9" />
-      <line x1="3" y1="15" x2="19" y2="15" />
-    </svg>
-  );
-}
-
-function IconLock() {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className="chat-sidebar__icon chat-sidebar__icon--sm"
-      aria-hidden="true"
-    >
-      <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
-      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-    </svg>
-  );
-}
 
 function IconAdd() {
   return (
@@ -527,6 +491,7 @@ function ChannelList({ channels, activeChannelId, onSelect, labelId, actions }: 
     <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={labelId}>
       {channels.map((ch) => {
         const isActive = ch.id === activeChannelId;
+        const isPrivate = ch.type === "private";
         const target: ConversationTarget = {
           kind: "channel",
           id: ch.id,
@@ -544,21 +509,16 @@ function ChannelList({ channels, activeChannelId, onSelect, labelId, actions }: 
               role="option"
               aria-selected={isActive}
               aria-label={withPinnedSuffix(
-                `Canal ${ch.type === "private" ? "privado " : ""}${ch.name}`,
+                channelAccessibleName(ch.name, isPrivate),
                 target.pinned,
               )}
               className={`chat-sidebar__nav-item${isActive ? " chat-sidebar__nav-item--active" : ""}`}
               onClick={() => onSelect(ch.id)}
             >
-              {ch.type === "private" ? <IconLock /> : <IconHash />}
+              <ChannelIcon isPrivate={isPrivate} className="chat-sidebar__icon" />
               <span className="chat-sidebar__row-lines">
                 <span className="chat-sidebar__row-line">
                   <span className="chat-sidebar__nav-item-name">{ch.name}</span>
-                  {ch.type === "private" && (
-                    <span className="chat-sidebar__badge chat-sidebar__badge--private sr-only">
-                      privado
-                    </span>
-                  )}
                   {ch.unreadCount != null && ch.unreadCount > 0 && (
                     <span
                       className={`chat-sidebar__unread-badge${ch.hasMentionUnread ? " chat-sidebar__unread-badge--mention" : ""}`}

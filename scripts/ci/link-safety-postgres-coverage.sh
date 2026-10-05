@@ -467,4 +467,25 @@ if [ ! -s "$PROFILE" ] || ! awk 'NR > 1 && $3 > 0 { found = 1; exit } END { exit
   exit 1
 fi
 
-echo "RF-21 PostgreSQL coverage written to ${PROFILE#"$ROOT_DIR"/}."
+# Ownership resets auth/chat schemas, so it must use a different database from
+# Link Safety. Measure its existing integration tests here instead of running
+# them again in the integration job and leaving their statements uncovered.
+if [ "$MODULE" = "services/chat-service" ] && [ -n "${OWNERSHIP_COVERAGE_DATABASE_URL:-}" ]; then
+  ownership_profile="${PROFILE%.out}.ownership.out"
+  ownership_merged="${PROFILE%.out}.ownership-merged.out"
+  (
+    cd "$ROOT_DIR/$MODULE"
+    env OWNERSHIP_TEST_DATABASE_URL="$OWNERSHIP_COVERAGE_DATABASE_URL" \
+      go test ./internal/storage -run '^TestOwnership.*PostgreSQL$' -count=1 \
+      -covermode=atomic -coverprofile="$ownership_profile"
+  )
+  if ! awk 'NR > 1 && $3 > 0 { found = 1 } END { exit found ? 0 : 1 }' "$ownership_profile"; then
+    echo "Ownership PostgreSQL coverage recorded no executed statements." >&2
+    exit 1
+  fi
+  awk -f "$ROOT_DIR/scripts/ci/merge-go-coverprofiles.awk" \
+    "$PROFILE" "$ownership_profile" >"$ownership_merged"
+  mv "$ownership_merged" "$PROFILE"
+fi
+
+echo "PostgreSQL coverage written to ${PROFILE#"$ROOT_DIR"/}."

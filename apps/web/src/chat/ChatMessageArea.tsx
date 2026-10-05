@@ -259,7 +259,10 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     onOwnReactionConfirmed: rememberReaction,
     onPinUpdated: reloadPins,
     // A pin.updated missed while disconnected is recovered here (issue #896).
-    onSubscriptionReady: reloadPins,
+    onSubscriptionReady: () => {
+      reloadPins();
+      reloadOpenDetails();
+    },
     onTypingUpdated: handleTypingUpdatedFromMessages,
     // Someone added participants to the open conversation (issue #398). The
     // event names nobody, so the only correct response is to refetch — which is
@@ -575,6 +578,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           kind={kind}
           workspaceId={ctx.workspaceId}
           name={resolvedName}
+          isPrivate={target.isPrivateChannel}
           counterpart={activeDM?.counterpart}
           presenceTarget={target.presenceTarget}
           // #673: once the direct call bar takes over presentation for this DM,

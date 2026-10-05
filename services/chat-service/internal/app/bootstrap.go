@@ -38,6 +38,7 @@ type bootstrap struct {
 }
 
 type bootstrapStores struct {
+	ownership             *storage.PGXOwnershipStore
 	closeDB               func()
 	ready                 bool
 	sessions              storage.SessionValidator
@@ -100,10 +101,12 @@ type bootstrapHandlers struct {
 }
 
 type bootstrapWorkers struct {
-	callCancel context.CancelFunc
-	callWG     *sync.WaitGroup
-	linkCancel context.CancelFunc
-	linkWG     *sync.WaitGroup
+	ownershipCancel context.CancelFunc
+	ownershipWG     *sync.WaitGroup
+	callCancel      context.CancelFunc
+	callWG          *sync.WaitGroup
+	linkCancel      context.CancelFunc
+	linkWG          *sync.WaitGroup
 }
 
 // newBootstrap builds the process-wide primitives every stage shares.
@@ -167,6 +170,7 @@ func (b *bootstrap) wireStores(pool storage.Pool) {
 	b.stores.channels = storage.NewPGXChannelStore(pool)
 	b.stores.members = storage.NewPGXMemberStore(pool)
 	b.stores.dms = storage.NewPGXDMStore(pool)
+	b.stores.ownership = storage.NewPGXOwnershipStore(pool)
 	b.stores.messages = storage.NewPGXMessageStore(pool)
 	b.stores.sidebarPins = storage.NewPGXSidebarPinStore(pool)
 	b.stores.conversationReadState = storage.NewPGXConversationReadStateStore(pool)
@@ -380,10 +384,10 @@ func (b *bootstrap) buildMessageHandler() {
 func (b *bootstrap) buildConversationHandlers() {
 	st, limiter := b.stores, b.realtime.reactionLimiter
 	if b.services.dm != nil {
-		b.handlers.directMessages = httpapi.NewDMHandler(st.workspaces, b.services.dm, limiter)
+		b.handlers.directMessages = httpapi.NewDMHandler(st.workspaces, b.services.dm, limiter).WithOwnership(st.ownership)
 	}
 	if b.services.channel != nil && limiter != nil {
-		b.handlers.channels = httpapi.NewChannelHandler(st.workspaces, b.services.channel, limiter)
+		b.handlers.channels = httpapi.NewChannelHandler(st.workspaces, b.services.channel, limiter).WithOwnership(st.ownership)
 	}
 	if b.services.channelCategory != nil && limiter != nil {
 		b.handlers.channelCategories = httpapi.NewChannelCategoryHandler(st.workspaces, b.services.channelCategory, limiter)
@@ -530,18 +534,20 @@ func (b *bootstrap) app() *App {
 		Logger: b.logger,
 		Handler: httpapi.NewRouter(b.cfg, b.logger, readiness, b.validator, b.stores.sessions, h.sidebar,
 			h.message, rt.wsHandler, h.directMessages, h.channels, h.channelCategories, h.antiSpam, b.metrics),
-		TracingShutdown:   b.shutdown,
-		hub:               rt.hub,
-		presence:          rt.presence,
-		presenceDirectory: rt.presenceDirectory,
-		mentionCache:      b.stores.mentionCache,
-		reactionLimiter:   rt.reactionLimiter,
-		typingLimiter:     rt.typingLimiter,
-		typingStore:       rt.typingStore,
-		callWorkerCancel:  b.workers.callCancel,
-		callWorkerWG:      b.workers.callWG,
-		linkScanCancel:    b.workers.linkCancel,
-		linkScanWG:        b.workers.linkWG,
-		closeDB:           b.stores.closeDB,
+		TracingShutdown:       b.shutdown,
+		hub:                   rt.hub,
+		presence:              rt.presence,
+		presenceDirectory:     rt.presenceDirectory,
+		mentionCache:          b.stores.mentionCache,
+		reactionLimiter:       rt.reactionLimiter,
+		typingLimiter:         rt.typingLimiter,
+		typingStore:           rt.typingStore,
+		ownershipWorkerCancel: b.workers.ownershipCancel,
+		ownershipWorkerWG:     b.workers.ownershipWG,
+		callWorkerCancel:      b.workers.callCancel,
+		callWorkerWG:          b.workers.callWG,
+		linkScanCancel:        b.workers.linkCancel,
+		linkScanWG:            b.workers.linkWG,
+		closeDB:               b.stores.closeDB,
 	}
 }

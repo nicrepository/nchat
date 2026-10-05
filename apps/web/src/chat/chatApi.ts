@@ -1,3 +1,4 @@
+import { parseOwnership } from "./ownershipApi";
 /**
  * Chat API client.
  *
@@ -2047,6 +2048,7 @@ interface ChannelDetailsEnvelope {
     can_add_members?: unknown;
     can_manage_members?: unknown;
     can_remove_members?: unknown;
+    ownership?: unknown;
   };
 }
 
@@ -2162,6 +2164,7 @@ export async function fetchChannelDetails(
     // inferred from can_manage_members: the two are different questions, and
     // the DELETE re-derives the real answer on every call.
     canRemoveMembers: data.can_remove_members === true,
+    ownership: parseOwnership(data.ownership),
   };
 }
 
@@ -2263,6 +2266,7 @@ interface GroupDetailsEnvelope {
     participants?: unknown;
     can_manage_members?: unknown;
     can_remove_members?: unknown;
+    ownership?: unknown;
   };
 }
 
@@ -2326,6 +2330,7 @@ export async function fetchGroupDetails(
     // Genuinely a different answer for a group (issue #469): every participant
     // may add, only the creator may remove.
     canRemoveMembers: data.can_remove_members === true,
+    ownership: parseOwnership(data.ownership),
   };
 }
 

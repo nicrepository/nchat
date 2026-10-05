@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/nicrepository/nchat/libs/go/platform/conversationownership"
 
 	"github.com/nicrepository/nchat/services/admin-service/internal/domain"
 )
@@ -387,7 +388,15 @@ const lockUserQuery = `
 //
 // Suspension revokes every session; activation restores none. There is no path
 // here that resurrects a credential.
-func (s *PGXUserDirectoryStore) UpdateUserStatus(ctx context.Context, userID string, newStatus string) (domain.UserStatusChange, error) {
+func (s *PGXUserDirectoryStore) UpdateUserStatus(ctx context.Context, userID, newStatus string) (domain.UserStatusChange, error) {
+	value, err := conversationownership.Retry(ctx, func() (domain.UserStatusChange, error) { return s.updateUserStatusOnce(ctx, userID, newStatus) })
+	if conversationownership.SQLState(err) == "P0953" {
+		return domain.UserStatusChange{}, domain.ErrConversationOwnershipConflict
+	}
+	return value, err
+}
+
+func (s *PGXUserDirectoryStore) updateUserStatusOnce(ctx context.Context, userID string, newStatus string) (domain.UserStatusChange, error) {
 	if s == nil || s.pool == nil {
 		return domain.UserStatusChange{}, domain.ErrUnavailable
 	}
@@ -396,6 +405,9 @@ func (s *PGXUserDirectoryStore) UpdateUserStatus(ctx context.Context, userID str
 		return domain.UserStatusChange{}, fmt.Errorf("begin status transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := prepareOwnershipInvalidation(ctx, tx, userID); err != nil {
+		return domain.UserStatusChange{}, err
+	}
 
 	current, err := lockUserForStatusChange(ctx, tx, userID, newStatus)
 	if err != nil {
@@ -772,4 +784,19 @@ func nullableCursorTime(cursor domain.Cursor) any {
 		return nil
 	}
 	return cursor.At
+}
+
+func prepareOwnershipInvalidation(ctx context.Context, tx pgx.Tx, userID string) error {
+	if _, err := tx.Exec(ctx, conversationownership.SerializableSQL); err != nil {
+		return err
+	}
+	var available bool
+	if err := tx.QueryRow(ctx, conversationownership.AvailabilitySQL).Scan(&available); err != nil {
+		return err
+	}
+	if !available {
+		return nil
+	}
+	_, err := tx.Exec(ctx, conversationownership.LockUserSQL, userID)
+	return err
 }

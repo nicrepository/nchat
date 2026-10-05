@@ -300,7 +300,7 @@ func TestPGXDMStore_AddGroupParticipants_LocksConversationThenActor(t *testing.T
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*dc\.type = 'group'.*FOR SHARE OF dc`).
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*dc\.type = 'group'.*FOR UPDATE OF dc`).
 		WithArgs(msConversation, msWorkspace).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(msConversation))
 	mock.ExpectQuery(`(?s)FROM chat\.dm_members dm.*FOR SHARE OF dm`).
@@ -345,7 +345,7 @@ func TestPGXDMStore_AddGroupParticipants_ReportsNothingForAnExistingParticipant(
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*FOR SHARE OF dc`).
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*FOR UPDATE OF dc`).
 		WithArgs(msConversation, msWorkspace).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(msConversation))
 	mock.ExpectQuery(`(?s)FROM chat\.dm_members dm.*FOR SHARE OF dm`).
@@ -386,7 +386,7 @@ func TestPGXDMStore_AddGroupParticipants_AddedMatchesTheReturnedIDs(t *testing.T
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*FOR SHARE OF dc`).
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*FOR UPDATE OF dc`).
 		WithArgs(msConversation, msWorkspace).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(msConversation))
 	mock.ExpectQuery(`(?s)FROM chat\.dm_members dm.*FOR SHARE OF dm`).
@@ -433,7 +433,7 @@ func TestPGXDMStore_AddGroupParticipants_RollsBackWhenEventInsertFails(t *testin
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*FOR SHARE OF dc`).
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*FOR UPDATE OF dc`).
 		WithArgs(msConversation, msWorkspace).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(msConversation))
 	mock.ExpectQuery(`(?s)FROM chat\.dm_members dm.*FOR SHARE OF dm`).
@@ -474,7 +474,7 @@ func TestPGXDMStore_AddGroupParticipants_RollsBackWhenActorNoLongerParticipates(
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)FOR SHARE OF dc`).
+	mock.ExpectQuery(`(?s)FOR UPDATE OF dc`).
 		WithArgs(msConversation, msWorkspace).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(msConversation))
 	mock.ExpectQuery(`(?s)FOR SHARE OF dm`).
@@ -503,7 +503,7 @@ func TestPGXDMStore_AddGroupParticipants_RollsBackWhenConversationNotLockable(t 
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)FOR SHARE OF dc`).
+	mock.ExpectQuery(`(?s)FOR UPDATE OF dc`).
 		WithArgs(msConversation, msWorkspace).
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectRollback()
@@ -527,7 +527,7 @@ func TestPGXDMStore_AddGroupParticipants_AcceptsNewcomersRegardlessOfSize(t *tes
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)FOR SHARE OF dc`).
+	mock.ExpectQuery(`(?s)FOR UPDATE OF dc`).
 		WithArgs(msConversation, msWorkspace).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(msConversation))
 	mock.ExpectQuery(`(?s)FOR SHARE OF dm`).

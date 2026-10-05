@@ -10,42 +10,10 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
-// Group rename and self-leave (issue #527).
-//
-// Both are group-DM mutations, both are authorized by *participation* — a group
-// has no owner, admin or moderator, because chat.dm_members.role is closed by
-// CHECK to the single value 'member' — and both persist a system message in the
-// same transaction as the change they describe.
-//
-// The lock protocol extends the one PGXDMStore.AddGroupParticipants documents,
-// and the order is the same everywhere so no cycle is reachable between a
-// rename, a leave and an add running at once:
-//
-//  1. the conversation row;
-//  2. the actor's own chat.dm_members row;
-//  3. the actor's own chat.workspace_members row;
-//  4. the write.
-//
-// Step 3 is what the security review found missing. Both operations *read*
-// chat.workspace_members as a precondition — a dm_members row outlives the
-// workspace membership that justified it — but neither held it, so a revocation
-// committing mid-transaction was observed too late and the write went through on
-// authority that no longer existed. It is held FOR SHARE for the same reason
-// lockActorChannelManagementSQL holds the channel path's: suspending, removing
-// or demoting a membership is an UPDATE of that row, which takes FOR NO KEY
-// UPDATE and conflicts with FOR SHARE, so the two serialise in both directions
-// while two participants acting at once still do not block each other.
-//
-// Step 2's mode depends on the operation, and that is the second thing the
-// review found: a transaction that is going to UPDATE a row must not take a
-// shared lock on it first. Two self-leaves doing that both hold FOR SHARE and
-// both then need the exclusive lock the other is holding — a textbook
-// lock-upgrade deadlock, which PostgreSQL resolves by aborting one of them with
-// 40P01 rather than by refusing it for a domain reason. Leave therefore takes
-// the actor's membership FOR UPDATE from the start; rename, which does not touch
-// that row, keeps FOR SHARE. Step 1 follows the same rule for the same reason:
-// the rename UPDATEs the conversation row, so it takes it FOR UPDATE, while the
-// leave does not and takes it FOR SHARE.
+// Legacy group rename and self-leave keep their #527 contracts while ownership
+// is disabled. Once enabled, the HTTP adapter delegates to PGXOwnershipStore.
+// All group writers lock the conversation FOR UPDATE before participant and
+// workspace memberships, serializing them with ownership and invalidation.
 
 // RenameGroupInput is the whole input of a group rename. The actor is an
 // identity and never a decision; the title has already been normalised by the
@@ -90,7 +58,7 @@ const lockGroupConversationSQL = `
 // row: archiving it is an UPDATE that conflicts with FOR SHARE, so an archival
 // in flight is still serialised against the operation, while two of them do not
 // block each other.
-const shareConversation = `FOR SHARE OF dc`
+const shareConversation = `FOR UPDATE OF dc`
 
 // updateConversation is for the rename, which UPDATEs this very row. Taking the
 // exclusive lock up front is what keeps two concurrent renames of one group from
@@ -299,7 +267,7 @@ func lockGroupForCreator(ctx context.Context, tx pgx.Tx, conversationID, workspa
 		  AND dc.workspace_id = $2::uuid
 		  AND dc.status = 'active'
 		  AND dc.type = 'group'
-		FOR SHARE OF dc`,
+		FOR UPDATE OF dc`,
 		conversationID, workspaceID,
 	).Scan(&lockedID, &createdBy)
 	if err != nil {

@@ -37,10 +37,10 @@ function safeDecodeURIComponent(value: string): string {
 }
 
 /**
- * The conversation's display name, from the sidebar payload the header already
- * has.
+ * The sidebar row behind the target, looked up once, and what the header shows
+ * of it: the name and, for a channel, its visibility (issue #1024).
  *
- * Issue #475: this used to fall back to the target's own route id, on the
+ * Issue #475: the name used to fall back to the target's own route id, on the
  * theory that a conversation the sidebar has not delivered yet should still
  * be identifiable. But a conversation absent from the sidebar payload is
  * exactly what a non-member's target looks like, and the route id is a raw
@@ -48,16 +48,36 @@ function safeDecodeURIComponent(value: string): string {
  * backend's non-enumerating 404 is designed to hide. Falls back to an empty
  * string instead; callers show a neutral placeholder while it is empty.
  */
-function conversationName(
+function resolveConversation(
   kind: "channel" | "dm",
   targetId: string,
   ctx: ChatOutletContext,
-  activeDM: DMConversation | undefined,
-): string {
+): Pick<ConversationTarget, "activeDM" | "resolvedName" | "isPrivateChannel"> {
   if (kind === "channel") {
-    return ctx.channels.find((channel) => channel.id === targetId)?.name ?? "";
+    const channel = ctx.channels.find((item) => item.id === targetId);
+    return {
+      activeDM: undefined,
+      resolvedName: channel?.name ?? "",
+      isPrivateChannel: channel?.type === "private",
+    };
   }
-  return activeDM?.name ?? "";
+  // The sidebar payload already carries the counterpart identity, so the header
+  // reads it from the outlet context instead of issuing a per-DM request.
+  const activeDM = ctx.dms.find((dm) => dm.id === targetId);
+  return { activeDM, resolvedName: activeDM?.name ?? "", isPrivateChannel: false };
+}
+
+/** Channels and groups take mentions (and the v3 body that carries them); a 1:1 DM does not. */
+function mentionSettings(
+  kind: "channel" | "dm",
+  targetId: string,
+  activeDM: DMConversation | undefined,
+): Pick<ConversationTarget, "mentionTarget" | "bodyFormat"> {
+  const mentionsEnabled = kind === "channel" || activeDM?.type === "group";
+  return {
+    mentionTarget: mentionsEnabled && targetId ? { kind, id: targetId } : undefined,
+    bodyFormat: mentionsEnabled ? "v3" : "v2",
+  };
 }
 
 /**
@@ -101,6 +121,8 @@ export interface ConversationTarget {
   activeDM: DMConversation | undefined;
   resolvedName: string;
   isChannel: boolean;
+  /** Issue #1024: the sidebar payload's own visibility, false for a DM or an unknown id. */
+  isPrivateChannel: boolean;
   mentionTarget: MentionTarget | undefined;
   bodyFormat: CodecFormat;
   presenceTarget: string | undefined;
@@ -115,23 +137,18 @@ export function useConversationTarget(kind: "channel" | "dm"): ConversationTarge
 
   const targetId = normalizeChatTargetId(safeDecodeURIComponent(params.id ?? ""));
   const focusMessageId = new URLSearchParams(location.search).get("message") ?? "";
-  // The sidebar payload already carries the counterpart identity, so the header
-  // reads it from the outlet context instead of issuing a per-DM request.
-  const activeDM = kind === "dm" ? ctx.dms.find((dm) => dm.id === targetId) : undefined;
-  const resolvedName = conversationName(kind, targetId, ctx, activeDM);
+  const conversation = resolveConversation(kind, targetId, ctx);
+  const { resolvedName } = conversation;
   const isChannel = kind === "channel";
-  const mentionsEnabled = isChannel || activeDM?.type === "group";
 
   return {
     ctx,
     targetId,
     focusMessageId,
     focusRequest: messageJumpRequest(location.state, location.key),
-    activeDM,
-    resolvedName,
+    ...conversation,
     isChannel,
-    mentionTarget: mentionsEnabled && targetId ? { kind, id: targetId } : undefined,
-    bodyFormat: mentionsEnabled ? "v3" : "v2",
+    ...mentionSettings(kind, targetId, conversation.activeDM),
     presenceTarget: targetId ? presenceTargetKey(kind, targetId) : undefined,
     // RF-32 (issue #458): the route's own kind and id — the very pair the
     // composer is keyed by — so an attachment can never be posted to the

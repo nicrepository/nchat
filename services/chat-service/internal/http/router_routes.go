@@ -146,12 +146,13 @@ func (r *routeSet) registerChannelRoutes(channels *ChannelHandler) {
 		return
 	}
 	r.handle("POST "+RouteChannels, nil, channels.Create)
+	r.registerOwnershipRoutes("/api/chat/channels/{channelID}", channels.Ownership)
 	// Rename (issue #527). PATCH only, and only under the {channelID} segment:
 	// the literal /details, /members and /call-participants sit under the same
 	// prefix and Go's mux prefers them.
-	r.handle("PATCH "+RouteChannel, nil, channels.Rename)
+	r.handle("PATCH "+RouteChannel, nil, channels.ownershipAware("rename", channels.Rename))
 	// Self-leave (issue #527). DELETE on the caller's own membership.
-	r.handle("DELETE "+RouteChannelMembership, nil, channels.Leave)
+	r.handle("DELETE "+RouteChannelMembership, nil, channels.ownershipAware("leave", channels.Leave))
 	// Channel details (issue #435) is a read, so it shares the listing budget
 	// rather than the write one: the panel refetches on every channel switch.
 	r.handle("GET "+RouteChannelDetails, r.list, channels.Details)
@@ -169,7 +170,7 @@ func (r *routeSet) registerChannelRoutes(channels *ChannelHandler) {
 	if channels.HasMembers() {
 		r.handle("POST "+RouteChannelMembers, nil, channels.AddMembers)
 		r.handle("GET "+RouteChannelMemberCandidates, nil, channels.MemberCandidates)
-		r.handle("DELETE "+RouteChannelMember, nil, channels.RemoveMember)
+		r.handle("DELETE "+RouteChannelMember, nil, channels.ownershipAware("remove", channels.RemoveMember))
 	}
 }
 
@@ -196,15 +197,16 @@ func (r *routeSet) registerDMRoutes(dms *DMHandler) {
 		return
 	}
 	r.handle("GET "+RouteDMCandidates, nil, dms.SearchCandidates)
+	r.registerOwnershipRoutes("/api/chat/dm/{conversationID}", dms.Ownership)
 	r.handle("POST "+RouteDMConversations, nil, dms.GetOrCreateDirect)
 	r.handle("POST "+RouteDMGroupConversations, nil, dms.CreateGroup)
 	// Adding participants (issue #398): same shared add-members budget as the
 	// channel route, applied inside the handler.
 	r.handle("POST "+RouteDMMembers, nil, dms.AddParticipants)
-	r.handle("PATCH "+RouteDMConversation, nil, dms.RenameGroup)
-	r.handle("DELETE "+RouteDMMembership, nil, dms.LeaveGroup)
+	r.handle("PATCH "+RouteDMConversation, nil, dms.ownershipAware("rename", dms.RenameGroup))
+	r.handle("DELETE "+RouteDMMembership, nil, dms.ownershipAware("leave", dms.LeaveGroup))
 	// Admin removal (issue #685), the counterpart to self-leave.
-	r.handle("DELETE "+RouteDMParticipant, nil, dms.RemoveParticipant)
+	r.handle("DELETE "+RouteDMParticipant, nil, dms.ownershipAware("remove", dms.RemoveParticipant))
 	r.handle("GET "+RouteDMMemberCandidates, nil, dms.ParticipantCandidates)
 	// Group details (issue #441) and the 1:1 profile panel (issue #443) are
 	// reads on the same resource, so they share the listing budget.
@@ -304,4 +306,10 @@ func (r *routeSet) registerPresenceRoutes(messages *MessageHandler) {
 		presence.metrics.Middleware(http.HandlerFunc(presence.Put)))))
 	r.mux.Handle("DELETE "+RoutePresenceMe, r.auth(r.presence.Middleware(
 		presence.metrics.Middleware(http.HandlerFunc(presence.Delete)))))
+}
+
+func (r *routeSet) registerOwnershipRoutes(prefix string, handler http.HandlerFunc) {
+	r.handle("GET "+prefix+"/ownership", r.list, handler)
+	r.handle("PATCH "+prefix+"/members/{userID}/role", r.pinAction, handler)
+	r.handle("POST "+prefix+"/ownership/{operation}", r.pinAction, handler)
 }

@@ -56,19 +56,21 @@ type App struct {
 	Handler         http.Handler
 	TracingShutdown observability.ShutdownFunc
 
-	hub               *ws.Hub
-	presence          *ws.PresenceTracker
-	presenceDirectory *ws.ValkeyPresenceDirectory
-	mentionCache      *storage.ValkeyMentionLabelCache
-	reactionLimiter   *ws.ValkeyReactionLimiter
-	typingLimiter     *ws.ValkeyReactionLimiter
-	typingStore       *ws.ValkeyTypingStore
-	callWorkerCancel  context.CancelFunc
-	callWorkerWG      *sync.WaitGroup
-	linkScanCancel    context.CancelFunc
-	linkScanWG        *sync.WaitGroup
-	closeDB           func()
-	shutdownOnce      sync.Once
+	hub                   *ws.Hub
+	presence              *ws.PresenceTracker
+	presenceDirectory     *ws.ValkeyPresenceDirectory
+	mentionCache          *storage.ValkeyMentionLabelCache
+	reactionLimiter       *ws.ValkeyReactionLimiter
+	typingLimiter         *ws.ValkeyReactionLimiter
+	typingStore           *ws.ValkeyTypingStore
+	ownershipWorkerCancel context.CancelFunc
+	ownershipWorkerWG     *sync.WaitGroup
+	callWorkerCancel      context.CancelFunc
+	callWorkerWG          *sync.WaitGroup
+	linkScanCancel        context.CancelFunc
+	linkScanWG            *sync.WaitGroup
+	closeDB               func()
+	shutdownOnce          sync.Once
 }
 
 // Shutdown stops the WebSocket hub, presence tracker, and tracing exporter in
@@ -105,7 +107,7 @@ func (a *App) shutdownComponents(ctx context.Context) error {
 }
 
 func (a *App) stopWorkers(ctx context.Context) error {
-	var callErr, linkErr error
+	var callErr, linkErr, ownershipErr error
 	if a.callWorkerCancel != nil {
 		a.callWorkerCancel()
 		callErr = awaitWaitGroup(ctx, a.callWorkerWG)
@@ -114,7 +116,11 @@ func (a *App) stopWorkers(ctx context.Context) error {
 		a.linkScanCancel()
 		linkErr = awaitWaitGroup(ctx, a.linkScanWG)
 	}
-	return firstShutdownError(callErr, linkErr)
+	if a.ownershipWorkerCancel != nil {
+		a.ownershipWorkerCancel()
+		ownershipErr = awaitWaitGroup(ctx, a.ownershipWorkerWG)
+	}
+	return firstShutdownError(callErr, linkErr, ownershipErr)
 }
 
 // closeResources releases what the hub was using, in the order that keeps the
@@ -200,6 +206,7 @@ func New(cfg config.Config) (*App, error) {
 	b.buildConversationHandlers()
 	b.buildHub()
 	b.startCallWorker()
+	b.startOwnershipWorker()
 	b.startLinkWorkers()
 	b.attachMessageBroadcasters()
 	b.attachConversationBroadcasters()
@@ -735,6 +742,10 @@ func domainLinkToWSPayload(link domain.MessageLink) ws.LinkPayload {
 		}
 	}
 	return payload
+}
+
+func (b *hubBroadcaster) PublishOwnershipUpdated(ctx context.Context, workspaceID, targetType, targetID string) error {
+	return b.hub.PublishConversationUpdatedReliable(ctx, workspaceID, ws.TargetType(targetType), targetID)
 }
 
 func (b *hubBroadcaster) PublishConversationUpdated(ctx context.Context, workspaceID, targetType, targetID string) {

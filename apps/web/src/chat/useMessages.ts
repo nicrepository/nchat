@@ -52,6 +52,7 @@ import type {
   WSAttachmentStatusEvent,
   WSConversationEventMessage,
   WSMembersAddedEvent,
+  WSConversationUpdatedEvent,
   WSPinUpdatedEvent,
   WSTypingUpdatedEvent,
 } from "./useChatWebSocket";
@@ -81,6 +82,7 @@ interface UseMessagesOptions {
    * membership would double the WebSocket count per conversation.
    */
   onMembersAdded?: (event: WSMembersAddedEvent) => void;
+  onConversationUpdated?: (event: WSConversationUpdatedEvent) => void;
   /**
    * Issue #469: called on a conversation.event for the active target.
    *
@@ -186,6 +188,7 @@ export function useMessages({
   onOwnReactionConfirmed,
   onPinUpdated,
   onMembersAdded,
+  onConversationUpdated,
   onConversationEvent,
   onAttachmentStatus,
   onTypingUpdated,
@@ -288,6 +291,7 @@ export function useMessages({
     listeners: {
       onPinUpdated,
       onMembersAdded,
+      onConversationUpdated,
       onConversationEvent,
       onAttachmentStatus,
       onTypingUpdated,

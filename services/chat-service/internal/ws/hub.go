@@ -831,8 +831,16 @@ func (h *Hub) PublishMembersAdded(
 // subscriber who may read the channel learns only that it changed; what it
 // changed to comes from the sidebar endpoint, which authorizes for itself.
 func (h *Hub) PublishConversationUpdated(ctx context.Context, workspaceID string, targetType TargetType, targetID string) {
+	if err := h.PublishConversationUpdatedReliable(ctx, workspaceID, targetType, targetID); err != nil {
+		h.logger.WarnContext(ctx, "ws: conversation update bus publish failed", "error", err)
+	}
+}
+
+// PublishConversationUpdatedReliable acknowledges bus delivery so a durable
+// outbox can retry a failed fan-out. Subscribers treat duplicates as refetches.
+func (h *Hub) PublishConversationUpdatedReliable(ctx context.Context, workspaceID string, targetType TargetType, targetID string) error {
 	if workspaceID == "" || targetID == "" {
-		return
+		return nil
 	}
 	evt := Event{
 		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeConversationUpdated,
@@ -842,19 +850,16 @@ func (h *Hub) PublishConversationUpdated(ctx context.Context, workspaceID string
 	}
 	data, err := json.Marshal(evt)
 	if err != nil {
-		h.logger.ErrorContext(ctx, "ws: marshal conversation.updated event", "error", err)
-		return
+		return err
 	}
 	select {
 	case h.bcast <- broadcastReq{event: evt, data: data}:
 	case <-ctx.Done():
-		return
+		return ctx.Err()
 	case <-h.quit:
-		return
+		return context.Canceled
 	}
-	if err := h.bus.Publish(ctx, evt); err != nil {
-		h.logger.WarnContext(ctx, "ws: conversation update bus publish failed", "error", err)
-	}
+	return h.bus.Publish(ctx, evt)
 }
 
 // PublishConversationEvent broadcasts that a system message was persisted in a

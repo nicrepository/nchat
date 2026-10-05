@@ -107,6 +107,7 @@ type membersBroadcaster interface {
 
 type ChannelHandler struct {
 	workspaces workspaceResolver
+	ownership  ownershipProvider
 	channels   channelProvider
 	limiter    channelRateLimiter
 	presence   presenceLookup
@@ -298,6 +299,7 @@ type channelDetailsMemberJSON struct {
 // sending the ID would only create the opportunity to render it when the name
 // is missing.
 type channelDetailsResponse struct {
+	Ownership          *storage.OwnershipDetails  `json:"ownership,omitempty"`
 	ID                 string                     `json:"id"`
 	Slug               string                     `json:"slug"`
 	DisplayName        string                     `json:"display_name"`
@@ -379,7 +381,13 @@ func (h *ChannelHandler) Details(w http.ResponseWriter, r *http.Request) {
 		writeChannelDetailsError(w, err)
 		return
 	}
-	httputil.WriteJSON(w, http.StatusOK, channelDetailsBody(details))
+	body := channelDetailsBody(details)
+	body.Ownership, err = ownershipProjection(r.Context(), h.ownership, storage.OwnershipScope{WorkspaceID: workspace.ID, Kind: "channel", ConversationID: channelID, ActorID: callerID})
+	if err != nil {
+		writeOwnershipError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, body)
 }
 
 // onlineUserIDs returns the workspace's online users in one call, or nothing

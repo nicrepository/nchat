@@ -942,6 +942,46 @@ describe("ChatMessageArea — channel header", () => {
     expect(header).toHaveTextContent("geral");
   });
 
+  // Issue #1024: the header draws the same ChannelIcon as the sidebar, from the
+  // visibility the sidebar payload already carries, and says "privado" in words.
+  it.each([
+    ["public", "Canal geral"],
+    ["private", "Canal privado geral"],
+  ] as const)("draws a %s channel's identity and names it", async (type, heading) => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  workspaceId: "workspace-1",
+                  channels: [{ id: "geral", name: "geral", type, canWrite: true }],
+                  dms: [],
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const header = await screen.findByTestId("chat-msg-header");
+    expect(within(header).getByRole("heading", { level: 1, name: heading })).toHaveTextContent(
+      /^geral$/,
+    );
+    expect(header.querySelector("svg[data-channel-icon]")).toHaveAttribute(
+      "data-channel-icon",
+      type,
+    );
+    expect(header.querySelector("img")).toBeNull();
+  });
+
   it("renders DM header with DM name", async () => {
     mockFetchDMMessages.mockResolvedValue(emptyPage);
     render(

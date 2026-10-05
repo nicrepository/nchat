@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/nicrepository/nchat/libs/go/platform/channelmembership"
+	"github.com/nicrepository/nchat/libs/go/platform/conversationownership"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
@@ -191,6 +192,11 @@ func addWorkspaceMember(ctx context.Context, q memberQuerier, workspaceID, userI
 // ActivateWorkspaceMember locks #geral before reactivating the target, matching
 // the channel-then-target order used by batch member additions.
 func (s *PGXMemberStore) ActivateWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
+	value, err := conversationownership.Retry(ctx, func() (domain.WorkspaceMember, error) { return s.activateWorkspaceMemberOnce(ctx, workspaceID, userID) })
+	return value, mapOwnershipError(err)
+}
+
+func (s *PGXMemberStore) activateWorkspaceMemberOnce(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return domain.WorkspaceMember{}, fmt.Errorf("begin activate workspace member: %w", err)
@@ -201,6 +207,10 @@ func (s *PGXMemberStore) ActivateWorkspaceMember(ctx context.Context, workspaceI
 			_ = tx.Rollback(ctx)
 		}
 	}()
+
+	if err := prepareOwnershipWorkspaceAccess(ctx, tx, workspaceID, userID); err != nil {
+		return domain.WorkspaceMember{}, err
+	}
 
 	if err := ensureWorkspaceActive(ctx, tx, workspaceID); err != nil {
 		return domain.WorkspaceMember{}, err
@@ -1340,4 +1350,19 @@ func (s *PGXMemberStore) RemoveChannelMemberByAdmin(ctx context.Context, workspa
 	}
 	committed = true
 	return event, nil
+}
+
+func prepareOwnershipWorkspaceAccess(ctx context.Context, tx pgx.Tx, workspaceID, userID string) error {
+	if _, err := tx.Exec(ctx, conversationownership.SerializableSQL); err != nil {
+		return err
+	}
+	var available bool
+	if err := tx.QueryRow(ctx, conversationownership.AvailabilitySQL).Scan(&available); err != nil {
+		return err
+	}
+	if !available {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `SELECT chat.lock_user_ownership_conversations($1::uuid,$2::uuid)`, userID, workspaceID)
+	return err
 }

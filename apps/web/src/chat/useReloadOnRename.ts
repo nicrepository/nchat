@@ -43,6 +43,15 @@
  */
 
 import { useEffect, useRef } from "react";
+import type { AsyncSection } from "./useConversationDetails";
+import type { ConversationDetails } from "./chatTypes";
+
+export function projectedConversationName(
+  details: AsyncSection<ConversationDetails>,
+): string | undefined {
+  if (details.status !== "ready" || details.data.kind === "direct") return undefined;
+  return details.data.name;
+}
 
 /**
  * @param key   stable identity of the target, `kind:id`. Never its name.
@@ -55,6 +64,7 @@ export function useReloadOnRename(
   name: string,
   open: boolean,
   reload: () => void,
+  projectedName?: string,
 ): void {
   const last = useRef({ key, name });
   useEffect(() => {
@@ -62,6 +72,9 @@ export function useReloadOnRename(
     last.current = { key, name };
     if (previous.key !== key) return;
     if (previous.name === name) return;
+    // A realtime invalidation may have already fetched this canonical name.
+    // It also refreshes roles, which can change while the name stays the same.
+    if (projectedName === name) return;
     if (open) reload();
-  }, [key, name, open, reload]);
+  }, [key, name, open, reload, projectedName]);
 }

@@ -301,6 +301,8 @@ func TestPGXUserStore_UpdateUserStatus_Suspend_Atomic(t *testing.T) {
 	// Atomic: BEGIN, lock+read status, UPDATE users, revoke sessions CTE,
 	// invalidate OIDC exchange codes, COMMIT — all or nothing.
 	mock.ExpectBegin()
+	mock.ExpectExec(`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`).WillReturnResult(pgxmock.NewResult("SET", 0))
+	mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(false))
 	mock.ExpectQuery(`SELECT status FROM auth\.users`).
 		WithArgs("uid-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
@@ -339,6 +341,8 @@ func TestPGXUserStore_UpdateUserStatus_Activate_NoRevocationNoOIDCInvalidation(t
 	// Activation: no session revocation and no OIDC exchange code invalidation.
 	// A code previously invalidated by suspension retains its used_at marker.
 	mock.ExpectBegin()
+	mock.ExpectExec(`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`).WillReturnResult(pgxmock.NewResult("SET", 0))
+	mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(false))
 	mock.ExpectQuery(`SELECT status FROM auth\.users`).
 		WithArgs("uid-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("suspended"))
@@ -369,6 +373,8 @@ func TestPGXUserStore_UpdateUserStatus_NotFound(t *testing.T) {
 	defer mock.Close()
 
 	mock.ExpectBegin()
+	mock.ExpectExec(`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`).WillReturnResult(pgxmock.NewResult("SET", 0))
+	mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(false))
 	mock.ExpectQuery(`SELECT status FROM auth\.users`).
 		WithArgs("no-id").
 		WillReturnRows(pgxmock.NewRows([]string{"status"})) // empty = not found
@@ -393,6 +399,8 @@ func TestPGXUserStore_UpdateUserStatus_InvalidTransition_Rejected(t *testing.T) 
 
 	// active→active is invalid; status is read under lock then rejected
 	mock.ExpectBegin()
+	mock.ExpectExec(`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`).WillReturnResult(pgxmock.NewResult("SET", 0))
+	mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(false))
 	mock.ExpectQuery(`SELECT status FROM auth\.users`).
 		WithArgs("uid-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
@@ -418,6 +426,8 @@ func TestPGXUserStore_UpdateUserStatus_RevocationFailure_RollsBackStatus(t *test
 	// Status update succeeds but session revocation fails → entire TX rolls back.
 	// No partial state: user remains active.
 	mock.ExpectBegin()
+	mock.ExpectExec(`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`).WillReturnResult(pgxmock.NewResult("SET", 0))
+	mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(false))
 	mock.ExpectQuery(`SELECT status FROM auth\.users`).
 		WithArgs("uid-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
@@ -450,6 +460,8 @@ func TestPGXUserStore_UpdateUserStatus_OIDCInvalidationFailure_RollsBackAll(t *t
 	defer mock.Close()
 
 	mock.ExpectBegin()
+	mock.ExpectExec(`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`).WillReturnResult(pgxmock.NewResult("SET", 0))
+	mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(false))
 	mock.ExpectQuery(`SELECT status FROM auth\.users`).
 		WithArgs("uid-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
@@ -494,6 +506,8 @@ func TestPGXUserStore_SuspendOIDCExchangeLifecycle(t *testing.T) {
 		defer mock.Close()
 
 		mock.ExpectBegin()
+		mock.ExpectExec(`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`).WillReturnResult(pgxmock.NewResult("SET", 0))
+		mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(false))
 		mock.ExpectQuery(`SELECT status FROM auth\.users`).
 			WithArgs("user-abc").
 			WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
@@ -536,6 +550,8 @@ func TestPGXUserStore_SuspendOIDCExchangeLifecycle(t *testing.T) {
 
 		// Activation TX must NOT include any UPDATE to oidc_exchange_codes.
 		mock.ExpectBegin()
+		mock.ExpectExec(`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`).WillReturnResult(pgxmock.NewResult("SET", 0))
+		mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(false))
 		mock.ExpectQuery(`SELECT status FROM auth\.users`).
 			WithArgs("user-abc").
 			WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("suspended"))

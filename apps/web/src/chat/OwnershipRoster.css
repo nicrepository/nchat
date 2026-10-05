@@ -1,0 +1,320 @@
+.ownership-roster {
+  padding: 18px 0;
+  color: var(--color-ink, #16121f);
+}
+.ownership-roster ul {
+  list-style: none;
+  padding: 0;
+  margin: 10px 0 14px;
+}
+.ownership-roster__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 58px;
+  padding: 8px 0;
+}
+.ownership-roster__avatar {
+  position: relative;
+  flex: none;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+}
+.ownership-roster__avatar .user-avatar__image {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+}
+.ownership-roster__person {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+.ownership-roster__name {
+  max-width: 100%;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.ownership-roster__identity {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.ownership-roster__identity:hover {
+  color: var(--color-primary, #6d28d9);
+}
+.ownership-roster__self {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--color-muted, #7c7390);
+}
+.ownership-roster__badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.ownership-roster__badge .material-symbols-outlined {
+  font-size: 13px;
+}
+.ownership-roster__badge--owner {
+  color: var(--color-primary-strong, #5b21b6);
+  background: var(--color-primary-tint, #f3ebfb);
+}
+.ownership-roster__badge--admin {
+  color: var(--color-ink-2, #3d3550);
+  background: var(--color-surface-2, #faf8fd);
+  border: 1px solid var(--color-border, #e8e3f0);
+}
+.ownership-roster__more {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--color-muted, #7c7390);
+  cursor: pointer;
+}
+.ownership-roster__more .material-symbols-outlined {
+  font-size: 21px;
+}
+.ownership-roster__more:hover,
+.ownership-roster__more[aria-expanded="true"] {
+  color: var(--color-primary, #6d28d9);
+  background: var(--color-primary-tint, #f3ebfb);
+}
+.ownership-member-menu {
+  position: fixed;
+  z-index: 430;
+  width: min(248px, calc(100vw - 16px));
+  box-sizing: border-box;
+  padding: 6px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 10px;
+  background: var(--color-surface, #fff);
+  box-shadow: 0 8px 30px rgb(22 18 31 / 16%);
+}
+.ownership-member-menu button {
+  display: block;
+  width: 100%;
+  min-height: 38px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-ink-2, #3d3550);
+  text-align: left;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.ownership-member-menu button:hover {
+  background: var(--color-surface-2, #faf8fd);
+}
+.ownership-member-menu .ownership-member-menu__danger {
+  margin-top: 4px;
+  border-top: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 0 0 6px 6px;
+  color: var(--color-danger, #b42318);
+}
+.ownership-roster__leave {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  min-height: 36px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-danger, #b42318);
+  cursor: pointer;
+}
+.ownership-roster__leave:hover {
+  background: var(--color-danger-tint, #fdeceb);
+}
+.ownership-roster__filters {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0;
+}
+.ownership-roster__filters label {
+  display: grid;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--color-muted, #7c7390);
+}
+.ownership-roster__empty {
+  margin: 20px 0;
+  font-size: 12px;
+  color: var(--color-muted, #7c7390);
+}
+.ownership-dialog {
+  box-sizing: border-box;
+  width: min(440px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+  padding: 24px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 16px;
+  background: var(--color-surface, #fff);
+  color: var(--color-ink, #16121f);
+  box-shadow: 0 24px 64px rgb(22 18 31 / 24%);
+}
+.ownership-dialog::backdrop {
+  background: rgb(22 18 31 / 58%);
+  backdrop-filter: blur(3px);
+}
+.ownership-dialog__heading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.ownership-dialog__icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  font-size: 22px;
+  color: var(--color-primary, #6d28d9);
+  background: var(--color-primary-tint, #f3ebfb);
+}
+.ownership-dialog h3 {
+  margin: 0;
+  font-size: 19px;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+.ownership-dialog p {
+  margin: 12px 0;
+  color: var(--color-muted, #7c7390);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.ownership-dialog__person {
+  display: grid;
+  gap: 5px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 10px;
+  background: var(--color-surface-2, #faf8fd);
+  overflow-wrap: anywhere;
+}
+.ownership-dialog__person strong {
+  font-size: 14px;
+}
+.ownership-dialog__person span {
+  font-size: 12px;
+  color: var(--color-muted, #7c7390);
+}
+.ownership-dialog label {
+  display: grid;
+  gap: 7px;
+  margin: 16px 0;
+  font-size: 12px;
+  font-weight: 600;
+}
+.ownership-dialog select,
+.ownership-roster__filters input,
+.ownership-roster__filters select {
+  width: 100%;
+  min-height: 40px;
+  box-sizing: border-box;
+  padding: 9px 12px;
+  border: 1px solid var(--color-border-strong, #d4cde3);
+  border-radius: 8px;
+  background: var(--color-surface, #fff);
+  color: var(--color-ink, #16121f);
+  font: inherit;
+  font-size: 13px;
+}
+.ownership-dialog .ownership-dialog__checkbox {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 12px 0;
+  border-top: 1px solid var(--color-border, #e8e3f0);
+  font-weight: 400;
+}
+.ownership-dialog__checkbox input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--color-primary, #6d28d9);
+}
+.ownership-dialog__buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 22px;
+}
+.ownership-dialog__buttons button {
+  min-height: 38px;
+  padding: 0 16px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 10px;
+  background: var(--color-surface, #fff);
+  color: var(--color-ink, #16121f);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ownership-dialog__buttons .ownership-dialog__confirm {
+  border-color: var(--color-primary, #6d28d9);
+  background: var(--color-primary, #6d28d9);
+  color: white;
+}
+.ownership-dialog__buttons .ownership-dialog__confirm--danger {
+  border-color: var(--color-danger, #b42318);
+  background: var(--color-danger, #b42318);
+}
+.ownership-dialog__buttons button:hover:not(:disabled) {
+  filter: brightness(0.96);
+}
+.ownership-dialog__buttons button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.ownership-dialog .ownership-dialog__error {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--color-danger-tint, #fdeceb);
+  color: var(--color-danger, #b42318);
+}
+.ownership-dialog :is(button, select, input):focus-visible,
+.ownership-roster :is(button, input, select):focus-visible,
+.ownership-member-menu button:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+@media (max-width: 480px) {
+  .ownership-dialog {
+    padding: 20px;
+  }
+  .ownership-dialog__buttons button {
+    flex: 1;
+  }
+}

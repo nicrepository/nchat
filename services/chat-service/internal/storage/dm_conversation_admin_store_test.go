@@ -331,7 +331,7 @@ func TestPGXDMStore_RenameGroupConversation_PropagatesFailures(t *testing.T) {
 // found, and this is the assertion that keeps it fixed.
 func TestPGXDMStore_LeaveGroupConversation_LocksTheMembershipForUpdate(t *testing.T) {
 	mock := newMock(t)
-	expectGroupLocks(mock, `FOR SHARE OF dc`, `FOR UPDATE OF dm`, "Equipe")
+	expectGroupLocks(mock, `FOR UPDATE OF dc`, `FOR UPDATE OF dm`, "Equipe")
 	mock.ExpectQuery(`INSERT INTO chat\.messages`).
 		WithArgs(adminWS, pgxmock.AnyArg(), pgxmock.AnyArg(), adminActor,
 			string(domain.ConversationEventMemberLeft), pgxmock.AnyArg()).
@@ -357,7 +357,7 @@ func TestPGXDMStore_LeaveGroupConversation_LocksTheMembershipForUpdate(t *testin
 // rather than committed as a departure that did not happen.
 func TestPGXDMStore_LeaveGroupConversation_NoActiveMembershipRollsBack(t *testing.T) {
 	mock := newMock(t)
-	expectGroupLocks(mock, `FOR SHARE OF dc`, `FOR UPDATE OF dm`, "Equipe")
+	expectGroupLocks(mock, `FOR UPDATE OF dc`, `FOR UPDATE OF dm`, "Equipe")
 	mock.ExpectQuery(`INSERT INTO chat\.messages`).
 		WithArgs(adminWS, pgxmock.AnyArg(), pgxmock.AnyArg(), adminActor,
 			string(domain.ConversationEventMemberLeft), pgxmock.AnyArg()).
@@ -415,7 +415,7 @@ func TestPGXDMStore_LeaveGroupConversation_PropagatesFailures(t *testing.T) {
 	// The departure and its event are one commit, in both directions.
 	t.Run("event insert", func(t *testing.T) {
 		mock := newMock(t)
-		expectGroupLocks(mock, `FOR SHARE OF dc`, `FOR UPDATE OF dm`, "Equipe")
+		expectGroupLocks(mock, `FOR UPDATE OF dc`, `FOR UPDATE OF dm`, "Equipe")
 		mock.ExpectQuery(`INSERT INTO chat\.messages`).
 			WithArgs(adminWS, pgxmock.AnyArg(), pgxmock.AnyArg(), adminActor,
 				string(domain.ConversationEventMemberLeft), pgxmock.AnyArg()).
@@ -431,7 +431,7 @@ func TestPGXDMStore_LeaveGroupConversation_PropagatesFailures(t *testing.T) {
 
 	t.Run("membership update", func(t *testing.T) {
 		mock := newMock(t)
-		expectGroupLocks(mock, `FOR SHARE OF dc`, `FOR UPDATE OF dm`, "Equipe")
+		expectGroupLocks(mock, `FOR UPDATE OF dc`, `FOR UPDATE OF dm`, "Equipe")
 		mock.ExpectQuery(`INSERT INTO chat\.messages`).
 			WithArgs(adminWS, pgxmock.AnyArg(), pgxmock.AnyArg(), adminActor,
 				string(domain.ConversationEventMemberLeft), pgxmock.AnyArg()).
@@ -450,7 +450,7 @@ func TestPGXDMStore_LeaveGroupConversation_PropagatesFailures(t *testing.T) {
 
 	t.Run("commit", func(t *testing.T) {
 		mock := newMock(t)
-		expectGroupLocks(mock, `FOR SHARE OF dc`, `FOR UPDATE OF dm`, "Equipe")
+		expectGroupLocks(mock, `FOR UPDATE OF dc`, `FOR UPDATE OF dm`, "Equipe")
 		mock.ExpectQuery(`INSERT INTO chat\.messages`).
 			WithArgs(adminWS, pgxmock.AnyArg(), pgxmock.AnyArg(), adminActor,
 				string(domain.ConversationEventMemberLeft), pgxmock.AnyArg()).
@@ -479,7 +479,7 @@ const adminTarget = "user-2"
 // one extra fact this operation's authorization needs, created_by.
 func expectCreatorLocks(mock pgxmock.PgxPoolIface, callerID, createdBy string) {
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*dc\.type = 'group'.*FOR SHARE OF dc`).
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*dc\.type = 'group'.*FOR UPDATE OF dc`).
 		WithArgs(adminConv, adminWS).
 		WillReturnRows(pgxmock.NewRows([]string{"id", "created_by"}).AddRow(adminConv, createdBy))
 	mock.ExpectQuery(`(?s)FROM chat\.dm_members dm.*dm\.status = 'active'.*FOR SHARE OF dm`).
@@ -586,7 +586,7 @@ func TestPGXDMStore_RemoveGroupParticipant_RollsBackWhenEventInsertFails(t *test
 func TestPGXDMStore_RemoveGroupParticipant_UnlockableConversationIsNotFound(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*dc\.type = 'group'.*FOR SHARE OF dc`).
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*dc\.type = 'group'.*FOR UPDATE OF dc`).
 		WithArgs(adminConv, adminWS).
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectRollback()

@@ -1,0 +1,14 @@
+BEGIN;
+DROP TRIGGER IF EXISTS ownership_workspace_access ON chat.workspace_members;
+DROP TRIGGER IF EXISTS ownership_account_access ON auth.users;
+DROP TRIGGER IF EXISTS dm_ownership_commit ON chat.dm_members;
+DROP TRIGGER IF EXISTS channel_ownership_commit ON chat.channel_members;
+DROP TRIGGER IF EXISTS dm_ownership_departure ON chat.dm_members;
+DROP TRIGGER IF EXISTS channel_ownership_departure ON chat.channel_members;
+DROP FUNCTION IF EXISTS chat.ownership_access_changed();
+DROP FUNCTION IF EXISTS chat.check_ownership_membership();
+DROP FUNCTION IF EXISTS chat.ownership_membership_departure();
+DROP FUNCTION IF EXISTS chat.ensure_conversation_owner(TEXT, UUID, BOOLEAN, TEXT);
+DROP FUNCTION IF EXISTS chat.lock_user_ownership_conversations(UUID, UUID);
+DROP FUNCTION IF EXISTS chat.lock_ownership_conversation(TEXT, UUID);
+COMMIT;

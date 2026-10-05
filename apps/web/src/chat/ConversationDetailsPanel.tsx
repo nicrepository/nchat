@@ -1,3 +1,5 @@
+import OwnershipRoster from "./OwnershipRoster";
+import { renameChannel, renameGroup } from "./chatApi";
 /**
  * ConversationDetailsPanel — the side panel for a channel ("Detalhes do canal",
  * issue #435), an ad-hoc group ("Detalhes do grupo", issue #441) and a 1:1 DM
@@ -1283,7 +1285,7 @@ function PeopleSection({
   // comparison closes it during render — the dialog unmounts, its
   // AbortController cancels any in-flight search or submit, and the selection
   // goes with it. One structural mechanism, no effect.
-  const pickerOpen = pickerFor !== null && pickerFor === targetId && targetId !== "";
+  const pickerOpen = pickerFor === targetId && targetId !== "";
 
   // Plain functions rather than useCallback: AddMembersDialog only calls them
   // — it keeps neither in an effect's dependencies and is not memoized — so
@@ -1320,6 +1322,7 @@ function PeopleSection({
     });
   }
 
+  const ownership = ownershipProjection(details);
   return (
     <>
       {/*
@@ -1329,72 +1332,89 @@ function PeopleSection({
         statement about a list that no longer exists. The remount React already
         offers is the whole mechanism; there is no reset protocol to maintain.
       */}
-      <ExpandableDetailsSection
-        key={`people-${targetId}`}
-        title={sectionWords.heading}
-        listLabel={sectionWords.label}
-        /*
+      {ownership ? (
+        <OwnershipRoster
+          key={`ownership-${kind}-${targetId}`}
+          kind={kind}
+          id={targetId}
+          ownership={ownership}
+          addButtonRef={addMembersButtonRef}
+          presence={presence}
+          onOpenDM={directMessageAction(openDM)}
+          workspaceId={workspaceId}
+          currentUserId={currentUserId}
+          reload={reload}
+          onCommitted={(text) => setAddedNotice({ targetId, text })}
+          onAdd={() => setPickerFor(targetId)}
+          onRemove={(member, trigger) => removal.request({ ...member, subtitle: "" }, trigger)}
+        />
+      ) : (
+        <ExpandableDetailsSection
+          key={`people-${targetId}`}
+          title={sectionWords.heading}
+          listLabel={sectionWords.label}
+          /*
           Left undefined whenever the preview is the whole collection, which is
           what keeps "Ver todos" as the default wording for every section that
           can genuinely show everything.
         */
-        expandLabel={channelRoster?.nextCursor ? "Carregar mais" : shortfall.expandLabel}
-        onExpand={channelRoster?.nextCursor ? loadMoreMembers : undefined}
-        content={peopleContent({
-          kind,
-          details,
-          roster: channelRoster,
-          rosterState: roster,
-          context: { presence, currentUserId, openDM },
-          workspaceId,
-          removal: rowRemoval,
-        })}
-      >
-        {/*
+          expandLabel={channelRoster?.nextCursor ? "Carregar mais" : shortfall.expandLabel}
+          onExpand={channelRoster?.nextCursor ? loadMoreMembers : undefined}
+          content={peopleContent({
+            kind,
+            details,
+            roster: channelRoster,
+            rosterState: roster,
+            context: { presence, currentUserId, openDM },
+            workspaceId,
+            removal: rowRemoval,
+          })}
+        >
+          {/*
           Named before the actions, directly under the list it is about: how many
           of the conversation's people this client is holding. The heading above
           already says how many there are.
         */}
-        <RosterShortfallNote note={shortfall.note} />
-        {/*
+          <RosterShortfallNote note={shortfall.note} />
+          {/*
           Rendered only once the server has answered and said this caller may
           add members. Loading, error and "not permitted" all leave it absent —
           the safe default, since canAddMembers is false unless the server sent
           exactly true. Hiding it is not the security boundary.
         */}
-        {canAdd && (
-          <button
-            ref={addMembersButtonRef}
-            type="button"
-            className="chat-details__wide-action"
-            onClick={() => setPickerFor(targetId)}
-            data-testid="chat-details-add-members"
-          >
-            <span className="material-symbols-outlined" aria-hidden="true">
-              person_add
-            </span>
-            {copy.addAction}
-          </button>
-        )}
-        {addedNotice?.targetId === targetId && (
-          // Announced rather than shown as a transient toast: the panel above
-          // has already been refetched, and this says what changed.
-          <p className="chat-details__note" role="status">
-            {addedNotice.text}
-          </p>
-        )}
-        {removal.notice !== "" && (
-          /*
+          {canAdd && (
+            <button
+              ref={addMembersButtonRef}
+              type="button"
+              className="chat-details__wide-action"
+              onClick={() => setPickerFor(targetId)}
+              data-testid="chat-details-add-members"
+            >
+              <span className="material-symbols-outlined" aria-hidden="true">
+                person_add
+              </span>
+              {copy.addAction}
+            </button>
+          )}
+        </ExpandableDetailsSection>
+      )}
+
+      {addedNotice?.targetId === targetId && (
+        <p className="chat-details__note" role="status">
+          {addedNotice.text}
+        </p>
+      )}
+      {removal.notice !== "" && (
+        /*
             A removal is announced rather than only seen (issue #469): the row
             it happened to is gone from the list, and focus has moved to the
             control above — neither of which says anything to someone who is
             not looking at the panel.
           */
-          <p className="chat-details__note" role="status">
-            {removal.notice}
-          </p>
-        )}
-      </ExpandableDetailsSection>
+        <p className="chat-details__note" role="status">
+          {removal.notice}
+        </p>
+      )}
 
       <MemberRemovalDialog
         kind={kind}
@@ -1437,6 +1457,36 @@ function PeopleSection({
  * Each section decides its own content; this function decides only which
  * sections exist and in what order.
  */
+function ownershipProjection(details: ConversationDetailsState["details"]) {
+  const target = ownershipConversationOf(details);
+  return target ? target.ownership : undefined;
+}
+
+function directMessageAction(access?: DirectMessageAccess) {
+  return access ? (userId: string) => access.coordinator.open(userId, access.origin) : undefined;
+}
+
+function ownershipConversationOf(details: ConversationDetailsState["details"]) {
+  if (details.status !== "ready" || details.data.kind === "direct") return undefined;
+  return details.data;
+}
+
+function ownershipRenameAction(
+  kind: "channel" | "group",
+  details: ConversationDetailsState["details"],
+  reload: () => void,
+  legacy?: ConversationRenameAction,
+): ConversationRenameAction | undefined {
+  const target = ownershipConversationOf(details);
+  if (!target?.ownership) return legacy;
+  if (target.ownership.capabilities.editMetadata !== true) return undefined;
+  return async (name: string) => {
+    if (kind === "channel") await renameChannel(target.id, name);
+    else await renameGroup(target.id, name);
+    reload();
+  };
+}
+
 function ConversationBody({
   kind,
   details: rawDetails,
@@ -1475,9 +1525,10 @@ function ConversationBody({
       ? { status: "loading" }
       : rawDetails;
 
+  const ownedRename = ownershipRenameAction(kind, details, reload, onRename);
   return (
     <>
-      <AboutSection kind={kind} details={details} onRename={onRename} />
+      <AboutSection kind={kind} details={details} onRename={ownedRename} />
       <PeopleSection
         kind={kind}
         details={details}

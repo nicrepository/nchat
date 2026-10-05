@@ -1,4 +1,4 @@
-import { type FormEvent, useEffect, useRef, useState } from "react";
+import { type FormEvent, useState } from "react";
 
 import { ApiRequestError } from "../lib/api";
 import { createChannel, createChannelCategory } from "./chatApi";
@@ -10,6 +10,7 @@ import {
   validateChannelForm,
   type ChannelFormType,
 } from "./channelForm";
+import { useSingleSubmission } from "./useSingleSubmission";
 
 interface ChannelCreationFormProps {
   categories: ChannelCategory[];
@@ -47,10 +48,119 @@ function createErrorMessage(error: unknown): string {
   return "Não foi possível criar o canal. Tente novamente.";
 }
 
+interface ChannelCategoryFieldProps {
+  categories: ChannelCategory[];
+  selectedCategoryId: string;
+  newCategoryName: string;
+  disabled: boolean;
+  onSelect: (categoryId: string) => void;
+  onNewCategoryNameChange: (name: string) => void;
+}
+
+/** Category picker, plus the name of a new one when that option is chosen. */
+function ChannelCategoryField({
+  categories,
+  selectedCategoryId,
+  newCategoryName,
+  disabled,
+  onSelect,
+  onNewCategoryNameChange,
+}: ChannelCategoryFieldProps) {
+  return (
+    <>
+      <label className="new-dm-dialog__group-name" htmlFor="new-channel-category-select">
+        Categoria
+      </label>
+      <div className="new-dm-dialog__search-field">
+        <select
+          id="new-channel-category-select"
+          value={selectedCategoryId}
+          disabled={disabled}
+          onChange={(event) => onSelect(event.target.value)}
+          style={{
+            width: "100%",
+            background: "transparent",
+            border: "none",
+            outline: "none",
+            color: "inherit",
+            font: "inherit",
+            fontSize: "14px",
+            height: "42px",
+            cursor: "pointer",
+          }}
+        >
+          <option value="">Nenhuma (Geral)</option>
+          {categories
+            .filter((cat) => cat.kind === "category" && cat.id)
+            .map((cat) => (
+              <option key={cat.id} value={cat.id}>
+                {cat.name}
+              </option>
+            ))}
+          <option value="__new__">+ Criar nova categoria...</option>
+        </select>
+      </div>
+
+      {selectedCategoryId === "__new__" && (
+        <>
+          <label className="new-dm-dialog__group-name" htmlFor="new-channel-new-category">
+            Nome da nova categoria
+          </label>
+          <div className="new-dm-dialog__search-field">
+            <input
+              id="new-channel-new-category"
+              type="text"
+              autoComplete="off"
+              placeholder="Ex.: Projetos Especiais"
+              value={newCategoryName}
+              disabled={disabled}
+              onChange={(event) => onNewCategoryNameChange(event.target.value)}
+            />
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
+interface ChannelSubmitFooterProps {
+  type: ChannelFormType;
+  pending: boolean;
+  disabled: boolean;
+}
+
+function ChannelSubmitFooter({ type, pending, disabled }: ChannelSubmitFooterProps) {
+  return (
+    <footer className="new-dm-dialog__footer">
+      <p className="new-dm-dialog__footer-hint">
+        {type === "public"
+          ? "Todo o workspace poderá entrar."
+          : "Somente convidados verão este canal."}
+      </p>
+      <button
+        type="submit"
+        className="new-dm-dialog__submit"
+        // The accessible name stays fixed while the visible label switches to
+        // "Criando…", so assistive tech announces the busy state instead of a
+        // control that appears to have been replaced mid-action.
+        aria-label="Criar canal"
+        disabled={disabled}
+        aria-busy={pending}
+      >
+        {pending ? "Criando…" : "Criar canal"}
+      </button>
+    </footer>
+  );
+}
+
 /**
  * The canonical channel-creation form (RF-01), rendered inside the single
  * "Nova conversa" dialog (BUG #393). It owns the fields and the one write it
  * can make; the dialog shell around it owns focus, Escape and the backdrop.
+ *
+ * The shell keeps it mounted (hidden) while another mode is visited, so the
+ * draft survives a detour (issue #1023). For the same reason it does not grab
+ * focus on mount: focus stays on the mode the user just chose.
  *
  * Nothing here decides whether the user may create a channel: the endpoint
  * derives the actor, the workspace and the membership from the session on every
@@ -70,14 +180,8 @@ export default function ChannelCreationForm({
   // than asking the user to keep it in sync themselves.
   const [slugEdited, setSlugEdited] = useState(false);
   const [type, setType] = useState<ChannelFormType>("public");
-  const [error, setError] = useState("");
-  const [pending, setPending] = useState(false);
-  const nameInputRef = useRef<HTMLInputElement>(null);
-  // State updates are asynchronous, so `pending` cannot stop a second click
-  // fired in the same tick; this ref is what actually makes submission single.
-  const submittingRef = useRef(false);
-  const abortRef = useRef<AbortController>(null);
-  const mountedRef = useRef(true);
+  const submission = useSingleSubmission(onPendingChange);
+  const { pending, error, setError } = submission;
 
   const effectiveSlug = slugEdited ? slug : slugifyChannelName(displayName);
   const trimmedName = displayName.trim();
@@ -87,20 +191,6 @@ export default function ChannelCreationForm({
   // telling someone their name is empty before they have typed is noise. The
   // field is never truncated, so a pasted name stays intact and editable.
   const nameError = trimmedName === "" ? null : validateChannelDisplayName(trimmedName);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    nameInputRef.current?.focus();
-    return () => {
-      mountedRef.current = false;
-      abortRef.current?.abort();
-    };
-  }, []);
-
-  function markPending(next: boolean) {
-    setPending(next);
-    onPendingChange(next);
-  }
 
   /**
    * The form's only entry point, for both Enter and the submit button.
@@ -112,57 +202,49 @@ export default function ChannelCreationForm({
    */
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    void submit();
+    submit();
+  }
+
+  function validationError(): string | null {
+    const message = validateChannelForm({ displayName, slug: effectiveSlug });
+    if (message) return message;
+    if (selectedCategoryId === "__new__" && !newCategoryName.trim()) {
+      return "Digite o nome da nova categoria.";
+    }
+    return null;
+  }
+
+  async function createWithCategory(signal: AbortSignal) {
+    let finalCategoryId = selectedCategoryId;
+    if (selectedCategoryId === "__new__") {
+      const newCat = await createChannelCategory(newCategoryName, signal);
+      finalCategoryId = newCat.id || "";
+    }
+    return createChannel(
+      {
+        slug: effectiveSlug,
+        displayName,
+        type,
+        categoryId: finalCategoryId || undefined,
+      },
+      signal,
+    );
   }
 
   /**
-   * Creates the channel, at most once per submission.
+   * Creates the channel, at most once per submission (useSingleSubmission).
    *
    * The local validation only spares a round trip; chat-service applies the same
    * rules and the authorization check no matter what is sent. On failure the form
-   * stays put with the fields intact so a retry costs one click, and the mounted
-   * guard keeps a late response from touching state after the dialog unmounts.
+   * stays put with the fields intact so a retry costs one click.
    */
-  async function submit() {
-    if (submittingRef.current) return;
-    const message = validateChannelForm({ displayName, slug: effectiveSlug });
+  function submit() {
+    const message = validationError();
     if (message) {
       setError(message);
       return;
     }
-    if (selectedCategoryId === "__new__" && !newCategoryName.trim()) {
-      setError("Digite o nome da nova categoria.");
-      return;
-    }
-    submittingRef.current = true;
-    markPending(true);
-    setError("");
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    try {
-      let finalCategoryId = selectedCategoryId;
-      if (selectedCategoryId === "__new__") {
-        const newCat = await createChannelCategory(newCategoryName, controller.signal);
-        finalCategoryId = newCat.id || "";
-      }
-
-      const channel = await createChannel(
-        {
-          slug: effectiveSlug,
-          displayName,
-          type,
-          categoryId: finalCategoryId || undefined,
-        },
-        controller.signal,
-      );
-      if (mountedRef.current) onCreated(channel.id);
-    } catch (err) {
-      if (mountedRef.current) setError(createErrorMessage(err));
-    } finally {
-      submittingRef.current = false;
-      if (mountedRef.current) markPending(false);
-    }
+    submission.run(createWithCategory, (channel) => onCreated(channel.id), createErrorMessage);
   }
 
   return (
@@ -203,7 +285,6 @@ export default function ChannelCreationForm({
           what the user meant to keep. The count that decides is the server's,
           mirrored here in code points. */}
           <input
-            ref={nameInputRef}
             id="new-channel-name"
             type="text"
             autoComplete="off"
@@ -252,63 +333,20 @@ export default function ChannelCreationForm({
           Letras minúsculas, números e hifens internos. Aparece como #{effectiveSlug || "canal"}.
         </p>
 
-        <label className="new-dm-dialog__group-name" htmlFor="new-channel-category-select">
-          Categoria
-        </label>
-        <div className="new-dm-dialog__search-field">
-          <select
-            id="new-channel-category-select"
-            value={selectedCategoryId}
-            disabled={pending}
-            onChange={(event) => {
-              setSelectedCategoryId(event.target.value);
-              setError("");
-            }}
-            style={{
-              width: "100%",
-              background: "transparent",
-              border: "none",
-              outline: "none",
-              color: "inherit",
-              font: "inherit",
-              fontSize: "14px",
-              height: "42px",
-              cursor: "pointer",
-            }}
-          >
-            <option value="">Nenhuma (Geral)</option>
-            {categories
-              .filter((cat) => cat.kind === "category" && cat.id)
-              .map((cat) => (
-                <option key={cat.id} value={cat.id}>
-                  {cat.name}
-                </option>
-              ))}
-            <option value="__new__">+ Criar nova categoria...</option>
-          </select>
-        </div>
-
-        {selectedCategoryId === "__new__" && (
-          <>
-            <label className="new-dm-dialog__group-name" htmlFor="new-channel-new-category">
-              Nome da nova categoria
-            </label>
-            <div className="new-dm-dialog__search-field">
-              <input
-                id="new-channel-new-category"
-                type="text"
-                autoComplete="off"
-                placeholder="Ex.: Projetos Especiais"
-                value={newCategoryName}
-                disabled={pending}
-                onChange={(event) => {
-                  setNewCategoryName(event.target.value);
-                  setError("");
-                }}
-              />
-            </div>
-          </>
-        )}
+        <ChannelCategoryField
+          categories={categories}
+          selectedCategoryId={selectedCategoryId}
+          newCategoryName={newCategoryName}
+          disabled={pending}
+          onSelect={(value) => {
+            setSelectedCategoryId(value);
+            setError("");
+          }}
+          onNewCategoryNameChange={(value) => {
+            setNewCategoryName(value);
+            setError("");
+          }}
+        />
 
         {error && (
           <p className="new-dm-dialog__error new-dm-dialog__error--open" role="alert">
@@ -317,25 +355,11 @@ export default function ChannelCreationForm({
         )}
       </div>
 
-      <footer className="new-dm-dialog__footer">
-        <p className="new-dm-dialog__footer-hint">
-          {type === "public"
-            ? "Todo o workspace poderá entrar."
-            : "Somente convidados verão este canal."}
-        </p>
-        <button
-          type="submit"
-          className="new-dm-dialog__submit"
-          // The accessible name stays fixed while the visible label switches to
-          // "Criando…", so assistive tech announces the busy state instead of a
-          // control that appears to have been replaced mid-action.
-          aria-label="Criar canal"
-          disabled={pending || trimmedName === "" || nameError !== null}
-          aria-busy={pending}
-        >
-          {pending ? "Criando…" : "Criar canal"}
-        </button>
-      </footer>
+      <ChannelSubmitFooter
+        type={type}
+        pending={pending}
+        disabled={pending || trimmedName === "" || nameError !== null}
+      />
     </form>
   );
 }

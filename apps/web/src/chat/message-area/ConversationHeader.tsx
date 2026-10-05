@@ -21,7 +21,8 @@ import { describePresence } from "../presenceDescription";
 import { presenceNeedsClock, usePresenceClock } from "../usePresenceClock";
 import { UserAvatar } from "../UserAvatar";
 import type { ConversationDetailsPanelState } from "../useConversationDetailsPanel";
-import { IconHash } from "./icons";
+import ChannelIcon from "../ChannelIcon";
+import { channelAccessibleName } from "../channelIdentity";
 
 interface DetailsToggleProps {
   open: boolean;
@@ -133,18 +134,31 @@ function ResourceCallAction({ state }: { state: ResourceCallHeaderState }) {
 
 interface HeaderChannelProps {
   name: string;
+  /** Issue #1024: from the sidebar payload the server already authorised. */
+  isPrivate: boolean;
   detailsToggle?: React.ReactNode;
   /** RF-24/#622: absent only when this header is not showing a resource call at all (never the case for a channel). */
   resourceCall?: ResourceCallHeaderState;
 }
 
-export function HeaderChannel({ name, detailsToggle, resourceCall }: HeaderChannelProps) {
+export function HeaderChannel({
+  name,
+  isPrivate,
+  detailsToggle,
+  resourceCall,
+}: HeaderChannelProps) {
   return (
     <header className="chat-msg-area__header" data-testid="chat-msg-header">
       <span className="chat-msg-area__header-icon" aria-hidden="true">
-        <IconHash />
+        <ChannelIcon isPrivate={isPrivate} />
       </span>
-      <h1 className="chat-msg-area__header-title">{name}</h1>
+      {/* The lock is decorative, so the heading says "privado" in words. */}
+      <h1
+        className="chat-msg-area__header-title"
+        aria-label={name ? channelAccessibleName(name, isPrivate) : undefined}
+      >
+        {name}
+      </h1>
       {resourceCall && <ResourceCallAction state={resourceCall} />}
       {detailsToggle}
     </header>
@@ -262,6 +276,8 @@ interface ConversationHeaderProps {
   kind: "channel" | "dm";
   workspaceId: string;
   name: string;
+  /** Only meaningful for a channel. */
+  isPrivate: boolean;
   counterpart: DMCounterpart | undefined;
   presenceTarget: string | undefined;
   onStartCall: ChatOutletContext["startCall"];
@@ -275,6 +291,7 @@ export default function ConversationHeader({
   kind,
   workspaceId,
   name,
+  isPrivate,
   counterpart,
   presenceTarget,
   onStartCall,
@@ -291,7 +308,14 @@ export default function ConversationHeader({
     />
   ) : undefined;
   if (kind === "channel") {
-    return <HeaderChannel name={name} resourceCall={resourceCall} detailsToggle={detailsToggle} />;
+    return (
+      <HeaderChannel
+        name={name}
+        isPrivate={isPrivate}
+        resourceCall={resourceCall}
+        detailsToggle={detailsToggle}
+      />
+    );
   }
   return (
     <HeaderDM

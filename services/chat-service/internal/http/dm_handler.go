@@ -59,6 +59,7 @@ const (
 
 type DMHandler struct {
 	workspaces workspaceResolver
+	ownership  ownershipProvider
 	dms        dmProvider
 	limiter    dmRateLimiter
 	broadcast  membersBroadcaster
@@ -136,8 +137,8 @@ type createGroupDMResponse struct {
 // and every other profile attribute are deliberately absent — a details panel
 // is not a directory export.
 //
-// There is no role: chat.dm_members.role is closed by CHECK to 'member', so a
-// group has no role worth showing.
+// Conversation-local roles and actions are projected separately in ownership
+// when the rollout is enabled; this legacy preview remains compatible.
 type groupParticipantJSON struct {
 	UserID      string `json:"user_id"`
 	DisplayName string `json:"display_name"`
@@ -162,14 +163,15 @@ type groupParticipantJSON struct {
 // participant_count is every active participant; participants is the capped
 // preview and its length must never be shown as the count.
 type groupDetailsResponse struct {
-	ID                 string                 `json:"id"`
-	Type               string                 `json:"type"`
-	Name               string                 `json:"name"`
-	Description        string                 `json:"description,omitempty"`
-	CreatorDisplayName string                 `json:"creator_display_name,omitempty"`
-	CreatedAt          string                 `json:"created_at"`
-	ParticipantCount   int                    `json:"participant_count"`
-	Participants       []groupParticipantJSON `json:"participants"`
+	Ownership          *storage.OwnershipDetails `json:"ownership,omitempty"`
+	ID                 string                    `json:"id"`
+	Type               string                    `json:"type"`
+	Name               string                    `json:"name"`
+	Description        string                    `json:"description,omitempty"`
+	CreatorDisplayName string                    `json:"creator_display_name,omitempty"`
+	CreatedAt          string                    `json:"created_at"`
+	ParticipantCount   int                       `json:"participant_count"`
+	Participants       []groupParticipantJSON    `json:"participants"`
 	// CanManageMembers (issue #398) is always sent, so a client that predates it
 	// reads absent-as-false and hides the add action — the safe direction. It is
 	// a rendering hint: POST .../members re-derives the decision in its own
@@ -218,7 +220,13 @@ func (h *DMHandler) GroupDetails(w http.ResponseWriter, r *http.Request) {
 		writeGroupDetailsError(w, err)
 		return
 	}
-	httputil.WriteJSON(w, http.StatusOK, h.groupDetailsBody(workspaceID, details))
+	body := h.groupDetailsBody(workspaceID, details)
+	body.Ownership, err = ownershipProjection(r.Context(), h.ownership, storage.OwnershipScope{WorkspaceID: workspaceID, Kind: "dm", ConversationID: conversationID, ActorID: callerID})
+	if err != nil {
+		writeOwnershipError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, body)
 }
 
 func (h *DMHandler) groupDetailsBody(workspaceID string, details service.GroupDetails) groupDetailsResponse {

@@ -1,3 +1,4 @@
+import { invalidateConversationDetails } from "./detailsInvalidation";
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 
@@ -654,7 +655,10 @@ export function useChatSidebar() {
     // coalescing refetch membership changes use: the server re-derives what this
     // user may see, and the row keeps its identity, its pin, its mute state and
     // its unread badge because the reducer replaces items by id.
-    onConversationUpdated: refreshSidebar,
+    onConversationUpdated: (event) => {
+      invalidateConversationDetails(event);
+      refreshSidebar();
+    },
     // A system message landed (a rename, someone leaving). The sidebar shows no
     // message content, but a departure changes what this user may see, so the
     // same refetch settles it — and it is coalesced, so a burst costs one.

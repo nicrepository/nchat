@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, type Page, test, type TestInfo } from "@playwright/test";
 
 import {
   OTHER_USER_ID,
@@ -200,5 +200,138 @@ test.describe("criação de conversas — DM 1:1 e grupo ad-hoc", () => {
       ),
     ).toBe(true);
     await expect(page).toHaveURL(new RegExp(`/chat/dm/${targetId}$`));
+  });
+});
+
+/**
+ * Issue #1023: Pessoa, Grupo e Canal são fluxos próprios dentro do mesmo
+ * diálogo. Aqui só o que precisa de navegador real — foco, teclado, layout e
+ * a volta do foco ao acionador; as combinações de draft ficam no Vitest.
+ */
+async function openWithTwoCandidates(page: Page, testInfo: TestInfo) {
+  const targetId = uniqueId(testInfo, "dm");
+  const scenario = createScenario({
+    kind: "dm",
+    targetId,
+    targetName: OTHER_USER_NAME,
+    messages: [makeMessage({ id: `${targetId}-msg`, body_text: "olá" })],
+    dmCandidates: [
+      { userId: SECOND_CANDIDATE_ID, displayName: SECOND_CANDIDATE_NAME },
+      { userId: THIRD_CANDIDATE_ID, displayName: THIRD_CANDIDATE_NAME },
+    ],
+  });
+  await installMessagingMocks(page, scenario);
+  await page.goto(`/chat/dm/${targetId}`);
+  return scenario;
+}
+
+test.describe("nova conversa — fluxos Pessoa, Grupo e Canal (#1023)", () => {
+  test("teclado: drafts de Grupo e Canal sobrevivem à troca de modo e o foco volta ao acionador", async ({
+    page,
+  }, testInfo) => {
+    const scenario = await openWithTwoCandidates(page, testInfo);
+    await expect(page.getByRole("heading", { name: "Canais" })).toBeVisible();
+    const trigger = page.getByRole("button", { name: "Nova conversa" });
+    await trigger.focus();
+    await page.keyboard.press("Enter");
+
+    const dialog = page.getByRole("dialog", { name: "Nova conversa" });
+    const search = dialog.getByRole("searchbox", { name: "Pesquisar pessoa" });
+    await expect(search).toBeFocused();
+
+    // Pessoa → Grupo pelas setas do seletor de modo; o foco fica no seletor.
+    await page.keyboard.press("Shift+Tab");
+    await expect(dialog.getByRole("radio", { name: "Pessoa" })).toBeFocused();
+    await page.keyboard.press("ArrowRight");
+    const groupRadio = dialog.getByRole("radio", { name: "Grupo" });
+    await expect(groupRadio).toBeChecked();
+    await expect(groupRadio).toBeFocused();
+
+    // Draft de Grupo.
+    await page.keyboard.press("Tab");
+    await expect(search).toBeFocused();
+    await page.keyboard.type(SECOND_CANDIDATE_NAME);
+    await dialog.getByRole("button", { name: SECOND_CANDIDATE_NAME }).press("Enter");
+    await dialog.getByRole("button", { name: THIRD_CANDIDATE_NAME }).press("Enter");
+    const groupName = dialog.getByLabel("Nome do grupo (opcional)");
+    await groupName.focus();
+    await page.keyboard.type("Infra 🚀");
+
+    // Grupo → Canal: o formulário não rouba o foco do seletor.
+    await groupRadio.focus();
+    await page.keyboard.press("ArrowRight");
+    const channelRadio = dialog.getByRole("radio", { name: "Canal" });
+    await expect(channelRadio).toBeFocused();
+    const channelName = dialog.getByLabel("Nome do canal");
+    await channelName.focus();
+    await page.keyboard.type("Operações");
+    await dialog.getByRole("radio", { name: "Privado" }).focus();
+    await page.keyboard.press("Space");
+
+    // Canal → Grupo: o draft de Grupo está intacto.
+    await channelRadio.focus();
+    await page.keyboard.press("ArrowLeft");
+    await expect(groupRadio).toBeChecked();
+    const chips = dialog.getByRole("list", { name: "Pessoas selecionadas" });
+    await expect(chips).toContainText(SECOND_CANDIDATE_NAME);
+    await expect(chips).toContainText(THIRD_CANDIDATE_NAME);
+    await expect(groupName).toHaveValue("Infra 🚀");
+    await expect(dialog.getByRole("button", { name: "Criar grupo" })).toBeEnabled();
+
+    // Grupo → Canal: o draft de Canal também.
+    await page.keyboard.press("ArrowRight");
+    await expect(channelName).toHaveValue("Operações");
+    await expect(dialog.getByLabel("Identificador")).toHaveValue("operacoes");
+    await expect(dialog.getByRole("radio", { name: "Privado" })).toBeChecked();
+
+    // Escape fecha sem criar nada e devolve o foco ao botão "Nova conversa".
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+    await expect(trigger).toBeFocused();
+    expect(scenario.requests.groupCreates).toEqual([]);
+    expect(scenario.requests.dmCreates).toEqual([]);
+  });
+
+  test("celular: modos sem overflow horizontal e com a ação de criar alcançável", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    const scenario = await openWithTwoCandidates(page, testInfo);
+    // No celular a navegação é uma gaveta: "Nova conversa" mora nela.
+    await page.getByTestId("chat-nav-toggle").click();
+    await page.getByRole("button", { name: "Nova conversa" }).click();
+    const dialog = page.getByRole("dialog", { name: "Nova conversa" });
+
+    const overflow = () =>
+      page.evaluate(() => {
+        const root = document.documentElement;
+        const modal = document.querySelector<HTMLElement>("[role='dialog']");
+        return {
+          page: root.scrollWidth - root.clientWidth,
+          dialog: modal ? modal.scrollWidth - modal.clientWidth : -1,
+        };
+      });
+
+    await dialog.getByRole("radio", { name: "Canal" }).check();
+    const createChannel = dialog.getByRole("button", { name: "Criar canal" });
+    await createChannel.scrollIntoViewIfNeeded();
+    await expect(createChannel).toBeInViewport();
+    expect(await overflow()).toEqual({ page: 0, dialog: 0 });
+
+    await dialog.getByRole("radio", { name: "Grupo" }).check();
+    await dialog.getByRole("searchbox", { name: "Pesquisar pessoa" }).fill(SECOND_CANDIDATE_NAME);
+    await dialog.getByRole("button", { name: SECOND_CANDIDATE_NAME }).click();
+    await dialog.getByRole("button", { name: THIRD_CANDIDATE_NAME }).click();
+    expect(await overflow()).toEqual({ page: 0, dialog: 0 });
+
+    const createGroup = dialog.getByRole("button", { name: "Criar grupo" });
+    await createGroup.scrollIntoViewIfNeeded();
+    await expect(createGroup).toBeInViewport();
+    await createGroup.click();
+
+    await expect(dialog).toBeHidden();
+    expect(scenario.requests.groupCreates).toEqual([
+      { participantUserIds: [SECOND_CANDIDATE_ID, THIRD_CANDIDATE_ID], title: "" },
+    ]);
   });
 });

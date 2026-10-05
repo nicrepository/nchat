@@ -18,7 +18,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { DMConversation } from "./chatTypes";
 import { useConversationDetails, type ConversationDetailsState } from "./useConversationDetails";
-import { useReloadOnRename } from "./useReloadOnRename";
+import { useReloadOnRename, projectedConversationName } from "./useReloadOnRename";
 
 export type ConversationDetailsKind = "channel" | "group" | "direct";
 
@@ -124,7 +124,13 @@ export function useConversationDetailsPanel(
   const detailsState = useConversationDetails(target);
   const reload = detailsState.reload;
 
-  useReloadOnRename(`${kind}:${targetId}`, resolvedName, open, reload);
+  useReloadOnRename(
+    `${kind}:${targetId}`,
+    resolvedName,
+    open,
+    reload,
+    projectedConversationName(detailsState.details),
+  );
   const restorePendingRef = useRestoreFocusOnClose(open, toggleRef);
 
   const close = useCallback(() => {

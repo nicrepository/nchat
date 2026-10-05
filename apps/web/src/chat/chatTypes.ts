@@ -1,3 +1,4 @@
+import type { OwnershipDetails } from "./ownershipApi";
 // ── Chat domain types ────────────────────────────────────────────────────────
 
 export type ChannelType = "public" | "private";
@@ -810,6 +811,7 @@ export interface ChannelMemberProfile {
  * up on screen as a fallback for the name that was missing.
  */
 export interface ChannelDetails {
+  ownership?: OwnershipDetails;
   id: string;
   slug: string;
   name: string;
@@ -929,6 +931,7 @@ export interface GroupParticipantProfile {
  * `participants.length`: that array is a capped preview.
  */
 export interface GroupDetails {
+  ownership?: OwnershipDetails;
   id: string;
   name: string;
   description: string;

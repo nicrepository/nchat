@@ -274,6 +274,8 @@ func AdminUpdateUserStatus(users service.UserStatusManager) http.Handler {
 			switch {
 			case errors.Is(err, domain.ErrNotFound):
 				httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "user not found")
+			case errors.Is(err, domain.ErrConversationOwnershipConflict):
+				httputil.WriteError(w, http.StatusConflict, httputil.ErrCodeConflict, "no eligible conversation owner remains")
 			case errors.Is(err, domain.ErrStatusTransitionNotAllowed):
 				httputil.WriteError(w, http.StatusUnprocessableEntity, "invalid_transition", "status transition not allowed")
 			case errors.Is(err, domain.ErrForbidden):
