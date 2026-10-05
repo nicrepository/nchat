@@ -71,6 +71,9 @@ type Notification struct {
 	// nothing here does, and the empty string is a recipient who expressed no
 	// level at all.
 	NotificationLevel string
+	// DoNotDisturb is the recipient's Do Not Disturb (issue #798), from the
+	// same projection and carried for the same reason as Muted.
+	DoNotDisturb bool
 	// Presentation is the one exception to "references only" above, and it is a
 	// narrow one (issue #870).
 	//
@@ -121,6 +124,7 @@ func notificationFrom(event storage.NotificationEvent) Notification {
 		OccurredAt:        event.OccurredAt,
 		Muted:             event.Muted,
 		NotificationLevel: event.NotificationLevel,
+		DoNotDisturb:      event.DoNotDisturb,
 		Presentation:      event.Presentation,
 	}
 }

@@ -1720,3 +1720,71 @@ func TestNotificationPresentationRetryRechecksGlobalAccountPostgreSQL(t *testing
 		})
 	}
 }
+
+// TestDoNotDisturbResolutionPostgreSQL is issue #798's half of the projection:
+// the worker reads Do Not Disturb from chat.user_presence in the same batch
+// statement, scoped by the row's own recipient and workspace, with the expiry
+// decided by the database clock.
+func TestDoNotDisturbResolutionPostgreSQL(t *testing.T) {
+	fixture := seedOutbox(t, notificationevent.StatePending, 2)
+	quiet, bystander := fixture.users[1], fixture.users[2]
+	for _, user := range []string{quiet, bystander} {
+		execFixture(t, fixture.pool, `
+			INSERT INTO chat.workspace_members (workspace_id, user_id) VALUES ($1::uuid, $2::uuid)
+			ON CONFLICT DO NOTHING`, notifyWorkerWorkspace, user)
+	}
+
+	if dnd := fixture.doNotDisturbByRecipient(t); dnd[quiet] || dnd[bystander] {
+		t.Fatalf("nobody chose anything, yet %+v", dnd)
+	}
+
+	fixture.setPresence(t, quiet, notifyWorkerWorkspace, "dnd", "1 hour")
+	dnd := fixture.doNotDisturbByRecipient(t)
+	if !dnd[quiet] || dnd[bystander] {
+		t.Fatalf("one member's Do Not Disturb = %+v", dnd)
+	}
+
+	fixture.setPresence(t, quiet, notifyWorkerWorkspace, "busy", "1 hour")
+	if dnd := fixture.doNotDisturbByRecipient(t); dnd[quiet] {
+		t.Fatal("busy read as Do Not Disturb")
+	}
+
+	fixture.setPresence(t, quiet, notifyWorkerWorkspace, "dnd", "-1 second")
+	if dnd := fixture.doNotDisturbByRecipient(t); dnd[quiet] {
+		t.Fatal("an expired Do Not Disturb still silences")
+	}
+
+	other := newIsolatedWorkspace(t, fixture.pool)
+	execFixture(t, fixture.pool, `INSERT INTO chat.workspace_members (workspace_id, user_id) VALUES ($1::uuid, $2::uuid)`, other, bystander)
+	fixture.setPresence(t, bystander, other, "dnd", "1 hour")
+	if dnd := fixture.doNotDisturbByRecipient(t); dnd[bystander] {
+		t.Fatal("Do Not Disturb in another workspace reached this tenant's event")
+	}
+}
+
+// setPresence writes a manual state directly, with an expiry relative to the
+// database clock so an already-expired state can be expressed.
+func (f *outboxFixture) setPresence(t *testing.T, userID, workspaceID, state, expiresIn string) {
+	t.Helper()
+	execFixture(t, f.pool, `
+		INSERT INTO chat.user_presence (workspace_id, user_id, manual_state, manual_expires_at, manual_updated_at)
+		VALUES ($1::uuid, $2::uuid, $3, clock_timestamp() + $4::interval, clock_timestamp())
+		ON CONFLICT (workspace_id, user_id) DO UPDATE
+		SET manual_state = EXCLUDED.manual_state, manual_expires_at = EXCLUDED.manual_expires_at,
+		    manual_updated_at = EXCLUDED.manual_updated_at`,
+		workspaceID, userID, state, expiresIn)
+}
+
+// doNotDisturbByRecipient reads what the projection resolved for every pending row.
+func (f *outboxFixture) doNotDisturbByRecipient(t *testing.T) map[string]bool {
+	t.Helper()
+	events, err := f.store().ListPending(context.Background(), 50)
+	if err != nil {
+		t.Fatalf("ListPending: %v", err)
+	}
+	byRecipient := make(map[string]bool, len(events))
+	for _, event := range events {
+		byRecipient[event.RecipientID] = event.DoNotDisturb
+	}
+	return byRecipient
+}

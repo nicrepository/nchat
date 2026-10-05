@@ -76,7 +76,10 @@ import (
 //	   ConversationLevelMentionsReplies and an ordinary message now produces a
 //	   suppression where version 1 produced a delivery, so an audit record from
 //	   before this change must not be read as though these rules decided it.
-const Version = 2
+//	3  issue #798: denyDoNotDisturb joined the rules. A recipient in Do Not
+//	   Disturb is now suppressed on every alert channel where version 2
+//	   delivered.
+const Version = 3
 
 // ConversationKind is the kind of conversation the event happened in.
 //
@@ -337,6 +340,11 @@ type Preferences struct {
 	Status PreferenceStatus
 	// Disabled is the recipient's global off switch: no alert on any channel.
 	Disabled bool
+	// DoNotDisturb is the recipient's presence choice (issue #798), resolved
+	// by the caller from chat.user_presence with its expiry already applied. It
+	// silences alerts and nothing else: the message is persisted, delivered and
+	// counted as unread, and its notification-centre row is still written.
+	DoNotDisturb bool
 	// Muted is this recipient's own preference for this one conversation. It
 	// silences alerts and nothing else — a muted conversation still counts
 	// unread, which this engine does not touch.
@@ -447,6 +455,10 @@ const (
 	// user_preference. An operator reading it months later is being told the
 	// alert was withheld by a fault, not by a choice.
 	ReasonPreferencesUnavailable Reason = "preferences_unavailable"
+	// ReasonDoNotDisturb is the recipient being in Do Not Disturb (issue #798).
+	// Its own code: it is a state the person chose for all of their
+	// conversations for a while, not a preference about this one.
+	ReasonDoNotDisturb Reason = "do_not_disturb"
 	// ReasonMuted is this conversation silenced by this recipient.
 	ReasonMuted Reason = "muted"
 	// ReasonConversationLevel is an event this recipient does not want alerts
