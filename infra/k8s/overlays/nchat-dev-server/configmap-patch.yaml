@@ -69,6 +69,11 @@ data:
   # from chat-service, which the link-safety egress policy grants only on 443.
   # Off, links cleared as safe stay clickable; only the card is absent.
   CHAT_LINK_PREVIEW_ENABLED: "false"
+  # Issue #798 manual presence (Busy, Do Not Disturb, Volto já, Away, Appear
+  # offline). nchat-dev is one slot replaced whole by every deploy, so no build
+  # from before #798 can run beside it: the gate production opens through
+  # make prod-manual-presence after its Blue/Green checks is simply on here.
+  CHAT_MANUAL_PRESENCE_ENABLED: "true"
   # RF-21 capacity. Stated explicitly per environment rather than left to the
   # application default, because the right numbers depend on the Cloudflare plan
   # this cluster is billed under and no code may assume one.
