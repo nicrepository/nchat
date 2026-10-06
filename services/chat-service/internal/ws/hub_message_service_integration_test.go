@@ -25,8 +25,8 @@ func (s *integChannelStore) CreateCategory(_ context.Context, _ storage.CreateCa
 func (s *integChannelStore) CreateChannel(_ context.Context, _ storage.CreateChannelInput) (domain.Channel, error) {
 	return domain.Channel{}, nil
 }
-func (s *integChannelStore) CreateChannelForActiveMember(_ context.Context, _ storage.CreateChannelInput) (domain.Channel, error) {
-	return domain.Channel{}, nil
+func (s *integChannelStore) CreateChannelForActiveMember(_ context.Context, _ storage.CreateChannelInput) (storage.CreateChannelResult, error) {
+	return storage.CreateChannelResult{}, nil
 }
 func (s *integChannelStore) GetCategoryByIDInWorkspace(_ context.Context, _, _ string) (domain.ChannelCategory, error) {
 	return domain.ChannelCategory{}, nil

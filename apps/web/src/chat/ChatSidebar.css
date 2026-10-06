@@ -1278,6 +1278,30 @@ button.chat-sidebar__user[aria-expanded="true"] {
   margin-top: 16px;
 }
 
+/* Issue #1025: the members step of a private channel. */
+.new-dm-dialog__members {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.new-dm-dialog__members legend {
+  margin: 0 24px 4px;
+  padding: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.new-dm-dialog__members > .new-dm-dialog__footer-hint {
+  margin: 4px 24px 0;
+}
+
+/* The creator: a member like the others, minus the remove control. */
+.new-dm-dialog__chip--fixed {
+  padding-right: 11px;
+}
+
 .new-dm-dialog__search input#new-dm-group-name {
   width: 100%;
   height: 42px;

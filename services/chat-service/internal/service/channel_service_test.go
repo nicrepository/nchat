@@ -36,7 +36,7 @@ func TestChannelService_CreatePublicChannel_ManagerSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateChannel: %v", err)
 	}
-	if got.ID != "ch-public" || got.CreatedBy != "owner-1" {
+	if got.Channel.ID != "ch-public" || got.Channel.CreatedBy != "owner-1" {
 		t.Fatalf("unexpected channel: %+v", got)
 	}
 	if !channels.lastCreateInput.EnsurePublicWorkspaceMembers {
@@ -72,7 +72,7 @@ func TestChannelService_CreatePrivateChannel_ManagerAddsCreatorMembership(t *tes
 	if err != nil {
 		t.Fatalf("CreateChannel: %v", err)
 	}
-	if got.ID != "ch-private" {
+	if got.Channel.ID != "ch-private" {
 		t.Fatalf("unexpected channel: %+v", got)
 	}
 	if channels.creatorMembershipSeeds != 1 || channels.lastSeededMemberUserID != "admin-1" {
@@ -111,7 +111,7 @@ func TestChannelService_CreateChannel_AnyActiveRoleSucceeds(t *testing.T) {
 			if err != nil {
 				t.Fatalf("CreateChannel: %v", err)
 			}
-			if got.ID != "ch-1" {
+			if got.Channel.ID != "ch-1" {
 				t.Fatalf("unexpected channel: %+v", got)
 			}
 			if channels.lastCreateInput.CreatedBy != "caller-1" || channels.lastCreateInput.IsGeneral {

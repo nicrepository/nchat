@@ -130,6 +130,10 @@ var (
 	ErrDuplicateChannelCategoryName = fmt.Errorf("%w: category name already in use", ErrConflict)
 	// ErrChannelCategoryLimitReached reports the per-workspace category ceiling.
 	ErrChannelCategoryLimitReached = fmt.Errorf("%w: workspace category limit reached", ErrConflict)
+	// ErrIdempotencyKeyReused reports an Idempotency-Key already bound to a
+	// different request by the same actor (issue #1025). Replaying it as the
+	// earlier result, or executing it as a new one, would both be wrong.
+	ErrIdempotencyKeyReused = fmt.Errorf("%w: idempotency key already used for a different request", ErrConflict)
 	// ErrTooManyMembersRequested reports a batch above MaxAddMembersPerRequest.
 	//
 	// This is a bound on the *request*, decided before any database work, and it

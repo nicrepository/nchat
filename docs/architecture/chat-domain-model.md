@@ -272,6 +272,14 @@ channel with `INSERT ... SELECT` from a row-locked authorized context
 allowlist itself, so neither a membership revoked concurrently nor a demotion to
 `guest` committed mid-flight leaves a row to insert from.
 
+A private channel may name its first members in the same request
+(`initial_member_ids`, issue #1025). They are inserted in the creation
+transaction through the add-members eligibility predicate, all or nothing, with
+the ordinary `member` role; the creator is implicit. An optional
+`Idempotency-Key` makes a retry return the channel it already created
+(`chat.channel_creation_requests`). The full contract is section D2 of
+[chat-membership-contracts.md](./chat-membership-contracts.md).
+
 `GET /api/chat/sidebar`'s `can_create_channel` field is **deprecated**: it is
 kept only so clients that predate BUG #393 keep working during rollout, and is
 ignored by the current UI, which offers "Nova conversa" as the single entry

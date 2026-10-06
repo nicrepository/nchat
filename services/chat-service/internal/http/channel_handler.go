@@ -15,7 +15,7 @@ import (
 
 // channelProvider is the ChannelService surface used by ChannelHandler.
 type channelProvider interface {
-	CreateChannel(ctx context.Context, input service.CreateChannelInput) (domain.Channel, error)
+	CreateChannel(ctx context.Context, input service.CreateChannelInput) (service.CreateChannelResult, error)
 	GetChannelDetails(ctx context.Context, input service.ChannelDetailsInput) (service.ChannelDetails, error)
 	// ListChannelMembers is the administrable membership behind the removal
 	// control (issue #469) — chat.channel_members, not the presence preview
@@ -171,11 +171,16 @@ func (h *ChannelHandler) HasMembers() bool {
 // createChannelRequest is the whole accepted body. The workspace, the creator,
 // is_general, status and position are server-derived and deliberately absent —
 // the strict decoder answers 400 to a client that sends them.
+//
+// initial_member_ids (issue #1025) is the only membership input, and it is a
+// list of people, never of roles: who becomes owner and which role an invitee
+// gets are the server's decisions.
 type createChannelRequest struct {
-	Slug        string `json:"slug"`
-	DisplayName string `json:"display_name"`
-	Type        string `json:"type"`
-	CategoryID  string `json:"category_id,omitempty"`
+	Slug             string   `json:"slug"`
+	DisplayName      string   `json:"display_name"`
+	Type             string   `json:"type"`
+	CategoryID       string   `json:"category_id,omitempty"`
+	InitialMemberIDs []string `json:"initial_member_ids,omitempty"`
 }
 
 type createChannelResponse struct {
@@ -194,26 +199,12 @@ type createChannelResponse struct {
 // membership and an active workspace may create a channel, whatever their role
 // (BUG #393), and the storage layer settles that atomically with the write.
 func (h *ChannelHandler) Create(w http.ResponseWriter, r *http.Request) {
-	if h.workspaces == nil || h.channels == nil || h.limiter == nil {
-		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "channels not available")
+	callerID, ok := h.admitChannelCreate(w, r)
+	if !ok {
 		return
 	}
-	callerID := GetContextUserID(r)
-	if callerID == "" {
-		writeUnauthorized(w)
-		return
-	}
-	allowed, err := h.limiter.AllowActionWithLimit(r.Context(), callerID, "channel_create", channelCreateRateLimit, channelRateLimitWindowSeconds)
-	if err != nil {
-		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "channels not available")
-		return
-	}
-	if !allowed {
-		w.Header().Set("Retry-After", strconv.Itoa(channelRateLimitWindowSeconds))
-		httputil.WriteError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
-		return
-	}
-	if !requireJSONContentType(w, r) {
+	idempotencyKey, ok := parseIdempotencyKey(w, r)
+	if !ok {
 		return
 	}
 	var request createChannelRequest
@@ -230,24 +221,71 @@ func (h *ChannelHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	channel, err := h.channels.CreateChannel(r.Context(), service.CreateChannelInput{
-		WorkspaceID: workspace.ID,
-		CallerID:    callerID,
-		CategoryID:  request.CategoryID,
-		Slug:        request.Slug,
-		DisplayName: request.DisplayName,
-		Type:        domain.ChannelType(request.Type),
+	result, err := h.channels.CreateChannel(r.Context(), service.CreateChannelInput{
+		WorkspaceID:      workspace.ID,
+		CallerID:         callerID,
+		CategoryID:       request.CategoryID,
+		Slug:             request.Slug,
+		DisplayName:      request.DisplayName,
+		Type:             domain.ChannelType(request.Type),
+		InitialMemberIDs: request.InitialMemberIDs,
+		IdempotencyKey:   idempotencyKey,
 	})
 	if err != nil {
 		writeCreateChannelError(w, err)
 		return
 	}
-	httputil.WriteJSON(w, http.StatusCreated, createChannelResponse{
+	h.announceCreatedChannel(r.Context(), workspace.ID, result)
+	status := http.StatusCreated
+	if result.Replayed {
+		status = http.StatusOK
+	}
+	channel := result.Channel
+	httputil.WriteJSON(w, status, createChannelResponse{
 		ID:          channel.ID,
 		Slug:        channel.Slug,
 		DisplayName: channel.DisplayName,
 		Type:        string(channel.Type),
 	})
+}
+
+// admitChannelCreate runs the transport gates of a creation — wiring,
+// authentication, the per-caller rate limit and the JSON content type — and
+// returns the session's caller. It has answered the request when ok is false.
+func (h *ChannelHandler) admitChannelCreate(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if h.workspaces == nil || h.channels == nil || h.limiter == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "channels not available")
+		return "", false
+	}
+	callerID := GetContextUserID(r)
+	if callerID == "" {
+		writeUnauthorized(w)
+		return "", false
+	}
+	allowed, err := h.limiter.AllowActionWithLimit(r.Context(), callerID, "channel_create", channelCreateRateLimit, channelRateLimitWindowSeconds)
+	if err != nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "channels not available")
+		return "", false
+	}
+	if !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(channelRateLimitWindowSeconds))
+		httputil.WriteError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
+		return "", false
+	}
+	return callerID, requireJSONContentType(w, r)
+}
+
+// announceCreatedChannel tells the invitees of a new private channel that it
+// is now available to them (issue #1025), through the same post-commit signal
+// add-members uses — the service only returns once the creation committed. They
+// are not subscribed to a channel that did not exist, so a room event could not
+// reach them. A replay announces nothing: those people were told the first
+// time, and the result's InitialMemberIDs is empty for it anyway.
+func (h *ChannelHandler) announceCreatedChannel(ctx context.Context, workspaceID string, result service.CreateChannelResult) {
+	if h.broadcast == nil || result.Replayed || len(result.InitialMemberIDs) == 0 {
+		return
+	}
+	h.broadcast.PublishConversationAvailable(ctx, workspaceID, "channel", result.Channel.ID, result.InitialMemberIDs)
 }
 
 // ── Channel details (issue #435) ─────────────────────────────────────────────
@@ -979,6 +1017,8 @@ func writeCreateChannelError(w http.ResponseWriter, err error) {
 		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid channel")
 	case errors.Is(err, domain.ErrForbidden):
 		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "forbidden")
+	case errors.Is(err, domain.ErrIdempotencyKeyReused):
+		httputil.WriteError(w, http.StatusConflict, "idempotency_key_reused", "idempotency key already used for a different request")
 	case errors.Is(err, domain.ErrDuplicateSlug), errors.Is(err, domain.ErrConflict):
 		httputil.WriteError(w, http.StatusConflict, "conflict", "channel already exists")
 	case errors.Is(err, domain.ErrNotFound):

@@ -32,6 +32,7 @@ helper do pacote) e da `t.Skip` quando ele nao existe, ou exige uma build tag.
 | `admin-service/internal/storage`                                | `ADMIN_TEST_DATABASE_URL`                       | `Tests / Go Integration` |     47 |
 | `auth-service/internal/storage`                                 | `AUTH_TEST_DATABASE_URL`                        | `Tests / Go Integration` |     31 |
 | `chat-service` contrato de membership (#881, #469)              | `CHAT_TEST_DATABASE_URL` + `-run`               | `Tests / Go Integration` |      8 |
+| `chat-service` criacao de canal privado com membros (#1025)     | `CHANNEL_CREATION_TEST_DATABASE_URL` + `-run`   | `Tests / Go Integration` |     12 |
 | `media-service/internal/storage`                                | `MEDIA_TEST_DATABASE_URL` + `-tags integration` | `Tests / Go Integration` |      1 |
 | `chat-service` Link Safety, outbox, prioridade, ack, lembrete   | `CHAT_TEST_DATABASE_URL`, 127 testes nomeados   | `Tests / Go Coverage`    |    127 |
 | `notification-service/internal/storage`                         | `NOTIFICATION_TEST_DATABASE_URL`, nomeados      | `Tests / Go Coverage`    |    113 |
@@ -39,6 +40,14 @@ helper do pacote) e da `t.Skip` quando ele nao existe, ou exige uma build tag.
 | **sem owner** — resto de `chat-service/internal/storage` (#935) | `CHAT_TEST_DATABASE_URL`                        | —                        |    114 |
 | **sem owner** — resto de `file-service/internal/storage` (#936) | `FILE_TEST_DATABASE_URL`                        | —                        |     18 |
 | **sem owner** — `file-service/internal/service` (#937)          | `FILE_TEST_DATABASE_URL` + SeaweedFS            | —                        |     46 |
+
+A familia #1025 (`TestChannelCreationPostgreSQL_*`) prova atomicidade, rollback, replay e
+conflito de `Idempotency-Key`, concorrencia da mesma chave e invalidacao concorrente. Ela nao
+entra no perfil de cobertura: o gate oficial mede chat-service acima de 90% sem ela, e o codigo
+de storage que ela exercita ja e medido pelos testes pgxmock. Por isso o owner e
+`Tests / Go Integration`, com banco proprio (`channel_creation_test`), porque o fixture
+reseta o schema `chat`. `go-integration-test.sh` recusa uma entrada cujo `-run` nao casa
+nenhum teste, para que um rename nao a desligue em silencio.
 
 Comandos: `make test-integration-go` (`scripts/ci/go-integration-test.sh`) e
 `make go-coverage-check` (`scripts/ci/go-coverage-check.sh`, que chama
