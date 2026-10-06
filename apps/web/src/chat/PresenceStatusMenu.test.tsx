@@ -34,7 +34,9 @@ function envelope(
 async function renderMenu() {
   const view = render(
     <MemoryRouter>
-      <PresenceStatusMenu selfId="me" displayName="Álvaro Neto" />
+      <PresenceStatusMenu selfId="me" displayName="Álvaro Neto">
+        {(trigger, summary) => <button {...trigger}>{summary.label}</button>}
+      </PresenceStatusMenu>
     </MemoryRouter>,
   );
   await act(async () => {});
@@ -42,7 +44,7 @@ async function renderMenu() {
 }
 
 function trigger() {
-  return screen.getByRole("button", { name: /alterar status/i });
+  return screen.getByRole("button", { name: /definir status/i });
 }
 
 function lastRequest(): { method?: string; body?: Record<string, unknown> } {
@@ -132,7 +134,7 @@ describe("PresenceStatusMenu", () => {
     expect(expiresAt).toBeLessThanOrEqual(after + 3_600_000);
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
     expect(trigger()).toHaveFocus();
-    expect(trigger()).toHaveAccessibleName("Status: Ocupado. Alterar status");
+    expect(trigger()).toHaveAccessibleName("Álvaro Neto, Ocupado. Definir status");
   });
 
   it("returns from the durations to the states", async () => {
@@ -196,7 +198,7 @@ describe("PresenceStatusMenu", () => {
     const user = userEvent.setup();
     await renderMenu();
     await waitFor(() =>
-      expect(trigger()).toHaveAccessibleName("Status: Aparecer offline. Alterar status"),
+      expect(trigger()).toHaveAccessibleName("Álvaro Neto, Aparecer offline. Definir status"),
     );
 
     await user.click(trigger());
@@ -223,7 +225,7 @@ describe("PresenceStatusMenu", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Não foi possível atualizar seu status.",
     );
-    expect(trigger()).toHaveAccessibleName("Alterar status");
+    expect(trigger()).toHaveAccessibleName("Álvaro Neto. Definir status");
 
     fetchMock.mockResolvedValueOnce(envelope("busy"));
     await user.click(screen.getByRole("button", { name: "Tentar novamente" }));
@@ -287,7 +289,7 @@ describe("PresenceStatusMenu", () => {
     fetchMock.mockResolvedValueOnce(envelope("dnd", EXPIRES, false));
     const user = userEvent.setup();
     await renderMenu();
-    expect(trigger()).toHaveAccessibleName("Status: Não perturbe. Alterar status");
+    expect(trigger()).toHaveAccessibleName("Álvaro Neto, Não perturbe. Definir status");
 
     await user.click(trigger());
     const menu = screen.getByRole("menu", { name: "Status" });

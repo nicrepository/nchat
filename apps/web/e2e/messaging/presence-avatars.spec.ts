@@ -196,11 +196,14 @@ test.describe("presença nos avatares (RF-58)", () => {
       user: { user_id: CURRENT_USER_ID, state: "online", updated_at: ONLINE_AT },
     });
 
-    const profile = page.getByRole("link", {
-      name: new RegExp(`Meu perfil de ${CURRENT_USER_NAME}`),
-    });
-    await expect(profile).toHaveAccessibleName(`Meu perfil de ${CURRENT_USER_NAME}, Disponível`);
-    await expect(profile.getByTestId("presence-dot")).toHaveAttribute("data-presence", "online");
+    // The footer's identity is the status control; its state is drawn once,
+    // under the name, and the avatar carries no dot (issue #798).
+    const identity = page.getByRole("button", { name: /definir status/i });
+    await expect(identity).toHaveAccessibleName(`${CURRENT_USER_NAME}, Disponível. Definir status`);
+    await expect(identity.getByTestId("presence-dot")).toHaveCount(1);
+    await expect(
+      identity.locator(".chat-sidebar__user-presence").getByTestId("presence-dot"),
+    ).toHaveAttribute("data-presence", "online");
   });
 });
 
@@ -259,9 +262,7 @@ test.describe("Blobatar determinístico (#1016)", () => {
     await page.screenshot({ path: testInfo.outputPath("profile-photo.png") });
     await page.reload();
     await expect(dmRow(page).locator("img")).toHaveAttribute("src", photo);
-    const selfImage = page
-      .getByRole("link", { name: new RegExp(`Meu perfil de ${CURRENT_USER_NAME}`) })
-      .locator("img");
+    const selfImage = page.getByRole("button", { name: /definir status/i }).locator("img");
     await expect(selfImage).toHaveAttribute("src", /^data:image\/svg\+xml/);
     const source = await selfImage.getAttribute("src");
     await page.goto(`/chat/dm/${GROUP_DM_ID}`);

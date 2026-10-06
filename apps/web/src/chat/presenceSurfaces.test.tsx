@@ -212,12 +212,12 @@ describe("sidebar DM rows", () => {
     expect(within(group).queryByTestId("presence-dot")).not.toBeInTheDocument();
   });
 
-  it("shows the authenticated user's own presence in the footer", async () => {
+  it("names the authenticated user's own presence in the footer, with one dot only", async () => {
     renderSidebar();
     openSocket();
     // The footer only exists once the profile has resolved; until then it is an
     // identity-neutral placeholder with nothing to decorate.
-    const profileLink = await screen.findByRole("link", { name: /Meu perfil de Ana Souza/ });
+    const identity = await screen.findByRole("button", { name: /^Ana Souza.*Definir status$/ });
 
     deliver({
       type: "presence.snapshot",
@@ -227,11 +227,26 @@ describe("sidebar DM rows", () => {
       complete: true,
     });
 
-    expect(profileLink).toHaveAccessibleName("Meu perfil de Ana Souza, Disponível");
-    expect(within(profileLink).getByTestId("presence-dot")).toHaveAttribute(
-      "data-presence",
-      "online",
-    );
+    expect(identity).toHaveAccessibleName("Ana Souza, Disponível. Definir status");
+    // The state is drawn once, under the name, inside the one control that
+    // sets it (issue #798): the avatar itself carries no dot.
+    const avatar = identity.querySelector(".chat-sidebar__avatar") as HTMLElement;
+    expect(within(avatar).queryByTestId("presence-dot")).not.toBeInTheDocument();
+    const row = identity.closest(".chat-sidebar__user-row") as HTMLElement;
+    const [dot, ...others] = within(row).getAllByTestId("presence-dot");
+    expect(others).toHaveLength(0);
+    expect(identity.querySelector(".chat-sidebar__user-presence")).toContainElement(dot);
+    expect(dot).toHaveAttribute("data-presence", "online");
+    expect(identity).toHaveTextContent("Disponível");
+    // Somebody else's avatar still shows theirs.
+    deliver({
+      type: "presence.snapshot",
+      target_type: "dm",
+      target_id: "dm-1",
+      users: [{ user_id: "user-juliane", state: "away", updated_at: T1 }],
+      complete: true,
+    });
+    expect(within(dmRow()).getByTestId("presence-dot")).toHaveAttribute("data-presence", "away");
   });
 });
 

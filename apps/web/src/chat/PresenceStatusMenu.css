@@ -1,49 +1,14 @@
 /* PresenceStatusMenu (issue #798). The popup reuses the sidebar's action-menu
    surface, so it is one visual family with the account menu beside it. */
 
+/* The menu's anchor: it wraps the trigger its caller draws (the sidebar
+   footer's identity block) and takes the space that block needs. */
 .presence-status {
   position: relative;
-  flex: none;
-  max-width: 45%;
+  flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-}
-
-.presence-status__trigger {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  min-height: 32px;
-  max-width: 100%;
-  padding: 4px 8px;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--cs-sidebar-text, inherit);
-  font: inherit;
-  font-size: 0.75rem;
-  cursor: pointer;
-}
-
-.presence-status__trigger:hover,
-.presence-status__trigger:focus-visible {
-  background: var(--cs-sidebar-hover, rgba(255, 255, 255, 0.06));
-}
-
-.presence-status__trigger:focus-visible {
-  outline: 2px solid currentColor;
-  outline-offset: -2px;
-}
-
-.presence-status__trigger[aria-busy="true"] {
-  opacity: 0.7;
-}
-
-.presence-status__trigger-label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .presence-status__error {

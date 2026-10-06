@@ -2059,9 +2059,11 @@ describe("ChatSidebar — footer", () => {
     );
   }
 
-  const userLink = () => screen.getByRole("link", { name: /meu perfil/i });
-  const avatarText = () => userLink().querySelector(".chat-sidebar__avatar")?.textContent;
-  const avatarSource = () => userLink().querySelector("img")?.getAttribute("src");
+  // The viewer's identity — avatar, name and state — is one button: the
+  // status control (issue #798).
+  const identity = () => screen.getByRole("button", { name: /definir status/i });
+  const avatarText = () => identity().querySelector(".chat-sidebar__avatar")?.textContent;
+  const avatarSource = () => identity().querySelector("img")?.getAttribute("src");
 
   it("shows no invented identity while the profile is loading", async () => {
     // A request that never settles: the loading state stays observable.
@@ -2092,7 +2094,7 @@ describe("ChatSidebar — footer", () => {
     renderFooter();
 
     await screen.findByText("Ana Souza");
-    const img = userLink().querySelector("img");
+    const img = identity().querySelector("img");
     expect(img).toHaveAttribute("src", "/api/auth/avatars/a.png");
     expect(img).toHaveAttribute("referrerpolicy", "no-referrer");
   });
@@ -2114,7 +2116,7 @@ describe("ChatSidebar — footer", () => {
     renderFooter();
 
     await screen.findByText("Ana Souza");
-    const img = userLink().querySelector("img") as HTMLImageElement;
+    const img = identity().querySelector("img") as HTMLImageElement;
     fireEvent.error(img);
 
     expect(avatarSource()).toMatch(/^data:image\/svg\+xml/);
@@ -2129,7 +2131,7 @@ describe("ChatSidebar — footer", () => {
     renderFooter();
 
     await screen.findByText("Ana Souza");
-    fireEvent.error(userLink().querySelector("img") as HTMLImageElement);
+    fireEvent.error(identity().querySelector("img") as HTMLImageElement);
     expect(avatarSource()).toMatch(/^data:image\/svg\+xml/);
 
     // A confirmed profile change publishes the new URL; the earlier failure is
@@ -2142,7 +2144,7 @@ describe("ChatSidebar — footer", () => {
     act(() => refreshSelfProfile());
 
     await waitFor(() =>
-      expect(userLink().querySelector("img")).toHaveAttribute("src", "/api/auth/avatars/new.png"),
+      expect(identity().querySelector("img")).toHaveAttribute("src", "/api/auth/avatars/new.png"),
     );
   });
 
@@ -2154,7 +2156,7 @@ describe("ChatSidebar — footer", () => {
     });
     renderFooter();
 
-    await waitFor(() => expect(userLink().querySelector("img")).toBeInTheDocument());
+    await waitFor(() => expect(identity().querySelector("img")).toBeInTheDocument());
 
     mockFetchMyProfile.mockResolvedValue({ id: "user-a", displayName: "Ana Souza" });
     act(() => refreshSelfProfile());
@@ -2183,22 +2185,23 @@ describe("ChatSidebar — footer", () => {
     renderFooter();
 
     // The name is one clipped element (CSS ellipsis), and the account menu
-    // trigger remains a sibling of the profile link rather than being pushed
-    // out of it.
+    // trigger remains a sibling of the status control rather than being
+    // pushed out of it.
     const name = await screen.findByText(longName);
     expect(name).toHaveClass("chat-sidebar__user-name");
     expect(avatarSource()).toMatch(/^data:image\/svg\+xml/);
     expect(screen.getByRole("button", { name: /menu da conta/i })).toBeInTheDocument();
   });
 
-  it("keeps the account menu trigger as a sibling of the profile link", async () => {
+  it("keeps the account menu trigger as a sibling of the status control", async () => {
     renderFooter();
 
     const trigger = await screen.findByRole("button", { name: /menu da conta/i });
+    await screen.findByText("Ana Souza");
     expect(trigger).toHaveAttribute("aria-haspopup", "menu");
     // Interactive elements must not nest: the trigger is a sibling of the
-    // profile link, never inside it.
-    expect(userLink().contains(trigger)).toBe(false);
+    // status control, never inside it.
+    expect(identity().contains(trigger)).toBe(false);
   });
 
   it("uses the supplied global-search action", async () => {
@@ -2233,27 +2236,93 @@ describe("ChatSidebar — footer", () => {
     expect(follows(newConversation, favorites)).toBe(true);
   });
 
-  it("keeps the profile link reachable", async () => {
-    renderFooter();
-
-    await screen.findByText("Ana Souza");
-    expect(userLink()).toHaveAttribute("href", "/profile");
-  });
-
-  it("reaches the profile link, the status control and the account menu by keyboard", async () => {
+  it("keeps the profile reachable from the account menu", async () => {
     const user = userEvent.setup();
     renderFooter();
 
     await screen.findByText("Ana Souza");
-    const status = screen.getByRole("button", { name: /alterar status/i });
+    await user.click(screen.getByRole("button", { name: /menu da conta/i }));
+    expect(screen.getByRole("menuitem", { name: "Meu perfil" })).toHaveAttribute(
+      "href",
+      "/profile",
+    );
+  });
+
+  it("reaches the status control and the account menu by keyboard", async () => {
+    const user = userEvent.setup();
+    renderFooter();
+
+    await screen.findByText("Ana Souza");
     const trigger = screen.getByRole("button", { name: /menu da conta/i });
-    userLink().focus();
-    expect(userLink()).toHaveFocus();
-    await user.tab();
-    expect(status).toHaveFocus();
+    identity().focus();
+    expect(identity()).toHaveFocus();
     await user.tab();
     expect(trigger).toHaveFocus();
   });
+
+  // Issue #798 follow-up: the identity block is the status control, with the
+  // state written once, under the name.
+  it("is one button holding the avatar without a dot, the name and the state", async () => {
+    renderFooter();
+
+    const name = await screen.findByText("Ana Souza");
+    const control = identity();
+    expect(control.tagName).toBe("BUTTON");
+    expect(control).toHaveAttribute("type", "button");
+    expect(control).toHaveAttribute("aria-haspopup", "menu");
+    expect(control).toHaveAttribute("aria-expanded", "false");
+    expect(control).toHaveAttribute("title", "Definir status");
+    expect(control).toHaveAccessibleName("Ana Souza. Definir status");
+    expect(control.contains(name)).toBe(true);
+    expect(control.querySelector(".chat-sidebar__avatar")).toBeInTheDocument();
+    expect(control.querySelector(".chat-sidebar__user-presence")).toBeInTheDocument();
+    // Nothing is known about the state yet (no socket here), so no dot at all —
+    // and the avatar never carries one. With a known state, exactly one dot is
+    // drawn, under the name: see presenceSurfaces.test.tsx.
+    const row = control.closest(".chat-sidebar__user-row") as HTMLElement;
+    expect(within(row).queryAllByTestId("presence-dot")).toHaveLength(0);
+    expect(screen.queryByRole("link", { name: /meu perfil/i })).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["the avatar", () => identity().querySelector(".chat-sidebar__avatar") as HTMLElement],
+    ["the name", () => screen.getByText("Ana Souza")],
+    ["the state", () => identity().querySelector(".chat-sidebar__user-presence") as HTMLElement],
+  ])("opens the status menu from %s", async (_part, part) => {
+    const user = userEvent.setup();
+    renderFooter();
+
+    await screen.findByText("Ana Souza");
+    await user.click(part());
+    expect(screen.getByRole("menu", { name: "Status" })).toBeInTheDocument();
+    expect(identity()).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("leaves the status menu closed when Settings is pressed", async () => {
+    const user = userEvent.setup();
+    renderFooter();
+
+    await screen.findByText("Ana Souza");
+    await user.click(screen.getByRole("button", { name: /menu da conta/i }));
+    expect(screen.queryByRole("menu", { name: "Status" })).not.toBeInTheDocument();
+    expect(identity()).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it.each([["{Enter}"], [" "]])(
+    "opens with %s and Escape closes, back on the identity",
+    async (key) => {
+      const user = userEvent.setup();
+      renderFooter();
+
+      await screen.findByText("Ana Souza");
+      identity().focus();
+      await user.keyboard(key);
+      expect(screen.getByRole("menu", { name: "Status" })).toBeInTheDocument();
+      await user.keyboard("{Escape}");
+      expect(screen.queryByRole("menu", { name: "Status" })).not.toBeInTheDocument();
+      expect(identity()).toHaveFocus();
+    },
+  );
 
   it("does not invent an identity when the profile fails to load", async () => {
     mockFetchMyProfile.mockRejectedValue(new ApiRequestError(500, "internal_error", "boom"));

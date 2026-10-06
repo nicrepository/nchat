@@ -561,7 +561,9 @@ test.describe("sidebar — renomear canal", () => {
  * control's reachability, by role and by keyboard — never by pixel.
  */
 test.describe("sidebar — rodapé do usuário autenticado", () => {
-  const userLink = (page: Page) => page.getByRole("link", { name: /meu perfil/i });
+  // The footer's identity is the status control (issue #798); the profile is
+  // in the account menu.
+  const userLink = (page: Page) => page.getByRole("button", { name: /definir status/i });
 
   test("mostra o nome real e o Blobatar quando não há foto", async ({ page }, testInfo) => {
     await openChatWithAllThreeCategories(page, testInfo);
@@ -605,10 +607,8 @@ test.describe("sidebar — rodapé do usuário autenticado", () => {
     const trigger = page.getByRole("button", { name: /menu da conta/i });
 
     await userLink(page).focus();
-    // Issue #798: the status control sits between the profile link and the
-    // account menu, in reading order.
-    await page.keyboard.press("Tab");
-    await expect(page.getByRole("button", { name: /alterar status/i })).toBeFocused();
+    // Issue #798: the status control comes before the account menu, in
+    // reading order.
     await page.keyboard.press("Tab");
     await expect(trigger).toBeFocused();
     await page.keyboard.press("Enter");

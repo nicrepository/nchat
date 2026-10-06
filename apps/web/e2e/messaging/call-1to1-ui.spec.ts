@@ -376,7 +376,8 @@ test.describe("chamada 1:1", () => {
       y: beforeDrag!.y,
     });
 
-    await page.getByRole("link", { name: /^Meu perfil/ }).click();
+    await page.getByRole("button", { name: /menu da conta/i }).click();
+    await page.getByRole("menuitem", { name: "Meu perfil" }).click();
     await expect(page).toHaveURL(/\/profile$/);
     await expect(floating).toBeVisible();
     await page.goBack();

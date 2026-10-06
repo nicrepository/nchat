@@ -2,6 +2,7 @@ import { expect, test, type Page, type TestInfo } from "@playwright/test";
 
 import {
   CURRENT_USER_ID,
+  CURRENT_USER_NAME,
   OTHER_USER_ID,
   OTHER_USER_NAME,
   createScenario,
@@ -45,6 +46,7 @@ import {
 const T0 = "2026-10-01T10:00:00.000Z";
 const T1 = "2026-10-01T10:05:00.000Z";
 const T2 = "2026-10-01T10:10:00.000Z";
+const T3 = "2026-10-01T10:15:00.000Z";
 
 async function openDM(page: Page, testInfo: TestInfo, settings?: PresenceSettingsServer) {
   const targetId = uniqueId(testInfo, "dm");
@@ -72,8 +74,13 @@ function writeAnswered(page: Page) {
   );
 }
 
+/** The footer's identity — avatar, name and state — is the status control. */
 function statusTrigger(page: Page) {
-  return page.getByRole("button", { name: /alterar status/i });
+  return page.getByRole("button", { name: /definir status/i });
+}
+
+function selfLabel(state: string) {
+  return `${CURRENT_USER_NAME}, ${state}. Definir status`;
 }
 
 function header(page: Page) {
@@ -100,14 +107,14 @@ test.describe("presença estilo Teams (#798)", () => {
   test("trocar de aba não envia nada e não torna ninguém ausente", async ({ page }, testInfo) => {
     const { targetId } = await openDM(page, testInfo);
     await announceSelf(page, targetId, { availability: "available" });
-    await expect(statusTrigger(page)).toHaveAccessibleName("Status: Disponível. Alterar status");
+    await expect(statusTrigger(page)).toHaveAccessibleName(selfLabel("Disponível"));
     const before = await pings(page);
 
     await leaveTab(page);
     // Leaving is not activity, and it is not a statement about anything: no
     // frame at all, so the only way to away is the server's idle timeout.
     expect(await pings(page)).toBe(before);
-    await expect(statusTrigger(page)).toHaveAccessibleName("Status: Disponível. Alterar status");
+    await expect(statusTrigger(page)).toHaveAccessibleName(selfLabel("Disponível"));
 
     // Coming back is a person returning, and is reported.
     await returnToTab(page);
@@ -122,7 +129,7 @@ test.describe("presença estilo Teams (#798)", () => {
 
     // The server's idle timeout ran out across every session.
     await announceSelf(page, targetId, { state: "away", availability: "away", updated_at: T1 });
-    await expect(statusTrigger(page)).toHaveAccessibleName(/Status: Ausente/);
+    await expect(statusTrigger(page)).toHaveAccessibleName(selfLabel("Ausente"));
 
     // A real interaction is reported at once; the server answers available.
     const before = await pings(page);
@@ -133,7 +140,7 @@ test.describe("presença estilo Teams (#798)", () => {
     expect(await pings(page)).toBe(before + 1);
 
     await announceSelf(page, targetId, { availability: "available", updated_at: T2 });
-    await expect(statusTrigger(page)).toHaveAccessibleName("Status: Disponível. Alterar status");
+    await expect(statusTrigger(page)).toHaveAccessibleName(selfLabel("Disponível"));
   });
 
   test("duas abas da mesma conta: a oculta não derruba a ativa", async ({ context }, testInfo) => {
@@ -150,7 +157,7 @@ test.describe("presença estilo Teams (#798)", () => {
     // The server aggregates both sessions and publishes one answer to both.
     for (const page of [hidden, active]) {
       await announceSelf(page, targetId, { availability: "available" });
-      await expect(statusTrigger(page)).toHaveAccessibleName("Status: Disponível. Alterar status");
+      await expect(statusTrigger(page)).toHaveAccessibleName(selfLabel("Disponível"));
     }
   });
 
@@ -250,9 +257,7 @@ test.describe("presença estilo Teams (#798)", () => {
     // The server told both sessions before answering; it also publishes them.
     for (const page of [first, second]) {
       await announceSelf(page, targetId, { availability: "dnd", updated_at: T1 });
-      await expect(statusTrigger(page)).toHaveAccessibleName(
-        "Status: Não perturbe. Alterar status",
-      );
+      await expect(statusTrigger(page)).toHaveAccessibleName(selfLabel("Não perturbe"));
     }
     await statusTrigger(second).click();
     await expect(second.getByRole("menuitemradio", { name: "Não perturbe" })).toHaveAttribute(
@@ -272,9 +277,7 @@ test.describe("presença estilo Teams (#798)", () => {
     await page.getByRole("menuitem", { name: "Hoje" }).click();
     await answered;
     expect(server.state).toBe("appear_offline");
-    await expect(statusTrigger(page)).toHaveAccessibleName(
-      "Status: Aparecer offline. Alterar status",
-    );
+    await expect(statusTrigger(page)).toHaveAccessibleName(selfLabel("Aparecer offline"));
 
     // Everyone else is told "offline"; this session stays connected and keeps
     // receiving the conversation.
@@ -283,9 +286,7 @@ test.describe("presença estilo Teams (#798)", () => {
       availability: "offline",
       updated_at: T1,
     });
-    await expect(statusTrigger(page)).toHaveAccessibleName(
-      "Status: Aparecer offline. Alterar status",
-    );
+    await expect(statusTrigger(page)).toHaveAccessibleName(selfLabel("Aparecer offline"));
     await emitMessageCreated(page, scenario as MessagingScenario, {
       kind: "dm",
       targetId,
@@ -307,9 +308,7 @@ test.describe("presença estilo Teams (#798)", () => {
     server.state = "appear_offline";
     server.expiresAt = new Date(start + HOUR).toISOString();
     await openDM(page, testInfo, server);
-    await expect(statusTrigger(page)).toHaveAccessibleName(
-      "Status: Aparecer offline. Alterar status",
-    );
+    await expect(statusTrigger(page)).toHaveAccessibleName(selfLabel("Aparecer offline"));
     const reads = server.requests.length;
 
     elapsed = HOUR + 1_000;
@@ -324,6 +323,62 @@ test.describe("presença estilo Teams (#798)", () => {
     );
   });
 
+  test("a identidade do rodapé é o controle de status, com um só indicador", async ({
+    page,
+  }, testInfo) => {
+    const server = createPresenceSettingsServer();
+    const { targetId } = await openDM(page, testInfo, server);
+    await announceSelf(page, targetId, { availability: "available" });
+
+    const identity = statusTrigger(page);
+    await expect(identity).toHaveAccessibleName(selfLabel("Disponível"));
+    await expect(identity.locator("img.chat-sidebar__avatar-img")).toBeVisible();
+    await expect(identity.locator(".chat-sidebar__user-name")).toHaveText(CURRENT_USER_NAME);
+    await expect(identity.locator(".chat-sidebar__user-presence")).toHaveText("Disponível");
+    // One dot in the whole footer row, under the name — none on the avatar.
+    const row = page.locator(".chat-sidebar__user-row");
+    await expect(row.getByTestId("presence-dot")).toHaveCount(1);
+    await expect(identity.locator(".chat-sidebar__avatar").getByTestId("presence-dot")).toHaveCount(
+      0,
+    );
+
+    // The name opens the menu; Busy for an hour.
+    await identity.locator(".chat-sidebar__user-name").click();
+    await page.getByRole("menuitemradio", { name: "Ocupado" }).click();
+    let answered = writeAnswered(page);
+    await page.getByRole("menuitem", { name: "1 hora" }).click();
+    await answered;
+    expect(server.state).toBe("busy");
+    // The server publishes the change to every session, this one included.
+    await announceSelf(page, targetId, { availability: "busy", updated_at: T1 });
+    await expect(identity).toHaveAccessibleName(selfLabel("Ocupado"));
+
+    // The avatar opens it again; Do Not Disturb.
+    await identity.locator(".chat-sidebar__avatar").click();
+    await page.getByRole("menuitemradio", { name: "Não perturbe" }).click();
+    answered = writeAnswered(page);
+    await page.getByRole("menuitem", { name: "1 hora" }).click();
+    await answered;
+    expect(server.state).toBe("dnd");
+    await announceSelf(page, targetId, { availability: "dnd", updated_at: T2 });
+    await expect(identity).toHaveAccessibleName(selfLabel("Não perturbe"));
+
+    // The state line opens it too; back to automatic.
+    await identity.locator(".chat-sidebar__user-presence").click();
+    await page.getByRole("menuitem", { name: "Redefinir status" }).click();
+    await expect.poll(() => server.state).toBeNull();
+    await announceSelf(page, targetId, { availability: "available", updated_at: T3 });
+    await expect(identity).toHaveAccessibleName(selfLabel("Disponível"));
+
+    // Settings is its own control: it never opens the status menu.
+    await page.getByRole("button", { name: /menu da conta/i }).click();
+    await expect(page.getByRole("menu", { name: "Status" })).toHaveCount(0);
+    await expect(page.getByRole("menuitem", { name: "Meu perfil" })).toHaveAttribute(
+      "href",
+      "/profile",
+    );
+  });
+
   test("com o gate fechado o menu mostra o estado e não oferece mudança", async ({
     page,
   }, testInfo) => {
@@ -332,7 +387,7 @@ test.describe("presença estilo Teams (#798)", () => {
     server.state = "dnd";
     server.expiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
     await openDM(page, testInfo, server);
-    await expect(statusTrigger(page)).toHaveAccessibleName(/Status: Não perturbe/);
+    await expect(statusTrigger(page)).toHaveAccessibleName(selfLabel("Não perturbe"));
     await statusTrigger(page).click();
     await expect(page.getByRole("menuitemradio")).toHaveCount(0);
     await expect(page.getByText("Alterar o status não está disponível no momento.")).toBeVisible();

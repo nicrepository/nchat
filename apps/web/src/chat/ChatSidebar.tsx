@@ -27,15 +27,10 @@ import LeaveConversationDialog from "./LeaveConversationDialog";
 import RenameChannelDialog from "./RenameChannelDialog";
 import { avatarColorFor, initialsFrom } from "./messageDisplay";
 import NewConversationDialog from "./NewConversationDialog";
-import {
-  presenceLabel,
-  presenceTargetKey,
-  usePresence,
-  usePresenceDetail,
-  type PresenceState,
-} from "./presence";
+import { presenceTargetKey, usePresenceDetail, type PresenceState } from "./presence";
 import { describePresence } from "./presenceDescription";
 import { UserAvatar } from "./UserAvatar";
+import PresenceDot from "./PresenceDot";
 import PresenceStatusMenu from "./PresenceStatusMenu";
 import SidebarUserMenu from "./SidebarUserMenu";
 import { sortByActivity } from "./sidebarOrder";
@@ -952,7 +947,8 @@ function ChannelsByCategory({
 // ── Footer user block ─────────────────────────────────────────────────────────
 
 /**
- * The authenticated user's own row: picture, name, and Settings beside it.
+ * The authenticated user's own row: picture, name and state as the one status
+ * control, and Settings beside it.
  *
  * Identity comes from GET /api/auth/me through the shared self-profile cache —
  * never from a client-chosen id, never from a fixture. Until that answer exists
@@ -961,49 +957,50 @@ function ChannelsByCategory({
  * not even for a frame. A load failure is its own state for the same reason: it
  * is not a user without an avatar.
  *
- * Profile and Settings are siblings, not nested links: one interactive element
- * may not contain another.
+ * The status control and Settings are siblings, not nested: one interactive
+ * element may not contain another.
  */
 function SidebarUser({ workspaceId }: { workspaceId: string }) {
   const self = useSelfProfile();
   // "" covers absent / null / whitespace-only — normalised once, in profileApi.
   const displayName = self.status === "ready" ? self.profile.displayName : "";
-  // The viewer's own presence comes back from the server like everyone else's:
-  // their session announces itself into the conversations it subscribes to, and
-  // the echo is what this reads. Nothing here decides locally that "I" am
-  // online, so the footer shows what the server would tell anybody else.
-  //
-  // No conversation is passed, and none would be right: the footer is not
-  // rendering this person *inside* a conversation. It therefore never shows
-  // "offline" — which is correct, because a viewer looking at their own row is
-  // by definition connected.
-  const presence = usePresence(self.status === "ready" ? self.profile.id : undefined);
-  const baseLabel = displayName ? `Meu perfil de ${displayName}` : "Meu perfil";
 
   return (
     <div className="chat-sidebar__user-row">
-      <Link
-        to="/profile"
-        className="chat-sidebar__user"
-        aria-label={presence === "unknown" ? baseLabel : `${baseLabel}, ${presenceLabel(presence)}`}
-      >
-        {self.status === "ready" ? (
-          <>
-            <Avatar
-              // No usable name means no initials to derive: an empty swatch,
-              // never "?". Its colour is still the user's own, so the row does
-              // not change identity when a name arrives.
-              userId={self.profile.id}
-              workspaceId={workspaceId}
-              displayName={displayName}
-              avatarUrl={self.profile.avatarUrl}
-              color={avatarColorFor(self.profile.id)}
-              status={presence}
-              size="md"
-            />
-            <span className="chat-sidebar__user-name">{displayName || "Meu perfil"}</span>
-          </>
-        ) : (
+      {self.status === "ready" ? (
+        // The whole identity — avatar, name and state — is the one control
+        // that sets the viewer's status (issue #798). The profile is in the
+        // account menu beside it. The state comes back from the server like
+        // everyone else's: nothing here decides locally that "I" am online.
+        <PresenceStatusMenu selfId={self.profile.id} displayName={displayName}>
+          {(trigger, summary) => (
+            <button {...trigger} className="chat-sidebar__user">
+              <Avatar
+                // No usable name means no initials to derive: an empty swatch,
+                // never "?". Its colour is still the user's own, so the row
+                // does not change identity when a name arrives. No dot: the
+                // state is written right below the name, once.
+                userId={self.profile.id}
+                workspaceId={workspaceId}
+                displayName={displayName}
+                avatarUrl={self.profile.avatarUrl}
+                color={avatarColorFor(self.profile.id)}
+                size="md"
+              />
+              <span className="chat-sidebar__user-identity" aria-hidden="true">
+                <span className="chat-sidebar__user-name">{displayName || "Meu perfil"}</span>
+                <span className="chat-sidebar__user-presence">
+                  <PresenceDot state={summary.dot} inline />
+                  <span className="chat-sidebar__user-presence-label">{summary.label}</span>
+                </span>
+              </span>
+            </button>
+          )}
+        </PresenceStatusMenu>
+      ) : (
+        // Same box as the real control, so the footer does not jump when the
+        // profile arrives — and nothing to press until it has.
+        <div className="chat-sidebar__user">
           <span
             className="chat-sidebar__user-placeholder"
             data-state={self.status}
@@ -1013,10 +1010,7 @@ function SidebarUser({ workspaceId }: { workspaceId: string }) {
             <span className="chat-sidebar__avatar chat-sidebar__avatar--md chat-sidebar__user-avatar-skeleton" />
             <span className="chat-sidebar__user-name-skeleton" />
           </span>
-        )}
-      </Link>
-      {self.status === "ready" && (
-        <PresenceStatusMenu selfId={self.profile.id} displayName={displayName} />
+        </div>
       )}
       <SidebarUserMenu />
     </div>

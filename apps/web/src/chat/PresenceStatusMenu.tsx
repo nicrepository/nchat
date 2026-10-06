@@ -15,7 +15,15 @@
  * and on a narrow screen the menu is a bottom sheet — nothing depends on hover.
  */
 
-import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
+} from "react";
 import { createPortal } from "react-dom";
 import { Link } from "react-router";
 
@@ -85,12 +93,42 @@ function useOutsideClose(
   }, [open, trigger, popup, close]);
 }
 
+/**
+ * What the menu hands its trigger: every attribute and handler that makes it
+ * the menu's button — the caller only chooses what it looks like.
+ */
+export interface StatusTriggerProps {
+  ref: (node: HTMLButtonElement | null) => void;
+  type: "button";
+  "aria-haspopup": "menu";
+  "aria-expanded": boolean;
+  "aria-controls": string | undefined;
+  "aria-busy": boolean;
+  "aria-label": string;
+  title: string;
+  onClick: () => void;
+}
+
+/** "Ana Souza, Ocupado. Definir status" — the parts that are known. */
+function triggerLabel(displayName: string, summary: SelfPresenceSummary): string {
+  const known = summary.dot === "unknown" ? [displayName] : [displayName, summary.label];
+  const who = known.filter(Boolean).join(", ");
+  return who ? `${who}. Definir status` : "Definir status";
+}
+
 export default function PresenceStatusMenu({
   selfId,
   displayName,
+  children,
 }: {
   selfId: string;
   displayName: string;
+  /**
+   * Draws the trigger — the footer's whole identity block — from the props
+   * that wire it to this menu and the summary it should show. Open, close,
+   * focus, keyboard and placement stay here.
+   */
+  children: (trigger: StatusTriggerProps, summary: SelfPresenceSummary) => ReactNode;
 }) {
   const controller = usePresenceSettings();
   const detail = usePresenceDetail(selfId);
@@ -102,11 +140,16 @@ export default function PresenceStatusMenu({
   const restoreFocus = useRef(false);
   const popupId = useId();
 
-  const close = useCallback((returnFocus = false) => {
-    restoreFocus.current = returnFocus;
-    setOpen(false);
-    setStep(statesStep);
-  }, []);
+  // The setters are stable; they are listed because the trigger's props carry
+  // them out of this component, which is what the compiler checks against.
+  const close = useCallback(
+    (returnFocus = false) => {
+      restoreFocus.current = returnFocus;
+      setOpen(false);
+      setStep(statesStep);
+    },
+    [setOpen, setStep],
+  );
   const closeOutside = useCallback(() => close(false), [close]);
   useOutsideClose(open, { trigger, popup }, closeOutside);
 
@@ -126,26 +169,21 @@ export default function PresenceStatusMenu({
     close(true);
   };
 
+  const triggerProps: StatusTriggerProps = {
+    ref: setTrigger,
+    type: "button",
+    "aria-haspopup": "menu",
+    "aria-expanded": open,
+    "aria-controls": open ? popupId : undefined,
+    "aria-busy": controller.pending,
+    "aria-label": triggerLabel(displayName, summary),
+    title: "Definir status",
+    onClick: () => (open ? close(false) : setOpen(true)),
+  };
+
   return (
     <div className="presence-status">
-      <button
-        ref={setTrigger}
-        type="button"
-        className="presence-status__trigger"
-        aria-haspopup="menu"
-        aria-expanded={open}
-        aria-controls={open ? popupId : undefined}
-        aria-busy={controller.pending}
-        aria-label={
-          summary.dot === "unknown" ? "Alterar status" : `Status: ${summary.label}. Alterar status`
-        }
-        onClick={() => (open ? close(false) : setOpen(true))}
-      >
-        <PresenceDot state={summary.dot} inline title={summary.label} />
-        <span className="presence-status__trigger-label" aria-hidden="true">
-          {summary.label}
-        </span>
-      </button>
+      <TriggerSlot render={children} trigger={triggerProps} summary={summary} />
       {controller.failed && <StatusError onRetry={controller.retry} />}
       {open &&
         createPortal(
@@ -165,6 +203,19 @@ export default function PresenceStatusMenu({
         )}
     </div>
   );
+}
+
+/** Draws the caller's trigger as an element of its own, from its props. */
+function TriggerSlot({
+  render,
+  trigger,
+  summary,
+}: {
+  render: (trigger: StatusTriggerProps, summary: SelfPresenceSummary) => ReactNode;
+  trigger: StatusTriggerProps;
+  summary: SelfPresenceSummary;
+}) {
+  return render(trigger, summary);
 }
 
 function StatusError({ onRetry }: { onRetry: () => void }) {
