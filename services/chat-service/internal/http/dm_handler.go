@@ -361,6 +361,16 @@ type directProfileJSON struct {
 	// Presence is omitted when the server does not track it, so a client can
 	// tell "not tracked" from "tracked and offline".
 	Presence string `json:"presence,omitempty"`
+	// LastSeenAt is when the server last published this person as offline
+	// (issue #798), present only while they are offline. It is the server's
+	// instant, never a client's, and carries nothing about their activity.
+	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+}
+
+// lastSeenLookup is the optional half of a presence source that can say when
+// an offline person was last seen.
+type lastSeenLookup interface {
+	LastSeen(ctx context.Context, workspaceID, userID string) (time.Time, bool)
 }
 
 // directProfileResponse is the panel payload for a 1:1 conversation.
@@ -412,6 +422,7 @@ func (h *DMHandler) DirectProfile(w http.ResponseWriter, r *http.Request) {
 		writeDirectProfileError(w, r, conversationID, err)
 		return
 	}
+	presence := h.presenceOf(workspaceID, result.Profile.UserID)
 	httputil.WriteJSON(w, http.StatusOK, directProfileResponse{
 		Kind:           "direct",
 		ConversationID: result.Conversation.ID,
@@ -420,9 +431,25 @@ func (h *DMHandler) DirectProfile(w http.ResponseWriter, r *http.Request) {
 			DisplayName: result.Profile.DisplayName,
 			AvatarURL:   result.Profile.AvatarURL,
 			Email:       result.Profile.Email,
-			Presence:    h.presenceOf(workspaceID, result.Profile.UserID),
+			Presence:    presence,
+			LastSeenAt:  h.lastSeenOf(r.Context(), workspaceID, result.Profile.UserID, presence),
 		},
 	})
+}
+
+// lastSeenOf is the last-seen instant of an offline profile, when the presence
+// source can tell. Never for someone present: "last seen" about a person who is
+// here would only disclose when they last left.
+func (h *DMHandler) lastSeenOf(ctx context.Context, workspaceID, userID, presence string) *time.Time {
+	lookup, ok := h.presence.(lastSeenLookup)
+	if !ok || presence != presenceOffline {
+		return nil
+	}
+	at, found := lookup.LastSeen(ctx, workspaceID, userID)
+	if !found {
+		return nil
+	}
+	return &at
 }
 
 // presenceOf reports the live presence of one user, or "" when presence is not

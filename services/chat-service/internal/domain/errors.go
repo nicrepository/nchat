@@ -18,6 +18,10 @@ var (
 	ErrGeneralChannelMissing     = errors.New("workspace general channel not found")
 	ErrCannotLeaveGeneralChannel = errors.New("cannot leave general channel")
 	ErrInvalidMessageTarget      = errors.New("invalid message target")
+	// ErrPresenceFactsUnavailable is a change to a fact presence is composed
+	// from that could not first be announced to presence (issue #798). Nothing
+	// was changed; the caller may retry.
+	ErrPresenceFactsUnavailable = errors.New("presence facts unavailable")
 	// ErrMentionNotEligible is deliberately non-enumerating: it covers an
 	// unknown, cross-workspace, inactive, or unauthorized mention target without
 	// revealing which condition failed.

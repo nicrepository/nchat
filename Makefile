@@ -1,4 +1,4 @@
-.PHONY: help install dev-web dev-admin-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check dev-gateway-up dev-gateway-down dev-gateway-status dev-gateway-logs dev-gateway-validate dev-tls-generate dev-tls-status dev-tls-clean tls-config-check k8s-render k8s-validate k8s-render-staging k8s-validate-staging k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci health-contract-check ci-config-check images-module-inputs-check images-module-inputs-check-test gateway-config-check web-security-headers-check web-livekit-integration-check sealed-secrets-validate sealed-secrets-policy-check sealed-secrets-install-controller sealed-secrets-fetch-cert build-web build-admin-web test-web test-admin-web lint-web lint-admin-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-govulncheck-gate-test security-trivy-fs security-trivy-config poc-seaweedfs poc-valkey poc-config-check observability-config-check grafana-dashboard-check migrations-check migrations-blue-green-test prod-blue-green-check prod-blue-green-check-test prod-stateful-check prod-stateful-check-test prod-stateful-preflight-test prod-stateful-apply prod-blue-green-test prod-blue-green-query-test prod-capacity-test prod-release-manifest-test cd-workflows-check cd-workflows-test prod-lifecycle-test prod-bootstrap-rbac-test prod-rollback-schema-test dev-smoke-test prod-runner-guard-test prod-capacity-evidence prod-blue-green-status prod-blue-green-bootstrap prod-blue-green-deploy prod-blue-green-smoke prod-blue-green-stable-smoke prod-blue-green-record-traffic-smoke prod-blue-green-rollback-schema-gate dev-smoke prod-blue-green-cutover prod-blue-green-rollback prod-blue-green-drain-old prod-notification-levels migrations-up migrations-down migrations-status migrations-reset migrations-smoke db-restore-test dev-observability-up dev-observability-down dev-observability-status dev-observability-logs dev-observability-validate dev-media-up dev-media-down dev-media-status dev-media-logs dev-media-validate media-config-check qa-webrtc-office-network webrtc-office-network-config-check ci ci-static-web ci-static-admin-web ci-static-go ci-static-repository ci-architecture-check ci-infra-config ci-infra-kubernetes ci-infra-migrations ci-infra-release-safety test-integration-go
+.PHONY: help install dev-web dev-admin-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check dev-gateway-up dev-gateway-down dev-gateway-status dev-gateway-logs dev-gateway-validate dev-tls-generate dev-tls-status dev-tls-clean tls-config-check k8s-render k8s-validate k8s-render-staging k8s-validate-staging k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci health-contract-check ci-config-check images-module-inputs-check images-module-inputs-check-test gateway-config-check web-security-headers-check web-livekit-integration-check sealed-secrets-validate sealed-secrets-policy-check sealed-secrets-install-controller sealed-secrets-fetch-cert build-web build-admin-web test-web test-admin-web lint-web lint-admin-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-govulncheck-gate-test security-trivy-fs security-trivy-config poc-seaweedfs poc-valkey poc-config-check observability-config-check grafana-dashboard-check migrations-check migrations-blue-green-test prod-blue-green-check prod-blue-green-check-test prod-stateful-check prod-stateful-check-test prod-stateful-preflight-test prod-stateful-apply prod-blue-green-test prod-blue-green-query-test prod-capacity-test prod-release-manifest-test cd-workflows-check cd-workflows-test prod-lifecycle-test prod-bootstrap-rbac-test prod-rollback-schema-test dev-smoke-test prod-runner-guard-test prod-capacity-evidence prod-blue-green-status prod-blue-green-bootstrap prod-blue-green-deploy prod-blue-green-deploy-release prod-blue-green-smoke prod-blue-green-stable-smoke prod-blue-green-record-traffic-smoke prod-blue-green-rollback-schema-gate dev-smoke prod-blue-green-cutover prod-blue-green-rollback prod-blue-green-drain-old prod-notification-levels prod-manual-presence migrations-up migrations-down migrations-status migrations-reset migrations-smoke db-restore-test dev-observability-up dev-observability-down dev-observability-status dev-observability-logs dev-observability-validate dev-media-up dev-media-down dev-media-status dev-media-logs dev-media-validate media-config-check qa-webrtc-office-network webrtc-office-network-config-check ci ci-static-web ci-static-admin-web ci-static-go ci-static-repository ci-architecture-check ci-infra-config ci-infra-kubernetes ci-infra-migrations ci-infra-release-safety test-integration-go
 
 help:
 	@echo "NChat development commands"
@@ -90,12 +90,13 @@ help:
 	@echo "  make prod-capacity-evidence  Collect cluster capacity evidence: ARGS=\"<output-dir>\""
 	@echo "  make prod-blue-green-status  Show the production release slots (requires cluster)"
 	@echo "  make prod-blue-green-bootstrap Establish production with Blue as baseline (requires cluster)"
-	@echo "  make prod-blue-green-deploy  Deploy the release into the candidate slot (requires cluster)"
+	@echo "  make prod-blue-green-deploy-release RELEASE_CHECKOUT=<dir>  From the default branch: check, then deploy that release into the candidate slot (requires cluster)"
 	@echo "  make prod-blue-green-smoke   Automated smoke of a slot: ARGS=\"--target green\""
 	@echo "  make prod-blue-green-cutover Promote a slot: ARGS=\"--target green\""
 	@echo "  make prod-blue-green-rollback Roll back: ARGS=\"--target blue 'reason'\""
 	@echo "  make prod-blue-green-drain-old Retire a slot: ARGS=\"--target blue\""
 	@echo "  make prod-notification-levels Conversation notification levels: ARGS=\"--status\" | ARGS=\"--set false\""
+	@echo "  make prod-manual-presence    Manual presence (issue #798): ARGS=\"--status\" | ARGS=\"--set false\""
 	@echo "  make dev-observability-up    Start Prometheus, Grafana, Jaeger"
 	@echo "  make dev-observability-down  Stop observability stack"
 	@echo "  make dev-observability-status Show observability stack status"
@@ -456,8 +457,15 @@ prod-blue-green-status:
 prod-blue-green-bootstrap:
 	pnpm prod:blue-green:bootstrap
 
+# Retired (issue #798): it ran the deploy script of whichever checkout it was
+# typed in, so a release from before #798 deployed itself unchecked.
 prod-blue-green-deploy:
-	pnpm prod:blue-green:deploy
+	@echo "prod-blue-green-deploy is retired: from a checkout of the default branch run" >&2
+	@echo "  make prod-blue-green-deploy-release RELEASE_CHECKOUT=<checkout of the release>" >&2
+	@exit 1
+
+prod-blue-green-deploy-release:
+	pnpm prod:blue-green:deploy-release $(RELEASE_CHECKOUT)
 
 prod-blue-green-smoke:
 	pnpm prod:blue-green:smoke $(ARGS)
@@ -491,6 +499,9 @@ prod-blue-green-drain-old:
 
 prod-notification-levels:
 	pnpm prod:notification-levels $(ARGS)
+
+prod-manual-presence:
+	pnpm prod:manual-presence $(ARGS)
 
 dev-observability-up:
 	pnpm dev:observability:up

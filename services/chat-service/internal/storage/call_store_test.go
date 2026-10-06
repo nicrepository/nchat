@@ -462,9 +462,9 @@ func TestPGXCallStoreRenewsPresenceOnlyAfterResourceAuthorization(t *testing.T) 
 			if test.authorized {
 				mock.ExpectQuery(`call_participant_leases`).WithArgs(callWorkspaceID, callCallerID, callID).
 					WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
-				mock.ExpectExec(`UPDATE chat.call_participant_leases SET expires_at`).
-					WithArgs(callID, callCallerID, callParticipationID, now.Add(30*time.Second)).
-					WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+				mock.ExpectQuery(`(?s)WITH prior.*FOR UPDATE.*UPDATE chat.call_participant_leases l SET expires_at`).
+					WithArgs(callID, callCallerID, pgxmock.AnyArg(), now.Add(30*time.Second)).
+					WillReturnRows(pgxmock.NewRows([]string{"lapsed"}).AddRow(false))
 				mock.ExpectCommit()
 			} else {
 				mock.ExpectRollback()
@@ -830,6 +830,7 @@ func TestPGXCallStoreTransitionEndsResourceCallAndRecordsEvent(t *testing.T) {
 		WithArgs(callID, string(domain.CallStatusEnded)).
 		WillReturnRows(resourceCallEndedRow(now))
 	expectCallEndedEvent(mock)
+	expectCallLeaseHolders(mock)
 	mock.ExpectCommit()
 
 	result, err := storage.NewPGXCallStore(mock).TransitionCall(context.Background(), storage.TransitionCallInput{

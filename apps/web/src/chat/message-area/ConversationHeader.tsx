@@ -16,7 +16,9 @@ import type { ChatOutletContext } from "../ChatShell";
 import type { DMCounterpart } from "../chatTypes";
 import { conversationDetailsPanelId } from "../conversationDetailsDisplay";
 import { avatarColorFor } from "../messageDisplay";
-import { presenceLabel, usePresence, type PresenceState } from "../presence";
+import { usePresenceDetail, type PresenceState } from "../presence";
+import { describePresence } from "../presenceDescription";
+import { presenceNeedsClock, usePresenceClock } from "../usePresenceClock";
 import { UserAvatar } from "../UserAvatar";
 import type { ConversationDetailsPanelState } from "../useConversationDetailsPanel";
 import ChannelIcon from "../ChannelIcon";
@@ -234,7 +236,9 @@ export function HeaderDM({
   detailsToggle,
   presenceTarget,
 }: HeaderDMProps) {
-  const presence = usePresence(counterpart?.userId, presenceTarget);
+  const detail = usePresenceDetail(counterpart?.userId, presenceTarget);
+  const presence = detail.state;
+  const now = usePresenceClock(presenceNeedsClock(presence));
 
   return (
     <header className="chat-msg-area__header" data-testid="chat-msg-header">
@@ -253,7 +257,7 @@ export function HeaderDM({
           className={`chat-msg-area__header-presence chat-msg-area__header-presence--${presence}`}
           data-testid="chat-msg-header-presence"
         >
-          {presenceLabel(presence)}
+          {describePresence(detail, now)}
         </span>
       )}
       {counterpart && onStartCall && (

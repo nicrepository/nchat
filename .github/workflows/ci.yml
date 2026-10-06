@@ -550,6 +550,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # The deploy tests run a real release from before issue #798
+          # (scripts/ci/test_prod_blue_green_scripts.sh), read from history.
+          fetch-depth: 0
       - name: Setup pnpm
         uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:

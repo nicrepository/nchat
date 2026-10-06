@@ -2,6 +2,7 @@ import "./ProfileIdentityCard.css";
 import { avatarColorFor } from "../chat/messageDisplay";
 import { UserAvatar } from "../chat/UserAvatar";
 import { presenceLabel, usePresence } from "../chat/presence";
+import PresenceDot from "../chat/PresenceDot";
 import type { SelfProfile } from "./profileApi";
 
 interface ProfileIdentityCardProps {
@@ -38,7 +39,7 @@ export default function ProfileIdentityCard({
         {profile.jobTitle && <p className="profile-identity__job-title">{profile.jobTitle}</p>}
         <div className="profile-identity__meta">
           <span className="profile-identity__presence">
-            <PresenceDotInline state={presence} /> {presenceLabel(presence)}
+            <PresenceDot state={presence} inline /> {presenceLabel(presence)}
           </span>
           {profile.timezone && (
             <span data-testid="profile-identity-timezone" className="profile-identity__timezone">
@@ -64,14 +65,5 @@ export default function ProfileIdentityCard({
         </div>
       </div>
     </section>
-  );
-}
-
-function PresenceDotInline({ state }: { state: string }) {
-  return (
-    <span
-      className={`profile-identity__presence-dot profile-identity__presence-dot--${state}`}
-      aria-hidden="true"
-    />
   );
 }

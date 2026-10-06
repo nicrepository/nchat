@@ -2562,10 +2562,18 @@ interface DirectProfileResponse {
   display_name?: unknown;
   avatar_url?: unknown;
   presence?: unknown;
+  last_seen_at?: unknown;
   email?: unknown;
   job_title?: unknown;
   department?: unknown;
   timezone?: unknown;
+}
+
+/** A server instant the panel may show as "visto às"; anything else is absent. */
+function lastSeenFrom(raw: unknown): number | undefined {
+  if (typeof raw !== "string") return undefined;
+  const at = Date.parse(raw);
+  return Number.isFinite(at) ? at : undefined;
 }
 
 /** A profile string the panel will render: text, trimmed, or absent. */
@@ -2677,6 +2685,7 @@ export async function fetchDirectProfile(
       displayName,
       avatarUrl: safeAvatarUrl(raw.avatar_url),
       presence,
+      lastSeenAt: lastSeenFrom(raw.last_seen_at),
       email: optionalText(raw.email),
       // No column stores these yet, so today they are always absent. Reading
       // them costs three lines and is what makes "when available" true rather

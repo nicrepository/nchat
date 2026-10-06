@@ -37,12 +37,14 @@ func TestSingleNode_LosingTheLastCoverageCorrectsTheTarget(t *testing.T) {
 
 	observer := newClient("c-a", "user-a", "ws-1", &fakeSender{})
 	registerInHub(t, h, observer)
-	tracker.Connect(observer.workspaceID, observer.userID, observer.id)
+	h.connectPresence(observer)
+	drainPresenceEvents(t, h) // registered in the shared reach, as the register path does
 	subscribeInHubState(t, h, observer, TargetTypeChannel, "chan-x")
 
 	subject := newClient("c-b", "user-b", "ws-1", &fakeSender{})
 	registerInHub(t, h, subject)
-	tracker.Connect(subject.workspaceID, subject.userID, subject.id)
+	h.connectPresence(subject)
+	drainPresenceEvents(t, h) // registered in the shared reach, as the register path does
 	keyX := subscribeInHubState(t, h, subject, TargetTypeChannel, "chan-x")
 	subscribeInHubState(t, h, subject, TargetTypeChannel, "chan-y")
 	drainPresenceEvents(t, h)
@@ -97,14 +99,16 @@ func TestSingleNode_OverlappingCoverageKeepsTheSubject(t *testing.T) {
 
 	observer := newClient("c-a", "user-a", "ws-1", &fakeSender{})
 	registerInHub(t, h, observer)
-	tracker.Connect(observer.workspaceID, observer.userID, observer.id)
+	h.connectPresence(observer)
+	drainPresenceEvents(t, h) // registered in the shared reach, as the register path does
 	subscribeInHubState(t, h, observer, TargetTypeChannel, "chan-x")
 
 	first := newClient("c-b1", "user-b", "ws-1", &fakeSender{})
 	second := newClient("c-b2", "user-b", "ws-1", &fakeSender{})
 	for _, c := range []*Client{first, second} {
 		registerInHub(t, h, c)
-		tracker.Connect(c.workspaceID, c.userID, c.id)
+		h.connectPresence(c)
+		drainPresenceEvents(t, h) // registered in the shared reach, as the register path does
 	}
 	keyX := subscribeInHubState(t, h, first, TargetTypeChannel, "chan-x")
 	subscribeInHubState(t, h, second, TargetTypeChannel, "chan-x")

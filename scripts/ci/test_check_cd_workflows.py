@@ -172,24 +172,63 @@ class ProductionWorkflowContracts(unittest.TestCase):
 
     def test_the_candidate_smoke_may_not_be_dropped(self):
         def mutate(workflow):
-            del workflow["jobs"]["candidate"]["steps"][10]
+            del workflow["jobs"]["candidate"]["steps"][12]
 
         self.refuses(PREPARE, mutate, "a candidate nobody smoked is not promotable")
 
     def test_the_selector_invariant_may_not_be_dropped(self):
         def mutate(workflow):
-            del workflow["jobs"]["candidate"]["steps"][11]
+            del workflow["jobs"]["candidate"]["steps"][13]
 
         self.refuses(PREPARE, mutate, "preparation must prove it moved no traffic")
 
     def test_the_lifecycle_gate_may_not_be_bypassed(self):
         def mutate(workflow):
-            step = workflow["jobs"]["candidate"]["steps"][8]
+            step = workflow["jobs"]["candidate"]["steps"][10]
             step["run"] = (
                 'echo "candidate=$(scripts/deploy/nchat-prod/status.sh | tail -1)" >>"$GITHUB_OUTPUT"'
             )
 
         self.refuses(PREPARE, mutate, "the reserved rollback slot must not be overwritten")
+
+    # --- the manual presence guard (issue #798) -----------------------------
+
+    @staticmethod
+    def guard_index(workflow) -> int:
+        steps = workflow["jobs"]["candidate"]["steps"]
+        return next(i for i, step in enumerate(steps) if "require-release-capability.sh" in str(step.get("run", "")))
+
+    def test_the_release_capability_guard_may_not_be_dropped(self):
+        def mutate(workflow):
+            index = self.guard_index(workflow)
+            del workflow["jobs"]["candidate"]["steps"][index - 1 : index + 1]
+
+        self.refuses(PREPARE, mutate, "an incompatible release would start in the idle slot")
+
+    def test_the_guard_may_not_run_the_release_s_own_copy(self):
+        def mutate(workflow):
+            step = workflow["jobs"]["candidate"]["steps"][self.guard_index(workflow)]
+            step["run"] = 'scripts/deploy/nchat-prod/require-release-capability.sh "$GITHUB_WORKSPACE"'
+
+        self.refuses(PREPARE, mutate, "an old release's scripts cannot guard against that release")
+
+    def test_the_control_plane_may_not_be_the_release_commit(self):
+        def mutate(workflow):
+            step = workflow["jobs"]["candidate"]["steps"][self.guard_index(workflow) - 1]
+            step["with"]["ref"] = "${{ needs.eligibility.outputs.sha }}"
+
+        self.refuses(PREPARE, mutate, "the control plane is the default branch, not the release")
+
+    def test_the_guard_may_not_run_after_anything_is_applied(self):
+        def mutate(workflow):
+            steps = workflow["jobs"]["candidate"]["steps"]
+            index = self.guard_index(workflow)
+            guard = steps[index - 1 : index + 1]
+            del steps[index - 1 : index + 1]
+            deploy = next(i for i, step in enumerate(steps) if "deploy.sh" in str(step.get("run", "")))
+            steps[deploy + 1 : deploy + 1] = guard
+
+        self.refuses(PREPARE, mutate, "a guard after the deploy has already started the release")
 
     # --- the shared mutation lock -------------------------------------------
 

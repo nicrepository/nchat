@@ -95,7 +95,7 @@ test.describe("painel de perfil em DM 1:1", () => {
     await expect(panel.getByRole("heading", { name: "Perfil" })).toBeVisible();
     await expect(panel.getByTestId("chat-details-profile-name")).toHaveText("Juliane Lino");
     // Presença é palavra, não só cor.
-    await expect(panel.getByTestId("chat-details-profile-status")).toHaveText(/Online/);
+    await expect(panel.getByTestId("chat-details-profile-status")).toHaveText(/Disponível/);
 
     const meta = panel.getByTestId("chat-details-profile-meta");
     await expect(meta).toContainText("Infraestrutura & Suporte");

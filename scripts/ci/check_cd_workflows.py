@@ -249,6 +249,18 @@ PREPARE_JOBS = {
                 "uses": DOWNLOAD,
                 "with": {"name": "capacity-evidence", "path": "capacity-evidence"},
             },
+            # Issue #798. The control plane's own copy of the manual presence
+            # guard: the default branch this YAML runs from, checked out beside
+            # the release, run against the release's manifests before the slot
+            # is reserved or anything applied. Its position is the contract: a
+            # release's own scripts can never protect against that release.
+            {
+                "uses": CHECKOUT,
+                "with": {"ref": "${{ github.sha }}", "path": "control-plane", "persist-credentials": False},
+            },
+            {
+                "run": ['control-plane/scripts/deploy/nchat-prod/require-release-capability.sh "$GITHUB_WORKSPACE"'],
+            },
             # One read of the cluster feeding the snapshot, the slot decision
             # and the lifecycle gate. Written as one script because they must
             # describe the same instant: separate readers could snapshot a

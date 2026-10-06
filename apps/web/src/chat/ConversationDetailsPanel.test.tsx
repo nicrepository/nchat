@@ -437,7 +437,7 @@ describe("ConversationDetailsPanel — canal: membros", () => {
     // No indicator and no word, because the store has said nothing. Both rows
     // are still there: the roster does not depend on presence.
     expect(screen.queryAllByTestId("presence-dot")).toHaveLength(0);
-    expect(screen.queryByText(/· Online/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/· Disponível/)).not.toBeInTheDocument();
     expect(screen.getByText("Membro")).toBeInTheDocument();
     expect(screen.getByText("Moderador")).toBeInTheDocument();
   });

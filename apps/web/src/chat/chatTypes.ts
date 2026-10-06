@@ -979,6 +979,11 @@ export interface DirectProfile {
   displayName: string;
   avatarUrl?: string;
   presence?: OnlineStatus;
+  /**
+   * When the server last published this person as offline, in epoch ms
+   * (issue #798). Present only while they are offline.
+   */
+  lastSeenAt?: number;
   email?: string;
   jobTitle?: string;
   department?: string;

@@ -66,9 +66,15 @@ func (h *Hub) runPresenceReconciler() {
 		defer ticker.Stop()
 		sweep = ticker.C
 	}
+	// Context changes that move no socket — an expiring manual state, a lapsed
+	// call lease — exist in every configuration (issue #798).
+	contextTicker := time.NewTicker(presenceContextSweepInterval)
+	defer contextTicker.Stop()
 
 	for {
 		select {
+		case <-contextTicker.C:
+			h.sweepPresenceContexts()
 		case <-sweep:
 			h.reconcilePresence()
 		case <-h.reconcileSignal:
@@ -213,26 +219,9 @@ func (h *Hub) reconcileTarget(key string) {
 	// without a directory is not a deployment without an authority — it is one
 	// where this hub *is* the authority — and reading its own state is what lets
 	// an unsubscribe be corrected here rather than never.
-	var (
-		users    []PresencePayload
-		complete bool
-	)
-	if h.directory != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), directoryReadTimeout)
-		entries, err := h.directory.Present(ctx, key)
-		cancel()
-		if err != nil {
-			// Nothing is sent on a failed read: an empty roster would be indistinguishable
-			// from "everybody left", and inventing that is worse than staying still.
-			h.logger.WarnContext(context.Background(), "ws: presence reconciliation read failed",
-				"target_type", string(parsed.targetType), "error", err)
-			return
-		}
-		// The same authorization the initial snapshot applies: a correction is not a
-		// reason to publish somebody the domain no longer places here (SR-444-01).
-		users, complete = h.authorizedRoster(parsed.workspaceID, parsed, aggregateRoster(entries))
-	} else {
-		users, complete = h.localRoster(parsed, key)
+	users, complete, ok := h.reconciledRoster(parsed, key)
+	if !ok {
+		return
 	}
 	if len(users) > presenceSnapshotMaxUsers {
 		users = users[:presenceSnapshotMaxUsers]
@@ -262,6 +251,37 @@ func (h *Hub) reconcileTarget(key string) {
 	case h.bcast <- broadcastReq{event: evt, data: data}:
 	case <-h.quit:
 	}
+}
+
+// reconciledRoster rebuilds one target's roster for reconciliation: from the
+// shared directory when there is one, from this instance's own connections when
+// there is not. ok is false when nothing may be sent at all.
+func (h *Hub) reconciledRoster(parsed targetKey, key string) (users []PresencePayload, complete, ok bool) {
+	if h.directory == nil {
+		users, complete = h.localRoster(parsed, key)
+		return users, complete, true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), directoryReadTimeout)
+	entries, err := h.directory.Present(ctx, key)
+	cancel()
+	if err != nil {
+		// Nothing is sent on a failed read: an empty roster would be indistinguishable
+		// from "everybody left", and inventing that is worse than staying still.
+		h.logger.WarnContext(context.Background(), "ws: presence reconciliation read failed",
+			"target_type", string(parsed.targetType), "error", err)
+		return nil, false, false
+	}
+	// The same authorization the initial snapshot applies: a correction is not a
+	// reason to publish somebody the domain no longer places here (SR-444-01).
+	users, complete = h.authorizedRoster(parsed.workspaceID, parsed, aggregateRoster(entries))
+	if users, err = h.composeRoster(context.Background(), parsed.workspaceID, users, entries); err != nil {
+		// The same rule as a failed directory read: silence rather than a
+		// roster that might name somebody who chose to appear offline.
+		h.logger.WarnContext(context.Background(), "ws: presence reconciliation context unavailable",
+			"target_type", string(parsed.targetType), "error", err)
+		return nil, false, false
+	}
+	return users, complete, true
 }
 
 // presenceRosterChanged records the roster just computed for a target and
@@ -442,10 +462,18 @@ func (h *Hub) desiredAssertions(workspaceID, userID string) map[string]struct{} 
 // coveredTargetsForUser is the desired coverage: what this instance's live
 // connections for that user are subscribed to right now.
 func (h *Hub) coveredTargetsForUser(workspaceID, userID string) map[string]struct{} {
+	// A connection inside its disconnect grace still covers its rooms (issue
+	// #798): its assertions stay, so no replica sees the person leave and come
+	// back. Read before h.mu, so the two locks are never nested.
+	lingering := h.lingeringKeysFor(presenceKey{workspaceID: workspaceID, userID: userID})
+
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	covered := make(map[string]struct{}, 8)
+	covered := make(map[string]struct{}, 8+len(lingering))
+	for _, key := range lingering {
+		covered[key] = struct{}{}
+	}
 	for _, c := range h.clients {
 		if c.workspaceID != workspaceID || c.userID != userID {
 			continue
@@ -541,6 +569,7 @@ func (h *Hub) withdrawLocalPresence() {
 	if h.directory == nil {
 		return
 	}
+	h.withdrawUserReach()
 	type withdrawal struct {
 		workspaceID string
 		userID      string

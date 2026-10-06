@@ -184,7 +184,7 @@ describe("sidebar DM rows", () => {
       users: [{ user_id: "user-juliane", state: "online", updated_at: T1 }],
       complete: true,
     });
-    expect(dmRow()).toHaveAccessibleName("Mensagem direta com Juliane Lino, Online");
+    expect(dmRow()).toHaveAccessibleName("Mensagem direta com Juliane Lino, Disponível");
     expect(within(dmRow()).getByTestId("presence-dot")).toHaveAttribute("data-presence", "online");
 
     deliver(presenceUpdate("user-juliane", "away", T2));
@@ -227,7 +227,7 @@ describe("sidebar DM rows", () => {
       complete: true,
     });
 
-    expect(profileLink).toHaveAccessibleName("Meu perfil de Ana Souza, Online");
+    expect(profileLink).toHaveAccessibleName("Meu perfil de Ana Souza, Disponível");
     expect(within(profileLink).getByTestId("presence-dot")).toHaveAttribute(
       "data-presence",
       "online",
@@ -303,7 +303,7 @@ describe("channel details member list", () => {
     renderDetails();
     openSocket();
 
-    expect(screen.queryByText(/Membro · Online/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Membro · Disponível/)).not.toBeInTheDocument();
     expect(screen.getByText("Membro")).toBeInTheDocument();
     expect(screen.queryByTestId("presence-dot")).not.toBeInTheDocument();
   });
@@ -321,7 +321,7 @@ describe("channel details member list", () => {
 
     expect(screen.getByText(/Membro · Ausente/)).toBeInTheDocument();
     expect(screen.getByTestId("presence-dot")).toHaveAttribute("data-presence", "away");
-    expect(screen.queryByText(/Membro · Online/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Membro · Disponível/)).not.toBeInTheDocument();
   });
 
   it("keeps the state readable without colour", () => {
@@ -383,7 +383,7 @@ describe("DM 1:1 profile follows presence (issue #898)", () => {
     expect(screen.getByTestId("chat-details-profile-status")).toHaveTextContent("Ausente");
 
     deliver(presenceUpdate("user-juliane", "online", T2));
-    expect(screen.getByTestId("chat-details-profile-status")).toHaveTextContent("Online");
+    expect(screen.getByTestId("chat-details-profile-status")).toHaveTextContent("Disponível");
   });
 });
 
@@ -595,6 +595,160 @@ describe("one presence for one person", () => {
   });
 });
 
+// Issue #798: the new states and their context reach every surface from the one
+// event, with the same words — none of them keeps its own idea of the state.
+describe("one availability for one person (issue #798)", () => {
+  function deliverEverywhere(presence: Record<string, unknown>) {
+    for (const [kind, targetId] of [
+      ["dm", "dm-1"],
+      ["channel", "geral"],
+    ] as const) {
+      deliver({ type: "presence.updated", target_type: kind, target_id: targetId, presence });
+    }
+  }
+
+  function renderSidebarAndHeader() {
+    return render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatSidebar
+          state={{
+            status: "ready",
+            currentUserId: "user-self",
+            workspaceId: "workspace-1",
+            channels: CHANNELS,
+            dms: DMS,
+            categories: [],
+          }}
+          retry={() => {}}
+        />
+        <HeaderDM
+          name="Juliane Lino"
+          counterpart={{ userId: "user-juliane", displayName: "Juliane Lino" }}
+          presenceTarget="dm:dm-1"
+        />
+      </MemoryRouter>,
+    );
+  }
+
+  it("shows busy in a call, then do not disturb, in every surface and in words", () => {
+    renderSidebarAndHeader();
+    openSocket();
+
+    deliverEverywhere({
+      user_id: "user-juliane",
+      state: "online",
+      availability: "busy",
+      activity: "in_call",
+      updated_at: T1,
+    });
+    expect(dmRow()).toHaveAccessibleName("Mensagem direta com Juliane Lino, Ocupado · Em chamada");
+    expect(within(dmRow()).getByTestId("presence-dot")).toHaveAttribute("data-presence", "busy");
+    expect(within(dmRow()).getByTestId("presence-dot")).toHaveAttribute(
+      "title",
+      "Ocupado · Em chamada",
+    );
+    expect(screen.getByTestId("chat-msg-header-presence")).toHaveTextContent(
+      "Ocupado · Em chamada",
+    );
+
+    deliverEverywhere({
+      user_id: "user-juliane",
+      state: "online",
+      availability: "dnd",
+      updated_at: T2,
+    });
+    expect(dmRow()).toHaveAccessibleName("Mensagem direta com Juliane Lino, Não perturbe");
+    expect(
+      within(screen.getByTestId("chat-msg-header")).getByTestId("presence-dot"),
+    ).toHaveAttribute("data-presence", "dnd");
+  });
+
+  it("degrades a future availability to the legacy state rather than inventing one", () => {
+    renderSidebarAndHeader();
+    openSocket();
+
+    deliverEverywhere({
+      user_id: "user-juliane",
+      state: "away",
+      availability: "napping",
+      updated_at: T1,
+    });
+    expect(dmRow()).toHaveAccessibleName("Mensagem direta com Juliane Lino, Ausente");
+  });
+
+  it("never puts a last seen in the sidebar, only where a person is looked at", () => {
+    renderSidebarAndHeader();
+    openSocket();
+
+    deliverEverywhere({
+      user_id: "user-juliane",
+      state: "offline",
+      availability: "offline",
+      updated_at: T1,
+    });
+    expect(dmRow()).toHaveAccessibleName("Mensagem direta com Juliane Lino, Offline");
+    expect(screen.getByTestId("chat-msg-header-presence")).toHaveTextContent(/^Offline · visto/);
+  });
+});
+
+describe("DM 1:1 profile last seen (issue #798)", () => {
+  function renderProfile(lastSeenAt?: number) {
+    return render(
+      <ConversationDetailsPanel
+        kind="direct"
+        state={{
+          details: {
+            status: "ready",
+            data: {
+              kind: "direct",
+              conversationId: "dm-1",
+              profile: {
+                userId: "user-juliane",
+                displayName: "Juliane Lino",
+                presence: "offline",
+                lastSeenAt,
+              },
+            },
+          },
+          files: { status: "loading" },
+          roster: { status: "loading" },
+          reload: () => {},
+        }}
+        currentUserId="user-self"
+        workspaceId="workspace-1"
+        onClose={() => {}}
+      />,
+    );
+  }
+
+  it("uses the profile's last seen for somebody the store only knows to be absent", () => {
+    renderProfile(Date.now() - 20 * 60_000);
+    openSocket();
+    deliver({
+      type: "presence.snapshot",
+      target_type: "dm",
+      target_id: "dm-1",
+      users: [],
+      complete: true,
+      taken_at: T2,
+    });
+    expect(screen.getByTestId("chat-details-profile-status")).toHaveTextContent(
+      "Offline · visto há 20 min",
+    );
+  });
+
+  it("says when the person was last seen as the server published it", () => {
+    renderProfile();
+    openSocket();
+    deliver(
+      presenceUpdate("user-juliane", "offline", new Date(Date.now() - 5 * 60_000).toISOString()),
+    );
+    expect(screen.getByTestId("chat-details-profile-status")).toHaveTextContent(
+      "Offline · visto há 5 min",
+    );
+  });
+});
+
 // ── message bubbles ──────────────────────────────────────────────────────────
 
 // The dot beside a sender's avatar is decorative and lives inside an
@@ -655,7 +809,7 @@ describe("message bubbles", () => {
   }
 
   it.each([
-    ["online", "Online"],
+    ["online", "Disponível"],
     ["away", "Ausente"],
     ["offline", "Offline"],
   ])("states %s in words next to the sender", (state, label) => {

@@ -48,7 +48,7 @@ func newMockPool(t *testing.T) pgxmock.PgxPoolIface {
 	return mock
 }
 
-func anyArgs(n int) []any {
+func channelCreateAnyArgs(n int) []any {
 	args := make([]any, n)
 	for i := range args {
 		args[i] = pgxmock.AnyArg()
@@ -86,7 +86,7 @@ func TestCreateChannelForActiveMember_KeyedCreationClaimsThenCreatesWithClaimedI
 func TestCreateChannelForActiveMember_ClaimedKeyWithSameHashReplays(t *testing.T) {
 	mock := newMockPool(t)
 	mock.ExpectBegin()
-	mock.ExpectQuery(claimSQL).WithArgs(anyArgs(4)...).WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(claimSQL).WithArgs(channelCreateAnyArgs(4)...).WillReturnError(pgx.ErrNoRows)
 	mock.ExpectQuery(readClaimSQL).WithArgs("ws-1", "user-1", "key-1").
 		WillReturnRows(pgxmock.NewRows([]string{"request_hash", "channel_id"}).AddRow("hash-1", "ch-old"))
 	mock.ExpectQuery(replaySQL).WithArgs("ch-old", "ws-1", "user-1").WillReturnRows(privateChannelRow("ch-old"))
@@ -105,39 +105,41 @@ func TestCreateChannelForActiveMember_KeyErrors(t *testing.T) {
 		want   error
 	}{
 		"claim fails": {
-			expect: func(m pgxmock.PgxPoolIface) { m.ExpectQuery(claimSQL).WithArgs(anyArgs(4)...).WillReturnError(boom) },
-			want:   boom,
+			expect: func(m pgxmock.PgxPoolIface) {
+				m.ExpectQuery(claimSQL).WithArgs(channelCreateAnyArgs(4)...).WillReturnError(boom)
+			},
+			want: boom,
 		},
 		"read claim fails": {
 			expect: func(m pgxmock.PgxPoolIface) {
-				m.ExpectQuery(claimSQL).WithArgs(anyArgs(4)...).WillReturnError(pgx.ErrNoRows)
-				m.ExpectQuery(readClaimSQL).WithArgs(anyArgs(3)...).WillReturnError(boom)
+				m.ExpectQuery(claimSQL).WithArgs(channelCreateAnyArgs(4)...).WillReturnError(pgx.ErrNoRows)
+				m.ExpectQuery(readClaimSQL).WithArgs(channelCreateAnyArgs(3)...).WillReturnError(boom)
 			},
 			want: boom,
 		},
 		"same key, other request": {
 			expect: func(m pgxmock.PgxPoolIface) {
-				m.ExpectQuery(claimSQL).WithArgs(anyArgs(4)...).WillReturnError(pgx.ErrNoRows)
-				m.ExpectQuery(readClaimSQL).WithArgs(anyArgs(3)...).
+				m.ExpectQuery(claimSQL).WithArgs(channelCreateAnyArgs(4)...).WillReturnError(pgx.ErrNoRows)
+				m.ExpectQuery(readClaimSQL).WithArgs(channelCreateAnyArgs(3)...).
 					WillReturnRows(pgxmock.NewRows([]string{"request_hash", "channel_id"}).AddRow("hash-other", "ch-old"))
 			},
 			want: domain.ErrIdempotencyKeyReused,
 		},
 		"replay of a channel the actor no longer reads": {
 			expect: func(m pgxmock.PgxPoolIface) {
-				m.ExpectQuery(claimSQL).WithArgs(anyArgs(4)...).WillReturnError(pgx.ErrNoRows)
-				m.ExpectQuery(readClaimSQL).WithArgs(anyArgs(3)...).
+				m.ExpectQuery(claimSQL).WithArgs(channelCreateAnyArgs(4)...).WillReturnError(pgx.ErrNoRows)
+				m.ExpectQuery(readClaimSQL).WithArgs(channelCreateAnyArgs(3)...).
 					WillReturnRows(pgxmock.NewRows([]string{"request_hash", "channel_id"}).AddRow("hash-1", "ch-old"))
-				m.ExpectQuery(replaySQL).WithArgs(anyArgs(3)...).WillReturnError(pgx.ErrNoRows)
+				m.ExpectQuery(replaySQL).WithArgs(channelCreateAnyArgs(3)...).WillReturnError(pgx.ErrNoRows)
 			},
 			want: domain.ErrForbidden,
 		},
 		"replay read fails": {
 			expect: func(m pgxmock.PgxPoolIface) {
-				m.ExpectQuery(claimSQL).WithArgs(anyArgs(4)...).WillReturnError(pgx.ErrNoRows)
-				m.ExpectQuery(readClaimSQL).WithArgs(anyArgs(3)...).
+				m.ExpectQuery(claimSQL).WithArgs(channelCreateAnyArgs(4)...).WillReturnError(pgx.ErrNoRows)
+				m.ExpectQuery(readClaimSQL).WithArgs(channelCreateAnyArgs(3)...).
 					WillReturnRows(pgxmock.NewRows([]string{"request_hash", "channel_id"}).AddRow("hash-1", "ch-old"))
-				m.ExpectQuery(replaySQL).WithArgs(anyArgs(3)...).WillReturnError(boom)
+				m.ExpectQuery(replaySQL).WithArgs(channelCreateAnyArgs(3)...).WillReturnError(boom)
 			},
 			want: boom,
 		},
@@ -173,8 +175,8 @@ func TestCreateChannelForActiveMember_InitialMemberFailuresRollBack(t *testing.T
 			mock.ExpectBegin()
 			mock.ExpectQuery(`WITH authorized_context`).WithArgs(authorizedContextArgs()...).WillReturnRows(privateChannelRow("ch-1"))
 			expectConversationCreatedEvent(mock, "ch-1", "")
-			mock.ExpectExec(`INSERT INTO chat.channel_members`).WithArgs(anyArgs(3)...).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-			query := mock.ExpectQuery(initialMembers).WithArgs(anyArgs(4)...)
+			mock.ExpectExec(`INSERT INTO chat.channel_members`).WithArgs(channelCreateAnyArgs(3)...).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+			query := mock.ExpectQuery(initialMembers).WithArgs(channelCreateAnyArgs(4)...)
 			if tc.err != nil {
 				query.WillReturnError(tc.err)
 			} else {

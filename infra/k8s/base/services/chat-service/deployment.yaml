@@ -33,6 +33,11 @@ spec:
         app.kubernetes.io/version: "0.0.0"
       annotations:
         nchat.nicrepository.io/image-placeholder: "true"
+        # This build honours manual presence (issue #798). Set by the release's
+        # own manifest, never by configuration, so a build from before #798
+        # cannot carry it: the production scripts refuse to enable manual
+        # presence while, or promote a slot where, a reader lacks it.
+        nchat.io/capability-manual-presence: "v1"
     spec:
       serviceAccountName: nchat-chat-service
       automountServiceAccountToken: false

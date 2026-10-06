@@ -96,6 +96,7 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	r.registerLinkSafetyRoutes(messages)
 	r.registerWorkspacePolicyRoutes(messages)
 	r.registerFavoriteAndPinRoutes(messages)
+	r.registerPresenceRoutes(messages)
 
 	// WebSocket endpoint: WSTokenMiddleware extracts a Bearer token from
 	// Sec-WebSocket-Protocol for browser clients that cannot set Authorization

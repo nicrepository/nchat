@@ -93,7 +93,7 @@ test.describe("presença nos avatares (RF-58)", () => {
     });
     await expect(dot(page)).toHaveAttribute("data-presence", "online");
     await expect(dmRow(page)).toHaveAccessibleName(
-      `Mensagem direta com ${OTHER_USER_NAME}, Online`,
+      `Mensagem direta com ${OTHER_USER_NAME}, Disponível`,
     );
 
     await emitPresence(page, {
@@ -199,7 +199,7 @@ test.describe("presença nos avatares (RF-58)", () => {
     const profile = page.getByRole("link", {
       name: new RegExp(`Meu perfil de ${CURRENT_USER_NAME}`),
     });
-    await expect(profile).toHaveAccessibleName(`Meu perfil de ${CURRENT_USER_NAME}, Online`);
+    await expect(profile).toHaveAccessibleName(`Meu perfil de ${CURRENT_USER_NAME}, Disponível`);
     await expect(profile.getByTestId("presence-dot")).toHaveAttribute("data-presence", "online");
   });
 });
@@ -438,7 +438,7 @@ test.describe("assinatura compartilhada e acessibilidade (#444)", () => {
 
     const bubble = page.getByTestId("chat-msg-bubble");
     await expect(bubble.getByTestId("chat-msg-sender")).toHaveText(OTHER_USER_NAME);
-    await expect(bubble.getByTestId("chat-msg-sender-presence")).toHaveText("Status: Online");
+    await expect(bubble.getByTestId("chat-msg-sender-presence")).toHaveText("Status: Disponível");
     await expect(bubble.getByTestId("presence-dot")).toHaveAttribute("aria-hidden", "true");
   });
 });

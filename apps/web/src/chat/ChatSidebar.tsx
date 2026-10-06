@@ -27,8 +27,16 @@ import LeaveConversationDialog from "./LeaveConversationDialog";
 import RenameChannelDialog from "./RenameChannelDialog";
 import { avatarColorFor, initialsFrom } from "./messageDisplay";
 import NewConversationDialog from "./NewConversationDialog";
-import { presenceLabel, presenceTargetKey, usePresence, type PresenceState } from "./presence";
+import {
+  presenceLabel,
+  presenceTargetKey,
+  usePresence,
+  usePresenceDetail,
+  type PresenceState,
+} from "./presence";
+import { describePresence } from "./presenceDescription";
 import { UserAvatar } from "./UserAvatar";
+import PresenceStatusMenu from "./PresenceStatusMenu";
 import SidebarUserMenu from "./SidebarUserMenu";
 import { sortByActivity } from "./sidebarOrder";
 import {
@@ -148,6 +156,8 @@ interface AvatarProps {
    * accessible label, so nothing here has to be reachable on its own.
    */
   status?: PresenceState;
+  /** The dot's hover text, when the row has more to say than the state. */
+  statusTitle?: string;
   size?: "sm" | "md";
 }
 
@@ -158,6 +168,7 @@ function Avatar({
   avatarUrl,
   color = "purple",
   status,
+  statusTitle,
   size = "sm",
 }: AvatarProps) {
   return (
@@ -171,6 +182,7 @@ function Avatar({
         displayName={displayName}
         avatarUrl={avatarUrl}
         presence={status}
+        presenceTitle={statusTitle}
         size={size}
         presenceRingColor="var(--cs-sidebar-bg)"
         imageClassName="chat-sidebar__avatar-img"
@@ -578,16 +590,19 @@ function DMRow({
   const counterpart = dm.counterpart;
   // Scoped to this conversation: the counterpart is one of its two participants,
   // so the server's roster for it is exactly the list that would have named them.
-  const presence = usePresence(
+  const presenceDetail = usePresenceDetail(
     isGroup ? undefined : counterpart?.userId,
     presenceTargetKey("dm", dm.id),
   );
+  const presence = presenceDetail.state;
   const baseLabel = isGroup ? `Grupo ${dm.name}` : `Mensagem direta com ${dm.name}`;
   // Presence in words, in the row's accessible name. The dot is what a sighted
   // user sees and this is what a screen reader hears, from the same value —
   // and it is why the avatar does not need to become a focusable control to
-  // make the state reachable by keyboard.
-  const label = presence === "unknown" ? baseLabel : `${baseLabel}, ${presenceLabel(presence)}`;
+  // make the state reachable by keyboard. No clock: a list row says what the
+  // state is and why ("Ocupado · Em chamada"), never a permanent last seen.
+  const presenceText = describePresence(presenceDetail);
+  const label = presence === "unknown" ? baseLabel : `${baseLabel}, ${presenceText}`;
   // A group is a group and a 1:1 is a 1:1, from the server's own discriminator —
   // the same value partitionDMs filed this row under. It is what keeps "Sair"
   // out of a direct conversation structurally rather than by a check at the end.
@@ -623,6 +638,7 @@ function DMRow({
             avatarUrl={counterpart?.avatarUrl}
             color={avatarColorFor(counterpart?.userId ?? dm.id)}
             status={presence}
+            statusTitle={presenceText}
             size="sm"
           />
         )}
@@ -999,6 +1015,9 @@ function SidebarUser({ workspaceId }: { workspaceId: string }) {
           </span>
         )}
       </Link>
+      {self.status === "ready" && (
+        <PresenceStatusMenu selfId={self.profile.id} displayName={displayName} />
+      )}
       <SidebarUserMenu />
     </div>
   );

@@ -104,8 +104,8 @@ type rule struct {
 //
 //	corporate policy      outside working hours
 //	event and context     historical origin, silent event type, open conversation
-//	personal preference   unreadable preferences, muted conversation,
-//	                      conversation level, globals
+//	personal preference   unreadable preferences, do not disturb, muted
+//	                      conversation, conversation level, globals
 //	channel availability  no usable push subscription
 //	coordinator state     already delivered, inside a burst cooldown
 //
@@ -119,6 +119,7 @@ var rules = []rule{
 	{ReasonSilentEventType, denySilentEventType},
 	{ReasonConversationOpen, denyConversationOpen},
 	{ReasonPreferencesUnavailable, denyUnresolvedPreferences},
+	{ReasonDoNotDisturb, denyDoNotDisturb},
 	{ReasonMuted, denyMuted},
 	{ReasonConversationLevel, denyConversationLevel},
 	{ReasonUserPreference, denyUserPreference},
@@ -217,6 +218,21 @@ func denyConversationOpen(c Context) channelSet {
 // under a fault that changed nothing.
 func denyUnresolvedPreferences(c Context) channelSet {
 	if c.Preferences.Status == PreferenceStatusUnavailable {
+		return setAll
+	}
+	return 0
+}
+
+// denyDoNotDisturb suppresses every alert channel while the recipient is in Do
+// Not Disturb (issue #798).
+//
+// Every channel, the toast included: an in-app toast is an interruption, and
+// interruption is what the state refuses. Priority does not bypass it — no
+// exception list exists yet, and the issue leaves which events may break
+// through to a later policy. Like every rule here it only subtracts, so a
+// corporate rule that already silenced the event keeps its reason.
+func denyDoNotDisturb(c Context) channelSet {
+	if c.Preferences.DoNotDisturb {
 		return setAll
 	}
 	return 0

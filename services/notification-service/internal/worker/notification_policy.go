@@ -63,6 +63,10 @@ func NewPolicyEvaluator() Evaluator {
 //     pair from the same table, so a worker that knew about the mute and not
 //     the level would make push disagree with the toast for the same event.
 //
+//   - Preferences.DoNotDisturb is the recipient's presence choice (issue
+//     #798), resolved from chat.user_presence by the same projection. The
+//     realtime consumer reads the same row, so push and toast agree.
+//
 //   - Preferences.Disabled and Preferences.SoundMode are unset, because neither
 //     has a server-side source of truth: the chime preference lives in the
 //     browser, and there is no global off switch. Both are inert here anyway —
@@ -88,6 +92,7 @@ func policyContext(notification Notification) notificationpolicy.Context {
 		Preferences: notificationpolicy.Preferences{
 			Muted:             notification.Muted,
 			ConversationLevel: notificationpolicy.ConversationLevel(notification.NotificationLevel),
+			DoNotDisturb:      notification.DoNotDisturb,
 		},
 		WebPushAvailable: true,
 	}

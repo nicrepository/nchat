@@ -82,7 +82,10 @@ import {
 import type { DirectMessageAccess } from "./directMessage";
 import { avatarColorFor, formatLongDate } from "./messageDisplay";
 import RecentFileRow from "./RecentFileRow";
-import { presenceLabel, presenceTargetKey, usePresence, usePresenceTarget } from "./presence";
+import { presenceTargetKey, usePresenceDetail, usePresenceTarget } from "./presence";
+import PresenceDot from "./PresenceDot";
+import { describePresence } from "./presenceDescription";
+import { presenceNeedsClock, usePresenceClock } from "./usePresenceClock";
 import { UserAvatar } from "./UserAvatar";
 import type {
   ConversationDetailsState,
@@ -585,7 +588,12 @@ function DirectProfileSection({
 }) {
   const profile = details.profile;
   const color = avatarColorFor(profile.userId);
-  const presence = usePresence(profile.userId, presenceTargetKey("dm", details.conversationId));
+  const presenceDetail = usePresenceDetail(
+    profile.userId,
+    presenceTargetKey("dm", details.conversationId),
+  );
+  const presence = presenceDetail.state;
+  const now = usePresenceClock(presenceNeedsClock(presence));
   return (
     <div className="chat-details__profile">
       <span
@@ -618,11 +626,11 @@ function DirectProfileSection({
           className={`chat-details__profile-status chat-details__profile-status--${presence}`}
           data-testid="chat-details-profile-status"
         >
-          <span
-            className={`chat-details__status-dot chat-details__status-dot--${presence}`}
-            aria-hidden="true"
-          />
-          {presenceLabel(presence)}
+          <PresenceDot state={presence} inline />
+          {/* The context the server gave: the call behind "Ocupado", or when an
+              offline person was last seen — from the realtime store, or from the
+              profile itself when this tab never saw them leave. */}
+          {describePresence(presenceDetail, now, profile.lastSeenAt)}
         </p>
       )}
 

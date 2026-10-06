@@ -112,8 +112,13 @@ export const PRESENCE_ACTIVITY_THROTTLE_MS = 25_000;
  * scrolls under an animation, a pointer nudged by a passing hand — none of those
  * are somebody using the application, and treating them as such is how an
  * abandoned tab stays online forever.
+ *
+ * `focus` is the window coming back to the person (issue #798). Its opposites —
+ * `blur`, a hidden tab — are deliberately absent: leaving a tab is not leaving
+ * the application, and away is only ever the server's idle timeout running out
+ * across every session the person has.
  */
-const ACTIVITY_EVENTS = ["keydown", "pointerdown", "touchstart", "wheel"] as const;
+const ACTIVITY_EVENTS = ["keydown", "pointerdown", "touchstart", "wheel", "focus"] as const;
 
 /**
  * Equal-jitter exponential backoff. Pure, so the schedule is asserted directly

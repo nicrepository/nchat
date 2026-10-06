@@ -51,6 +51,8 @@ type bootstrapStores struct {
 	sidebarPins           *storage.PGXSidebarPinStore
 	conversationReadState *storage.PGXConversationReadStateStore
 	notificationPrefs     *storage.PGXNotificationPrefStore
+	presence              *storage.PGXPresenceStore
+	calls                 *storage.PGXCallStore
 	mentionCache          *storage.ValkeyMentionLabelCache
 }
 
@@ -173,6 +175,7 @@ func (b *bootstrap) wireStores(pool storage.Pool) {
 	b.stores.sidebarPins = storage.NewPGXSidebarPinStore(pool)
 	b.stores.conversationReadState = storage.NewPGXConversationReadStateStore(pool)
 	b.stores.notificationPrefs = storage.NewPGXNotificationPrefStore(pool)
+	b.stores.presence = storage.NewPGXPresenceStore(pool)
 }
 
 func (b *bootstrap) wireServices(pool storage.Pool) {
@@ -182,7 +185,8 @@ func (b *bootstrap) wireServices(pool storage.Pool) {
 	b.services.favorite = service.NewFavoriteService(storage.NewPGXFavoriteStore(pool))
 	b.services.pin = service.NewPinService(storage.NewPGXPinStore(pool))
 	b.services.acknowledgement = service.NewAcknowledgementService(storage.NewPGXAcknowledgementStore(pool))
-	b.services.call = service.NewCallService(storage.NewPGXCallStore(pool), time.Duration(cfg.CallRingTimeoutSeconds)*time.Second, nil, nil)
+	b.stores.calls = storage.NewPGXCallStore(pool)
+	b.services.call = service.NewCallService(b.stores.calls, time.Duration(cfg.CallRingTimeoutSeconds)*time.Second, nil, nil)
 	b.services.permission = service.NewPermissionService(st.members, st.channels)
 	b.services.channel = service.NewChannelService(st.workspaces, st.channels, st.members)
 	// channelStore is both the category store and the visible-channel read
@@ -225,7 +229,7 @@ func (b *bootstrap) wireLinks() error {
 // is nil, so ServeWS answers 503 before any client connects.
 func (b *bootstrap) buildPresence() {
 	rt := &b.realtime
-	rt.presence = ws.NewPresenceTracker(defaultPresenceAwayTimeout)
+	rt.presence = ws.NewPresenceTrackerWithGrace(defaultPresenceAwayTimeout, defaultPresenceDisconnectGrace)
 	rt.authorizer = ws.NopAuthorizer{}
 	if b.stores.workspaces != nil {
 		rt.authorizer = ws.NewServiceAuthorizer(b.stores.channels, b.stores.dms)
@@ -252,7 +256,20 @@ func (b *bootstrap) buildPresence() {
 		rt.instanceID = uuid.New().String()
 	}
 	rt.presenceInstanceID = uuid.NewString()
-	rt.options = []ws.HubOption{ws.WithPresence(rt.presence), ws.WithPresenceInstanceID(rt.presenceInstanceID)}
+	rt.options = []ws.HubOption{
+		ws.WithPresence(rt.presence), ws.WithPresenceInstanceID(rt.presenceInstanceID),
+		// The reach bridge to replicas from before issue #798 is for the
+		// rollout window only, which ends before manual presence is enabled.
+		ws.WithLegacyPresenceBridge(!b.cfg.ManualPresenceEnabled),
+	}
+	if metrics := newHubPresenceMetrics(b.metrics); metrics != nil {
+		rt.options = append(rt.options, ws.WithPresenceMetrics(metrics))
+	}
+	// Manual states, calls and last seen (issue #798). Checked on the concrete
+	// pointer: a nil store in the interface would be a non-nil source.
+	if b.stores.presence != nil {
+		rt.options = append(rt.options, ws.WithPresenceContext(b.stores.presence))
+	}
 }
 
 // buildBus wires the cross-instance broadcast and the shared presence state
@@ -323,7 +340,7 @@ func (b *bootstrap) withCallOptions(options []ws.HubOption, limiter *ws.ValkeyRe
 // buildHub assembles the hub from everything the realtime stages collected.
 func (b *bootstrap) buildHub() {
 	rt := &b.realtime
-	rt.options = withRecipientPolicyOption(rt.options, b.stores.notificationPrefs)
+	rt.options = withRecipientPolicyOption(rt.options, b.stores.notificationPrefs, b.stores.presence)
 	rt.hub = ws.NewHub(rt.authorizer, b.logger, rt.bus, rt.instanceID, rt.options...)
 	rt.wsHandler = ws.ServeWSWithConfig(rt.hub, b.logger, rt.workspaces, httpapi.GetContextUserID,
 		wsHandlerConfig(b.cfg, b.stores.sessions, rt.displayNames))
@@ -392,6 +409,11 @@ func (b *bootstrap) startCallWorker() {
 	// PublishConversationEvent (issue #835), whose string targetType the
 	// adapter maps to the hub's own typed ws.TargetType.
 	b.services.call.SetPublisher(b.broadcaster())
+	// Every participation change announces itself to presence (issue #798)
+	// before it commits; the hub exists by now and no call is served yet.
+	if b.stores.calls != nil && b.realtime.hub != nil {
+		b.stores.calls.SetPresenceFacts(b.realtime.hub)
+	}
 	ctx, cancel := workerLifecycle()
 	b.workers.callCancel = cancel
 	b.workers.callWG = &sync.WaitGroup{}
@@ -458,12 +480,25 @@ func (b *bootstrap) attachMessageBroadcasters() {
 		handler = handler.WithPins(b.services.pin, b.broadcaster())
 	}
 	b.handlers.message = wireAcknowledgements(handler, b.services.acknowledgement, b.realtime.hub)
+	// The caller's own manual presence (issue #798) announces over the hub.
+	if b.stores.presence != nil && b.stores.workspaces != nil {
+		presence := service.NewPresenceService(b.stores.presence, b.realtime.hub)
+		b.handlers.message = b.handlers.message.WithPresence(
+			httpapi.NewPresenceHandler(b.stores.workspaces, presence, b.metrics).
+				WithWritesEnabled(b.cfg.ManualPresenceEnabled))
+	}
 }
 
 // attachConversationBroadcasters wires the channel and DM routes that report
 // presence or announce membership changes, both of which need the hub.
 func (b *bootstrap) attachConversationBroadcasters() {
 	reporter := presenceReporter{tracker: b.realtime.presence}
+	if b.realtime.hub != nil {
+		reporter.projections = b.realtime.hub
+	}
+	if b.stores.presence != nil {
+		reporter.store = b.stores.presence
+	}
 	if channels := b.handlers.channels; channels != nil {
 		// The channel-details panel (issue #435) reports member presence from
 		// the same tracker the hub feeds; add members (issue #398) and rename

@@ -66,7 +66,7 @@ export interface RosterContext {
 /**
  * The order presence imposes on the list.
  *
- * Only these four values exist, and only one of them is a claim of absence.
+ * Only one of these values is a claim of absence.
  * `offline` is the server saying this person is gone; `unknown` is this tab
  * saying it has not been told. Ranking `unknown` above `offline` is what keeps
  * a roster loaded before the presence snapshot arrives from reading as a list
@@ -83,9 +83,14 @@ export interface RosterContext {
  */
 const presenceRank: Record<PresenceState, number> = {
   online: 0,
-  away: 1,
-  unknown: 2,
-  offline: 3,
+  // Present but not to be interrupted lightly (issue #798): still here, so
+  // still above the people who stepped away.
+  busy: 1,
+  dnd: 1,
+  brb: 2,
+  away: 2,
+  unknown: 3,
+  offline: 4,
 };
 
 /**

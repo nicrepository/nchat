@@ -90,6 +90,19 @@ func WithCallLimiter(limiter CallLimiter, maxActions, windowSeconds int) HubOpti
 }
 
 func (h *Hub) handleCallMessage(ctx context.Context, c *Client, msg ClientMessage) error {
+	err := h.dispatchCallMessage(ctx, c, msg)
+	// A call change that moves somebody in or out of a call announces it to
+	// presence before it commits (issue #798; see OpenPresenceFacts). An
+	// announcement that cannot be made refuses the change, exactly as an
+	// unavailable call-start budget does: the call commands already depend on
+	// the same shared store.
+	if errors.Is(err, domain.ErrPresenceFactsUnavailable) {
+		return fmt.Errorf("%w: %v", ErrCallFeatureDisabled, err)
+	}
+	return err
+}
+
+func (h *Hub) dispatchCallMessage(ctx context.Context, c *Client, msg ClientMessage) error {
 	if h.callHandler == nil {
 		return ErrCallFeatureDisabled
 	}
@@ -314,6 +327,7 @@ func (h *Hub) handleCallMessage(ctx context.Context, c *Client, msg ClientMessag
 }
 
 func (h *Hub) PublishCall(ctx context.Context, call domain.Call) {
+	h.refreshCallParticipants(call)
 	if call.IsResource() {
 		h.publishCallToTarget(ctx, call, TargetType(call.TargetType), call.TargetID)
 		return
