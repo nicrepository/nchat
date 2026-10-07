@@ -253,6 +253,72 @@ func fileBranch(kind, visible, attachmentColumn, messageColumn, channelName, dmT
  JOIN chat.messages m ON m.id=ma.message_id AND m.` + messageColumn + `=v.id AND m.status='active'`
 }
 
+// Links finds URLs in messages the caller can read (#1081). It reads what
+// chat-service recorded when it wrote the message — chat.message_link_scans,
+// the canonical URL of each link — and never re-parses a body:
+//
+//   - only the association of a trusted current projection counts: the
+//     message's link_safety_projection_version is above 0 and its fingerprint
+//     is non-empty, and the row carries that same fingerprint. Version 0 is
+//     what chat 000031 declares untrustworthy (a body written by a pre-000029
+//     writer, or rewritten by an old pod, which resets version and fingerprint
+//     while the old rows stay behind), and an empty fingerprint certifies
+//     nothing — both fail closed, so a URL an edit removed is never found;
+//   - only active messages, through the same visibility CTEs as every other
+//     category;
+//   - a malicious target, or one on the fetch denylist (the evidence the edit
+//     history projection also treats as condemned), is never a result: its URL
+//     is withheld from every reader, so finding it would reveal it.
+//
+// The match runs over the URLs (link_scans) first and reaches messages by
+// idx_message_link_scans_url, then the PK of chat.messages. Visibility is a
+// hashed membership test against the caller's materialized conversations,
+// and the conversation is joined for the page rows only: the planner
+// estimates `LIKE '%term%'` at a handful of rows, and joined per match it
+// nested-looped the visible channels for every association (measured,
+// docs/api/search.md). Rank: 0 exact URL, 1 exact host, 2 prefix of the URL
+// or of host+path, 3 anywhere; then newest message first. A canonical URL is
+// always scheme://host[:port]/path (urlsafety.CanonicalizeURL), so the host is
+// everything between "://" and the first "/".
+func (s *PGXSearchStore) Links(ctx context.Context, userID, query string, limit int, c domain.LinkCursor) ([]domain.LinkResult, error) {
+	sql := `WITH ` + materialized(visibleConversationsCTEs) + `, targets AS MATERIALIZED (
+ SELECT ls.canonical_url, LOWER(ls.canonical_url) AS lurl, LOWER(SUBSTR(ls.canonical_url, STRPOS(ls.canonical_url, '://')+3)) AS rest
+ FROM chat.link_scans ls
+ WHERE ls.status<>'malicious' AND LOWER(ls.canonical_url) LIKE $2 ESCAPE '\'
+  AND NOT EXISTS (SELECT 1 FROM files.link_fetch_denylist d WHERE d.url_digest=SHA256(CONVERT_TO(ls.canonical_url, 'UTF8')))
+), ranked AS (
+ SELECT t.canonical_url, t.rest, m.id AS message_id, m.channel_id, m.dm_conversation_id, m.sender_id, m.created_at,
+ LEFT(ENCODE(SHA256(CONVERT_TO(t.canonical_url, 'UTF8')), 'hex'), 32) AS target_key,
+ CASE WHEN t.lurl IN ($3, $3 || '/') THEN 0
+  WHEN SPLIT_PART(t.rest, '/', 1)=$3 THEN 1
+  WHEN STARTS_WITH(t.lurl, $3) OR STARTS_WITH(t.rest, $3) THEN 2
+  ELSE 3 END AS rank
+ FROM targets t
+ JOIN chat.message_link_scans mls ON mls.canonical_url=t.canonical_url
+ JOIN chat.messages m ON m.id=mls.message_id AND m.status='active'
+  AND m.link_safety_projection_version>0 AND m.link_safety_fingerprint<>'' AND mls.fingerprint=m.link_safety_fingerprint
+ WHERE m.channel_id IN (SELECT id FROM visible_channels) OR m.dm_conversation_id IN (SELECT id FROM visible_dms)
+), page AS (
+ SELECT * FROM ranked WHERE (NOT $5 OR (-rank,created_at,message_id,target_key)<($6::int,$7::timestamptz,$8::uuid,$9::text))
+ ORDER BY rank ASC,created_at DESC,message_id DESC,target_key DESC LIMIT $4
+), p AS (
+ SELECT m.*, ` + conversationColumns + ` FROM page m` + conversationJoin + `
+) SELECT p.message_id, p.target_key, p.canonical_url, SPLIT_PART(p.rest, '/', 1), p.conversation_kind, p.conversation_id, p.conversation_type, ` + conversationNameExpr + `,
+ p.sender_id, ` + authsession.DisplayNameExpr + `, u.avatar_url, p.created_at, p.rank
+ FROM p JOIN auth.users u ON u.id=p.sender_id
+ ORDER BY p.rank ASC,p.created_at DESC,p.message_id DESC,p.target_key DESC`
+	var rank, createdAt, messageID, targetKey any
+	if c.Version != 0 {
+		rank, createdAt, messageID, targetKey = -c.Rank, c.CreatedAt, c.MessageID, c.TargetKey
+	}
+	return collect(ctx, s.pool, "links", sql, func(rows pgx.Rows) (domain.LinkResult, error) {
+		var v domain.LinkResult
+		err := rows.Scan(&v.MessageID, &v.TargetKey, &v.URL, &v.Hostname, &v.ConversationKind, &v.ConversationID,
+			&v.ConversationType, &v.ConversationName, &v.SenderID, &v.SenderDisplayName, &v.SenderAvatarURL, &v.CreatedAt, &v.Rank)
+		return v, err
+	}, userID, likeQuery(query), strings.ToLower(query), limit, c.Version != 0, rank, createdAt, messageID, targetKey)
+}
+
 func collect[T any](ctx context.Context, pool Queryer, label, sql string, scan func(pgx.Rows) (T, error), args ...any) ([]T, error) {
 	rows, err := pool.Query(ctx, sql, args...)
 	if err != nil {

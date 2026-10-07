@@ -20,9 +20,8 @@ import type {
   ConversationType,
   FileResultResponse,
   GroupResultResponse,
-  LegacyMessageResultResponse,
+  LinkResultResponse,
   MessageResultResponse,
-  MessageSearchResult,
   SearchCategory,
   SearchEnvelope,
   SearchErrorKind,
@@ -38,6 +37,10 @@ export function classifySearchError(error: unknown): SearchErrorKind {
   if (!(error instanceof ApiRequestError)) return "unknown";
   if (error.status === 400) return "bad_request";
   if (error.status === 403) return "forbidden";
+  // A route or a method this search-service does not have: a rolling deploy
+  // serving a new web against an older service (docs/api/search.md). Never
+  // "no results".
+  if (error.status === 404 || error.status === 405) return "unavailable";
   if (error.status >= 500) return "server_error";
   return "unknown";
 }
@@ -48,24 +51,26 @@ export interface SearchRequestOptions {
   signal?: AbortSignal;
 }
 
-function buildSearchParams(query: string, limit?: number, cursor?: string): URLSearchParams {
-  const params = new URLSearchParams({ q: query });
-  if (limit !== undefined) params.set("limit", String(limit));
-  if (cursor) params.set("cursor", cursor);
-  return params;
-}
-
+/**
+ * One page, always as a POST with q/limit/cursor in the body (#1081). The
+ * query typed in the field may be a whole URL, a token or any other secret —
+ * no rule can tell which — so it never travels in a URL: not on the first
+ * page, not on the next, not on a retry. A search-service that does not take
+ * the body (404/405, an older release mid-rollout) leaves the category
+ * "unavailable"; there is no GET to fall back to (docs/api/search.md).
+ */
 async function fetchSearchPage<TResponse, TResult>(
   path: string,
   query: string,
   mapItem: (item: TResponse) => TResult,
-  options: SearchRequestOptions = {},
+  { limit, cursor, signal }: SearchRequestOptions,
 ): Promise<SearchResultPage<TResult>> {
-  const params = buildSearchParams(query, options.limit, options.cursor);
-  const response = await authenticatedFetch<SearchEnvelope<TResponse>>(
-    `${SEARCH_BASE}/${path}?${params}`,
-    { method: "GET", signal: options.signal },
-  );
+  const body = JSON.stringify({ q: query, limit, cursor: cursor || undefined });
+  const response = await authenticatedFetch<SearchEnvelope<TResponse>>(`${SEARCH_BASE}/${path}`, {
+    method: "POST",
+    body,
+    signal,
+  });
   const page = response.data;
   return {
     items: page.data.map(mapItem),
@@ -144,99 +149,34 @@ const MAPPERS: { [C in SearchCategory]: (item: never) => SearchResultByCategory[
     conversation: mapConversation(item),
     createdAt: item.created_at,
   }),
-};
-
-// ── Messages: V2 with a rollout fallback (#900) ────────────────────────────────
-//
-// /v2/messages carries every conversation kind. A search-service from before
-// #900 does not have it and answers 404 — its catch-all for an unknown route —
-// and then, and only then, the page comes from the legacy /messages: public
-// channel messages in the channel-only shape, mapped into the same
-// MessageSearchResult. 401 is the auth client's to handle, and 403, 5xx, a
-// network failure or an abort are real failures shown as such, never a
-// fallback. Nothing outside this module knows which endpoint answered.
-
-/** Marks a next-page cursor issued by the legacy endpoint, so it goes back there. */
-const LEGACY_CURSOR_PREFIX = "legacy:";
-
-function mapLegacyMessage(item: LegacyMessageResultResponse): MessageSearchResult {
-  return {
-    id: item.id,
-    // The legacy endpoint only ever searched public channels.
-    conversation: {
-      kind: "channel",
-      id: item.channel_id,
-      type: "public",
-      name: item.channel_name ?? "",
-    },
+  links: (item: LinkResultResponse) => ({
+    id: `${item.message_id}:${item.target_key}`,
+    messageId: item.message_id,
+    url: item.url,
+    hostname: item.hostname,
+    conversation: mapConversation(item),
     senderId: item.sender_id,
     senderDisplayName: item.sender_display_name,
-    senderAvatarUrl: null,
-    bodyText: item.body_text,
     createdAt: item.created_at,
-    score: item.score,
-  };
-}
+  }),
+};
 
-async function searchLegacyMessages(
-  query: string,
-  options: SearchRequestOptions,
-): Promise<SearchResultPage<MessageSearchResult>> {
-  const page = await fetchSearchPage<LegacyMessageResultResponse, MessageSearchResult>(
-    "messages",
-    query,
-    mapLegacyMessage,
-    options,
-  );
-  return {
-    // A row with no channel has no route; it is dropped, never guessed.
-    items: page.items.filter(
-      (item) => typeof item.conversation.id === "string" && item.conversation.id !== "",
-    ),
-    nextCursor: page.nextCursor === null ? null : `${LEGACY_CURSOR_PREFIX}${page.nextCursor}`,
-    hasMore: page.hasMore,
-  };
-}
-
-function isMissingEndpoint(error: unknown): boolean {
-  return error instanceof ApiRequestError && error.status === 404;
-}
-
-async function searchMessages(
-  query: string,
-  options: SearchRequestOptions = {},
-): Promise<SearchResultPage<MessageSearchResult>> {
-  const { cursor } = options;
-  if (cursor?.startsWith(LEGACY_CURSOR_PREFIX)) {
-    return searchLegacyMessages(query, {
-      ...options,
-      cursor: cursor.slice(LEGACY_CURSOR_PREFIX.length),
-    });
-  }
-  try {
-    return await fetchSearchPage(
-      "v2/messages",
-      query,
-      MAPPERS.messages as (item: unknown) => MessageSearchResult,
-      options,
-    );
-  } catch (error) {
-    // A V2 cursor means V2 answered this search before; it is never replayed
-    // against the legacy endpoint, whose cursors and result set differ.
-    if (!isMissingEndpoint(error) || cursor) throw error;
-    return searchLegacyMessages(query, options);
-  }
-}
+/** Messages are searched on V2: every conversation kind (#900). */
+const PATHS: { [C in SearchCategory]: string } = {
+  messages: "v2/messages",
+  users: "users",
+  channels: "channels",
+  groups: "groups",
+  files: "files",
+  links: "links",
+};
 
 /** One page of one category. */
 export function searchCategory<C extends SearchCategory>(
   category: C,
   query: string,
-  options?: SearchRequestOptions,
+  options: SearchRequestOptions = {},
 ): Promise<SearchResultPage<SearchResultByCategory[C]>> {
-  if (category === "messages") {
-    return searchMessages(query, options) as Promise<SearchResultPage<SearchResultByCategory[C]>>;
-  }
   const map = MAPPERS[category] as (item: unknown) => SearchResultByCategory[C];
-  return fetchSearchPage(category, query, map, options);
+  return fetchSearchPage(PATHS[category], query, map, options);
 }

@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"net/http"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/nicrepository/nchat/libs/go/platform/buildinfo"
@@ -40,18 +42,22 @@ func NewHandlerWithDependencies(serviceName string, deps Dependencies) http.Hand
 		protect := func(h http.Handler) http.Handler {
 			return BearerAuth(deps.Tokens)(RequireActiveSession(deps.Sessions)(h))
 		}
-		register := func(publicPath, strippedPath string, handler http.HandlerFunc) {
-			protected := httputil.MethodNotAllowed(http.MethodGet, protect(handler))
+		register := func(publicPath, strippedPath string, handler http.HandlerFunc, methods ...string) {
+			protected := allowMethods(protect(handler), methods...)
 			mux.Handle(publicPath, protected)
 			mux.Handle(strippedPath, protected)
 		}
 		// Deprecated, retained for rollout compatibility: pre-#900 web builds.
-		register("/api/search/messages", "/messages", search.LegacyMessages)
-		register("/api/search/v2/messages", "/v2/messages", search.Messages)
-		register("/api/search/users", "/users", search.Users)
-		register("/api/search/channels", "/channels", search.Channels)
-		register("/api/search/groups", "/groups", search.Groups)
-		register("/api/search/files", "/files", search.Files)
+		register("/api/search/messages", "/messages", search.LegacyMessages, http.MethodGet)
+		// GET is the #900 contract, kept for older web builds; POST carries the
+		// same search in the body, so the query never reaches a URL (#1081).
+		register("/api/search/v2/messages", "/v2/messages", search.Messages, http.MethodGet, http.MethodPost)
+		register("/api/search/users", "/users", search.Users, http.MethodGet, http.MethodPost)
+		register("/api/search/channels", "/channels", search.Channels, http.MethodGet, http.MethodPost)
+		register("/api/search/groups", "/groups", search.Groups, http.MethodGet, http.MethodPost)
+		register("/api/search/files", "/files", search.Files, http.MethodGet, http.MethodPost)
+		// Links has no GET: no client ever needs one (#1081).
+		register("/api/search/links", "/links", search.Links, http.MethodPost)
 	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
@@ -59,6 +65,19 @@ func NewHandlerWithDependencies(serviceName string, deps Dependencies) http.Hand
 
 	obs := observability.HTTPMiddleware(obsCfg, metrics)
 	return httputil.Recover(httputil.RequestID(httputil.SecurityHeaders(obs(mux))))
+}
+
+// allowMethods is httputil.MethodNotAllowed for a route that answers more than
+// one method.
+func allowMethods(next http.Handler, methods ...string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !slices.Contains(methods, r.Method) {
+			w.Header().Set("Allow", strings.Join(methods, ", "))
+			httputil.WriteError(w, http.StatusMethodNotAllowed, httputil.ErrCodeBadRequest, "method not allowed")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func versionHandler(serviceName string) http.Handler {

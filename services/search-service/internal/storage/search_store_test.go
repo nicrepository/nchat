@@ -260,3 +260,53 @@ func TestLegacyMessagesPropagatesQueryScanAndIterationFailures(t *testing.T) {
 		return err
 	}, legacyColumns, []any{"m1", "c1", "Geral", "u1", "Ana", "body", time.Now(), 0.8})
 }
+
+var linkColumns = []string{"message_id", "target_key", "canonical_url", "hostname", "conversation_kind", "conversation_id", "conversation_type", "conversation_name", "sender_id", "sender_name", "avatar_url", "created_at", "rank"}
+
+// What the SQL admits is proven in search_links_postgres_test.go; here only the
+// guards that must never drop out of the text: the current-content binding,
+// the condemned targets and the shared visibility CTEs.
+func TestLinksReadCurrentNonCondemnedAssociationsThroughTheVisibilityCTEs(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mock.Close()
+	created := time.Date(2026, 9, 1, 9, 41, 0, 0, time.UTC)
+	pattern := `(?s)visible_channels AS MATERIALIZED.*visible_dms AS MATERIALIZED.*FROM chat\.link_scans ls.*ls\.status<>'malicious'.*files\.link_fetch_denylist.*m\.status='active'\s+AND m\.link_safety_projection_version>0 AND m\.link_safety_fingerprint<>'' AND mls\.fingerprint=m\.link_safety_fingerprint.*WHERE m\.channel_id IN \(SELECT id FROM visible_channels\) OR m\.dm_conversation_id IN \(SELECT id FROM visible_dms\)`
+	mock.ExpectQuery(pattern).WithArgs("user-1", `%docs\_x%`, "docs_x", 6, false, nil, nil, nil, nil).
+		WillReturnRows(pgxmock.NewRows(linkColumns).AddRow("m1", "abababababababababababababababab", "https://docs_x/a", "docs_x", "channel", "c1", "public", "geral", "u1", "Ana", nil, created, 1))
+	rows, err := NewPGXSearchStore(mock).Links(context.Background(), "user-1", "DOCS_X", 6, domain.LinkCursor{})
+	if err != nil || len(rows) != 1 || rows[0].Hostname != "docs_x" || rows[0].Rank != 1 || rows[0].ConversationName != "geral" {
+		t.Fatalf("rows=%+v err=%v", rows, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLinksPassesCursorValues(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mock.Close()
+	c := domain.LinkCursor{Version: 1, Rank: 2, CreatedAt: time.Date(2026, 9, 1, 9, 41, 0, 0, time.UTC), MessageID: "22222222-2222-4222-8222-222222222222", TargetKey: "abababababababababababababababab"}
+	mock.ExpectQuery("WITH search_scope").WithArgs("user-1", "%docs%", "docs", 2, true, -2, c.CreatedAt, c.MessageID, c.TargetKey).WillReturnRows(pgxmock.NewRows(linkColumns))
+	if _, err := NewPGXSearchStore(mock).Links(context.Background(), "user-1", "docs", 2, c); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLinksPropagatesQueryScanAndIterationFailures(t *testing.T) {
+	testStoreFailures(t, "links", func(mock pgxmock.PgxPoolIface, rows *pgxmock.Rows, queryErr error) error {
+		expect := mock.ExpectQuery("WITH search_scope").WithArgs("user-1", "%term%", "term", 2, false, nil, nil, nil, nil)
+		if queryErr != nil {
+			expect.WillReturnError(queryErr)
+		} else {
+			expect.WillReturnRows(rows)
+		}
+		_, err := NewPGXSearchStore(mock).Links(context.Background(), "user-1", "term", 2, domain.LinkCursor{})
+		return err
+	}, linkColumns, []any{"m1", "k", "https://x/", "x", "channel", "c1", "public", "geral", "u1", "Ana", nil, time.Now(), 3})
+}

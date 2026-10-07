@@ -54,6 +54,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 # schema, so it gets a database of its own through
 # CHANNEL_CREATION_TEST_DATABASE_URL; it is not in the Go Coverage profile
 # (chat-service clears 90% without it).
+# search-service has one entry per family on the same SEARCH_TEST_DATABASE_URL
+# (both reset the schemas on setup and the entries run one after the other):
+# an exact `^Name$` each, so the "matches no test" refusal below holds for each
+# family on its own instead of passing while the other still matches.
 # media-service carries a `//go:build integration` tag, so without `-tags` its
 # suite is not even compiled.
 SUITES=(
@@ -63,6 +67,7 @@ SUITES=(
   "services/auth-service|AUTH_TEST_DATABASE_URL|./internal/storage|"
   "services/media-service|MEDIA_TEST_DATABASE_URL|./internal/storage|-tags integration"
   "services/search-service|SEARCH_TEST_DATABASE_URL|./internal/storage|-run ^TestSearchAuthorizationPostgreSQL$"
+  "services/search-service|SEARCH_TEST_DATABASE_URL|./internal/storage|-run ^TestSearchLinksPostgreSQL$"
 )
 
 for suite in "${SUITES[@]}"; do

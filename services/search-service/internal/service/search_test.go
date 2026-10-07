@@ -28,6 +28,15 @@ type fakeStore struct {
 	channelsErr   error
 	groupsErr     error
 	filesErr      error
+	links         []domain.LinkResult
+	linkCursor    domain.LinkCursor
+	linksErr      error
+}
+
+func (f *fakeStore) Links(_ context.Context, _ string, _ string, limit int, cursor domain.LinkCursor) ([]domain.LinkResult, error) {
+	f.linkCursor = cursor
+	f.fetchLimit = limit
+	return f.links, f.linksErr
 }
 
 func (f *fakeStore) Messages(_ context.Context, _ string, _ string, limit int, cursor domain.MessageCursor) ([]domain.MessageResult, error) {
@@ -159,7 +168,7 @@ func TestSearchGroupsPaginatesWithItsOwnCursor(t *testing.T) {
 	rows := []domain.GroupResult{{ID: "11111111-1111-4111-8111-111111111111", SortName: "alfa"}, {ID: "22222222-2222-4222-8222-222222222222", SortName: "beta"}}
 	store := &fakeStore{groups: rows}
 	page, err := New(store).SearchGroups(context.Background(), "user", "a", 1, "")
-	if err != nil || len(page.Items) != 1 || page.NextCursor == "" || store.fetchLimit != 2 {
+	if err != nil || len(page.Items) != 1 || store.fetchLimit != 2 {
 		t.Fatalf("page=%+v err=%v limit=%d", page, err, store.fetchLimit)
 	}
 	if _, err := New(store).SearchGroups(context.Background(), "user", "a", 1, page.NextCursor); err != nil || store.nameCursor.Name != "alfa" {
@@ -250,5 +259,57 @@ func TestLegacyAndV2MessageCursorsDoNotCross(t *testing.T) {
 	storeErr := errors.New("legacy failed")
 	if _, err := New(&fakeStore{legacyErr: storeErr}).SearchLegacyMessages(context.Background(), "user", "termo", 1, ""); !errors.Is(err, storeErr) {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func linkRows() []domain.LinkResult {
+	at := time.Date(2026, 9, 1, 9, 41, 0, 0, time.UTC)
+	return []domain.LinkResult{
+		{MessageID: "11111111-1111-4111-8111-111111111111", TargetKey: "abababababababababababababababab", CreatedAt: at, Rank: 1},
+		{MessageID: "22222222-2222-4222-8222-222222222222", TargetKey: "abababababababababababababababab", CreatedAt: at, Rank: 3},
+	}
+}
+
+func TestSearchLinksPaginatesWithATypedQueryBoundCursor(t *testing.T) {
+	rows := linkRows()
+	store := &fakeStore{links: rows}
+	page, err := New(store).SearchLinks(context.Background(), "user", "docs.example.com", 1, "")
+	if err != nil || len(page.Items) != 1 || store.fetchLimit != 2 {
+		t.Fatalf("page=%+v limit=%d err=%v", page, store.fetchLimit, err)
+	}
+	c, err := domain.DecodeLinkCursor(page.NextCursor, "docs.example.com")
+	if err != nil || c.Rank != 1 || c.MessageID != rows[0].MessageID || c.TargetKey != rows[0].TargetKey {
+		t.Fatalf("cursor=%+v err=%v", c, err)
+	}
+	if _, err := New(store).SearchLinks(context.Background(), "user", "docs.example.com", 1, page.NextCursor); err != nil || store.linkCursor.MessageID != rows[0].MessageID {
+		t.Fatalf("second page cursor=%+v err=%v", store.linkCursor, err)
+	}
+}
+
+func TestSearchLinksRefusesACursorOfAnotherQueryOrType(t *testing.T) {
+	rows := linkRows()
+	store := &fakeStore{links: rows}
+	page, _ := New(store).SearchLinks(context.Background(), "user", "docs.example.com", 1, "")
+	if _, err := New(store).SearchLinks(context.Background(), "user", "runbook", 1, page.NextCursor); !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("cursor of another query err=%v", err)
+	}
+	fileCursor, _ := domain.EncodeFileCursor("docs.example.com", rows[0].CreatedAt, rows[0].MessageID)
+	if _, err := New(store).SearchLinks(context.Background(), "user", "docs.example.com", 1, fileCursor); !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("file cursor accepted for links: %v", err)
+	}
+}
+
+func TestSearchLinksHandlesEmptyStoreAndEncodingFailures(t *testing.T) {
+	if page, err := New(&fakeStore{}).SearchLinks(context.Background(), "user", "x", 20, ""); err != nil || len(page.Items) != 0 || page.NextCursor != "" {
+		t.Fatalf("empty page=%+v err=%v", page, err)
+	}
+	storeErr := errors.New("links failed")
+	if _, err := New(&fakeStore{linksErr: storeErr}).SearchLinks(context.Background(), "user", "x", 20, ""); !errors.Is(err, storeErr) {
+		t.Fatalf("store err=%v", err)
+	}
+	bad := linkRows()
+	bad[0].MessageID = "bad"
+	if _, err := New(&fakeStore{links: bad}).SearchLinks(context.Background(), "user", "x", 1, ""); !errors.Is(err, domain.ErrInvalidCursor) {
+		t.Fatalf("encode err=%v", err)
 	}
 }

@@ -11,6 +11,7 @@ vi.mock("../lib/authClient", () => ({
 }));
 
 import { classifySearchError, searchCategory } from "./searchApi";
+import { SEARCH_CATEGORIES } from "./searchTypes";
 
 /**
  * Every nchat service wraps its body in a shared {"data": ...} envelope
@@ -36,7 +37,7 @@ afterEach(() => {
 });
 
 describe("searchCategory", () => {
-  it("sends only q, limit and cursor to the category's endpoint", async () => {
+  it("POSTs only q, limit and cursor, in the body, to the category's endpoint", async () => {
     mockAuthFetch.mockResolvedValue(envelope([], "next", true));
     const signal = new AbortController().signal;
 
@@ -44,16 +45,18 @@ describe("searchCategory", () => {
 
     const url = requestedUrl();
     expect(url.pathname).toBe("/api/search/groups");
-    expect([...url.searchParams.keys()].sort()).toEqual(["cursor", "limit", "q"]);
-    expect(url.searchParams.get("q")).toBe("backup");
-    expect(mockAuthFetch.mock.calls[0][1]).toEqual({ method: "GET", signal });
+    expect(url.search).toBe("");
+    const init = mockAuthFetch.mock.calls[0][1] as RequestInit;
+    expect(init).toEqual({ method: "POST", body: expect.any(String), signal });
+    expect(JSON.parse(init.body as string)).toEqual({ q: "backup", limit: 5, cursor: "prev" });
     expect(page).toEqual({ items: [], nextCursor: "next", hasMore: true });
   });
 
   it("omits limit and cursor when not given", async () => {
     mockAuthFetch.mockResolvedValue(envelope([]));
     await searchCategory("users", "ana");
-    expect([...requestedUrl().searchParams.keys()]).toEqual(["q"]);
+    const init = mockAuthFetch.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(init.body as string)).toEqual({ q: "ana" });
   });
 
   it("maps a message to its conversation, whatever its kind", async () => {
@@ -196,144 +199,154 @@ describe("searchCategory", () => {
   });
 });
 
+describe("searchCategory('links')", () => {
+  const row = {
+    message_id: "m7",
+    target_key: "abababababababababababababababab",
+    url: "https://docs.example.com/runbook?ref=fixture",
+    hostname: "docs.example.com",
+    conversation_kind: "dm",
+    conversation_id: "g1",
+    conversation_type: "group",
+    conversation_name: "Projeto",
+    sender_id: "u1",
+    sender_display_name: "Ana",
+    created_at: "2026-09-01T09:41:00Z",
+  };
+
+  it("POSTs the query in the body and never in the URL", async () => {
+    mockAuthFetch.mockResolvedValue(envelope([row], "next", true));
+    const signal = new AbortController().signal;
+    const query = "https://docs.example.com/runbook?ref=fixture";
+
+    const page = await searchCategory("links", query, { limit: 5, cursor: "prev", signal });
+
+    const [url, init] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/search/links");
+    expect(url).not.toContain("ref=fixture");
+    expect(init).toEqual({ method: "POST", body: expect.any(String), signal });
+    expect(JSON.parse(init.body as string)).toEqual({ q: query, limit: 5, cursor: "prev" });
+    expect(page).toEqual({
+      items: [
+        {
+          id: "m7:abababababababababababababababab",
+          messageId: "m7",
+          url: row.url,
+          hostname: "docs.example.com",
+          conversation: { kind: "dm", id: "g1", type: "group", name: "Projeto" },
+          senderId: "u1",
+          senderDisplayName: "Ana",
+          createdAt: "2026-09-01T09:41:00Z",
+        },
+      ],
+      nextCursor: "next",
+      hasMore: true,
+    });
+  });
+
+  it("sends only the query when there is no limit or cursor", async () => {
+    mockAuthFetch.mockResolvedValue(envelope([]));
+    await searchCategory("links", "docs");
+    const init = mockAuthFetch.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(init.body as string)).toEqual({ q: "docs" });
+  });
+
+  it("surfaces a missing route as an error, never as an empty page or a fallback", async () => {
+    mockAuthFetch.mockRejectedValue(new ApiRequestError(404, "not_found", "not found"));
+    const failure = searchCategory("links", "docs").catch((error: unknown) => error);
+    expect(classifySearchError(await failure)).toBe("unavailable");
+    expect(mockAuthFetch).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("classifySearchError", () => {
   it("maps statuses to UI error kinds", () => {
     expect(classifySearchError(new ApiRequestError(400, "bad_request", "x"))).toBe("bad_request");
     expect(classifySearchError(new ApiRequestError(403, "forbidden", "x"))).toBe("forbidden");
     expect(classifySearchError(new ApiRequestError(503, "internal", "x"))).toBe("server_error");
-    expect(classifySearchError(new ApiRequestError(404, "not_found", "x"))).toBe("unknown");
+    // A route the deployed search-service lacks (rollout): never "no results".
+    expect(classifySearchError(new ApiRequestError(404, "not_found", "x"))).toBe("unavailable");
+    expect(classifySearchError(new ApiRequestError(409, "conflict", "x"))).toBe("unknown");
     expect(classifySearchError(new Error("network"))).toBe("unknown");
   });
 });
 
-// ── Messages across a rollout (#900): V2 first, legacy only when V2 is absent ──
+// ── Transport (#1081): a POST body, always, and nothing after it ─────────────
+//
+// Any string may be a secret, so no query is ever "safe for a URL": a signed
+// URL and a short opaque token are proven the same way. Whatever the
+// search-service answers — including an older release without the POST (404,
+// 405) — the client sends exactly one POST and never a GET, a V2 GET or the
+// legacy /messages.
 
-const v2Row = {
-  id: "m1",
-  conversation_kind: "dm",
-  conversation_id: "d1",
-  conversation_type: "group",
-  conversation_name: "Projeto",
-  sender_id: "u1",
-  sender_display_name: "Ana",
-  body_text: "backup",
-  created_at: "2026-01-01T00:00:00Z",
-  score: 1,
-};
-const legacyRow = {
-  id: "m2",
-  channel_id: "c1",
-  channel_name: "geral",
-  sender_id: "u1",
-  sender_display_name: "Ana",
-  body_text: "backup",
-  created_at: "2026-01-01T00:00:00Z",
-  score: 1,
-};
-const paths = () =>
-  mockAuthFetch.mock.calls.map(([url]) => new URL(url as string, "http://localhost").pathname);
-const notFound = () => new ApiRequestError(404, "not_found", "not found");
+// Built from fragments so the source carries no secret-like literal for the
+// scanners; at runtime they are exactly a signed URL and a short opaque token.
+const SIGNED_URL_QUERY = ["https://example.test/reset/token?signature=", "SECRET", "123"].join("");
+const SHORT_OPAQUE_QUERY = ["ABCDEF", "1234567890"].join("");
+const QUERIES = [SIGNED_URL_QUERY, SHORT_OPAQUE_QUERY];
 
-describe("searchCategory('messages') across versions", () => {
-  it("A. uses V2 and never the legacy endpoint when V2 answers", async () => {
-    mockAuthFetch.mockResolvedValue(envelope([v2Row]));
-    const page = await searchCategory("messages", "backup", { limit: 5 });
-    expect(paths()).toEqual(["/api/search/v2/messages"]);
-    expect(page.items[0].conversation).toEqual({
-      kind: "dm",
-      id: "d1",
-      type: "group",
-      name: "Projeto",
-    });
-  });
+const ENDPOINTS = {
+  messages: "/api/search/v2/messages",
+  users: "/api/search/users",
+  channels: "/api/search/channels",
+  groups: "/api/search/groups",
+  files: "/api/search/files",
+  links: "/api/search/links",
+} as const;
 
-  it("B. falls back exactly once to the legacy endpoint when V2 does not exist, and normalizes it", async () => {
-    mockAuthFetch
-      .mockRejectedValueOnce(notFound())
-      .mockResolvedValueOnce(envelope([legacyRow], "raw-legacy", true));
-    const signal = new AbortController().signal;
-    const page = await searchCategory("messages", "backup", { limit: 5, signal });
+const FAILURES: Array<[string, unknown]> = [
+  ["404", new ApiRequestError(404, "not_found", "not found")],
+  ["405", new ApiRequestError(405, "bad_request", "method not allowed")],
+  ["401", new ApiRequestError(401, "unauthorized", "x")],
+  ["403", new ApiRequestError(403, "forbidden", "x")],
+  ["500", new ApiRequestError(500, "internal", "x")],
+  ["503", new ApiRequestError(503, "unavailable", "x")],
+  ["network failure", new TypeError("Failed to fetch")],
+  ["abort", new DOMException("aborted", "AbortError")],
+];
 
-    expect(paths()).toEqual(["/api/search/v2/messages", "/api/search/messages"]);
-    const legacyUrl = new URL(mockAuthFetch.mock.calls[1][0] as string, "http://localhost");
-    expect(legacyUrl.searchParams.get("q")).toBe("backup");
-    expect(legacyUrl.searchParams.get("limit")).toBe("5");
-    expect(mockAuthFetch.mock.calls[1][1]).toEqual({ method: "GET", signal });
-    expect(page.items).toEqual([
-      {
-        id: "m2",
-        conversation: { kind: "channel", id: "c1", type: "public", name: "geral" },
-        senderId: "u1",
-        senderDisplayName: "Ana",
-        senderAvatarUrl: null,
-        bodyText: "backup",
-        createdAt: "2026-01-01T00:00:00Z",
-        score: 1,
-      },
-    ]);
-    expect(page.hasMore).toBe(true);
-    expect(page.nextCursor).not.toBe("raw-legacy");
-  });
+/** The one request sent: a POST to the category's endpoint, q in the body only. */
+function expectOnePostWithTheQueryInItsBody(category: keyof typeof ENDPOINTS, query: string) {
+  expect(mockAuthFetch).toHaveBeenCalledTimes(1);
+  const [url, init] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+  const parsed = new URL(url, "http://localhost");
+  expect(parsed.pathname).toBe(ENDPOINTS[category]);
+  expect(parsed.search).toBe("");
+  expect(url).not.toContain(query);
+  expect(init.method).toBe("POST");
+  return JSON.parse(init.body as string) as Record<string, unknown>;
+}
 
-  it.each([
-    ["C. 401", new ApiRequestError(401, "unauthorized", "x")],
-    ["D. 403", new ApiRequestError(403, "forbidden", "x")],
-    ["E. 500", new ApiRequestError(500, "internal", "x")],
-    ["E. 503", new ApiRequestError(503, "unavailable", "x")],
-    ["F. network failure", new TypeError("Failed to fetch")],
-    ["F. abort", new DOMException("aborted", "AbortError")],
-  ])("%s is a real failure, never a fallback", async (_name, error) => {
-    mockAuthFetch.mockRejectedValue(error);
-    await expect(searchCategory("messages", "backup")).rejects.toBe(error);
-    expect(paths()).toEqual(["/api/search/v2/messages"]);
-  });
+describe("the query only ever travels in a POST body (#1081)", () => {
+  it.each(SEARCH_CATEGORIES.flatMap((c) => QUERIES.map((q) => [c, q] as const)))(
+    "%s, %j: one POST, cursor and limit in the body too",
+    async (category, query) => {
+      mockAuthFetch.mockResolvedValue(envelope([], "next", true));
+      const page = await searchCategory(category, query, { limit: 20, cursor: "page-2" });
+      const body = expectOnePostWithTheQueryInItsBody(category, query);
+      expect(body).toEqual({ q: query, limit: 20, cursor: "page-2" });
+      expect(page.nextCursor).toBe("next");
+    },
+  );
 
-  it("does not loop when the legacy endpoint is missing too", async () => {
-    mockAuthFetch.mockRejectedValue(notFound());
-    await expect(searchCategory("messages", "backup")).rejects.toBeInstanceOf(ApiRequestError);
-    expect(paths()).toEqual(["/api/search/v2/messages", "/api/search/messages"]);
-  });
+  it.each(
+    SEARCH_CATEGORIES.flatMap((c) =>
+      QUERIES.flatMap((q) => FAILURES.map(([name, error]) => [c, q, name, error] as const)),
+    ),
+  )(
+    "%s, %j, %s: the failure surfaces and no GET follows",
+    async (category, query, _name, error) => {
+      mockAuthFetch.mockRejectedValue(error);
+      await expect(searchCategory(category, query)).rejects.toBe(error);
+      expectOnePostWithTheQueryInItsBody(category, query);
+    },
+  );
 
-  it("G. sends a legacy next page back to the legacy endpoint with its own cursor", async () => {
-    mockAuthFetch
-      .mockRejectedValueOnce(notFound())
-      .mockResolvedValueOnce(envelope([legacyRow], "raw-legacy", true));
-    const first = await searchCategory("messages", "backup");
-    mockAuthFetch.mockClear().mockResolvedValue(envelope([{ ...legacyRow, id: "m3" }]));
-
-    const second = await searchCategory("messages", "backup", { cursor: first.nextCursor! });
-
-    expect(paths()).toEqual(["/api/search/messages"]);
-    expect(
-      new URL(mockAuthFetch.mock.calls[0][0] as string, "http://localhost").searchParams.get(
-        "cursor",
-      ),
-    ).toBe("raw-legacy");
-    expect(second.items[0].conversation).toEqual({
-      kind: "channel",
-      id: "c1",
-      type: "public",
-      name: "geral",
-    });
-    expect(second.nextCursor).toBeNull();
-  });
-
-  it("never replays a V2 cursor against the legacy endpoint", async () => {
-    mockAuthFetch.mockRejectedValue(notFound());
-    await expect(
-      searchCategory("messages", "backup", { cursor: "v2-cursor" }),
-    ).rejects.toBeInstanceOf(ApiRequestError);
-    expect(paths()).toEqual(["/api/search/v2/messages"]);
-  });
-
-  it("G. drops a legacy row with no channel instead of routing it to undefined", async () => {
-    const withoutChannel: Partial<typeof legacyRow> = { ...legacyRow };
-    delete withoutChannel.channel_id;
-    mockAuthFetch
-      .mockRejectedValueOnce(notFound())
-      .mockResolvedValueOnce(envelope([withoutChannel, legacyRow]));
-    const page = await searchCategory("messages", "backup");
-    expect(page.items.map((item) => item.id)).toEqual(["m2"]);
-    expect(page.items.every((item) => typeof item.conversation.id === "string")).toBe(true);
+  it("an older search-service (404/405) is unavailable, never an empty result", async () => {
+    for (const [, error] of FAILURES.slice(0, 2)) {
+      mockAuthFetch.mockReset().mockRejectedValue(error);
+      const failure = await searchCategory("users", SHORT_OPAQUE_QUERY).catch((e: unknown) => e);
+      expect(classifySearchError(failure)).toBe("unavailable");
+    }
   });
 });

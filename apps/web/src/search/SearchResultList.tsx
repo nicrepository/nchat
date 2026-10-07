@@ -9,6 +9,8 @@ function errorMessage(kind: SearchErrorKind | null): string {
       return "Você não tem permissão para ver esses resultados.";
     case "bad_request":
       return "Não foi possível interpretar essa busca.";
+    case "unavailable":
+      return "Esta busca ainda não está disponível.";
     default:
       return "Não foi possível buscar agora.";
   }

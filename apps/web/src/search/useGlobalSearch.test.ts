@@ -10,7 +10,7 @@ vi.mock("./searchApi", async () => {
   return { ...actual, searchCategory: (...args: unknown[]) => mockSearchCategory(...args) };
 });
 
-import { messageResult, resultPage, userResult } from "./searchFixtures";
+import { linkResult, messageResult, resultPage, userResult } from "./searchFixtures";
 import type { SearchCategory, SearchResultPage } from "./searchTypes";
 import {
   OVERVIEW_LIMIT,
@@ -71,7 +71,7 @@ describe("useGlobalSearch", () => {
     expect(mockSearchCategory).not.toHaveBeenCalled();
   });
 
-  it("debounces typing, then loads the five overview sections with a small limit", async () => {
+  it("debounces typing, then loads every overview section with a small limit", async () => {
     const { result, commit } = setup();
     act(() => result.current.setQuery("ba"));
     act(() => vi.advanceTimersByTime(100));
@@ -83,6 +83,7 @@ describe("useGlobalSearch", () => {
       "channels",
       "groups",
       "files",
+      "links",
     ]);
     expect(
       calls().every(([, query, options]) => query === "backup" && options.limit === OVERVIEW_LIMIT),
@@ -125,6 +126,33 @@ describe("useGlobalSearch", () => {
 
     expect(result.current.state.activeQuery).toBe("backup");
     expect(result.current.state.overview.messages.items.map((m) => m.id)).toEqual(["for-backup"]);
+  });
+
+  it("Links: a late page of query A never lands on query B, in the tab or in Tudo", async () => {
+    const late = deferred<SearchResultPage<unknown>>();
+    mockSearchCategory.mockImplementation((category: SearchCategory, query: string) =>
+      category === "links" && query === "docs"
+        ? late.promise
+        : Promise.resolve(resultPage([linkResult({ id: `for-${query}` })])),
+    );
+    const { result, commit } = setup({ query: "", tab: "links" });
+    await commit("docs");
+    const [first] = calls().filter(([category]) => category === "links");
+    expect(first[2].limit).toBe(PAGE_LIMIT);
+    await commit("docs.example.com");
+
+    expect(first[2].signal.aborted).toBe(true);
+    late.resolve(resultPage([linkResult({ id: "stale" })]));
+    await flush();
+    expect(result.current.state.tabs.links.items.map((item) => item.id)).toEqual([
+      "for-docs.example.com",
+    ]);
+
+    act(() => result.current.setActiveTab("all"));
+    await flush();
+    expect(result.current.state.overview.links.items.map((item) => item.id)).toEqual([
+      "for-docs.example.com",
+    ]);
   });
 
   it("pages a tab by cursor, skipping rows an earlier page already showed", async () => {

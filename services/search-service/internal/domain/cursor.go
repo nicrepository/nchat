@@ -29,6 +29,9 @@ const (
 	CursorChannels   = "channels"
 	CursorGroups     = "groups"
 	CursorFiles      = "files"
+	CursorLinks      = "links"
+	// MaxLinkRank is the weakest link match (see storage.Links).
+	MaxLinkRank = 3
 )
 
 var ErrInvalidCursor = errors.New("invalid cursor")
@@ -70,6 +73,46 @@ type NameCursor struct {
 	QueryHash string `json:"q"`
 	Name      string `json:"n"`
 	ID        string `json:"id"`
+}
+
+// LinkCursor pages links by (Rank, CreatedAt desc, MessageID desc, TargetKey
+// desc). It names the target by its key, never by its URL.
+type LinkCursor struct {
+	Version   int       `json:"v"`
+	Type      string    `json:"t"`
+	QueryHash string    `json:"q"`
+	Rank      int       `json:"k"`
+	CreatedAt time.Time `json:"c"`
+	MessageID string    `json:"id"`
+	TargetKey string    `json:"u"`
+}
+
+func EncodeLinkCursor(query string, rank int, createdAt time.Time, messageID, targetKey string) (string, error) {
+	if !validLinkCursor(rank, createdAt, messageID, targetKey) {
+		return "", ErrInvalidCursor
+	}
+	return encodeCursor(LinkCursor{CursorVersion, CursorLinks, queryHash(query), rank, createdAt.UTC(), messageID, targetKey})
+}
+
+func DecodeLinkCursor(raw, query string) (LinkCursor, error) {
+	var c LinkCursor
+	if err := decodeCursor(raw, &c); err != nil || c.Version != CursorVersion || c.Type != CursorLinks || c.QueryHash != queryHash(query) || !validLinkCursor(c.Rank, c.CreatedAt, c.MessageID, c.TargetKey) {
+		return LinkCursor{}, ErrInvalidCursor
+	}
+	return c, nil
+}
+
+func validLinkCursor(rank int, createdAt time.Time, messageID, targetKey string) bool {
+	return rank >= 0 && rank <= MaxLinkRank && !createdAt.IsZero() && validID(messageID) && validTargetKey(targetKey)
+}
+
+// validTargetKey accepts chat-service's LinkTargetKey shape: 32 lowercase hex.
+func validTargetKey(key string) bool {
+	if len(key) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(key)
+	return err == nil && strings.ToLower(key) == key
 }
 
 func EncodeMessageCursor(query string, score float64, createdAt time.Time, id string, rankedAt time.Time) (string, error) {

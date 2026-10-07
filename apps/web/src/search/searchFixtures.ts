@@ -4,6 +4,7 @@ import type {
   ChannelSearchResult,
   FileSearchResult,
   GroupSearchResult,
+  LinkSearchResult,
   MessageSearchResult,
   SearchResultPage,
   UserSearchResult,
@@ -64,6 +65,20 @@ export function fileResult(overrides: Partial<FileSearchResult> = {}): FileSearc
     previewStatus: "available",
     messageId: "m9",
     conversation: { kind: "channel", id: "c1", type: "public", name: "infraestrutura" },
+    createdAt: "2026-09-01T09:41:00Z",
+    ...overrides,
+  };
+}
+
+export function linkResult(overrides: Partial<LinkSearchResult> = {}): LinkSearchResult {
+  return {
+    id: "m7:abababababababababababababababab",
+    messageId: "m7",
+    url: "https://docs.example.com/runbook",
+    hostname: "docs.example.com",
+    conversation: { kind: "channel", id: "c1", type: "public", name: "infraestrutura" },
+    senderId: "u1",
+    senderDisplayName: "Juliane Lino",
     createdAt: "2026-09-01T09:41:00Z",
     ...overrides,
   };

@@ -98,6 +98,29 @@ type FileResult struct {
 	CreatedAt        time.Time `json:"created_at"`
 }
 
+// LinkResult (POST /api/search/links) is one occurrence of a URL in a message
+// the caller may read: the same URL in two messages is two results, each with
+// its own conversation and author. URL and Hostname are the canonical target
+// chat-service recorded for the message's current content
+// (chat.message_link_scans), never re-parsed from the body. TargetKey is
+// chat-service's LinkTargetKey for that URL. A malicious target is never a
+// result, so URL is always one a reader of the message is already shown.
+type LinkResult struct {
+	MessageID         string    `json:"message_id"`
+	TargetKey         string    `json:"target_key"`
+	URL               string    `json:"url"`
+	Hostname          string    `json:"hostname"`
+	ConversationKind  string    `json:"conversation_kind"`
+	ConversationID    string    `json:"conversation_id"`
+	ConversationType  string    `json:"conversation_type"`
+	ConversationName  string    `json:"conversation_name"`
+	SenderID          string    `json:"sender_id"`
+	SenderDisplayName string    `json:"sender_display_name"`
+	SenderAvatarURL   *string   `json:"sender_avatar_url,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+	Rank              int       `json:"-"`
+}
+
 type Page[T any] struct {
 	Items      []T
 	NextCursor string
@@ -110,4 +133,5 @@ type (
 	ChannelPage       = Page[ChannelResult]
 	GroupPage         = Page[GroupResult]
 	FilePage          = Page[FileResult]
+	LinkPage          = Page[LinkResult]
 )
