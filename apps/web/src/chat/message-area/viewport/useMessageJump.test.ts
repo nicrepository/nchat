@@ -72,3 +72,46 @@ describe("useMessageJump — following a deep link", () => {
     expect(scrollToMessage).toHaveBeenCalledTimes(2);
   });
 });
+
+/**
+ * #1088: a link the opening could not reach. The request that asked for it is
+ * spent — the message arriving later by itself must not pull the reader back —
+ * but a new request for the same message (#896) still travels.
+ */
+describe("useMessageJump — a link the opening could not reach", () => {
+  function renderMissed() {
+    let loaded = false;
+    const commands = { scrollToMessage: vi.fn(() => true), hasRow: vi.fn(() => loaded) };
+    const hook = renderHook(
+      ({ request, messages }: { request: string; messages: Message[] }) =>
+        useMessageJump(commands, messages, "m-old", request, true),
+      { initialProps: { request: "entry-1", messages: noMessages } },
+    );
+    const arrive = () => {
+      loaded = true;
+      hook.rerender({ request: "entry-1", messages: [{ id: "m-old" } as Message] });
+    };
+    return { ...hook, arrive, scrollToMessage: commands.scrollToMessage };
+  }
+
+  it("does not travel when the message is loaded later without being asked for", () => {
+    const { arrive, scrollToMessage } = renderMissed();
+
+    arrive();
+
+    expect(scrollToMessage).not.toHaveBeenCalled();
+  });
+
+  it("travels exactly once, with the highlight, when the same message is asked for again", () => {
+    const { arrive, rerender, result, scrollToMessage } = renderMissed();
+    arrive();
+    const messages = [{ id: "m-old" } as Message];
+
+    rerender({ request: "entry-2", messages });
+    rerender({ request: "entry-2", messages });
+
+    expect(scrollToMessage).toHaveBeenCalledTimes(1);
+    expect(scrollToMessage).toHaveBeenCalledWith("m-old");
+    expect(result.current.highlightedMessageId).toBe("m-old");
+  });
+});

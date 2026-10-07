@@ -2,7 +2,6 @@ import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 
 import type { MessagePage } from "../chatTypes";
 import { ApiRequestError } from "../../lib/api";
-import { insertMessageChronologically } from "./messageOrder";
 import type { MessagesGateway } from "./messagesGateway";
 import type { ConversationScope } from "./useConversationScope";
 import type { ReactionTimers } from "./useReactionTimers";
@@ -44,32 +43,14 @@ interface Options {
   nextCursor: string;
   /** Whether an older-page fetch is already in progress, from committed state. */
   loadingMore: boolean;
-  /** Direct-navigation target resolved through the authorized single-message GET. */
+  /**
+   * A `?message=` deep link. Only its identity matters here: a new one reopens
+   * the conversation from its newest page, and the viewport pages back to the
+   * message through the ordinary history (#1088). It is never fetched on its
+   * own — a message spliced in outside its page is not part of the history
+   * the timeline prepends to, so the reader would land beside it, not on it.
+   */
   focusMessageId?: string;
-}
-
-/**
- * The initial page, with the deep-linked message guaranteed to be in it.
- *
- * A focus id that is invalid, removed or inaccessible produces the generic page
- * and no error: which of the three it was is not something this client is told,
- * and not something it should let a reader distinguish.
- */
-async function fetchPageWithFocus(
-  gateway: MessagesGateway,
-  focusMessageId: string | undefined,
-  signal: AbortSignal,
-): Promise<MessagePage> {
-  const page = await gateway.fetchPage(undefined, signal);
-  if (!focusMessageId || page.messages.some((message) => message.id === focusMessageId)) {
-    return page;
-  }
-  try {
-    const focused = await gateway.fetchMessage(focusMessageId, signal);
-    return { ...page, messages: insertMessageChronologically(page.messages, focused).messages };
-  } catch {
-    return page;
-  }
 }
 
 export function useMessageLoading({
@@ -119,7 +100,7 @@ export function useMessageLoading({
     pageAbort.current = controller;
     dispatch({ type: "loading" });
 
-    fetchPageWithFocus(gateway, focusMessageId, controller.signal).then(
+    gateway.fetchPage(undefined, controller.signal).then(
       (page) => {
         if (!scope.isCurrent(loadKey)) return;
         dispatch({ type: "loaded", page: sanitizePage(page) });
@@ -137,12 +118,12 @@ export function useMessageLoading({
       fallbacks.abortAll();
       reactionTimers.clearAll();
     };
-  }, [dispatch, fallbacks, focusMessageId, gateway, reactionTimers, sanitizePage, scope]);
+  }, [dispatch, fallbacks, gateway, reactionTimers, sanitizePage, scope]);
 
   useEffect(() => {
     if (!scope.targetId) return;
     return load();
-  }, [load, scope.targetId]);
+  }, [load, scope.targetId, focusMessageId]);
 
   const retry = useCallback(() => {
     if (scope.targetId) load();

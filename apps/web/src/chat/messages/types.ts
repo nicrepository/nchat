@@ -57,6 +57,13 @@ export interface MessagesState {
   sending: boolean;
   /** True while an older-page fetch is in progress. */
   loadingMore: boolean;
+  /**
+   * How many older-page fetches have come back — with a page or an error —
+   * since the conversation loaded (#1088). The one authoritative "a page
+   * arrived" signal: a page of duplicates, an empty page or a failed one can
+   * leave both the array and the cursor exactly as they were.
+   */
+  olderPagesSettled: number;
   /** Describes the most recent change to the messages array for scroll management. */
   lastMutation: LastMutation;
   /** Recoverable realtime fallback error; initial loads and manual retries remain authoritative. */
@@ -197,6 +204,7 @@ export const initialState: MessagesState = {
   sendError: null,
   sending: false,
   loadingMore: false,
+  olderPagesSettled: 0,
   lastMutation: "none",
   realtimeError: null,
   actionError: null,

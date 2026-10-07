@@ -35,6 +35,8 @@ export interface MessageListProps {
   workspaceId: string;
   hasMore: boolean;
   loadingMore: boolean;
+  /** #1088: older pages that have come back, so a search can tell one arrived. */
+  olderPagesSettled: number;
   lastMutation: LastMutation;
   /**
    * What a message offers. Without onQuoteJump: travelling to a quoted message
@@ -84,6 +86,7 @@ export default function MessageList(props: MessageListProps) {
     workspaceId,
     hasMore,
     loadingMore,
+    olderPagesSettled,
     lastMutation,
     actions,
     onLoadMore,
@@ -116,6 +119,7 @@ export default function MessageList(props: MessageListProps) {
     messages,
     currentUserId,
     hasMore,
+    olderPagesSettled,
     lastMutation,
     conversationKey,
     unreadCountAtOpen,

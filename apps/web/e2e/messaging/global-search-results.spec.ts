@@ -1,6 +1,6 @@
 import { expect, test, type Page, type Request, type Route } from "@playwright/test";
 
-import { installPaginatedMessages, TINY_JPEG } from "../helpers/largeConversationFixture";
+import { installPaginatedMessages, list, TINY_JPEG } from "../helpers/largeConversationFixture";
 import {
   GROUP_DM_ID,
   GROUP_DM_NAME,
@@ -244,6 +244,51 @@ function linkRow(
   };
 }
 
+/**
+ * Issue #1088: the `before` cursors of the older pages the timeline asks for,
+ * in order. A deep link to a message outside the first page has to page back
+ * to it — one request per page, never the same page twice.
+ */
+function olderPagesRequested(page: Page, targetId: string): string[] {
+  const cursors: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    const before = url.searchParams.get("before");
+    if (before && url.pathname.endsWith(`/channels/${targetId}/messages`)) cursors.push(before);
+  });
+  return cursors;
+}
+
+/**
+ * Issue #1088: the target was reached through the history it belongs to. A
+ * message spliced in beside the wrong page would sit next to other neighbours,
+ * and the page loaded after the jump would carry the reader away from it — so
+ * this is asserted only once nothing older is left to load. Callers assert
+ * first that the requested pages reached the start of the history.
+ */
+async function expectReachedThroughHistory(
+  page: Page,
+  history: ReturnType<typeof makeMessage>[],
+  index: number,
+) {
+  const target = history[index];
+  await expect(messageBubble(page, target.id)).toBeInViewport();
+  await expect(messageBubble(page, history.at(-1)!.id)).not.toBeInViewport();
+  const order = await list(page).evaluate((element) =>
+    [...element.querySelectorAll<HTMLElement>("[data-testid='chat-msg-bubble']")].map(
+      (bubble) => bubble.dataset.messageId,
+    ),
+  );
+  const at = order.indexOf(target.id);
+  expect(order.slice(at - 1, at + 2)).toEqual(
+    history.slice(index - 1, index + 2).map((message) => message.id),
+  );
+  // Still virtualized (#675): the pages asked for reach the start of the
+  // history, so all of it is loaded — and only a window of it is mounted.
+  await expect(page.getByTestId("chat-virtual-canvas")).toBeAttached();
+  expect(order.length).toBeLessThan(history.length);
+}
+
 test.describe("busca global — resultados categorizados (#900)", () => {
   test("Tudo mostra cada categoria encontrada, sem avatar no cabeçalho", async ({
     page,
@@ -294,6 +339,8 @@ test.describe("busca global — resultados categorizados (#900)", () => {
     await page.goto(`/chat/channel/${targetId}`);
     await expect(messageBubble(page, history.at(-1)!.id)).toBeVisible();
 
+    const older = olderPagesRequested(page, targetId);
+
     await openSearch(page, "backup");
     const target = history[3];
     const highlighted = page.waitForFunction(
@@ -311,8 +358,10 @@ test.describe("busca global — resultados categorizados (#900)", () => {
       `/chat/channel/${targetId}?message=${encodeURIComponent(target.id)}`,
     );
     await highlighted;
-    await expect(messageBubble(page, target.id)).toBeInViewport();
-    await expect(messageBubble(page, history.at(-1)!.id)).not.toBeInViewport();
+    // 70..119 opened; 20..69 and then 0..19, which holds the target and ends
+    // the history — so nothing else can be asked for afterwards.
+    expect(older).toEqual([history[70].id, history[20].id]);
+    await expectReachedThroughHistory(page, history, 3);
   });
 
   test("pessoa abre a DM", async ({ page }, testInfo) => {
@@ -595,6 +644,7 @@ test.describe("busca global — links (#1081)", () => {
     const { history } = await openChannelWithHistory(page, targetId, 120);
     await installPaginatedMessages(page, targetId, history);
     const target = history[3];
+    const older = olderPagesRequested(page, targetId);
     const where = conversation("channel", targetId, "public", "infraestrutura");
     await installSearch(page, (category) =>
       category === "links" ? [linkRow(target.id, where)] : [],
@@ -625,7 +675,8 @@ test.describe("busca global — links (#1081)", () => {
       `/chat/channel/${targetId}?message=${encodeURIComponent(target.id)}`,
     );
     await highlighted;
-    await expect(messageBubble(page, target.id)).toBeInViewport();
+    expect(older).toEqual([history[70].id, history[20].id]);
+    await expectReachedThroughHistory(page, history, 3);
   });
 
   test("link em grupo e em DM abrem a mensagem na conversa certa", async ({ page }, testInfo) => {

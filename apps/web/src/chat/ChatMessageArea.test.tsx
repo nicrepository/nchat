@@ -30,6 +30,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearTokens, setTokens } from "../lib/authSession";
 import { flushResizeObservers, observedElements } from "../setupTests";
 import ChatMessageArea from "./ChatMessageArea";
+import { withMessageJump } from "./useConversationTarget";
 import { isCatalogedEmoji, loadEmojiCatalog, resetEmojiCatalogCache } from "./emoji/emojiCatalog";
 import { avatarColorFor } from "./messageDisplay";
 import type { Message, MessagePage, MessageSecuritySnapshot } from "./chatTypes";
@@ -4808,30 +4809,6 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
       expect(screen.queryByTestId("chat-composer-reference")).not.toBeInTheDocument(),
     );
   });
-
-  it("loads and highlights a directly navigated source outside the latest page", async () => {
-    const focused = makeMessage({ id: "older-message", bodyText: "mensagem antiga" });
-    mockFetchChannelMessages.mockResolvedValue(emptyPage);
-    mockFetchChannelMessage.mockResolvedValue(focused);
-    render(
-      <MemoryRouter initialEntries={["/chat/channel/source?message=older-message"]}>
-        <Routes>
-          <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
-        </Routes>
-      </MemoryRouter>,
-    );
-
-    expect(await screen.findByText("mensagem antiga")).toBeInTheDocument();
-    expect(mockFetchChannelMessage).toHaveBeenCalledWith(
-      "source",
-      "older-message",
-      expect.any(AbortSignal),
-    );
-    expect(window.Element.prototype.scrollIntoView).toHaveBeenCalledWith({
-      behavior: "smooth",
-      block: "center",
-    });
-  });
 });
 
 // ── Stale response guard ──────────────────────────────────────────────────────
@@ -5249,6 +5226,215 @@ describe("ChatMessageArea — infinite scroll", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it("pages back to a directly navigated source outside the latest page, then highlights it", async () => {
+    // #1088: the target is reached through the ordinary history — the page it
+    // belongs to — never spliced in on its own beside a page it is not part of.
+    // The sentinel's observer never fires here, so the older page can only have
+    // been asked for by the opening resolution's bounded search.
+    const focused = makeMessage({ id: "older-message", bodyText: "mensagem antiga" });
+    mockFetchChannelMessages.mockImplementation((_id: string, cursor?: string) =>
+      Promise.resolve(
+        cursor === "cursor-older"
+          ? { messages: [focused], nextCursor: "" }
+          : {
+              messages: [makeMessage({ id: "latest", bodyText: "recente" })],
+              nextCursor: "cursor-older",
+            },
+      ),
+    );
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/source?message=older-message"]}>
+        <Routes>
+          <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("mensagem antiga")).toBeInTheDocument();
+    expect(mockFetchChannelMessages).toHaveBeenCalledWith(
+      "source",
+      "cursor-older",
+      expect.any(AbortSignal),
+    );
+    expect(mockFetchChannelMessage).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(window.Element.prototype.scrollIntoView).toHaveBeenCalledWith({
+        behavior: "smooth",
+        block: "center",
+      }),
+    );
+    expect(
+      document.querySelector('[data-message-id="older-message"].chat-msg-area__msg--highlight'),
+    ).not.toBeNull();
+  });
+  it("never lets a page searched for in the conversation left behind move the next one", async () => {
+    // #1088 item 10: A is still paging back to its deep link when the reader
+    // opens B; A's page arriving afterwards must not land, travel or highlight.
+    const user = userEvent.setup();
+    let resolveOlderA!: (page: MessagePage) => void;
+    mockFetchChannelMessages.mockImplementation((id: string, cursor?: string) => {
+      if (id === "canal-b") {
+        return Promise.resolve(messagePage([makeMessage({ id: "b-1", bodyText: "conversa B" })]));
+      }
+      if (cursor === "cursor-a") return new Promise<MessagePage>((r) => (resolveOlderA = r));
+      return Promise.resolve({
+        messages: [makeMessage({ id: "a-latest", bodyText: "recente de A" })],
+        nextCursor: "cursor-a",
+      });
+    });
+
+    function TwoChannels() {
+      const navigate = useNavigate();
+      return (
+        <div>
+          <button onClick={() => navigate("/chat/channel/canal-b")}>Ir para B</button>
+          <Routes>
+            <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Routes>
+        </div>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/canal-a?message=a-old"]}>
+        <TwoChannels />
+      </MemoryRouter>,
+    );
+    await waitFor(() =>
+      expect(mockFetchChannelMessages).toHaveBeenCalledWith(
+        "canal-a",
+        "cursor-a",
+        expect.any(AbortSignal),
+      ),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Ir para B" }));
+    expect(await screen.findByText("conversa B")).toBeInTheDocument();
+    await act(async () =>
+      resolveOlderA({
+        messages: [makeMessage({ id: "a-old", bodyText: "alvo de A" })],
+        nextCursor: "",
+      }),
+    );
+
+    expect(screen.queryByText("alvo de A")).not.toBeInTheDocument();
+    expect(document.querySelector(".chat-msg-area__msg--highlight")).toBeNull();
+    expect(window.Element.prototype.scrollIntoView).not.toHaveBeenCalledWith({
+      behavior: "smooth",
+      block: "center",
+    });
+  });
+
+  /**
+   * #1088: a conversation whose page n holds one message and points at page
+   * n+1, up to `last`. `holds(n)` names the message on page n.
+   */
+  function chainPages(last: number, holds: (n: number) => string) {
+    mockFetchChannelMessages.mockImplementation((_id: string, cursor?: string) => {
+      const n = cursor ? Number(cursor.slice(1)) : 0;
+      return Promise.resolve({
+        messages: [makeMessage({ id: holds(n), bodyText: `pagina ${n}` })],
+        nextCursor: n === last ? "" : `p${n + 1}`,
+      });
+    });
+  }
+
+  /** Opens the deep link, with a control that asks for the same message again. */
+  function openDeepLink(messageId: string) {
+    function AskAgain() {
+      const navigate = useNavigate();
+      return (
+        <button
+          onClick={() =>
+            navigate(`/chat/channel/source?message=${messageId}`, {
+              state: withMessageJump(undefined),
+            })
+          }
+        >
+          Ir para a mensagem
+        </button>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={[`/chat/channel/source?message=${messageId}`]}>
+        <AskAgain />
+        <Routes>
+          <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  /** Waits for pages from..to to arrive in order, one round each. */
+  async function pagesArrive(from: number, to: number) {
+    for (let n = from; n <= to; n += 1) {
+      expect(await screen.findByText(`pagina ${n}`)).toBeInTheDocument();
+    }
+  }
+
+  const travelled = () =>
+    vi
+      .mocked(window.Element.prototype.scrollIntoView)
+      .mock.calls.filter(([options]) => (options as ScrollIntoViewOptions)?.block === "center");
+
+  it("reaches a target found exactly on the last page the cap allows", async () => {
+    // Before the fix, asking for that page spent the cap at once and the
+    // opening fell back to the tail while the page was still on its way.
+    chainPages(12, (n) => (n === 10 ? "target" : `h-${n}`));
+    openDeepLink("target");
+
+    await pagesArrive(0, 10);
+
+    await waitFor(() =>
+      expect(
+        document.querySelector('[data-message-id="target"].chat-msg-area__msg--highlight'),
+      ).not.toBeNull(),
+    );
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(11);
+  });
+
+  it("keeps paging after a page that only repeated loaded messages", async () => {
+    // Page 1 repeats page 0's message: the array is unchanged, the cursor moved.
+    chainPages(3, (n) => (n === 1 ? "h-0" : n === 2 ? "target" : `h-${n}`));
+    openDeepLink("target");
+
+    expect(await screen.findByText("pagina 2")).toBeInTheDocument();
+    expect(mockFetchChannelMessages).toHaveBeenCalledWith("source", "p2", expect.any(AbortSignal));
+    await waitFor(() => expect(travelled()).toHaveLength(1));
+  });
+
+  it("follows no deep link once the bounded search has given up on it, until asked again", async () => {
+    // The target sits past the cap. Once the search settles elsewhere, the
+    // reader paging back by hand to the target must not be yanked to it — but
+    // asking for it again travels, once (#896).
+    chainPages(12, (n) => (n === 12 ? "target" : `h-${n}`));
+    openDeepLink("target");
+
+    // The initial page plus exactly MAX_BOUNDARY_SEARCH_PAGES, then it stops.
+    await pagesArrive(0, 10);
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(11);
+
+    for (const n of [11, 12]) {
+      act(() => {
+        capturedIOCallback?.(
+          [{ isIntersecting: true } as IntersectionObserverEntry],
+          {} as IntersectionObserver,
+        );
+      });
+      expect(await screen.findByText(`pagina ${n}`)).toBeInTheDocument();
+    }
+    expect(document.querySelector(".chat-msg-area__msg--highlight")).toBeNull();
+    expect(travelled()).toHaveLength(0);
+
+    await userEvent.setup().click(screen.getByRole("button", { name: "Ir para a mensagem" }));
+
+    await waitFor(() => expect(travelled()).toHaveLength(1));
+    expect(
+      document.querySelector('[data-message-id="target"].chat-msg-area__msg--highlight'),
+    ).not.toBeNull();
+    // Neither asked for again nor reloaded: the same conversation, the same pages.
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(13);
   });
 
   it("loads older messages when top sentinel becomes visible and renders them", async () => {

@@ -200,7 +200,8 @@ export interface ViewportCore {
    * `auto` rather than `smooth`, because an animated scroll cannot be corrected
    * as rows on the way are measured for the first time, which is exactly what
    * happens when travelling into unvisited history. False means the message is
-   * not in the loaded window at all, and nothing moved.
+   * not in the loaded window at all, and nothing moved. A move outranks an armed
+   * prepend restoration, which it abandons.
    */
   scrollToMessage: (messageId: string) => boolean;
   /** Whether a message is in the loaded window, mounted or not. */
@@ -377,14 +378,15 @@ export function useViewportCore(): ViewportCoreState {
   }, []);
 
   const scrollToMessage = useCallback((messageId: string) => {
-    const el = messageRefs.current.get(messageId);
-    if (el) {
-      el.scrollIntoView({ behavior: "smooth", block: "center" });
-      return true;
-    }
     const index = rowIndexRef.current.get(messageId);
     if (index === undefined) return false;
-    virtualizerRef.current?.scrollToIndex(index, { align: "center" });
+    // The same handoff as beginNavigation: a jump is the reader asking to be
+    // taken somewhere, so a restoration still armed by the page that brought
+    // the message in (#1088) must not put the old position back over it.
+    prependRestoreRef.current = null;
+    const el = messageRefs.current.get(messageId);
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+    else virtualizerRef.current?.scrollToIndex(index, { align: "center" });
     return true;
   }, []);
 

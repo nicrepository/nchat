@@ -19,7 +19,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { NavigationReason, NavigationTarget } from "./navigation";
 import {
   decideOpenPositionResolution,
-  type OpenPositionInput,
+  type ResolutionInput,
   type ScrollTarget,
 } from "./openPosition";
 import type { ViewportCore } from "./useViewportCore";
@@ -37,8 +37,8 @@ export interface OpenPositionState {
   scrollTarget: ScrollTarget;
 }
 
-// searchAttempts is this hook's own state, not something the caller supplies.
-interface Params extends Omit<OpenPositionInput, "searchAttempts"> {
+// The search's progress is this hook's own state, not something the caller supplies.
+interface Params extends Omit<ResolutionInput, "searchAttempts" | "searchedAt" | "resolved"> {
   core: ViewportCore;
   onLoadMore: () => void;
 }
@@ -75,7 +75,7 @@ export function useOpenPositionResolution({
   const [scrollTarget, setScrollTarget] = useState<ScrollTarget>(undefined);
   const [target, setTarget] = useState<NavigationTarget | null>(null);
   const [searchAttempts, setSearchAttempts] = useState(0);
-  const [searchedForLength, setSearchedForLength] = useState(-1);
+  const [searchedAt, setSearchedAt] = useState(-1);
 
   // Stable ref so the page-fetch effect below never depends on the caller
   // handing down the same function identity.
@@ -87,11 +87,11 @@ export function useOpenPositionResolution({
   const decision = decideOpenPositionResolution({
     ...input,
     searchAttempts,
-    searchedForLength,
+    searchedAt,
     resolved,
   });
   if (decision.kind === "search") {
-    setSearchedForLength(decision.searchedLength);
+    setSearchedAt(decision.searchedAt);
     setSearchAttempts((n) => n + 1);
   } else if (decision.kind === "settle") {
     // Each of these is applied unconditionally because each is idempotent:
