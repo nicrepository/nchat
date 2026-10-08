@@ -580,6 +580,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           name={resolvedName}
           isPrivate={target.isPrivateChannel}
           counterpart={activeDM?.counterpart}
+          conversation={activeDM}
           presenceTarget={target.presenceTarget}
           // #673: once the direct call bar takes over presentation for this DM,
           // the header suppresses its own call actions — the same pattern #657

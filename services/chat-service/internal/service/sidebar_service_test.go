@@ -188,6 +188,10 @@ func (f *sidebarFakePinStore) ListVisible(_ context.Context, _, _ string) ([]sto
 
 // Group rename and self-leave are not exercised here; these exist so the fake
 // still satisfies storage.DMStore (issue #527).
+func (f *sidebarFakeDMStore) SetGroupAvatarEmoji(context.Context, storage.SetGroupAvatarInput) error {
+	return nil
+}
+
 func (f *sidebarFakeDMStore) RenameGroupConversation(context.Context, storage.RenameGroupInput) (storage.RenameGroupResult, error) {
 	return storage.RenameGroupResult{}, nil
 }

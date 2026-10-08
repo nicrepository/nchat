@@ -48,7 +48,8 @@ func seedConversationAdminFixtures(t *testing.T, pool *pgxpool.Pool) {
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO chat.channel_members (channel_id, user_id, role)
-		VALUES ($1, $3, 'member'), ($2, $3, 'member'), ($1, $4, 'member')`,
+		VALUES ($1, $3, 'member'), ($2, $3, 'member'), ($1, $4, 'member')
+		ON CONFLICT (channel_id, user_id) DO NOTHING`,
 		adminLeaveChanID, adminPrivateChanID, chanMember, chanOwner,
 	); err != nil {
 		t.Fatalf("seed channel members: %v", err)

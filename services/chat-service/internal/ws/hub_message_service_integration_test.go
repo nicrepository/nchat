@@ -58,6 +58,10 @@ func (s *integChannelStore) ListVisibleChannelsByUser(_ context.Context, _, _ st
 // exists so integChannelStore still satisfies storage.ChannelStore (issue #527).
 // The two group mutations are unused here for the same reason, and stubbed for
 // the same reason: interface satisfaction, not behaviour (issue #527).
+func (s *integDMStore) SetGroupAvatarEmoji(context.Context, storage.SetGroupAvatarInput) error {
+	return nil
+}
+
 func (s *integDMStore) RenameGroupConversation(context.Context, storage.RenameGroupInput) (storage.RenameGroupResult, error) {
 	return storage.RenameGroupResult{}, nil
 }

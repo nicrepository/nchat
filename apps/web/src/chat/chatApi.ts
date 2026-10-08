@@ -43,6 +43,7 @@ import {
   type MentionCandidate,
   type MentionTarget,
   type DMConversation,
+  type DMType,
   type FavoriteItem,
   type FavoritesPage,
   type Message,
@@ -104,6 +105,8 @@ interface SidebarDMResponse {
   name: string;
   /** Absent on group DMs and on pre-counterpart server responses. */
   counterpart?: SidebarDMCounterpartResponse;
+  /** A group's emoji identity (issue #1026); absent when Automático. */
+  avatar_emoji?: unknown;
   /** Validated as `unknown`: absent on pre-#414 responses, null when empty. */
   created_at?: unknown;
   last_message_at?: unknown;
@@ -317,6 +320,7 @@ function mapSidebarDM(dm: SidebarDMResponse): DMConversation | undefined {
     name: dm.name,
     participants: [],
     counterpart: type === "group" ? undefined : mapSidebarCounterpart(dm.counterpart),
+    ...groupAvatarEmoji(type, dm.avatar_emoji),
     createdAt: sidebarTimestamp(dm.created_at),
     lastMessageAt: sidebarTimestamp(dm.last_message_at),
     muted: dm.muted === true,
@@ -324,6 +328,15 @@ function mapSidebarDM(dm: SidebarDMResponse): DMConversation | undefined {
     ...(pinnedAt ? { pinnedAt } : {}),
     ...(isUnreadCount(dm.unread_count) ? { unreadCount: dm.unread_count } : {}),
   };
+}
+
+/**
+ * A group's emoji, when the server sent one. Only groups have an identity, and
+ * anything that is not a non-empty string reads as Automático. It is rendered
+ * as a text node, never markup; the server's catalog check is the boundary.
+ */
+function groupAvatarEmoji(type: DMType, raw: unknown): { avatarEmoji?: string } {
+  return type === "group" && typeof raw === "string" && raw !== "" ? { avatarEmoji: raw } : {};
 }
 
 function mapSidebarDMs(raw: SidebarDMResponse[] | undefined): DMConversation[] {
@@ -636,15 +649,19 @@ export async function getOrCreateDirectDM(
 export async function createGroupDM(
   participantUserIds: string[],
   title: string,
+  avatarEmoji: string | undefined,
   signal?: AbortSignal,
 ): Promise<string> {
   const trimmedTitle = title.trim();
   const response = await authenticatedFetch<GroupDMEnvelope>(`${CHAT_BASE}/dms/group`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    // Automático sends no identity at all (issue #1026): initials are derived
+    // from the name on render, so there is nothing of theirs to persist.
     body: JSON.stringify({
       participant_user_ids: participantUserIds,
       ...(trimmedTitle ? { title: trimmedTitle } : {}),
+      ...(avatarEmoji ? { avatar_emoji: avatarEmoji } : {}),
     }),
     signal,
   });
@@ -820,6 +837,30 @@ export async function renameGroup(
     },
   );
   return { id: response.data.id, name: response.data.title };
+}
+
+/**
+ * Sets a group's emoji identity, or — with no emoji — returns it to Automático
+ * by removing the persisted one (issue #1026). Groups only; authority is the
+ * rename's, re-derived server-side, and the emoji is re-validated there.
+ */
+export async function setGroupAvatarEmoji(
+  conversationId: string,
+  emoji: string | undefined,
+  signal?: AbortSignal,
+): Promise<void> {
+  const target = `${CHAT_BASE}/dm/${encodeURIComponent(conversationId)}/avatar`;
+  await authenticatedFetch(
+    target,
+    emoji
+      ? {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ emoji }),
+          signal,
+        }
+      : { method: "DELETE", signal },
+  );
 }
 
 /**

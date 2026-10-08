@@ -18,7 +18,14 @@ const {
   mockGetOrCreateDirectDM:
     vi.fn<(userId: string, signal?: AbortSignal) => Promise<DirectDMResult>>(),
   mockCreateGroupDM:
-    vi.fn<(userIds: string[], title: string, signal?: AbortSignal) => Promise<string>>(),
+    vi.fn<
+      (
+        userIds: string[],
+        title: string,
+        avatarEmoji: string | undefined,
+        signal?: AbortSignal,
+      ) => Promise<string>
+    >(),
   mockCreateChannel:
     vi.fn<
       (
@@ -28,6 +35,20 @@ const {
     >(),
   mockCreateChannelCategory:
     vi.fn<(name: string, signal?: AbortSignal) => Promise<{ id?: string; name: string }>>(),
+}));
+
+// The #496 picker is exercised by its own suite; here it only has to hand an
+// emoji back, the way the real one does on a click.
+vi.mock("./emoji/EmojiPicker", () => ({
+  default: ({ onSelect }: { onSelect: (emoji: string) => void }) => (
+    <div aria-label="Emojis de teste" role="group">
+      {["🎉", "👩‍💻"].map((emoji) => (
+        <button key={emoji} type="button" onClick={() => onSelect(emoji)}>
+          {emoji}
+        </button>
+      ))}
+    </div>
+  ),
 }));
 
 vi.mock("./chatApi", () => ({
@@ -41,8 +62,12 @@ vi.mock("./chatApi", () => ({
     mockSearchDMCandidates(query, signal),
   getOrCreateDirectDM: (userId: string, signal?: AbortSignal) =>
     mockGetOrCreateDirectDM(userId, signal),
-  createGroupDM: (userIds: string[], title: string, signal?: AbortSignal) =>
-    mockCreateGroupDM(userIds, title, signal),
+  createGroupDM: (
+    userIds: string[],
+    title: string,
+    avatarEmoji: string | undefined,
+    signal?: AbortSignal,
+  ) => mockCreateGroupDM(userIds, title, avatarEmoji, signal),
 }));
 
 function deferred<T>() {
@@ -417,6 +442,11 @@ async function searchAndSelect(query: string, results: DMCandidate[], names: str
   }
 }
 
+/** Participantes → Identidade (issue #1026). */
+function continueToIdentity() {
+  fireEvent.click(screen.getByRole("button", { name: "Continuar" }));
+}
+
 const groupCandidates: DMCandidate[] = [
   { userId: "user-2", displayName: "Joana" },
   { userId: "user-3", displayName: "Marcos" },
@@ -438,8 +468,10 @@ describe("NewConversationDialog — group mode", () => {
 
     switchToGroup();
     expect(screen.getByRole("radio", { name: "Grupo" })).toBeChecked();
-    expect(screen.getByLabelText("Nome do grupo (opcional)")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Criar grupo" })).toBeDisabled();
+    // Participantes first: the name and the creation belong to Identidade.
+    expect(screen.queryByLabelText("Nome do grupo (opcional)")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Criar grupo" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continuar" })).toBeDisabled();
     expect(mockGetOrCreateDirectDM).not.toHaveBeenCalled();
   });
 
@@ -465,7 +497,7 @@ describe("NewConversationDialog — group mode", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Remover Marcos" }));
     expect(chips).not.toHaveTextContent("Marcos");
-    expect(screen.getByRole("button", { name: "Criar grupo" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Continuar" })).toBeDisabled();
   });
 
   it("keeps the selection when the query changes and when a stale response lands", async () => {
@@ -510,12 +542,15 @@ describe("NewConversationDialog — group mode", () => {
     switchToGroup();
     await searchAndSelect("jo", groupCandidates, ["Joana"]);
 
-    const submit = screen.getByRole("button", { name: "Criar grupo" });
-    expect(submit).toBeDisabled();
-    fireEvent.click(submit);
+    const next = screen.getByRole("button", { name: "Continuar" });
+    expect(next).toBeDisabled();
+    fireEvent.click(next);
+    expect(screen.queryByRole("button", { name: "Criar grupo" })).not.toBeInTheDocument();
     expect(mockCreateGroupDM).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Marcos" }));
+    continueToIdentity();
+    expect(mockCreateGroupDM).not.toHaveBeenCalled();
     fireEvent.change(screen.getByLabelText("Nome do grupo (opcional)"), {
       target: { value: "  Infra  " },
     });
@@ -527,6 +562,7 @@ describe("NewConversationDialog — group mode", () => {
     expect(mockCreateGroupDM).toHaveBeenCalledWith(
       ["user-2", "user-3"],
       "  Infra  ",
+      undefined,
       expect.any(AbortSignal),
     );
     const busy = screen.getByRole("button", { name: "Criando…" });
@@ -545,6 +581,7 @@ describe("NewConversationDialog — group mode", () => {
     const props = renderDialog();
     switchToGroup();
     await searchAndSelect("jo", groupCandidates, ["Joana", "Marcos"]);
+    continueToIdentity();
 
     fireEvent.click(screen.getByRole("button", { name: "Criar grupo" }));
     await act(async () => Promise.resolve());
@@ -552,6 +589,7 @@ describe("NewConversationDialog — group mode", () => {
     expect(mockCreateGroupDM).toHaveBeenCalledWith(
       ["user-2", "user-3"],
       "",
+      undefined,
       expect.any(AbortSignal),
     );
     expect(props.onOpened).toHaveBeenCalledWith("dm-group");
@@ -564,6 +602,7 @@ describe("NewConversationDialog — group mode", () => {
     const props = renderDialog();
     switchToGroup();
     await searchAndSelect("jo", groupCandidates, ["Joana", "Marcos"]);
+    continueToIdentity();
 
     fireEvent.click(screen.getByRole("button", { name: "Criar grupo" }));
     await act(async () => Promise.resolve());
@@ -571,7 +610,11 @@ describe("NewConversationDialog — group mode", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Não foi possível criar o grupo");
     expect(screen.queryByText(/sql/i)).not.toBeInTheDocument();
     expect(props.onOpened).not.toHaveBeenCalled();
+    // Back to Participantes: the selection survived the failure.
+    fireEvent.click(screen.getByRole("button", { name: "Voltar" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.getByRole("list", { name: "Pessoas selecionadas" })).toHaveTextContent("Joana");
+    continueToIdentity();
 
     fireEvent.click(screen.getByRole("button", { name: "Criar grupo" }));
     await act(async () => Promise.resolve());
@@ -591,6 +634,7 @@ describe("NewConversationDialog — group mode", () => {
     renderDialog();
     switchToGroup();
     await searchAndSelect("jo", groupCandidates, ["Joana", "Marcos"]);
+    continueToIdentity();
 
     fireEvent.click(screen.getByRole("button", { name: "Criar grupo" }));
     await act(async () => Promise.resolve());
@@ -604,6 +648,7 @@ describe("NewConversationDialog — group mode", () => {
     const props = renderDialog();
     switchToGroup();
     await searchAndSelect("jo", groupCandidates, ["Joana", "Marcos"]);
+    continueToIdentity();
 
     // Both clicks inside one act(): React has not re-rendered in between, so the
     // button is still enabled for the second one and only the in-flight guard
@@ -675,6 +720,8 @@ describe("NewConversationDialog — group mode", () => {
   it("renders a hostile group name as text", async () => {
     renderDialog();
     switchToGroup();
+    await searchAndSelect("jo", groupCandidates, ["Joana", "Marcos"]);
+    continueToIdentity();
 
     fireEvent.change(screen.getByLabelText("Nome do grupo (opcional)"), {
       target: { value: '<img src=x onerror="alert(1)">' },
@@ -690,6 +737,7 @@ describe("NewConversationDialog — group mode", () => {
     renderDialog();
     switchToGroup();
     await searchAndSelect("jo", groupCandidates, ["Joana", "Marcos"]);
+    continueToIdentity();
 
     const nameField = screen.getByLabelText("Nome do grupo (opcional)");
     const emojiName = Array.from({ length: 120 }, () => "🙂").join("");
@@ -712,6 +760,8 @@ describe("NewConversationDialog — group mode", () => {
   it("truncates an over-long ASCII name by code points as the user types", async () => {
     renderDialog();
     switchToGroup();
+    await searchAndSelect("jo", groupCandidates, ["Joana", "Marcos"]);
+    continueToIdentity();
 
     const nameField = screen.getByLabelText("Nome do grupo (opcional)");
     fireEvent.change(nameField, { target: { value: "a".repeat(121) } });
@@ -1080,19 +1130,24 @@ function chooseMode(name: "Pessoa" | "Grupo" | "Canal") {
 async function fillGroupDraft() {
   chooseMode("Grupo");
   await searchAndSelect("jo", groupCandidates, ["Joana", "Marcos"]);
+  continueToIdentity();
   fireEvent.change(screen.getByLabelText("Nome do grupo (opcional)"), {
     target: { value: "Infra 🙂" },
   });
 }
 
+// The draft spans both steps: the flow comes back on Identidade, and going
+// back to Participantes finds the selection and the query intact.
 function expectGroupDraft() {
+  expect(screen.getByLabelText("Nome do grupo (opcional)")).toHaveValue("Infra 🙂");
+  expect(screen.getByRole("button", { name: "Criar grupo" })).toBeEnabled();
+  fireEvent.click(screen.getByRole("button", { name: "Voltar" }));
   const chips = screen.getByRole("list", { name: "Pessoas selecionadas" });
   expect(chips).toHaveTextContent("Joana");
   expect(chips).toHaveTextContent("Marcos");
-  expect(screen.getByLabelText("Nome do grupo (opcional)")).toHaveValue("Infra 🙂");
   expect(screen.getByRole("searchbox", { name: "Pesquisar pessoa" })).toHaveValue("jo");
   expect(screen.getByRole("button", { name: "Joana" })).toHaveAttribute("aria-pressed", "true");
-  expect(screen.getByRole("button", { name: "Criar grupo" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Continuar" })).toBeEnabled();
 }
 
 const draftCategories: ChannelCategory[] = [{ id: "cat-1", name: "Projetos", kind: "category" }];
@@ -1319,5 +1374,152 @@ describe("NewConversationDialog — independent drafts", () => {
     expect(dialog).toHaveAccessibleDescription(/pelo menos 2 pessoas/i);
     chooseMode("Canal");
     expect(dialog).toHaveAccessibleDescription(/canais públicos/i);
+  });
+});
+
+// ── Group identity step (issue #1026) ────────────────────────────────────────
+
+async function settleLazy() {
+  await act(async () => {
+    await vi.dynamicImportSettled();
+  });
+}
+
+const preview = () => screen.getByRole("img", { name: /Prévia da identidade/ });
+
+async function openIdentityStep() {
+  const props = renderDialog();
+  switchToGroup();
+  await searchAndSelect("jo", groupCandidates, ["Joana", "Marcos"]);
+  continueToIdentity();
+  return props;
+}
+
+async function chooseEmoji(emoji: string) {
+  fireEvent.click(screen.getByRole("radio", { name: "Emoji" }));
+  await settleLazy();
+  fireEvent.click(screen.getByRole("button", { name: emoji }));
+}
+
+describe("NewConversationDialog — group identity (issue #1026)", () => {
+  it("moves Participantes → Identidade with focus on the name and Automático chosen", async () => {
+    await openIdentityStep();
+
+    expect(screen.getByLabelText("Nome do grupo (opcional)")).toHaveFocus();
+    expect(screen.queryByRole("searchbox")).not.toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "Identidade do grupo" })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Automático" })).toBeChecked();
+    expect(screen.getByRole("radio", { name: "Emoji" })).not.toBeChecked();
+    // Untitled, the preview shows the name the server will give the group.
+    expect(preview()).toHaveAccessibleName("Prévia da identidade: iniciais GD");
+  });
+
+  it("recomputes the automatic preview as the name is typed, without any request", async () => {
+    await openIdentityStep();
+
+    fireEvent.change(screen.getByLabelText("Nome do grupo (opcional)"), {
+      target: { value: "Infra Web" },
+    });
+    expect(preview()).toHaveAccessibleName("Prévia da identidade: iniciais IW");
+    expect(preview().textContent).toBe("IW");
+    fireEvent.change(screen.getByLabelText("Nome do grupo (opcional)"), {
+      target: { value: "Plataforma" },
+    });
+    expect(preview().textContent).toBe("P");
+    expect(mockCreateGroupDM).not.toHaveBeenCalled();
+  });
+
+  it("previews a chosen emoji and keeps Criar grupo off until one is chosen", async () => {
+    await openIdentityStep();
+
+    fireEvent.click(screen.getByRole("radio", { name: "Emoji" }));
+    expect(screen.getByText("Escolha um emoji para o grupo.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Criar grupo" })).toBeDisabled();
+    await settleLazy();
+    fireEvent.click(screen.getByRole("button", { name: "👩‍💻" }));
+
+    expect(preview()).toHaveAccessibleName("Prévia da identidade: emoji 👩‍💻");
+    expect(preview().textContent).toBe("👩‍💻");
+    expect(screen.getByRole("button", { name: "Criar grupo" })).toBeEnabled();
+    expect(mockCreateGroupDM).not.toHaveBeenCalled();
+  });
+
+  it("keeps participants, name and emoji across Identidade → Participantes → Identidade", async () => {
+    await openIdentityStep();
+    fireEvent.change(screen.getByLabelText("Nome do grupo (opcional)"), {
+      target: { value: "Infra" },
+    });
+    await chooseEmoji("🎉");
+
+    fireEvent.click(screen.getByRole("button", { name: "Voltar" }));
+    expect(screen.getByRole("searchbox", { name: "Pesquisar pessoa" })).toHaveFocus();
+    const chips = screen.getByRole("list", { name: "Pessoas selecionadas" });
+    expect(chips).toHaveTextContent("Joana");
+    expect(chips).toHaveTextContent("Marcos");
+
+    continueToIdentity();
+    await settleLazy();
+    expect(screen.getByLabelText("Nome do grupo (opcional)")).toHaveValue("Infra");
+    expect(screen.getByRole("radio", { name: "Emoji" })).toBeChecked();
+    expect(preview().textContent).toBe("🎉");
+    expect(mockCreateGroupDM).not.toHaveBeenCalled();
+  });
+
+  it("submits the chosen emoji", async () => {
+    mockCreateGroupDM.mockResolvedValue("dm-group");
+    const props = await openIdentityStep();
+    await chooseEmoji("👩‍💻");
+
+    fireEvent.click(screen.getByRole("button", { name: "Criar grupo" }));
+    await act(async () => Promise.resolve());
+
+    expect(mockCreateGroupDM).toHaveBeenCalledTimes(1);
+    expect(mockCreateGroupDM).toHaveBeenCalledWith(
+      ["user-2", "user-3"],
+      "",
+      "👩‍💻",
+      expect.any(AbortSignal),
+    );
+    expect(props.onOpened).toHaveBeenCalledWith("dm-group");
+  });
+
+  it("drops the emoji when switching back to Automático, so none is sent", async () => {
+    mockCreateGroupDM.mockResolvedValue("dm-group");
+    await openIdentityStep();
+    fireEvent.change(screen.getByLabelText("Nome do grupo (opcional)"), {
+      target: { value: "Infra" },
+    });
+    await chooseEmoji("🎉");
+
+    fireEvent.click(screen.getByRole("radio", { name: "Automático" }));
+    expect(preview().textContent).toBe("I");
+    expect(screen.queryByRole("button", { name: "🎉" })).not.toBeInTheDocument();
+    // Emoji again starts empty: the previous choice did not survive.
+    fireEvent.click(screen.getByRole("radio", { name: "Emoji" }));
+    expect(screen.getByRole("button", { name: "Criar grupo" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("radio", { name: "Automático" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Criar grupo" }));
+    await act(async () => Promise.resolve());
+    expect(mockCreateGroupDM).toHaveBeenCalledWith(
+      ["user-2", "user-3"],
+      "Infra",
+      undefined,
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("locks the identity while the creation is pending", async () => {
+    const request = deferred<string>();
+    mockCreateGroupDM.mockReturnValue(request.promise);
+    await openIdentityStep();
+    await chooseEmoji("🎉");
+
+    fireEvent.click(screen.getByRole("button", { name: "Criar grupo" }));
+
+    expect(screen.getByRole("radio", { name: "Automático" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Voltar" })).toBeDisabled();
+    expect(screen.queryByRole("group", { name: "Emojis de teste" })).not.toBeInTheDocument();
+    await act(async () => request.resolve("dm-group"));
   });
 });

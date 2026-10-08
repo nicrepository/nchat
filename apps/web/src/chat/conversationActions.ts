@@ -54,6 +54,7 @@ export type ConversationActionId =
   | "mute"
   | "unmute"
   | "rename"
+  | "identity"
   | "details"
   | "leave";
 
@@ -201,6 +202,11 @@ function manageActions(target: ConversationTarget): ConversationAction[] {
       icon: "pencil",
       group: "manage",
     });
+  }
+  // A group's identity (issue #1026) is metadata like its name, offered under
+  // the same rule; channels have no avatar and a 1:1 shows the person's.
+  if (target.kind === "group" && canRenameConversation(target)) {
+    actions.push({ id: "identity", label: "Alterar identidade", icon: "pencil", group: "manage" });
   }
   actions.push({ id: "details", label: detailsLabel(target.kind), icon: "info", group: "manage" });
   return actions;

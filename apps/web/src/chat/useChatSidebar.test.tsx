@@ -20,6 +20,7 @@ const {
   mockMarkConversationRead,
   mockSetSidebarConversationPinned,
   mockRenameChannel,
+  mockSetGroupAvatarEmoji,
   mockSetConversationMuted,
   mockSetConversationNotificationMode,
   mockLeaveConversation,
@@ -32,6 +33,7 @@ const {
   mockMarkConversationRead: vi.fn(),
   mockSetSidebarConversationPinned: vi.fn(),
   mockRenameChannel: vi.fn(),
+  mockSetGroupAvatarEmoji: vi.fn(),
   mockSetConversationMuted: vi.fn(),
   mockSetConversationNotificationMode: vi.fn(),
   mockLeaveConversation: vi.fn(),
@@ -58,6 +60,7 @@ vi.mock("./chatApi", () => ({
   markConversationRead: mockMarkConversationRead,
   setSidebarConversationPinned: mockSetSidebarConversationPinned,
   renameChannel: mockRenameChannel,
+  setGroupAvatarEmoji: (...args: unknown[]) => mockSetGroupAvatarEmoji(...args),
   setConversationMuted: mockSetConversationMuted,
   setConversationNotificationMode: mockSetConversationNotificationMode,
   leaveConversation: mockLeaveConversation,
@@ -3071,6 +3074,36 @@ describe("useChatSidebar — ações do menu de conversa", () => {
         name: "Plataforma",
         pinnedAt: "2026-08-12T10:00:00Z",
       });
+    });
+  });
+
+  // Issue #1026: same no-optimism rule as the rename — the server's answer, then
+  // the canonical refetch, is what moves the identity.
+  it("persists a group identity and converges through a refetch", async () => {
+    mockSetGroupAvatarEmoji.mockResolvedValue(undefined);
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    const fetchesBefore = mockFetchSidebarData.mock.calls.length;
+
+    await act(async () => {
+      await result.current.setGroupAvatar(dmC, "🎉");
+      await result.current.setGroupAvatar(dmC, undefined);
+    });
+
+    expect(mockSetGroupAvatarEmoji).toHaveBeenNthCalledWith(1, dmC, "🎉");
+    expect(mockSetGroupAvatarEmoji).toHaveBeenNthCalledWith(2, dmC, undefined);
+    await waitFor(() =>
+      expect(mockFetchSidebarData.mock.calls.length).toBeGreaterThan(fetchesBefore),
+    );
+  });
+
+  it("propagates a refused identity change", async () => {
+    mockSetGroupAvatarEmoji.mockRejectedValue(new Error("forbidden"));
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(async () => {
+      await expect(result.current.setGroupAvatar(dmC, "🎉")).rejects.toThrow("forbidden");
     });
   });
 

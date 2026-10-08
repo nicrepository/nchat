@@ -282,6 +282,9 @@ type DMConversation struct {
 	WorkspaceID string
 	Type        DMConversationType
 	Title       string
+	// AvatarEmoji is a group's chosen identity emoji (issue #1026). Empty means
+	// Automático: initials derived from the current name, never stored.
+	AvatarEmoji string
 	Status      DMConversationStatus
 	CreatedBy   string
 	CreatedAt   time.Time

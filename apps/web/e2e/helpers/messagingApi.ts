@@ -65,6 +65,8 @@ interface SidebarDMFixture extends SidebarActivityFixture {
   counterpart?: { user_id: string; display_name: string; avatar_url?: string };
   /** Issue #527: this viewer's own notification preference. */
   muted?: boolean;
+  /** Issue #1026: a group's emoji identity; absent is Automático. */
+  avatar_emoji?: string;
 }
 
 export interface DMCandidateFixture {
@@ -249,7 +251,9 @@ export interface MessagingScenario {
     leaves: Array<{ targetType: "channel" | "dm"; targetId: string }>;
     reactions: Array<{ messageId: string; emoji: string; added: boolean }>;
     dmCreates: Array<{ otherUserId: string }>;
-    groupCreates: Array<{ participantUserIds: string[]; title: string }>;
+    groupCreates: Array<{ participantUserIds: string[]; title: string; avatarEmoji?: string }>;
+    /** Issue #1026: identity changes; `null` is the explicit return to Automático. */
+    groupAvatars: Array<{ conversationId: string; emoji: string | null }>;
     /**
      * Issue #1025: every POST /api/chat/channels that reached the mock, in
      * order, with its Idempotency-Key — so a spec can prove a retry reused it
@@ -629,6 +633,7 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
       reactions: [],
       dmCreates: [],
       groupCreates: [],
+      groupAvatars: [],
       channelCreates: [],
       attachmentUploads: [],
       attachmentContentFetches: [],
@@ -2377,6 +2382,45 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
   await page.route("**/api/chat/channels/*/membership", leaveConversation);
   await page.route("**/api/chat/dm/*/membership", leaveConversation);
 
+  // Group identity (issue #1026): PUT sets the emoji, DELETE returns the group
+  // to Automático. Groups only, like the real statement; the server's catalog
+  // check is modelled as "one non-markup value", which is all a spec needs.
+  await page.route("**/api/chat/dm/*/avatar", async (route) => {
+    const request = route.request();
+    const id = decodeURIComponent(new URL(request.url()).pathname.split("/").at(-2) ?? "");
+    const group = scenario.sidebarDMs.find((dm) => dm.id === id && dm.type === "group");
+    if (!group || (request.method() !== "PUT" && request.method() !== "DELETE")) {
+      await route.fulfill({
+        status: 404,
+        contentType: "application/json",
+        body: errorBody("not_found"),
+      });
+      return;
+    }
+    if (request.method() === "DELETE") {
+      scenario.requests.groupAvatars.push({ conversationId: id, emoji: null });
+      delete group.avatar_emoji;
+      await route.fulfill({ status: 204 });
+      return;
+    }
+    const raw = (request.postDataJSON() ?? {}) as { emoji?: unknown };
+    if (typeof raw.emoji !== "string" || raw.emoji === "" || raw.emoji.includes("<")) {
+      await route.fulfill({
+        status: 400,
+        contentType: "application/json",
+        body: errorBody("bad_request"),
+      });
+      return;
+    }
+    scenario.requests.groupAvatars.push({ conversationId: id, emoji: raw.emoji });
+    group.avatar_emoji = raw.emoji;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: { id, avatar_emoji: raw.emoji } }),
+    });
+  });
+
   // Group rename (issue #527). Groups only: a 1:1 conversation is refused, the
   // way the real statement refuses it by requiring type = 'group'.
   await page.route("**/api/chat/dm/*", async (route) => {
@@ -2666,9 +2710,14 @@ async function installConversationMocks(page: Page, scenario: MessagingScenario)
     const raw = (await request.postDataJSON()) as {
       participant_user_ids?: string[];
       title?: string;
+      avatar_emoji?: string;
     };
     const participantUserIds = raw.participant_user_ids ?? [];
-    scenario.requests.groupCreates.push({ participantUserIds, title: raw.title ?? "" });
+    scenario.requests.groupCreates.push({
+      participantUserIds,
+      title: raw.title ?? "",
+      ...(raw.avatar_emoji !== undefined ? { avatarEmoji: raw.avatar_emoji } : {}),
+    });
     const unknown = participantUserIds.some(
       (userId) => !scenario.dmCandidates.some((c) => c.userId === userId),
     );
@@ -2678,7 +2727,13 @@ async function installConversationMocks(page: Page, scenario: MessagingScenario)
     }
     const conversationId = `e2e-group-${scenario.requests.groupCreates.length}`;
     const name = raw.title?.trim() || "Grupo sem nome";
-    scenario.sidebarDMs.push({ id: conversationId, type: "group", name, unread_count: 0 });
+    scenario.sidebarDMs.push({
+      id: conversationId,
+      type: "group",
+      name,
+      unread_count: 0,
+      ...(raw.avatar_emoji ? { avatar_emoji: raw.avatar_emoji } : {}),
+    });
     scenario.messagesByTarget.set(targetKey("dm", conversationId), []);
     await route.fulfill({
       status: 201,

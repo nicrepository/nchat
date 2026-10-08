@@ -130,6 +130,11 @@ export interface DMConversation extends ConversationActivity {
   name: string;
   participants: DMParticipant[];
   counterpart?: DMCounterpart;
+  /**
+   * A group's emoji identity (issue #1026). Absent is Automático: GroupAvatar
+   * derives initials from `name`, so nothing derived is ever held here.
+   */
+  avatarEmoji?: string;
   unreadCount?: number;
   /** True once the unread count includes a message that mentions the current user. */
   hasMentionUnread?: boolean;
