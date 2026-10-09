@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM golang:1.25.13-bookworm AS build
+FROM golang:1.26.9-bookworm AS build
 WORKDIR /src
 
 # This stage builds with GOWORK=off, so go.work's `use` directives never apply
