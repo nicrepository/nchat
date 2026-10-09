@@ -119,7 +119,7 @@ interface Props {
    * positioning targets this instead.
    */
   unreadDividerRef: RefObject<HTMLDivElement | null>;
-  setMessageRef: (messageId: string, el: HTMLDivElement | null) => void;
+  setMessageRef: (messageId: string, el: HTMLElement | null) => void;
 }
 
 export default function MessageTimelineItem({
@@ -201,6 +201,7 @@ function TimelineMessageRow({
         message={message}
         scope={context.systemScope}
         viewerId={context.currentUserId}
+        setMessageRef={setMessageRef}
       />
     );
   }

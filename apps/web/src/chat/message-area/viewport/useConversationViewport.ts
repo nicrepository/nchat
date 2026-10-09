@@ -28,7 +28,9 @@ import { usePrependRestoreEffects, useRowResizeAdjustment } from "./usePrependRe
 import { useTimelineRows } from "./useTimelineRows";
 import { useNavigator, useUnreadBoundary } from "./useNavigator";
 import { useTailArrival, useTailFollow } from "./useTailFollow";
-import { useUnreadCount } from "./useUnreadCount";
+import type { TimelinePosition } from "../../messages/messageOrder";
+import type { ReadProgress } from "../../readCursor";
+import { useReadCursor } from "../read/useReadCursor";
 import { useMessageJump } from "./useMessageJump";
 import { useAnchorCapture, useInfiniteTop, useListFocusRecovery } from "./useListBoundaries";
 
@@ -51,7 +53,10 @@ export interface ConversationViewportInput {
   focusRequest?: string;
   onLoadMore: () => void;
   onCaptureAnchor: (key: string, anchor: ViewportAnchor) => void;
-  onReachedBottom: () => void;
+  /** #1082: the server's current read point for this conversation, live. */
+  serverReadThrough: TimelinePosition | null | undefined;
+  /** #1082: the read cursor advanced, or the unread it leaves changed. */
+  onReadProgress: (conversationKey: string, progress: ReadProgress) => void;
 }
 
 export interface ConversationViewport {
@@ -71,7 +76,7 @@ export interface ConversationViewport {
    * consumer it has arrived.
    */
   scrollRoot: HTMLDivElement | null;
-  setMessageRef: (messageId: string, el: HTMLDivElement | null) => void;
+  setMessageRef: (messageId: string, el: HTMLElement | null) => void;
   rows: TimelineRow[];
   virtualized: boolean;
   virtualizer: Virtualizer<HTMLDivElement, Element>;
@@ -127,8 +132,7 @@ export function useConversationViewport(input: ConversationViewportInput): Conve
     adjustForRowResize,
   });
 
-  const unread = useUnreadCount(input.unreadCountAtOpen);
-  const arrival = useTailArrival(core, input.onReachedBottom, unread.clear);
+  const arrival = useTailArrival(core);
   const navigator = useNavigator({
     core,
     conversationKey: input.conversationKey,
@@ -152,31 +156,12 @@ export function useConversationViewport(input: ConversationViewportInput): Conve
 
   useTailFollow({
     core,
-    phase,
     messages: input.messages,
-    currentUserId: input.currentUserId,
     lastMutation: input.lastMutation,
     resolved,
     arrival,
     navigator,
-    onUnreadArrival: unread.countArrival,
   });
-
-  const boundaryAhead = useUnreadBoundary(core, firstUnreadMessageId);
-  const scrollButton = scrollButtonState({
-    awayFromTail: phase !== "AT_BOTTOM" && phase !== "RESTORING_POSITION",
-    unreadCount: unread.count,
-    hasBoundary: firstUnreadMessageId !== null,
-    boundaryAhead,
-  });
-  // #880 item 10: one control, two destinations. Which one it means is the
-  // button state's answer, so pressing it can only ever agree with what it
-  // says — there is no second source deciding where it goes.
-  const { navigateToFirstUnread, navigateToTail } = navigator;
-  const onScrollButtonClick = useCallback(() => {
-    if (scrollButton.mode === "first-unread") navigateToFirstUnread("button");
-    else navigateToTail("button");
-  }, [navigateToFirstUnread, navigateToTail, scrollButton.mode]);
 
   // #1088: a link the opening could not reach settled on another destination.
   // That request is spent — a page the reader loads by hand later must not yank
@@ -192,6 +177,40 @@ export function useConversationViewport(input: ConversationViewportInput): Conve
   useInfiniteTop(core, input.hasMore, input.onLoadMore);
   useAnchorCapture(core, input.conversationKey, input.onCaptureAnchor);
   const focusList = useListFocusRecovery(core);
+
+  // #1082: read state, beside the viewport rather than inside it — it reads
+  // the same mounted rows and never moves the scrollport. Last on purpose: its
+  // look after each commit is a layout effect too, and by registering after
+  // every one above it runs after all of them — after the opening position has
+  // started its navigation, a prepend restoration has armed, and a deep link
+  // has claimed the scrollport — so it never reads a frame one of them is
+  // about to move.
+  const read = useReadCursor({
+    core,
+    messages: input.messages,
+    currentUserId: input.currentUserId,
+    unreadCountAtOpen: input.unreadCountAtOpen,
+    serverReadThrough: input.serverReadThrough,
+    resolved,
+    conversationKey: input.conversationKey,
+    onReadProgress: input.onReadProgress,
+  });
+
+  const boundaryAhead = useUnreadBoundary(core, firstUnreadMessageId);
+  const scrollButton = scrollButtonState({
+    awayFromTail: phase !== "AT_BOTTOM" && phase !== "RESTORING_POSITION",
+    unreadCount: read.unreadCount,
+    hasBoundary: firstUnreadMessageId !== null,
+    boundaryAhead,
+  });
+  // #880 item 10: one control, two destinations. Which one it means is the
+  // button state's answer, so pressing it can only ever agree with what it
+  // says — there is no second source deciding where it goes.
+  const { navigateToFirstUnread, navigateToTail } = navigator;
+  const onScrollButtonClick = useCallback(() => {
+    if (scrollButton.mode === "first-unread") navigateToFirstUnread("button");
+    else navigateToTail("button");
+  }, [navigateToFirstUnread, navigateToTail, scrollButton.mode]);
 
   return {
     attachList: core.attachList,

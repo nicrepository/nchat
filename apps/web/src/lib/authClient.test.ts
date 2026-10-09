@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiRequestError } from "./api";
 import { AUTH_SKIP_PREFIXES, _resetState, authenticatedFetch } from "./authClient";
-import { clearTokens, getAccessToken, setTokens } from "./authSession";
+import { clearTokens, getAccessToken, onAuthChange, setTokens } from "./authSession";
 
 const mockApiFetch = vi.fn();
 vi.mock("./api", async () => {
@@ -168,6 +168,21 @@ describe("authenticatedFetch", () => {
       await authenticatedFetch("/api/resource", { method: "GET" });
 
       expect(getAccessToken()).toBe("new_at");
+    });
+
+    // #1082: a rotation is the same session; listeners holding session state
+    // (the read cursor writer) must be able to tell it from a new login.
+    it("installs the rotated token as a refresh of the same session", async () => {
+      setTokens("expired_at");
+      const changes = vi.fn();
+      const unsubscribe = onAuthChange(changes);
+      mockApiFetch.mockRejectedValueOnce(make401()).mockResolvedValueOnce({});
+      mockRefresh.mockResolvedValue(makeTokenPair());
+
+      await authenticatedFetch("/api/resource", { method: "GET" });
+      unsubscribe();
+
+      expect(changes.mock.calls).toEqual([["refresh"]]);
     });
 
     it("retries with updated authorization header after successful refresh", async () => {

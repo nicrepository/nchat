@@ -42,6 +42,9 @@ type SidebarChannel struct {
 	LastMessageAt *time.Time
 	PinnedAt      *time.Time
 	UnreadCount   int
+	// ReadThrough is the point UnreadCount is counted from (issue #1082). Nil
+	// when the viewer has never read here.
+	ReadThrough *domain.ReadThrough
 	// CanRename is the server's own answer to "may this caller rename this
 	// channel" (issue #527), derived from the membership GetSidebar already
 	// loaded. It exists so the row's action menu can omit an item the server
@@ -261,13 +264,16 @@ func (s *SidebarService) SetConversationNotificationPreference(
 	}
 }
 
-func (s *SidebarService) MarkConversationRead(ctx context.Context, userID, targetType, targetID string, lastReadMessageID *string) error {
+// MarkConversationRead advances the caller's read cursor and returns the
+// conversation's read state as it stands afterwards (issue #1082), so the
+// write itself is a point the client converges on.
+func (s *SidebarService) MarkConversationRead(ctx context.Context, userID, targetType, targetID string, lastReadMessageID *string) (domain.ConversationReadState, error) {
 	workspace, _, err := s.authorizeWorkspaceMember(ctx, userID)
 	if err != nil {
-		return err
+		return domain.ConversationReadState{}, err
 	}
 	if s.readState == nil {
-		return fmt.Errorf("conversation read state unavailable")
+		return domain.ConversationReadState{}, fmt.Errorf("conversation read state unavailable")
 	}
 	return s.readState.MarkRead(ctx, workspace.ID, userID, targetType, targetID, lastReadMessageID)
 }
@@ -429,8 +435,8 @@ func (s *SidebarService) GetSidebar(ctx context.Context, userID string) (Sidebar
 // a NUL, which is why the lookups below name the target-type constant of the
 // store they came from rather than sharing one.
 type sidebarDecorations struct {
-	pinnedAt map[string]time.Time
-	unread   map[string]int
+	pinnedAt   map[string]time.Time
+	readStates map[string]domain.ConversationReadState
 	// notifPrefs holds both halves of the notification preference — the mute and
 	// the level — because they are one row and reading them separately would be
 	// a second statement for no gain (issue #136).
@@ -442,7 +448,7 @@ func (s *SidebarService) loadSidebarDecorations(ctx context.Context, workspaceID
 	if err != nil {
 		return sidebarDecorations{}, err
 	}
-	unread, err := s.unreadTargets(ctx, workspaceID, userID)
+	readStates, err := s.readStateTargets(ctx, workspaceID, userID)
 	if err != nil {
 		return sidebarDecorations{}, err
 	}
@@ -450,7 +456,7 @@ func (s *SidebarService) loadSidebarDecorations(ctx context.Context, workspaceID
 	if err != nil {
 		return sidebarDecorations{}, err
 	}
-	return sidebarDecorations{pinnedAt: pinnedAt, unread: unread, notifPrefs: notifPrefs}, nil
+	return sidebarDecorations{pinnedAt: pinnedAt, readStates: readStates, notifPrefs: notifPrefs}, nil
 }
 
 // A nil store is a sidebar assembled without that feature wired in, not an
@@ -471,15 +477,15 @@ func (s *SidebarService) pinnedTargets(ctx context.Context, workspaceID, userID 
 	return pinnedAt, nil
 }
 
-func (s *SidebarService) unreadTargets(ctx context.Context, workspaceID, userID string) (map[string]int, error) {
+func (s *SidebarService) readStateTargets(ctx context.Context, workspaceID, userID string) (map[string]domain.ConversationReadState, error) {
 	if s.readState == nil {
-		return map[string]int{}, nil
+		return map[string]domain.ConversationReadState{}, nil
 	}
-	counts, err := s.readState.UnreadCounts(ctx, workspaceID, userID)
+	states, err := s.readState.ReadStates(ctx, workspaceID, userID)
 	if err != nil {
-		return nil, fmt.Errorf("list unread counts: %w", err)
+		return nil, fmt.Errorf("list read states: %w", err)
 	}
-	return counts, nil
+	return states, nil
 }
 
 // projectSidebarChannel decides what one row says. The capabilities are the same
@@ -492,6 +498,7 @@ func projectSidebarChannel(access storage.VisibleChannelAccess, member domain.Wo
 		pinnedPtr = &pinnedCopy
 	}
 	notifPref := decorations.notifPrefs[storage.NotificationPrefTargetChannel+"\x00"+access.Channel.ID]
+	readState := decorations.readStates[storage.ConversationReadTargetChannel+"\x00"+access.Channel.ID]
 	return SidebarChannel{
 		Channel:  access.Channel,
 		CanWrite: domain.CanWriteChannel(&member, access.ChannelMember, access.Channel),
@@ -502,7 +509,8 @@ func projectSidebarChannel(access storage.VisibleChannelAccess, member domain.Wo
 		NotificationLevel: notificationLevelOr(notifPref.Level),
 		LastMessageAt:     access.LastMessageAt,
 		PinnedAt:          pinnedPtr,
-		UnreadCount:       decorations.unread[storage.ConversationReadTargetChannel+"\x00"+access.Channel.ID],
+		UnreadCount:       readState.UnreadCount,
+		ReadThrough:       readState.ReadThrough,
 	}
 }
 
@@ -514,7 +522,9 @@ func decorateSidebarDMs(dms []domain.DMConversationWithParticipantIDs, decoratio
 			pinnedCopy := pinned
 			dms[i].PinnedAt = &pinnedCopy
 		}
-		dms[i].UnreadCount = decorations.unread[storage.ConversationReadTargetDM+"\x00"+dms[i].ID]
+		readState := decorations.readStates[storage.ConversationReadTargetDM+"\x00"+dms[i].ID]
+		dms[i].UnreadCount = readState.UnreadCount
+		dms[i].ReadThrough = readState.ReadThrough
 		notifPref := decorations.notifPrefs[storage.NotificationPrefTargetDM+"\x00"+dms[i].ID]
 		dms[i].Muted = notifPref.Muted
 		dms[i].NotificationLevel = notificationLevelOr(notifPref.Level)

@@ -67,6 +67,8 @@ import { inertDirectMessage, useDirectMessageAccess } from "./directMessage";
 import { useMessageDialogs } from "./message-area/hooks/useMessageDialogs";
 import { useTypingIndicatorLabel } from "./message-area/hooks/useTypingIndicatorLabel";
 import { useViewportAnchors } from "./message-area/hooks/useViewportAnchors";
+import type { ReadProgress } from "./readCursor";
+import { readTargetFromKey } from "./readCursorWriter";
 
 interface ChatMessageAreaProps {
   kind: "channel" | "dm";
@@ -142,8 +144,27 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     currentUserId: ctx.currentUserId,
     channels: ctx.channels,
     dms: ctx.dms,
-    markRead: ctx.markRead,
   });
+  // #1082: progress is reported for the conversation the timeline was mounted
+  // for, named by its key — never for whatever the route says now, which can
+  // already be the next conversation while the previous one's rows are still
+  // on screen.
+  const reportReadProgress = ctx.reportReadProgress;
+  // The server's read point for this conversation, as the sidebar holds it now
+  // — not as of opening — so a read on another device reaches the timeline.
+  const serverReadThrough = useMemo(
+    () =>
+      (kind === "channel" ? ctx.channels : ctx.dms).find((item) => item.id === targetId)?.serverRead
+        ?.readThrough,
+    [kind, targetId, ctx.channels, ctx.dms],
+  );
+  const onReadProgress = useCallback(
+    (conversationKey: string, progress: ReadProgress) => {
+      const readTarget = readTargetFromKey(conversationKey);
+      if (readTarget) reportReadProgress?.(readTarget, progress);
+    },
+    [reportReadProgress],
+  );
 
   const recentReactionEmojis = useMemo(
     () => quickReactionEmojis(emojiUsage, allowedReactionEmojis),
@@ -622,9 +643,11 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           focusRequest={target.focusRequest}
           conversationKey={anchors.conversationKey}
           unreadCountAtOpen={anchors.unreadCountAtOpen}
+          sidebarLoading={ctx.sidebarLoading}
           initialAnchor={anchors.initialAnchor}
           onCaptureAnchor={anchors.onCaptureAnchor}
-          onReachedBottom={anchors.onReachedBottom}
+          serverReadThrough={serverReadThrough}
+          onReadProgress={onReadProgress}
         />
 
         <ConversationNotices

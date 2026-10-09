@@ -29,6 +29,17 @@ interface SidebarActivityFixture {
   pinned_at?: string | null;
 }
 
+type ReadPositionFixture = { created_at: string; message_id: string | null } | null;
+
+/**
+ * Issue #1082: what POST …/read answers with, and what a sidebar row with a
+ * server-side cursor carries — the count, and the point it is counted from.
+ */
+interface ReadStateFixture {
+  unread_count: number;
+  read_through: ReadPositionFixture;
+}
+
 interface SidebarChannelFixture extends SidebarActivityFixture {
   id: string;
   slug: string;
@@ -275,7 +286,20 @@ export interface MessagingScenario {
      * the panel opened with the compact page only and fetched more on demand.
      */
     attachmentListings: Array<{ targetId: string; limit: number; before: string | null }>;
+    /**
+     * Issue #1082: every POST …/read, in order, with the message it read
+     * through (null for "mark the whole conversation read").
+     */
+    reads: Array<{ targetId: string; lastReadMessageId: string | null }>;
   };
+  /**
+   * Issue #1082: the server-side read cursor per "kind:targetId" — the index of
+   * the last message read, which only ever moves forward (-1: nothing read). A
+   * conversation with a cursor here reports its read state, computed when the
+   * sidebar is served, exactly as the backend does; one without keeps its
+   * fixture's static unread_count.
+   */
+  readCursors: Map<string, number>;
   forwardedByIdempotencyKey: Map<
     string,
     { destinationChannelId: string; sourceMessageId: string; message: RawMessage }
@@ -638,7 +662,9 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
       attachmentUploads: [],
       attachmentContentFetches: [],
       attachmentListings: [],
+      reads: [],
     },
+    readCursors: new Map(),
     forwardedByIdempotencyKey: new Map(),
     sidebarChannels,
     sidebarDMs,
@@ -2250,8 +2276,9 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
           // (chatApi.ts reads sidebar.workspace?.id), so a mock that omits it
           // is not exercising the real shape.
           workspace: { id: "e2e-workspace", name: "E2E Workspace", slug: "e2e-workspace" },
-          channels: scenario.sidebarChannels,
-          dm_conversations: scenario.sidebarDMs,
+          channels: scenario.sidebarChannels.map((row) => withReadState(scenario, "channel", row)),
+          dm_conversations: scenario.sidebarDMs.map((row) => withReadState(scenario, "dm", row)),
+          precise_read_cursor: true,
         },
       }),
     }),
@@ -2294,20 +2321,32 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
   await page.route("**/api/chat/channels/*/sidebar-pin", mutateSidebarPin);
   await page.route("**/api/chat/dm/*/sidebar-pin", mutateSidebarPin);
 
+  // Issue #1082: POST …/read, faithful to the backend's contract — the message
+  // is resolved inside the conversation (anything else is the same 404 a
+  // missing conversation gets), the cursor only moves forward, and the answer
+  // is the read state after the write, which the sidebar then reports too. A
+  // read_cursor other than "message" is refused, as the strict decoder does.
   const markConversationRead = async (route: Route) => {
     const request = route.request();
-    const parts = new URL(request.url()).pathname.split("/");
-    const marker = parts.indexOf("channels") >= 0 ? "channels" : "dm";
-    const id = parts[parts.indexOf(marker) + 1];
-    const item =
-      marker === "channels"
-        ? scenario.sidebarChannels.find((channel) => channel.id === id)
-        : scenario.sidebarDMs.find((dm) => dm.id === id);
-    if (request.method() !== "POST" || !item) {
+    const { targetType, id } = sidebarTargetFromURL(request.url());
+    const body = readRequestBody(request.postData());
+    if (!body) {
+      await route.fulfill({ status: 400 });
+      return;
+    }
+    const row = request.method() === "POST" ? sidebarRowFor(scenario, targetType, id) : undefined;
+    const lastReadMessageId = body.last_read_message_id;
+    const state = row && advanceReadCursor(scenario, targetType, id, lastReadMessageId);
+    if (!state) {
       await route.fulfill({ status: 404 });
       return;
     }
-    await route.fulfill({ status: 204 });
+    scenario.requests.reads.push({ targetId: id, lastReadMessageId: lastReadMessageId ?? null });
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: state }),
+    });
   };
   await page.route("**/api/chat/channels/*/read", markConversationRead);
   await page.route("**/api/chat/dm/*/read", markConversationRead);
@@ -2546,6 +2585,80 @@ function sidebarTargetFromURL(url: string): { targetType: "channel" | "dm"; id: 
     targetType: marker === "channels" ? "channel" : "dm",
     id: parts[parts.indexOf(marker) + 1] ?? "",
   };
+}
+
+function sidebarRowFor(
+  scenario: MessagingScenario,
+  targetType: "channel" | "dm",
+  id: string,
+): SidebarChannelFixture | SidebarDMFixture | undefined {
+  return targetType === "channel"
+    ? scenario.sidebarChannels.find((channel) => channel.id === id)
+    : scenario.sidebarDMs.find((dm) => dm.id === id);
+}
+
+/**
+ * A read request's body, or undefined when the server would refuse it: the
+ * only read_cursor it knows is "message". No last_read_message_id means "the
+ * whole conversation".
+ */
+function readRequestBody(
+  raw: string | null,
+): { last_read_message_id?: string; read_cursor?: string } | undefined {
+  const body = raw
+    ? (JSON.parse(raw) as { last_read_message_id?: string; read_cursor?: string })
+    : {};
+  return body.read_cursor === undefined || body.read_cursor === "message" ? body : undefined;
+}
+
+function positionOf(message: RawMessage | undefined): ReadPositionFixture {
+  return message ? { created_at: message.created_at, message_id: message.id } : null;
+}
+
+/** The read state a cursor at `cursor` (an index into `messages`) leaves. */
+function readStateAt(messages: RawMessage[], cursor: number): ReadStateFixture {
+  return {
+    unread_count: messages
+      .slice(cursor + 1)
+      .filter((message) => message.status === "active" && message.sender_id !== CURRENT_USER_ID)
+      .length,
+    read_through: positionOf(messages[cursor]),
+  };
+}
+
+/** A sidebar row as served: with its read state when it has a server cursor. */
+function withReadState<T extends SidebarChannelFixture | SidebarDMFixture>(
+  scenario: MessagingScenario,
+  targetType: "channel" | "dm",
+  row: T,
+): T | (T & ReadStateFixture) {
+  const key = targetKey(targetType, row.id);
+  const cursor = scenario.readCursors.get(key);
+  if (cursor === undefined) return row;
+  return { ...row, ...readStateAt(scenario.messagesByTarget.get(key) ?? [], cursor) };
+}
+
+/**
+ * The server's read cursor (issue #1082): the named message, or the newest
+ * when none is named, never moving backwards. Undefined when the message is not
+ * in the conversation. The mock's arrays are in timeline order, so the index is
+ * the position.
+ */
+function advanceReadCursor(
+  scenario: MessagingScenario,
+  targetType: "channel" | "dm",
+  id: string,
+  lastReadMessageId: string | undefined,
+): ReadStateFixture | undefined {
+  const key = targetKey(targetType, id);
+  const messages = scenario.messagesByTarget.get(key) ?? [];
+  const index = lastReadMessageId
+    ? messages.findIndex((message) => message.id === lastReadMessageId)
+    : messages.length - 1;
+  if (lastReadMessageId && index < 0) return undefined;
+  const cursor = Math.max(scenario.readCursors.get(key) ?? -1, index);
+  scenario.readCursors.set(key, cursor);
+  return readStateAt(messages, cursor);
 }
 
 /** The general channel is structural; the mocks refuse it exactly as SQL does. */

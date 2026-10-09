@@ -1271,16 +1271,22 @@ describe("a virtualized timeline", { timeout: 30_000 }, () => {
 
   it("offers the unread boundary first and the end afterwards, from the one control", async () => {
     mockFetchChannelMessages.mockResolvedValue({ messages: history(), nextCursor: "" });
-    await openVirtualizedChannel({ unreadCount: 12 });
+    // More unread than one screen holds, so landing on the boundary reads only
+    // the first of them (#1082) and the rest are still ahead.
+    await openVirtualizedChannel({ unreadCount: 40 });
     await settleLayout();
 
     // Reading history, well above the boundary: what the control offers is the
-    // nearest thing not yet seen, which is the boundary and not the end.
+    // nearest thing not yet seen, which is the boundary and not the end — and
+    // its count is what is still unread, not a number frozen at opening.
     scrollport.scrollTo(0);
     await settleLayout();
     const toBoundary = await screen.findByRole("button", {
-      name: "Começar pelas 12 novas mensagens",
+      name: /^Começar pelas \d+ novas mensagens$/,
     });
+    const remaining = Number(/\d+/.exec(toBoundary.getAttribute("aria-label") ?? "")?.[0]);
+    expect(remaining).toBeGreaterThan(0);
+    expect(remaining).toBeLessThan(40);
 
     await act(async () => {
       toBoundary.click();

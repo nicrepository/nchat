@@ -54,13 +54,14 @@ type readingSidebarProvider struct {
 	stubSidebarProvider
 	args    []string
 	message *string
+	state   domain.ConversationReadState
 	err     error
 }
 
-func (s *readingSidebarProvider) MarkConversationRead(_ context.Context, userID, targetType, targetID string, lastReadMessageID *string) error {
+func (s *readingSidebarProvider) MarkConversationRead(_ context.Context, userID, targetType, targetID string, lastReadMessageID *string) (domain.ConversationReadState, error) {
 	s.args = []string{userID, targetType, targetID}
 	s.message = lastReadMessageID
-	return s.err
+	return s.state, s.err
 }
 
 func (s *pinningSidebarProvider) PinConversation(_ context.Context, userID, targetType, targetID string) error {
@@ -286,26 +287,38 @@ func TestSidebarHandler_ValidAuth_ReturnsSidebar(t *testing.T) {
 
 func TestSidebarHandler_MarkReadUsesAuthenticatedUserAndOptionalMessageID(t *testing.T) {
 	v := makeTestValidator(t)
-	svc := &readingSidebarProvider{}
+	messageID := "22222222-2222-4222-8222-222222222222"
+	svc := &readingSidebarProvider{state: domain.ConversationReadState{
+		UnreadCount: 2,
+		ReadThrough: &domain.ReadThrough{CreatedAt: time.Date(2026, 7, 15, 10, 0, 0, 123456000, time.UTC), MessageID: &messageID},
+	}}
 	router := sidebarRouter(v, svc)
 	channelID := "11111111-1111-4111-8111-111111111111"
-	messageID := "22222222-2222-4222-8222-222222222222"
 	req := authSidebarPinRequest(t, http.MethodPost, "/api/chat/channels/"+channelID+"/read")
 	req.Body = http.NoBody
 	req.ContentLength = 0
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
-	if rr.Code != http.StatusNoContent {
-		t.Fatalf("empty body expected 204, got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusOK {
+		t.Fatalf("empty body expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	// #1082: the answer is the read state after the write, the point the client
+	// reconciles with — the full fraction kept, the id alongside.
+	want := `{"data":{"unread_count":2,"read_through":{"created_at":"2026-07-15T10:00:00.123456Z","message_id":"` + messageID + `"}}}`
+	if got := strings.TrimSpace(rr.Body.String()); got != want {
+		t.Fatalf("body = %s, want %s", got, want)
 	}
 
+	// The precise cursor declares itself, so a server without it refuses the
+	// body instead of reading it as "everything is read" (issue #1082).
+	precise := `{"last_read_message_id":"` + messageID + `","read_cursor":"message"}`
 	req = authSidebarPinRequest(t, http.MethodPost, "/api/chat/dm/33333333-3333-4333-8333-333333333333/read")
-	req.Body = io.NopCloser(strings.NewReader(`{"last_read_message_id":"` + messageID + `"}`))
-	req.ContentLength = int64(len(`{"last_read_message_id":"` + messageID + `"}`))
+	req.Body = io.NopCloser(strings.NewReader(precise))
+	req.ContentLength = int64(len(precise))
 	rr = httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
-	if rr.Code != http.StatusNoContent {
-		t.Fatalf("body expected 204, got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusOK {
+		t.Fatalf("body expected 200, got %d: %s", rr.Code, rr.Body.String())
 	}
 	if got, want := strings.Join(svc.args, ","), strings.Join([]string{testUserID, service.ReadTargetDM, "33333333-3333-4333-8333-333333333333"}, ","); got != want {
 		t.Fatalf("read args = %q, want %q", got, want)
@@ -337,6 +350,19 @@ func TestSidebarHandler_MarkReadRejectsUnauthorizedInvalidAndInaccessibleRequest
 		sidebarRouter(v, &readingSidebarProvider{}).ServeHTTP(rr, req)
 		if rr.Code != http.StatusBadRequest {
 			t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("unknown read cursor semantics", func(t *testing.T) {
+		req := authSidebarPinRequest(t, http.MethodPost, path)
+		body := `{"last_read_message_id":"22222222-2222-4222-8222-222222222222","read_cursor":"time"}`
+		req.Body = io.NopCloser(strings.NewReader(body))
+		req.ContentLength = int64(len(body))
+		rr := httptest.NewRecorder()
+		svc := &readingSidebarProvider{}
+		sidebarRouter(v, svc).ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest || svc.args != nil {
+			t.Fatalf("expected 400 before any write, got %d (args %v)", rr.Code, svc.args)
 		}
 	})
 
@@ -1022,19 +1048,23 @@ func TestSidebarHandler_ResponseContract_NoSensitiveFields(t *testing.T) {
 		// pinned_at is the caller's private ordering preference, and muted
 		// (issue #527) with notification_level (issue #136) are the two halves
 		// of their private notification preference. All of them say when or
-		// whether, never what, who or which message.
+		// whether, never what or who. read_through (issue #1082) is the one that
+		// names a message, and only the caller's own read point — a message the
+		// server already proved visible to them when the cursor was written —
+		// because ordering two messages written in the same microsecond needs
+		// the id as well as the instant.
 		for _, key := range []string{
 			"id", "type", "name", "created_at", "last_message_at", "pinned_at", "unread_count",
-			"muted", "notification_level",
+			"read_through", "muted", "notification_level",
 		} {
 			if _, ok := dm[key]; !ok {
 				t.Fatalf("missing expected DM field %q in %v", key, dm)
 			}
 		}
 		counterpart, hasCounterpart := dm["counterpart"]
-		wantFields := 9
+		wantFields := 10
 		if hasCounterpart {
-			wantFields = 10
+			wantFields = 11
 		}
 		if len(dm) != wantFields {
 			t.Fatalf("expected exactly %d DM fields, got %d: %v", wantFields, len(dm), dm)
@@ -1247,5 +1277,24 @@ func TestSidebarHandler_PublishesTheWorkspaceUploadLimit(t *testing.T) {
 				t.Fatalf("message attachment limits missing: %+v", envelope.Data.Workspace)
 			}
 		})
+	}
+}
+
+// Issue #1082: a client reads progressively only against a server that says it
+// implements the precise read cursor — never on the strength of its own build.
+func TestSidebarHandler_AdvertisesThePreciseReadCursor(t *testing.T) {
+	v := makeTestValidator(t)
+	svc := &stubSidebarProvider{data: service.SidebarData{
+		Workspace: domain.Workspace{ID: "ws-1", Name: "NIC Labs", Slug: "default", Status: domain.WorkspaceStatusActive},
+	}}
+	rr := httptest.NewRecorder()
+	sidebarRouter(v, svc).ServeHTTP(rr, authGet(t))
+
+	var envelope struct {
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	mustDecode(t, rr, &envelope)
+	if got := string(envelope.Data["precise_read_cursor"]); got != "true" {
+		t.Fatalf("precise_read_cursor = %q, want true", got)
 	}
 }

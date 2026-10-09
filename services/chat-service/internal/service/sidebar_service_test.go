@@ -99,21 +99,22 @@ type sidebarFakeChannelStore struct {
 }
 
 type sidebarFakeReadStateStore struct {
-	counts   map[string]int
-	countErr error
-	markErr  error
-	markArgs []string
-	message  *string
+	states    map[string]domain.ConversationReadState
+	statesErr error
+	markState domain.ConversationReadState
+	markErr   error
+	markArgs  []string
+	message   *string
 }
 
-func (f *sidebarFakeReadStateStore) MarkRead(_ context.Context, workspaceID, userID, targetType, targetID string, lastReadMessageID *string) error {
+func (f *sidebarFakeReadStateStore) MarkRead(_ context.Context, workspaceID, userID, targetType, targetID string, lastReadMessageID *string) (domain.ConversationReadState, error) {
 	f.markArgs = []string{workspaceID, userID, targetType, targetID}
 	f.message = lastReadMessageID
-	return f.markErr
+	return f.markState, f.markErr
 }
 
-func (f *sidebarFakeReadStateStore) UnreadCounts(_ context.Context, _, _ string) (map[string]int, error) {
-	return f.counts, f.countErr
+func (f *sidebarFakeReadStateStore) ReadStates(_ context.Context, _, _ string) (map[string]domain.ConversationReadState, error) {
+	return f.states, f.statesErr
 }
 
 func (f *sidebarFakeChannelStore) CreateCategory(_ context.Context, _ storage.CreateCategoryInput) (domain.ChannelCategory, error) {
@@ -713,10 +714,11 @@ func TestSidebarService_GetSidebarAppliesOnlyVisiblePins(t *testing.T) {
 }
 
 func TestSidebarService_GetSidebarAppliesAuthoritativeUnreadCountsWithoutCreatingRows(t *testing.T) {
-	readState := &sidebarFakeReadStateStore{counts: map[string]int{
-		storage.ConversationReadTargetChannel + "\x00channel-1": 4,
-		storage.ConversationReadTargetDM + "\x00dm-1":           2,
-		storage.ConversationReadTargetChannel + "\x00removed":   99,
+	channelPoint := &domain.ReadThrough{CreatedAt: time.Date(2026, 7, 15, 10, 0, 0, 123456000, time.UTC)}
+	readState := &sidebarFakeReadStateStore{states: map[string]domain.ConversationReadState{
+		storage.ConversationReadTargetChannel + "\x00channel-1": {UnreadCount: 4, ReadThrough: channelPoint},
+		storage.ConversationReadTargetDM + "\x00dm-1":           {UnreadCount: 2},
+		storage.ConversationReadTargetChannel + "\x00removed":   {UnreadCount: 99},
 	}}
 	svc, _, _ := newPinnedSidebarService(nil)
 	svc.WithReadState(readState)
@@ -728,19 +730,27 @@ func TestSidebarService_GetSidebarAppliesAuthoritativeUnreadCountsWithoutCreatin
 	if data.Channels[0].UnreadCount != 4 || data.DMs[0].UnreadCount != 2 {
 		t.Fatalf("unread counts not applied: %+v", data)
 	}
+	// The point each count is counted from travels with it (#1082).
+	if data.Channels[0].ReadThrough != channelPoint || data.DMs[0].ReadThrough != nil {
+		t.Fatalf("read points not applied: %+v / %+v", data.Channels[0].ReadThrough, data.DMs[0].ReadThrough)
+	}
 	if len(data.Channels) != 1 || len(data.DMs) != 1 {
 		t.Fatalf("read state must not create sidebar rows: %+v", data)
 	}
 }
 
 func TestSidebarService_MarkConversationReadDerivesWorkspaceAndUser(t *testing.T) {
-	readState := &sidebarFakeReadStateStore{}
+	readState := &sidebarFakeReadStateStore{markState: domain.ConversationReadState{UnreadCount: 3}}
 	svc, _, _ := newPinnedSidebarService(nil)
 	svc.WithReadState(readState)
 	messageID := "22222222-2222-4222-8222-222222222222"
 
-	if err := svc.MarkConversationRead(context.Background(), sidebarUserID, service.ReadTargetChannel, "channel-1", &messageID); err != nil {
+	state, err := svc.MarkConversationRead(context.Background(), sidebarUserID, service.ReadTargetChannel, "channel-1", &messageID)
+	if err != nil {
 		t.Fatalf("MarkConversationRead: %v", err)
+	}
+	if state.UnreadCount != 3 {
+		t.Fatalf("returned state = %+v, want the store's post-write state", state)
 	}
 	want := []string{sidebarWsID, sidebarUserID, service.ReadTargetChannel, "channel-1"}
 	if len(readState.markArgs) != len(want) {

@@ -872,6 +872,84 @@ describe("fetchSidebarData", () => {
     expect(dms[0].unreadCount).toBe(2);
   });
 
+  // Issue #1082: the point each count is counted from.
+  it("reads the precise cursor capability only from an explicit true", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        current_user_id: "u-1",
+        workspace: { id: "ws-1" },
+        channels: [],
+        dm_conversations: [],
+        precise_read_cursor: true,
+      },
+    });
+    expect((await fetchSidebarData()).preciseReadCursor).toBe(true);
+  });
+
+  it("maps the server's read state, and treats anything malformed as absent", async () => {
+    const point = { created_at: "2026-07-15T10:00:00.123456Z", message_id: "m-1" };
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          {
+            id: "ch-1",
+            slug: "a",
+            display_name: "a",
+            type: "public",
+            unread_count: 2,
+            read_through: point,
+          },
+          {
+            id: "ch-2",
+            slug: "b",
+            display_name: "b",
+            type: "public",
+            unread_count: 1,
+            read_through: { created_at: "2026-07-15T09:00:00Z", message_id: null },
+          },
+          {
+            id: "ch-3",
+            slug: "c",
+            display_name: "c",
+            type: "public",
+            unread_count: 0,
+            read_through: null,
+          },
+          {
+            id: "ch-4",
+            slug: "d",
+            display_name: "d",
+            type: "public",
+            read_through: { message_id: "x" },
+          },
+          {
+            id: "ch-5",
+            slug: "e",
+            display_name: "e",
+            type: "public",
+            read_through: { created_at: "2026-07-15T09:00:00Z", message_id: 7 },
+          },
+          { id: "ch-6", slug: "f", display_name: "f", type: "public", read_through: "nope" },
+          { id: "ch-7", slug: "g", display_name: "g", type: "public" },
+        ],
+        dms: [{ id: "dm-1", type: "direct", name: "Ana", unread_count: 2, read_through: point }],
+      }),
+    );
+
+    const { channels, dms, preciseReadCursor } = await fetchSidebarData();
+    expect(preciseReadCursor).toBe(false);
+    expect(channels.map((channel) => channel.readState)).toEqual([
+      { unreadCount: 2, readThrough: { createdAt: point.created_at, id: "m-1" } },
+      { unreadCount: 1, readThrough: { createdAt: "2026-07-15T09:00:00Z", id: null } },
+      { unreadCount: 0, readThrough: null },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    ]);
+    expect(dms[0].readState?.readThrough).toEqual({ createdAt: point.created_at, id: "m-1" });
+  });
+
   it("keeps the sidebar's authoritative unread count for categorized channels", async () => {
     mockAuthFetch
       .mockResolvedValueOnce(
@@ -1109,7 +1187,38 @@ describe("fetchSidebarData", () => {
     expect(channels[0]).toMatchObject({ id: "ch-orfao", categoryId: "cat-1", canWrite: true });
   });
 
-  it("marks target-specific conversations read with an optional message id", async () => {
+  it("returns the read state the write answers with (issue #1082)", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        unread_count: 2,
+        read_through: { created_at: "2026-07-15T10:00:00Z", message_id: "m-1" },
+      },
+    });
+    await expect(markConversationRead("channel", "ch-1", "m-1")).resolves.toEqual({
+      unreadCount: 2,
+      readThrough: { createdAt: "2026-07-15T10:00:00Z", id: "m-1" },
+    });
+
+    // An older server answers 204: nothing to reconcile with.
+    mockAuthFetch.mockResolvedValue(undefined);
+    await expect(markConversationRead("channel", "ch-1")).resolves.toBeUndefined();
+  });
+
+  it("asks for keepalive when the write has to outlive the page", async () => {
+    mockAuthFetch.mockResolvedValue(undefined);
+    await markConversationRead("dm", "dm-1", "m-9", { keepalive: true });
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/dm-1/read", {
+      method: "POST",
+      keepalive: true,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ last_read_message_id: "m-9", read_cursor: "message" }),
+    });
+  });
+
+  // R1 (#1082 review): a cursor declares itself, so a server without the cursor
+  // refuses it (strict body, 400) instead of reading "everything is read".
+  it("marks target-specific conversations read with an optional, self-declaring cursor", async () => {
     mockAuthFetch.mockResolvedValue({});
     await markConversationRead("channel", "ch 1");
     await markConversationRead("dm", "dm 1", "message-1");
@@ -1120,7 +1229,7 @@ describe("fetchSidebarData", () => {
     expect(mockAuthFetch).toHaveBeenNthCalledWith(2, "/api/chat/dm/dm%201/read", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ last_read_message_id: "message-1" }),
+      body: JSON.stringify({ last_read_message_id: "message-1", read_cursor: "message" }),
     });
   });
 
@@ -1294,6 +1403,7 @@ describe("partial sidebar compatibility", () => {
       // The issue #136 capability: absent from the payload, so the gate reads
       // as shut and the settings page offers the binary control.
       notificationLevelsEnabled: false,
+      preciseReadCursor: false,
       channels: [],
       dms: [],
       categories: [],
@@ -2971,6 +3081,7 @@ describe("fetchSidebarData", () => {
         maxFiles: 1,
         maxBytes: Number.MAX_SAFE_INTEGER,
         notificationLevelsEnabled: false,
+        preciseReadCursor: false,
         channels: [],
         dms: [],
         categories: [],
@@ -2989,6 +3100,7 @@ describe("fetchSidebarData", () => {
       // The issue #136 capability: absent from the payload, so the gate reads
       // as shut and the settings page offers the binary control.
       notificationLevelsEnabled: false,
+      preciseReadCursor: false,
       channels: [],
       dms: [],
       categories: [],

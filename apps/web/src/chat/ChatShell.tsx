@@ -10,6 +10,8 @@ import type { Call, CallType } from "./callState";
 import type { ResourceCallTarget } from "./useResourceCallSession";
 import type { Channel, DMConversation } from "./chatTypes";
 import type { WorkspaceAttachmentLimits } from "./chatApi";
+import type { ReadProgress } from "./readCursor";
+import type { ReadTarget } from "./readCursorWriter";
 import type { SidebarState } from "./useChatSidebar";
 import type { ConversationDraftsApi } from "./useConversationDrafts";
 
@@ -112,14 +114,18 @@ export interface ChatOutletContext {
   dms: DMConversation[];
   attachmentLimits?: WorkspaceAttachmentLimits;
   /**
-   * The same markRead useChatSidebar already hands the sidebar's own "Marcar
-   * como lida" menu action (#527) — not a second read-state mechanism.
-   * ChatMessageArea calls it once it has evidence the user reached the real
-   * bottom (#492); opening the route alone is no longer sufficient. Optional
-   * like every other callback here, so a partial outlet context (tests,
-   * emptyOutletContext) never has to fabricate one.
+   * Where the open timeline reports how far the reader has read (#1082): the
+   * read cursor and the unread it leaves, which useChatSidebar projects onto
+   * the conversation's row and persists. Optional like every other callback
+   * here, so a partial outlet context (tests, emptyOutletContext) never has to
+   * fabricate one.
    */
-  markRead?: (target: { kind: "channel" | "dm"; targetId: string }) => void;
+  reportReadProgress?: (target: ReadTarget, progress: ReadProgress) => void;
+  /**
+   * #1082: the sidebar has not loaded yet, so no conversation's unread count is
+   * known — and where a conversation opens depends on it.
+   */
+  sidebarLoading?: boolean;
   refreshConversations?: () => void;
   /**
    * The session's one open-DM coordinator (issue #895), owned by AppShell.
@@ -184,7 +190,7 @@ export interface ChatOutletContext {
 }
 
 export default function ChatShell() {
-  const { state, retry, markRead, drafts, renameChannel, renameGroup, directMessage } =
+  const { state, retry, reportReadProgress, drafts, renameChannel, renameGroup, directMessage } =
     useOutletContext<AppShellOutletContext>();
   const ready = readySidebar(state);
   const {
@@ -291,7 +297,8 @@ export default function ChatShell() {
     channels: ready.channels,
     dms: ready.dms,
     attachmentLimits: ready.attachmentLimits,
-    markRead,
+    reportReadProgress,
+    sidebarLoading: state.status === "loading",
     drafts,
     renameChannel,
     renameGroup,

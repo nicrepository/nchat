@@ -124,6 +124,7 @@ function makeContext(
     retry: overrides.retry ?? vi.fn(async () => {}),
     setPinned: vi.fn(async () => {}),
     markRead: vi.fn(),
+    reportReadProgress: vi.fn(),
     renameChannel: vi.fn(async () => {}),
     renameGroup: vi.fn(async () => {}),
     setGroupAvatar: vi.fn(async () => {}),

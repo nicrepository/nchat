@@ -21,6 +21,8 @@ import type { EmojiUsage } from "../../emoji/emojiUsage";
 import { TimelineScrollRootContext } from "../../lazyAttachment";
 import type { TimelineRow } from "../../timelineVirtualization";
 import type { LastMutation } from "../../useMessages";
+import type { TimelinePosition } from "../../messages/messageOrder";
+import type { ReadProgress } from "../../readCursor";
 import { useConversationViewport } from "../viewport/useConversationViewport";
 import MessageTimelineItem, {
   type ConversationMessageActions,
@@ -75,8 +77,10 @@ export interface MessageListProps {
   initialAnchor: ViewportAnchor | null;
   /** #492: called on unmount (leaving the conversation) with the current anchor. */
   onCaptureAnchor: (key: string, anchor: ViewportAnchor) => void;
-  /** #492: called once the bottom sentinel confirms the real tail was reached. */
-  onReachedBottom: () => void;
+  /** #1082: the server's current read point for this conversation, live. */
+  serverReadThrough?: TimelinePosition | null;
+  /** #1082: the read cursor advanced, or the unread it leaves changed. */
+  onReadProgress: (conversationKey: string, progress: ReadProgress) => void;
 }
 
 export default function MessageList(props: MessageListProps) {
@@ -96,7 +100,7 @@ export default function MessageList(props: MessageListProps) {
     focusMessageId,
     focusRequest,
     onCaptureAnchor,
-    onReachedBottom,
+    onReadProgress,
   } = props;
 
   const {
@@ -128,7 +132,8 @@ export default function MessageList(props: MessageListProps) {
     focusRequest,
     onLoadMore,
     onCaptureAnchor,
-    onReachedBottom,
+    onReadProgress,
+    serverReadThrough: props.serverReadThrough,
   });
   const reactionMenu = useReactionMenu();
   const messagesById = useMemo(

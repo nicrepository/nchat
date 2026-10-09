@@ -414,6 +414,9 @@ type DMConversationWithParticipantIDs struct {
 	LastMessageAt          *time.Time
 	PinnedAt               *time.Time
 	UnreadCount            int
+	// ReadThrough is the viewer's server-side read point (issue #1082), the one
+	// UnreadCount is counted from; nil when they have never read here.
+	ReadThrough *ReadThrough
 	// Muted is the viewer's own notification preference for this conversation
 	// (issue #527), viewer-scoped like the counterpart fields above and never a
 	// property of the conversation itself.

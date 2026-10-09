@@ -204,6 +204,33 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe("ChatShell opening readiness", () => {
+  it("stops waiting for unread data when the sidebar request fails", async () => {
+    const sidebar = deferredValue<Awaited<ReturnType<typeof fetchSidebarData>>>();
+    vi.mocked(fetchSidebarData).mockReturnValue(sidebar.promise);
+    function OpeningStatus() {
+      const { sidebarLoading } = useOutletContext<ChatOutletContext>();
+      return <div data-testid="opening-status">{sidebarLoading ? "waiting" : "usable"}</div>;
+    }
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/chan-1"]}>
+        <CallSessionProvider>
+          <Routes>
+            <Route element={<AppShell />}>
+              <Route path="/chat" element={<ChatShell />}>
+                <Route path="channel/:id" element={<OpeningStatus />} />
+              </Route>
+            </Route>
+          </Routes>
+        </CallSessionProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("opening-status")).toHaveTextContent("waiting");
+    await act(async () => sidebar.reject(new Error("sidebar unavailable")));
+    expect(screen.getByTestId("opening-status")).toHaveTextContent("usable");
+  });
+});
+
 describe("ChatShell call identity bootstrap", () => {
   it("keeps ringing until the sidebar resolves without recreating call signaling", async () => {
     const sidebar = deferredValue<Awaited<ReturnType<typeof fetchSidebarData>>>();
@@ -1639,8 +1666,9 @@ describe("ChatShell — leaving the conversation on screen", () => {
 // the sidebar's own "Marcar como lida" menu action, so it can call it once it
 // has evidence the user reached the real bottom — not a second read-state
 // mechanism, the same one, reached through ChatShell's own outlet context.
-describe("ChatShell — forwards markRead through its own outlet context", () => {
+describe("ChatShell — forwards reportReadProgress through its own outlet context (#1082)", () => {
   const readingId = "00000000-0000-4000-8000-0000000005e1";
+  const readMessageId = "00000000-0000-4000-8000-0000000005e2";
 
   function renderShellAt(path: string) {
     return render(
@@ -1668,14 +1696,21 @@ describe("ChatShell — forwards markRead through its own outlet context", () =>
     return (
       <button
         type="button"
-        onClick={() => ctx.markRead?.({ kind: "channel", targetId: readingId })}
+        onClick={() =>
+          ctx.reportReadProgress?.(
+            { kind: "channel", targetId: readingId },
+            {
+              readThrough: { id: readMessageId, createdAt: "2026-07-15T10:00:00Z" },
+            },
+          )
+        }
       >
-        Marcar como lida
+        Li até aqui
       </button>
     );
   }
 
-  it("hands the real useChatSidebar markRead down, not a second implementation", async () => {
+  it("hands the real useChatSidebar read progress down, not a second implementation", async () => {
     const user = userEvent.setup();
     vi.mocked(fetchSidebarData).mockResolvedValue({
       currentUserId,
@@ -1691,12 +1726,20 @@ describe("ChatShell — forwards markRead through its own outlet context", () =>
       ],
       dms: [],
       categories: [],
+      // A server with the read cursor: only then is reading persisted
+      // progressively (#1082).
+      preciseReadCursor: true,
     });
 
     renderShellAt(`/chat/channel/${readingId}`);
-    await user.click(await screen.findByRole("button", { name: "Marcar como lida" }));
+    await user.click(await screen.findByRole("button", { name: "Li até aqui" }));
 
-    await waitFor(() => expect(markConversationRead).toHaveBeenCalledWith("channel", readingId));
+    // The read cursor travels to the server as the message read through.
+    await waitFor(() =>
+      expect(markConversationRead).toHaveBeenCalledWith("channel", readingId, readMessageId, {
+        keepalive: false,
+      }),
+    );
   });
 });
 

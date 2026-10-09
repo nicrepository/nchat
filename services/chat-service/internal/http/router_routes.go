@@ -16,6 +16,8 @@ import (
 //   - getSingle: guards GET single-message fallback used by realtime WS.
 //   - post: guards POST send-message (write endpoint).
 //   - pinAction: guards pin/unpin separately from normal message writes.
+//   - readCursor: guards POST …/read on its own budget, sized from the read
+//     cursor writer's cadence (issue #1082).
 //
 // GC goroutines run for the process lifetime; tests that build a limiter
 // explicitly use t.Cleanup(limiter.Stop).
@@ -30,6 +32,7 @@ type routeSet struct {
 	post          *UserRateLimiter
 	forward       *UserRateLimiter
 	pinAction     *UserRateLimiter
+	readCursor    *UserRateLimiter
 	mentionSearch *UserRateLimiter
 	presence      *UserRateLimiter
 }
@@ -42,6 +45,7 @@ func newRouteSet(validator *TokenValidator, sessionValidator SessionValidator, a
 		post:          NewUserRateLimiter(msgPostRateLimit, time.Minute),
 		forward:       NewUserRateLimiter(messageForwardRateLimit, time.Minute),
 		pinAction:     NewUserRateLimiter(pinActionRateLimit, time.Minute),
+		readCursor:    NewUserRateLimiter(readCursorRateLimit, time.Minute),
 		mentionSearch: NewUserRateLimiter(mentionSearchRateLimit, time.Minute),
 		presence:      NewUserRateLimiter(presenceRateLimit, time.Minute),
 	}
@@ -95,8 +99,8 @@ func (r *routeSet) registerSidebarRoutes(sidebar *SidebarHandler) {
 	r.handle("DELETE "+RouteChannelMute, r.pinAction, sidebar.UnmuteChannel)
 	r.handle("POST "+RouteDMMute, r.pinAction, sidebar.MuteDM)
 	r.handle("DELETE "+RouteDMMute, r.pinAction, sidebar.UnmuteDM)
-	r.handle("POST "+RouteChannelRead, r.pinAction, sidebar.MarkChannelRead)
-	r.handle("POST "+RouteDMRead, r.pinAction, sidebar.MarkDMRead)
+	r.handle("POST "+RouteChannelRead, r.readCursor, sidebar.MarkChannelRead)
+	r.handle("POST "+RouteDMRead, r.readCursor, sidebar.MarkDMRead)
 	// The canonical whole-preference write (issue #136) shares the pin-action
 	// budget with the mute shortcut above, deliberately: they change the same
 	// row, so giving the newer route its own budget would only mean a caller

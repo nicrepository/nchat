@@ -65,7 +65,7 @@ export interface MessageBubbleProps {
   onQuoteJump?: (messageId: string) => void;
   onReferenceJump?: (reference: NonNullable<Message["reference"]>) => void;
   isHighlighted?: boolean;
-  setMessageRef?: (messageId: string, el: HTMLDivElement | null) => void;
+  setMessageRef?: (messageId: string, el: HTMLElement | null) => void;
   /**
    * RF-21 "Verificar novamente" (issue #135). Asks the server to re-read what it
    * already knows about this message's unverified links; it never starts a new

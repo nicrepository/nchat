@@ -5,6 +5,9 @@ import {
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 
+import { ApiRequestError } from "../lib/api";
+import { isAuthenticated, onAuthChange } from "../lib/authSession";
+
 import {
   fetchSidebarData,
   leaveConversation as leaveConversationRequest,
@@ -25,9 +28,28 @@ import {
   type ConversationActivity,
   type ConversationNotificationLevel,
   type ConversationNotificationMode,
+  type ConversationReadState,
   type DMConversation,
 } from "./chatTypes";
 import { laterActivity } from "./sidebarOrder";
+import type { ReadProgress } from "./readCursor";
+import {
+  createReadCursorWriter,
+  type ReadCursorWriter,
+  type ReadTarget,
+  type ReadWriteOutcome,
+  type ReadWriteSender,
+} from "./readCursorWriter";
+import {
+  acceptServerRead,
+  acceptSidebarAnswer,
+  applyArrival,
+  applyMarkAllRequested,
+  applyReadProgress,
+  rememberRead,
+  type AnswerProvenance,
+  type ReadRow,
+} from "./sidebarReadState";
 import {
   loadPersistedUnread,
   savePersistedUnread,
@@ -48,6 +70,9 @@ import {
 } from "./useChatWebSocket";
 
 // ── State ────────────────────────────────────────────────────────────────────
+
+/** #1082: a write's answer, and when — on the session's request clock — it was sent. */
+type TimedReadState = ConversationReadState & { startedAt: number };
 
 export type SidebarState =
   | { status: "loading" }
@@ -72,6 +97,12 @@ export type SidebarState =
        * the server would refuse.
        */
       notificationLevelsEnabled?: boolean;
+      /**
+       * Issue #1082: whether this server implements the precise read cursor,
+       * as the payload that hydrated this state says. Reading is persisted
+       * progressively only when it does.
+       */
+      preciseReadCursor?: boolean;
       channels: Channel[];
       dms: DMConversation[];
       categories: ChannelCategory[];
@@ -96,6 +127,9 @@ type Action =
        * never undefined there.
        */
       persistedUnread: PersistedUnreadEntry[];
+      preciseReadCursor: boolean;
+      /** #1082: when, on the session's request clock, this fetch started and landed. */
+      provenance: AnswerProvenance;
     }
   | { type: "error"; error: string }
   | { type: "reload" }
@@ -103,13 +137,22 @@ type Action =
       type: "message_created";
       target: WSSubscriptionTarget;
       senderId: string;
+      messageId: string;
       /** The message's own persisted creation instant, as the server stated it. */
       messageCreatedAt: string;
-      activeTarget?: WSSubscriptionTarget;
       /** Whether this message names the current user (specific @mention or @all). */
       isMentioned: boolean;
+      /** #1082: the request-clock tick at which this client learned of the message. */
+      at: number;
     }
-  | { type: "target_opened"; target: WSSubscriptionTarget }
+  | { type: "read_progress"; target: WSSubscriptionTarget; progress: ReadProgress }
+  | { type: "marked_all_read"; target: WSSubscriptionTarget; at: number }
+  | {
+      type: "read_confirmed";
+      target: WSSubscriptionTarget;
+      outcome: ReadWriteOutcome<TimedReadState>;
+      receivedAt: number;
+    }
   | { type: "pin_changed"; target: WSSubscriptionTarget; pinnedAt: string | null }
   | {
       type: "preference_changed";
@@ -152,31 +195,32 @@ function mergeActivity<T extends ConversationActivity & { id: string }>(
  * Restores unread/mention state across a "loaded" dispatch — the reducer's
  * only reconciliation point, run on mount and on every refreshSidebar().
  *
- * The server's unreadCount is authoritative whenever present. In-memory and
- * persisted values only bridge the first response or a rolling deployment
- * where an older backend omits that field. Mention state remains client-only.
- * Membership still comes from `incoming` only, same as mergeActivity — this
- * never fabricates a row for a conversation the server did not return.
+ * Each row is what sidebarReadState makes of the server's answer and what this
+ * session remembers about it (#1082). Membership still comes from `incoming`
+ * only, same as mergeActivity — this never fabricates a row for a conversation
+ * the server did not return.
  */
-function mergeUnread<T extends { id: string; unreadCount?: number; hasMentionUnread?: boolean }>(
+function mergeUnread<T extends ReadRow>(
   incoming: T[],
   previous: T[] | undefined,
   type: "channel" | "dm",
-  persisted: PersistedUnreadEntry[],
+  action: Extract<Action, { type: "loaded" }>,
 ): T[] {
   const known = new Map((previous ?? []).map((item) => [item.id, item]));
   const restored = new Map(
-    persisted.filter((entry) => entry.type === type).map((entry) => [entry.id, entry]),
+    action.persistedUnread.filter((entry) => entry.type === type).map((entry) => [entry.id, entry]),
   );
-  return incoming.map((item) => {
-    const prev = known.get(item.id);
-    const entry = restored.get(item.id);
-    const unreadCount = item.unreadCount ?? prev?.unreadCount ?? entry?.unreadCount;
-    const hasMentionUnread =
-      prev?.hasMentionUnread ?? entry?.hasMentionUnread ?? item.hasMentionUnread;
-    if (unreadCount === undefined && hasMentionUnread === undefined) return item;
-    return { ...item, unreadCount, hasMentionUnread };
-  });
+  return incoming.map((item) =>
+    acceptSidebarAnswer(
+      rememberRead(item, known.get(item.id), restored.get(item.id)),
+      {
+        readState: item.readState,
+        unreadCount: item.unreadCount,
+        precise: action.preciseReadCursor,
+      },
+      action.provenance,
+    ),
+  );
 }
 
 /**
@@ -243,6 +287,31 @@ function applyPreference(
 }
 
 /**
+ * Replaces the one row `target` names with `update(row)`, and returns the same
+ * state object when the update changed nothing — so a repeated report costs no
+ * render anywhere.
+ */
+function updateReadRow(
+  state: Extract<SidebarState, { status: "ready" }>,
+  target: WSSubscriptionTarget,
+  update: <T extends ReadRow>(row: T) => T,
+): SidebarState {
+  const apply = <T extends ReadRow>(items: T[]): T[] => {
+    const index = items.findIndex((item) => item.id === target.targetId);
+    if (index < 0) return items;
+    const updated = update(items[index]);
+    if (updated === items[index]) return items;
+    return items.map((item, i) => (i === index ? updated : item));
+  };
+  if (target.kind === "channel") {
+    const channels = apply(state.channels);
+    return channels === state.channels ? state : { ...state, channels };
+  }
+  const dms = apply(state.dms);
+  return dms === state.dms ? state : { ...state, dms };
+}
+
+/**
  * Rebuilds the ready state from a server response, carrying forward the two
  * things the response does not carry: how recently each surviving conversation
  * was written in, and the viewer's unread/mention state.
@@ -251,7 +320,14 @@ function applyLoaded(
   state: SidebarState,
   action: Extract<Action, { type: "loaded" }>,
 ): SidebarState {
-  const previous = state.status === "ready" ? state : undefined;
+  // Read state belongs to the user and workspace that produced it (#1082): a
+  // payload for anyone else is a first load, never merged into theirs.
+  const previous =
+    state.status === "ready" &&
+    state.currentUserId === action.currentUserId &&
+    state.workspaceId === action.workspaceId
+      ? state
+      : undefined;
   const channels = mergeActivity(action.channels, previous?.channels);
   const dms = mergeActivity(action.dms, previous?.dms);
   return {
@@ -260,56 +336,11 @@ function applyLoaded(
     workspaceId: action.workspaceId,
     attachmentLimits: action.attachmentLimits,
     notificationLevelsEnabled: action.notificationLevelsEnabled,
-    channels: mergeUnread(channels, previous?.channels, "channel", action.persistedUnread),
-    dms: mergeUnread(dms, previous?.dms, "dm", action.persistedUnread),
+    preciseReadCursor: action.preciseReadCursor,
+    channels: mergeUnread(channels, previous?.channels, "channel", action),
+    dms: mergeUnread(dms, previous?.dms, "dm", action),
     categories: action.categories || [],
   };
-}
-
-/**
- * Whether this message adds to an unread count.
- *
- * Narrower than the rule for activity: the user's own message is not unread to
- * them, and neither is one arriving in the conversation they are currently
- * reading. Activity keeps its own, broader rule — writing in a conversation is
- * what makes it the most recently active one, whoever wrote and wherever they
- * are looking — because the two questions have different answers.
- */
-function countsAsUnread(
-  state: Extract<SidebarState, { status: "ready" }>,
-  action: Extract<Action, { type: "message_created" }>,
-): boolean {
-  if (action.senderId === state.currentUserId) return false;
-  return !(
-    action.activeTarget?.kind === action.target.kind &&
-    action.activeTarget.targetId === action.target.targetId
-  );
-}
-
-function incrementUnread<
-  T extends { id: string; unreadCount?: number; hasMentionUnread?: boolean },
->(items: T[], targetId: string, isMentioned: boolean): T[] {
-  return items.map((item) =>
-    item.id === targetId
-      ? {
-          ...item,
-          unreadCount: (item.unreadCount ?? 0) + 1,
-          hasMentionUnread: item.hasMentionUnread || isMentioned,
-        }
-      : item,
-  );
-}
-
-/** Opening a conversation is what marks it read; a row with nothing unread is left alone. */
-function clearUnread<T extends { id: string; unreadCount?: number; hasMentionUnread?: boolean }>(
-  items: T[],
-  targetId: string,
-): T[] {
-  return items.map((item) =>
-    item.id === targetId && item.unreadCount
-      ? { ...item, unreadCount: 0, hasMentionUnread: false }
-      : item,
-  );
 }
 
 function applyMessageCreated(
@@ -317,28 +348,47 @@ function applyMessageCreated(
   action: Extract<Action, { type: "message_created" }>,
 ): SidebarState {
   if (state.status !== "ready") return state;
-  const counts = countsAsUnread(state, action);
+  const eligible = action.senderId !== state.currentUserId;
+  const kind = {
+    eligible,
+    counts: eligible,
+    isMention: action.isMentioned && eligible,
+  };
+  const message = { id: action.messageId, createdAt: action.messageCreatedAt };
+  const arrived = updateReadRow(state, action.target, (row) =>
+    applyArrival(row, kind, message, action.at),
+  );
+  if (arrived.status !== "ready") return arrived;
   const { targetId } = action.target;
   if (action.target.kind === "channel") {
-    const channels = counts
-      ? incrementUnread(state.channels, targetId, action.isMentioned)
-      : state.channels;
-    return { ...state, channels: bumpActivity(channels, targetId, action.messageCreatedAt) };
+    return {
+      ...arrived,
+      channels: bumpActivity(arrived.channels, targetId, action.messageCreatedAt),
+    };
   }
-  const dms = counts ? incrementUnread(state.dms, targetId, action.isMentioned) : state.dms;
-  return { ...state, dms: bumpActivity(dms, targetId, action.messageCreatedAt) };
+  return { ...arrived, dms: bumpActivity(arrived.dms, targetId, action.messageCreatedAt) };
 }
 
-function applyTargetOpened(
+/**
+ * The read state of one row moved (#1082): the open timeline reported
+ * progress, the reader marked everything read, or a write came back with the
+ * server's answer. Only the named row is touched.
+ */
+function applyReadTransition(
   state: SidebarState,
-  action: Extract<Action, { type: "target_opened" }>,
+  action: Extract<Action, { type: "read_progress" | "marked_all_read" | "read_confirmed" }>,
 ): SidebarState {
   if (state.status !== "ready") return state;
-  const { targetId } = action.target;
-  if (action.target.kind === "channel") {
-    return { ...state, channels: clearUnread(state.channels, targetId) };
-  }
-  return { ...state, dms: clearUnread(state.dms, targetId) };
+  return updateReadRow(state, action.target, (row) => {
+    if (action.type === "read_progress") return applyReadProgress(row, action.progress);
+    if (action.type === "marked_all_read") return applyMarkAllRequested(row, action.at);
+    // A precise answer means nothing to a row whose server no longer has the
+    // cursor (a rollback that reached this tab after the write left).
+    const { outcome, receivedAt } = action;
+    const answer = state.preciseReadCursor ? outcome.state : undefined;
+    const provenance = answer && { startedAt: answer.startedAt, receivedAt };
+    return acceptServerRead(row, answer, provenance, { endsMarkAll: outcome.request === "all" });
+  });
 }
 
 // Routing only: each case names the transition and hands the state to the pure
@@ -354,8 +404,10 @@ function reducer(state: SidebarState, action: Action): SidebarState {
       return { status: "loading" };
     case "message_created":
       return applyMessageCreated(state, action);
-    case "target_opened":
-      return applyTargetOpened(state, action);
+    case "read_progress":
+    case "marked_all_read":
+    case "read_confirmed":
+      return applyReadTransition(state, action);
     case "preference_changed":
       return applyPreference(state, action.target, action.change);
     case "pin_changed":
@@ -457,7 +509,46 @@ function presentIncomingMessage(
   );
 }
 
+/**
+ * #1082 (security review SR-002): how long the read cursor writer waits after
+ * the server rate-limits a write — the server's own Retry-After for POST
+ * …/read, a fixed 60s (UserRateLimiter). Every other failure is not a "not now".
+ */
+export const READ_RATE_LIMIT_BACKOFF_MS = 60_000;
+
+function readBackoffAfter(error: unknown): number | undefined {
+  const limited = error instanceof ApiRequestError && error.status === 429;
+  return limited ? READ_RATE_LIMIT_BACKOFF_MS : undefined;
+}
+
 // ── Hook ─────────────────────────────────────────────────────────────────────
+
+type SidebarData = Awaited<ReturnType<typeof fetchSidebarData>>;
+
+/** The "loaded" action a sidebar payload makes. */
+function loadedAction(
+  data: SidebarData,
+  persistedUnread: PersistedUnreadEntry[],
+  provenance: AnswerProvenance,
+): Extract<Action, { type: "loaded" }> {
+  return {
+    type: "loaded",
+    currentUserId: data.currentUserId,
+    workspaceId: data.workspaceId,
+    attachmentLimits: {
+      maxUploadBytes: data.maxUploadBytes ?? null,
+      maxFiles: data.maxFiles ?? 1,
+      maxBytes: data.maxBytes ?? Number.MAX_SAFE_INTEGER,
+    },
+    notificationLevelsEnabled: data.notificationLevelsEnabled ?? false,
+    channels: data.channels,
+    dms: data.dms,
+    categories: data.categories,
+    persistedUnread,
+    preciseReadCursor: data.preciseReadCursor ?? false,
+    provenance,
+  };
+}
 
 export function useChatSidebar() {
   const [state, dispatch] = useReducer(reducer, { status: "loading" });
@@ -473,47 +564,50 @@ export function useChatSidebar() {
   const openedTargetId = openedTarget?.targetId;
   const mountedRef = useRef(true);
   const loadPromiseRef = useRef<Promise<void> | null>(null);
+  // #1082: this session's request clock. Every sidebar fetch and read write
+  // takes a tick when it starts and when it is answered, every arrival and
+  // mark-all the tick at which it happened. It only answers causal questions —
+  // was this request sent after that answer arrived, did this message arrive
+  // before that request left — never which messages a snapshot counted. See
+  // sidebarReadState.
+  const clockRef = useRef(0);
+  const tick = useCallback(() => ++clockRef.current, []);
+  // #1082: the auth session the read state belongs to, advanced by the same
+  // auth changes that restart the writer — a login, a logout, an account
+  // switch, never a refresh rotation. A fetch started under another session
+  // lands nowhere.
+  const sessionRef = useRef(0);
+  // #1082: whether the server takes precise read positions, as the newest
+  // accepted payload said — synchronous, so a write about to be sent asks the
+  // server that is there now, not the one the last render saw.
+  const capabilityRef = useRef(false);
+  // #1082 (security review SR-001): the user this session's read state
+  // was loaded for, and — after a refresh rotation, until the server has said
+  // whose token it is — the check every read write waits on. The refresh token
+  // is a cookie every tab shares, so a rotation can hand this tab another
+  // account's token; "refresh" is a claim, and this is where it is verified.
+  const sessionUserRef = useRef<string | null>(null);
+  const identityCheckRef = useRef<Promise<boolean> | null>(null);
 
   const load = useCallback(() => {
     if (loadPromiseRef.current) return loadPromiseRef.current;
     dispatch({ type: "reload" });
+    const session = sessionRef.current;
+    const startedAt = tick();
+    const current = () => mountedRef.current && session === sessionRef.current;
 
     const loading = fetchSidebarData()
-      .then(
-        ({
-          currentUserId,
-          workspaceId,
-          maxUploadBytes,
-          maxFiles,
-          maxBytes,
-          channels,
-          dms,
-          categories,
-          notificationLevelsEnabled,
-        }) => {
-          if (mountedRef.current) {
-            const persistedUnread =
-              currentUserId && workspaceId ? loadPersistedUnread(currentUserId, workspaceId) : [];
-            dispatch({
-              type: "loaded",
-              currentUserId,
-              workspaceId,
-              attachmentLimits: {
-                maxUploadBytes: maxUploadBytes ?? null,
-                maxFiles: maxFiles ?? 1,
-                maxBytes: maxBytes ?? Number.MAX_SAFE_INTEGER,
-              },
-              notificationLevelsEnabled: notificationLevelsEnabled ?? false,
-              channels,
-              dms,
-              categories,
-              persistedUnread,
-            });
-          }
-        },
-      )
+      .then((data) => {
+        if (!current()) return;
+        const { currentUserId, workspaceId } = data;
+        const persistedUnread =
+          currentUserId && workspaceId ? loadPersistedUnread(currentUserId, workspaceId) : [];
+        capabilityRef.current = data.preciseReadCursor ?? false;
+        sessionUserRef.current = currentUserId;
+        dispatch(loadedAction(data, persistedUnread, { startedAt, receivedAt: tick() }));
+      })
       .catch((err: unknown) => {
-        if (mountedRef.current) {
+        if (current()) {
           const message =
             err instanceof Error ? err.message : "Não foi possível carregar os dados.";
           dispatch({ type: "error", error: message });
@@ -524,7 +618,7 @@ export function useChatSidebar() {
       });
     loadPromiseRef.current = loading;
     return loading;
-  }, []);
+  }, [tick]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -586,41 +680,18 @@ export function useChatSidebar() {
     }
     refreshInFlight.current = true;
     const run = () => {
+      const session = sessionRef.current;
+      const startedAt = tick();
       fetchSidebarData()
-        .then(
-          ({
-            currentUserId,
-            workspaceId,
-            maxUploadBytes,
-            maxFiles,
-            maxBytes,
-            channels,
-            dms,
-            categories,
-            notificationLevelsEnabled,
-          }) => {
-            if (mountedRef.current)
-              dispatch({
-                type: "loaded",
-                currentUserId,
-                workspaceId,
-                attachmentLimits: {
-                  maxUploadBytes: maxUploadBytes ?? null,
-                  maxFiles: maxFiles ?? 1,
-                  maxBytes: maxBytes ?? Number.MAX_SAFE_INTEGER,
-                },
-                notificationLevelsEnabled: notificationLevelsEnabled ?? false,
-                channels,
-                dms,
-                categories,
-                // previous is always defined at this call site (refreshSidebar
-                // only ever runs once the sidebar is already "ready"), so
-                // mergeUnread never consults this — never worth a localStorage
-                // read here.
-                persistedUnread: [],
-              });
-          },
-        )
+        .then((data) => {
+          if (!mountedRef.current || session !== sessionRef.current) return;
+          capabilityRef.current = data.preciseReadCursor ?? false;
+          // previous is always defined at this call site (refreshSidebar only
+          // ever runs once the sidebar is already "ready"), so mergeUnread
+          // never consults the persisted cache — never worth a localStorage
+          // read here.
+          dispatch(loadedAction(data, [], { startedAt, receivedAt: tick() }));
+        })
         .catch(() => {
           // The sidebar on screen stays valid; the next event or navigation
           // retries. Deliberately no error state and no retry loop — a failed
@@ -636,7 +707,127 @@ export function useChatSidebar() {
         });
     };
     run();
-  }, []);
+  }, [tick]);
+
+  // #1082: a row holding what it could not settle — an answer refused, or one
+  // taken as a conservative upper bound — is reconciled by one refetch, whose
+  // request starts after it and so settles it. Event-driven and coalesced: all
+  // the marks up to the latest are covered by the same refetch, and its own
+  // answer leaves a new mark only if something new happened while it was out.
+  const convergedThrough = useRef(0);
+  useEffect(() => {
+    if (state.status !== "ready") return;
+    let latest = 0;
+    for (const row of [...state.channels, ...state.dms]) {
+      latest = Math.max(latest, row.reconcileAfter ?? 0);
+    }
+    if (latest <= convergedThrough.current) return;
+    convergedThrough.current = latest;
+    refreshSidebar();
+  }, [state, refreshSidebar]);
+
+  /**
+   * POST …/read for the read cursor writer (#1082), stamped with the tick it
+   * was sent at. A position refused as a bad request means the server no
+   * longer has the precise cursor — a rollback reached this tab: positions
+   * stop at once, nothing is acknowledged or retried, and the sidebar asks the
+   * server for its authority instead.
+   */
+  const sendReadCursor = useCallback<ReadWriteSender<TimedReadState>>(
+    (target, lastReadMessageId, options) => {
+      const session = sessionRef.current;
+      const send = () => {
+        const startedAt = tick();
+        return markConversationRead(target.kind, target.targetId, lastReadMessageId, options).then(
+          (state) => state && { ...state, startedAt },
+          (error: unknown) => {
+            const refused = error instanceof ApiRequestError && error.status === 400;
+            if (lastReadMessageId && refused && session === sessionRef.current) {
+              capabilityRef.current = false;
+              refreshSidebar();
+            }
+            throw error;
+          },
+        );
+      };
+      // A position read under one identity is never sent under another: while
+      // a rotated token is unconfirmed, the write waits, and it is dropped if
+      // the token turns out to be someone else's.
+      const check = identityCheckRef.current;
+      if (!check) return send();
+      return check.then((same) => {
+        if (!same) throw new Error("read cursor dropped: the session changed");
+        return send();
+      });
+    },
+    [tick, refreshSidebar],
+  );
+
+  // #1082: the one writer of read cursors for this session. It outlives every
+  // timeline that feeds it, so a conversation left mid-debounce still gets its
+  // write, under its own target; and it lives exactly as long as the session —
+  // the auth session itself, not the sidebar that last loaded — so a token
+  // installed or removed drops everything pending at that very moment, before
+  // any timer of the old session can fire. The read state goes with it: what
+  // the sidebar showed belonged to the previous identity, so it is dropped and
+  // loaded again for the new one. A refresh rotation keeps the writer, what it
+  // has pending, and the read state — once the server confirms the rotated
+  // token is still this session's user. Until then writes wait; a token of
+  // another user, or no answer, is a session change like any other.
+  const readWriterRef = useRef<ReadCursorWriter | null>(null);
+  useEffect(() => {
+    const start = () => {
+      readWriterRef.current?.dispose();
+      const writer = createReadCursorWriter(
+        sendReadCursor,
+        (target, outcome) => {
+          if (readWriterRef.current !== writer) return;
+          dispatch({ type: "read_confirmed", target, outcome, receivedAt: tick() });
+        },
+        { acceptsPositions: () => capabilityRef.current, backoffAfter: readBackoffAfter },
+      );
+      readWriterRef.current = writer;
+    };
+    start();
+    const changeSession = () => {
+      sessionRef.current += 1;
+      capabilityRef.current = false;
+      sessionUserRef.current = null;
+      identityCheckRef.current = null;
+      loadPromiseRef.current = null;
+      start();
+      dispatch({ type: "reload" });
+      if (isAuthenticated()) void load();
+    };
+    const confirmIdentity = () => {
+      const expected = sessionUserRef.current;
+      // Nothing was loaded for anyone yet: the load in flight is the new token's.
+      if (expected === null) return;
+      const session = sessionRef.current;
+      const settle = (same: boolean) => {
+        if (!mountedRef.current || session !== sessionRef.current) return false;
+        if (!same) changeSession();
+        return same;
+      };
+      const check = fetchSidebarData().then(
+        (data) => settle(data.currentUserId === expected),
+        () => settle(false),
+      );
+      identityCheckRef.current = check;
+      void check.finally(() => {
+        if (identityCheckRef.current === check) identityCheckRef.current = null;
+      });
+    };
+    const unsubscribe = onAuthChange((change) => {
+      if (change === "refresh") confirmIdentity();
+      else changeSession();
+    });
+    return () => {
+      unsubscribe();
+      readWriterRef.current?.dispose();
+      readWriterRef.current = null;
+    };
+  }, [load, sendReadCursor, tick]);
 
   const realtimeTargets: WSSubscriptionTarget[] =
     state.status === "ready"
@@ -718,9 +909,10 @@ export function useChatSidebar() {
         type: "message_created",
         target: { kind: event.target_type, targetId: event.target_id },
         senderId: event.payload?.sender_id ?? "",
+        messageId: event.message_id,
         messageCreatedAt,
-        activeTarget: openedTarget,
         isMentioned,
+        at: tick(),
       });
     },
   });
@@ -744,24 +936,66 @@ export function useChatSidebar() {
   );
 
   /**
+   * The open timeline's read progress (#1082): the cursor it reached.
+   *
+   * The cursor goes to the writer, which coalesces a reading session into a
+   * handful of writes; the count moves when the server answers them, never on
+   * the cursor alone — the browser cannot prove which messages a count
+   * included (see sidebarReadState). Opening a
+   * conversation reports nothing by itself — only rows actually seen move the
+   * cursor, so a conversation opened and left keeps every unread it had.
+   *
+   * Against a server without the precise cursor (one an open tab can meet
+   * during a rollback) nothing is persisted progressively: that server would
+   * read any write as "everything is read until now". There are no
+   * automatic read writes. Only an explicit manual mark-all is safe when the
+   * loaded timeline may contain gaps.
+   */
+  const reportReadProgress = useCallback((target: ReadTarget, progress: ReadProgress) => {
+    dispatch({ type: "read_progress", target, progress });
+    if (capabilityRef.current) readWriterRef.current?.advance(target, progress.readThrough);
+  }, []);
+
+  // A cursor read moments before the tab is hidden or closed must not wait out
+  // the debounce: the page may never run another timer. A page restored from
+  // the back/forward cache has been frozen for an unknown time, so it asks the
+  // server again rather than trusting what it showed.
+  useEffect(() => {
+    const onPageHide = () => readWriterRef.current?.flushOnUnload();
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) refreshSidebar();
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") readWriterRef.current?.flush();
+    };
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("pageshow", onPageShow);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("pageshow", onPageShow);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [refreshSidebar]);
+
+  /**
    * Marks a conversation read without opening it (issue #527).
    *
-   * Deliberately the same pair the navigation effect above performs — the local
-   * `target_opened` transition plus the server receipt — rather than a second
-   * rule: "this conversation has no unread messages" has one meaning, and a
-   * menu action must not invent another. Nothing here navigates, changes the
-   * selection or touches the composer.
-   *
-   * The receipt is fire-and-forget for the same reason it is on navigation: a
-   * failed write leaves the badge cleared locally until the next refetch
-   * reconciles it, and must never break the sidebar.
+   * The explicit "everything here is read": the row clears at once, and the
+   * server resolves "everything" to the newest message it holds — the client
+   * names no position, so nothing that arrives afterwards is consumed. It goes
+   * through the same writer as the cursor, so it never races a read write for
+   * the same conversation. Nothing here navigates, changes the selection or
+   * touches the composer, and a failed write is reconciled by the next refetch
+   * rather than surfaced.
    */
-  const markRead = useCallback((target: WSSubscriptionTarget) => {
-    dispatch({ type: "target_opened", target });
-    void Promise.resolve(markConversationRead(target.kind, target.targetId)).catch(() => {
-      // See above: a failed read receipt is not a UI failure.
-    });
-  }, []);
+  const markRead = useCallback(
+    (target: WSSubscriptionTarget) => {
+      dispatch({ type: "marked_all_read", target, at: tick() });
+      readWriterRef.current?.markAll(target);
+    },
+    [tick],
+  );
 
   /**
    * Renames a channel and converges every surface that renders its name.
@@ -968,6 +1202,7 @@ export function useChatSidebar() {
     retry: load,
     setPinned,
     markRead,
+    reportReadProgress,
     renameChannel,
     renameGroup,
     setGroupAvatar,
