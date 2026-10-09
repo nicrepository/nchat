@@ -26,6 +26,14 @@
  * goes out, and the sidebar's next refetch reconciles with the server either
  * way. The server is the last line of monotonicity — this only saves it work.
  *
+ * A write the server refuses for now (rate limited) is different: the position
+ * is kept — the greatest pending — and nothing is sent for that conversation
+ * until the server's window has passed. Then it goes out once by itself, so a
+ * reader who stopped reading still gets it saved. If that retry is refused
+ * too, nothing more goes out by itself until a write succeeds: the next read,
+ * mark-all or flush sends it, so a server that keeps refusing meets no retry
+ * loop, only the reader's own activity.
+ *
  * One writer serves one session — one user in one workspace. Its owner
  * disposes it when that identity ends; nothing pending survives into the next
  * session, and a write still in flight finishes without effect.
@@ -70,6 +78,12 @@ export interface ReadCursorWriterOptions {
   debounceMs?: number;
   /** Whether the server takes explicit positions right now; asked at send time. */
   acceptsPositions?: () => boolean;
+  /**
+   * How long (ms) the server asked to wait after a failed write, when the
+   * failure is a "not now" — a rate limit — rather than a refusal. Undefined
+   * for every other failure.
+   */
+  backoffAfter?: (error: unknown) => number | undefined;
 }
 
 interface Entry {
@@ -87,6 +101,12 @@ interface Entry {
    */
   acknowledged: TimelinePosition | null;
   timer: ReturnType<typeof setTimeout> | null;
+  /** Until when (epoch ms) the server asked for no more writes here. */
+  blockedUntil: number;
+  /** A refused write is pending, and waits for the reader's next trigger. */
+  held: boolean;
+  /** The automatic retry after a refusal is spent until a write succeeds. */
+  retried: boolean;
 }
 
 export interface ReadCursorWriter {
@@ -140,6 +160,9 @@ function newEntry(target: ReadTarget): Entry {
     inFlight: null,
     acknowledged: null,
     timer: null,
+    blockedUntil: 0,
+    held: false,
+    retried: false,
   };
 }
 
@@ -164,6 +187,7 @@ export function createReadCursorWriter<S extends ConversationReadState = Convers
   {
     debounceMs = READ_CURSOR_DEBOUNCE_MS,
     acceptsPositions = () => true,
+    backoffAfter = () => undefined,
   }: ReadCursorWriterOptions = {},
 ): ReadCursorWriter {
   const entries = new Map<string, Entry>();
@@ -179,14 +203,30 @@ export function createReadCursorWriter<S extends ConversationReadState = Convers
       })
       .then(
         (state) => acknowledge(entry, through, state),
-        () => {
+        (error: unknown) => {
+          if (disposed) return;
           // Not acknowledged: a later advance is free to try again.
-          if (!disposed) onSettled(entry.target, { request: through, ok: false });
+          const backoff = backoffAfter(error);
+          if (backoff !== undefined) hold(entry, through, backoff);
+          onSettled(entry.target, { request: through, ok: false });
         },
       );
 
+  /**
+   * A write refused for now: kept, and nothing more sent until the window
+   * passes — then once by itself, unless that once was already this.
+   */
+  const hold = (entry: Entry, through: ReadPosition | "all", backoffMs: number) => {
+    entry.blockedUntil = Date.now() + backoffMs;
+    entry.held = entry.retried;
+    entry.retried = true;
+    if (through === "all") entry.markAllPending = true;
+    else if (isAhead(through, entry.pending, entry.acknowledged)) entry.pending = through;
+  };
+
   const acknowledge = (entry: Entry, through: ReadPosition | "all", state: S | undefined) => {
     if (disposed) return;
+    entry.retried = false;
     const fresh = state && !isBehind(state.readThrough, entry.acknowledged) ? state : undefined;
     if (fresh?.readThrough) entry.acknowledged = fresh.readThrough;
     // A pending position the server already holds is not worth a request.
@@ -202,14 +242,22 @@ export function createReadCursorWriter<S extends ConversationReadState = Convers
     entry.inFlight = through;
     void request(entry, through, keepalive).finally(() => {
       entry.inFlight = null;
-      if (entry.pending !== null || entry.markAllPending) schedule(entry);
+      if (!entry.held && (entry.pending !== null || entry.markAllPending)) schedule(entry);
     });
   };
 
+  /** A write for this entry, one window from now — or once the server's window passes. */
   const schedule = (entry: Entry) => {
     if (!disposed && entry.inFlight === null && entry.timer === null) {
-      entry.timer = setTimeout(() => write(entry), debounceMs);
+      const delay = Math.max(debounceMs, entry.blockedUntil - Date.now());
+      entry.timer = setTimeout(() => write(entry), delay);
     }
+  };
+
+  /** The reader did something: a held write may go out again, once allowed. */
+  const trigger = (entry: Entry) => {
+    entry.held = false;
+    schedule(entry);
   };
 
   const entryFor = (target: ReadTarget): Entry => {
@@ -227,18 +275,20 @@ export function createReadCursorWriter<S extends ConversationReadState = Convers
       const entry = entryFor(target);
       if (!isAhead(position, entry.pending, entry.inFlight, entry.acknowledged)) return;
       entry.pending = position;
-      schedule(entry);
+      trigger(entry);
     },
     markAll: (target) => {
       if (disposed) return;
       const entry = entryFor(target);
       entry.markAllPending = true;
-      schedule(entry);
+      trigger(entry);
     },
     flush: () => {
       for (const entry of entries.values()) {
-        if (entry.timer === null) continue;
-        clearTimeout(entry.timer);
+        const waiting = entry.timer !== null || entry.held;
+        if (!waiting || Date.now() < entry.blockedUntil) continue;
+        if (entry.timer !== null) clearTimeout(entry.timer);
+        entry.held = false;
         write(entry, true);
       }
     },

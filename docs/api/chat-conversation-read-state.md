@@ -123,6 +123,11 @@ A missing conversation, an unauthorized one, and a message outside it, not
 visible to the caller or nonexistent all return the same non-enumerating `404`.
 A malformed id or an unknown `read_cursor` is `400`.
 
+`POST …/read` has a per-user budget of its own — 180 requests a minute, per
+replica — sized from the web client's write cadence (below) and separate from
+the ten-a-minute budget of pin, mute and ownership actions. Past it, the
+answer is `429` with `Retry-After: 60`.
+
 ### Rollout
 
 The migration is expand-only (two nullable columns and a pair check), so both
@@ -188,7 +193,17 @@ The server is authoritative; the client keeps a projection in between.
   trip, never one per message, however fast the network. "Mark as read" is
   tracked separately from the cursor and invents no position: the count shows
   zero until the server answers with the point it resolved. A failed write is
-  not retried; the next read writes again.
+  not retried; the next read writes again. A `429` is not an acknowledgement:
+  the greatest position (or the "mark as read") is kept, and nothing is sent
+  for the 60 s the server asked for. Then it is sent once by itself, so an idle
+  reader's cursor is still saved; if that retry is refused too, only the next
+  read, flush or page exit sends it — one automatic retry until a write
+  succeeds, never a loop. A logout or account switch drops it.
+- **Identity on refresh.** The refresh token is a cookie every tab shares, so
+  a refresh can hand a tab another account's access token. After a refresh,
+  writes wait until a sidebar fetch confirms the same `current_user_id`; a
+  different user, or no answer, is handled as a session change — pending
+  positions are dropped and the sidebar loads again.
 - **Confirmed read frontier.** The furthest read point any server answer
   confirmed never moves back; the writer holds the same rule for its
   acknowledgements. An answer — a refetch's or a write's, normal or terminal —

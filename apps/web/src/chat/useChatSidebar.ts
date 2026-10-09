@@ -505,6 +505,18 @@ function presentIncomingMessage(
   );
 }
 
+/**
+ * #1082 (security review SR-002): how long the read cursor writer waits after
+ * the server rate-limits a write — the server's own Retry-After for POST
+ * …/read, a fixed 60s (UserRateLimiter). Every other failure is not a "not now".
+ */
+export const READ_RATE_LIMIT_BACKOFF_MS = 60_000;
+
+function readBackoffAfter(error: unknown): number | undefined {
+  const limited = error instanceof ApiRequestError && error.status === 429;
+  return limited ? READ_RATE_LIMIT_BACKOFF_MS : undefined;
+}
+
 // ── Hook ─────────────────────────────────────────────────────────────────────
 
 type SidebarData = Awaited<ReturnType<typeof fetchSidebarData>>;
@@ -565,6 +577,13 @@ export function useChatSidebar() {
   // accepted payload said — synchronous, so a write about to be sent asks the
   // server that is there now, not the one the last render saw.
   const capabilityRef = useRef(false);
+  // #1082 (security review SR-001): the user this session's read state
+  // was loaded for, and — after a refresh rotation, until the server has said
+  // whose token it is — the check every read write waits on. The refresh token
+  // is a cookie every tab shares, so a rotation can hand this tab another
+  // account's token; "refresh" is a claim, and this is where it is verified.
+  const sessionUserRef = useRef<string | null>(null);
+  const identityCheckRef = useRef<Promise<boolean> | null>(null);
 
   const load = useCallback(() => {
     if (loadPromiseRef.current) return loadPromiseRef.current;
@@ -580,6 +599,7 @@ export function useChatSidebar() {
         const persistedUnread =
           currentUserId && workspaceId ? loadPersistedUnread(currentUserId, workspaceId) : [];
         capabilityRef.current = data.preciseReadCursor ?? false;
+        sessionUserRef.current = currentUserId;
         dispatch(loadedAction(data, persistedUnread, { startedAt, receivedAt: tick() }));
       })
       .catch((err: unknown) => {
@@ -712,18 +732,29 @@ export function useChatSidebar() {
   const sendReadCursor = useCallback<ReadWriteSender<TimedReadState>>(
     (target, lastReadMessageId, options) => {
       const session = sessionRef.current;
-      const startedAt = tick();
-      return markConversationRead(target.kind, target.targetId, lastReadMessageId, options).then(
-        (state) => state && { ...state, startedAt },
-        (error: unknown) => {
-          const refused = error instanceof ApiRequestError && error.status === 400;
-          if (lastReadMessageId && refused && session === sessionRef.current) {
-            capabilityRef.current = false;
-            refreshSidebar();
-          }
-          throw error;
-        },
-      );
+      const send = () => {
+        const startedAt = tick();
+        return markConversationRead(target.kind, target.targetId, lastReadMessageId, options).then(
+          (state) => state && { ...state, startedAt },
+          (error: unknown) => {
+            const refused = error instanceof ApiRequestError && error.status === 400;
+            if (lastReadMessageId && refused && session === sessionRef.current) {
+              capabilityRef.current = false;
+              refreshSidebar();
+            }
+            throw error;
+          },
+        );
+      };
+      // A position read under one identity is never sent under another: while
+      // a rotated token is unconfirmed, the write waits, and it is dropped if
+      // the token turns out to be someone else's.
+      const check = identityCheckRef.current;
+      if (!check) return send();
+      return check.then((same) => {
+        if (!same) throw new Error("read cursor dropped: the session changed");
+        return send();
+      });
     },
     [tick, refreshSidebar],
   );
@@ -735,8 +766,10 @@ export function useChatSidebar() {
   // installed or removed drops everything pending at that very moment, before
   // any timer of the old session can fire. The read state goes with it: what
   // the sidebar showed belonged to the previous identity, so it is dropped and
-  // loaded again for the new one. A refresh rotation is the same session with
-  // a new token: the writer, what it has pending, and the read state carry on.
+  // loaded again for the new one. A refresh rotation keeps the writer, what it
+  // has pending, and the read state — once the server confirms the rotated
+  // token is still this session's user. Until then writes wait; a token of
+  // another user, or no answer, is a session change like any other.
   const readWriterRef = useRef<ReadCursorWriter | null>(null);
   useEffect(() => {
     const start = () => {
@@ -747,19 +780,43 @@ export function useChatSidebar() {
           if (readWriterRef.current !== writer) return;
           dispatch({ type: "read_confirmed", target, outcome, receivedAt: tick() });
         },
-        { acceptsPositions: () => capabilityRef.current },
+        { acceptsPositions: () => capabilityRef.current, backoffAfter: readBackoffAfter },
       );
       readWriterRef.current = writer;
     };
     start();
-    const unsubscribe = onAuthChange((change) => {
-      if (change === "refresh") return;
+    const changeSession = () => {
       sessionRef.current += 1;
       capabilityRef.current = false;
+      sessionUserRef.current = null;
+      identityCheckRef.current = null;
       loadPromiseRef.current = null;
       start();
       dispatch({ type: "reload" });
       if (isAuthenticated()) void load();
+    };
+    const confirmIdentity = () => {
+      const expected = sessionUserRef.current;
+      // Nothing was loaded for anyone yet: the load in flight is the new token's.
+      if (expected === null) return;
+      const session = sessionRef.current;
+      const settle = (same: boolean) => {
+        if (!mountedRef.current || session !== sessionRef.current) return false;
+        if (!same) changeSession();
+        return same;
+      };
+      const check = fetchSidebarData().then(
+        (data) => settle(data.currentUserId === expected),
+        () => settle(false),
+      );
+      identityCheckRef.current = check;
+      void check.finally(() => {
+        if (identityCheckRef.current === check) identityCheckRef.current = null;
+      });
+    };
+    const unsubscribe = onAuthChange((change) => {
+      if (change === "refresh") confirmIdentity();
+      else changeSession();
     });
     return () => {
       unsubscribe();

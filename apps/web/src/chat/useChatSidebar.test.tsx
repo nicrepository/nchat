@@ -15,7 +15,7 @@ import { parseInstant } from "./instant";
 import { savePersistedUnread } from "./sidebarUnreadPersistence";
 import type { WSMessageCreatedEvent, WSNotificationPolicy } from "./useChatWebSocket";
 import { READ_CURSOR_DEBOUNCE_MS } from "./readCursorWriter";
-import { useChatSidebar, type SidebarState } from "./useChatSidebar";
+import { READ_RATE_LIMIT_BACKOFF_MS, useChatSidebar, type SidebarState } from "./useChatSidebar";
 
 const {
   mockFetchSidebarData,
@@ -4388,6 +4388,66 @@ describe("useChatSidebar — read cursor (#1082)", () => {
       expect(writes.at(-1)).toBe("m-50");
     });
 
+    // Security review SR-002: a rate-limited write is neither acknowledged nor
+    // retried in a loop; the final cursor goes out once the server allows it.
+    it("keeps the count and the cursor through a 429, and persists the cursor after the window", async () => {
+      mockMarkConversationRead.mockRejectedValueOnce(
+        new ApiRequestError(429, "rate_limited", "too many requests"),
+      );
+      answersAfter(0);
+      const { result } = await ready();
+      vi.useFakeTimers();
+      try {
+        act(() => result.current.reportReadProgress(channelBTarget, progress(2)));
+        await elapse(READ_CURSOR_DEBOUNCE_MS + 1);
+        expect(rowB(result.current.state)).toMatchObject({
+          unreadCount: 5,
+          readThrough: position(2),
+        });
+
+        // Reading on inside the server's window sends nothing.
+        act(() => result.current.reportReadProgress(channelBTarget, progress(4)));
+        await elapse(READ_RATE_LIMIT_BACKOFF_MS - 1000);
+        expect(mockMarkConversationRead).toHaveBeenCalledTimes(1);
+
+        // Past it, the greatest position goes out once, and its answer shows.
+        await elapse(1000 + READ_CURSOR_DEBOUNCE_MS + 1);
+        expect(mockMarkConversationRead).toHaveBeenCalledTimes(2);
+        expect(mockMarkConversationRead).toHaveBeenLastCalledWith("channel", channelB, "m-4", {
+          keepalive: false,
+        });
+        expect(rowB(result.current.state).unreadCount).toBe(1);
+        // And the refresh path (a 400 downgrade) was not taken for a 429.
+        expect(mockFetchSidebarData).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("saves the cursor of a reader who went idle after a 429, once the window passes", async () => {
+      mockMarkConversationRead.mockRejectedValueOnce(
+        new ApiRequestError(429, "rate_limited", "too many requests"),
+      );
+      answersAfter(0);
+      const { result } = await ready();
+      vi.useFakeTimers();
+      try {
+        act(() => result.current.reportReadProgress(channelBTarget, progress(2)));
+        await elapse(READ_CURSOR_DEBOUNCE_MS + 1);
+        // Nothing else happens: no read, no flush, no navigation.
+        await elapse(READ_RATE_LIMIT_BACKOFF_MS + 1);
+        expect(mockMarkConversationRead).toHaveBeenCalledTimes(2);
+        expect(mockMarkConversationRead).toHaveBeenLastCalledWith("channel", channelB, "m-2", {
+          keepalive: false,
+        });
+        expect(rowB(result.current.state).unreadCount).toBe(3);
+        await elapse(10 * READ_RATE_LIMIT_BACKOFF_MS);
+        expect(mockMarkConversationRead).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("keeps the server's count when the write fails, and writes the next read", async () => {
       mockMarkConversationRead.mockRejectedValueOnce(new Error("offline"));
       answersAfter(0);
@@ -4883,8 +4943,8 @@ describe("useChatSidebar — read cursor (#1082)", () => {
     expect(mockFetchSidebarData).toHaveBeenCalledTimes(1);
   });
 
-  // J: a refresh rotation is the same session.
-  it("keeps the read state across a refresh rotation", async () => {
+  // J: a refresh rotation is the same session — once the server confirms it.
+  it("keeps the read state across a refresh rotation, asking the server once whose token it is", async () => {
     const { result } = await ready();
     act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
     const before = result.current.state;
@@ -4893,7 +4953,7 @@ describe("useChatSidebar — read cursor (#1082)", () => {
     await act(async () => {});
 
     expect(result.current.state).toBe(before);
-    expect(mockFetchSidebarData).toHaveBeenCalledTimes(1);
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(2);
   });
 
   // R5: the writer's lifetime is the auth session's.
@@ -4933,6 +4993,128 @@ describe("useChatSidebar — read cursor (#1082)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // Security review SR-001: the refresh token is a cookie every tab shares. A
+  // tab that logs in as B rotates it, and this tab's next refresh is handed B's
+  // token — still labelled a "refresh".
+  describe("a refresh rotation that hands this tab another account's token", () => {
+    it("holds a pending cursor until the server confirms the same user, then sends it once", async () => {
+      const { result } = await ready();
+      const confirmation = deferredValue<ReturnType<typeof sidebar>>();
+      mockFetchSidebarData.mockReturnValueOnce(confirmation.promise);
+      vi.useFakeTimers();
+      try {
+        act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+        act(() => setTokens("session-a-rotated", "refresh"));
+        await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+        expect(mockMarkConversationRead).not.toHaveBeenCalled();
+
+        await act(async () => confirmation.resolve(sidebar(readState(5, 0))));
+        await elapse();
+        expect(mockMarkConversationRead).toHaveBeenCalledTimes(1);
+        expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelB, "m-3", {
+          keepalive: false,
+        });
+        expect(rowB(result.current.state).readThrough).toEqual(position(3));
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("never sends A's pending cursor under B's token, and loads B's own read state", async () => {
+      const { result } = await ready();
+      mockFetchSidebarData.mockResolvedValue(sidebar(readState(7, 1), {}, "user-b"));
+      vi.useFakeTimers();
+      try {
+        act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+        act(() => setTokens("session-b-via-cookie", "refresh"));
+        await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+      } finally {
+        vi.useRealTimers();
+      }
+      await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+      expect(mockMarkConversationRead).not.toHaveBeenCalled();
+      expect(result.current.state).toMatchObject({ currentUserId: "user-b" });
+      expect(rowB(result.current.state)).toMatchObject({
+        unreadCount: 7,
+        serverRead: { readThrough: position(1) },
+      });
+      expect(rowB(result.current.state).readThrough).toBeUndefined();
+    });
+
+    it("drops a write already waiting on the check when the token turns out to be B's", async () => {
+      const { result } = await ready();
+      const confirmation = deferredValue<ReturnType<typeof sidebar>>();
+      mockFetchSidebarData.mockReturnValueOnce(confirmation.promise);
+      mockFetchSidebarData.mockResolvedValue(sidebar(readState(7, 1), {}, "user-b"));
+      vi.useFakeTimers();
+      try {
+        act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+        act(() => setTokens("session-b-via-cookie", "refresh"));
+        // The debounce fires: the write is handed over and waits on the check.
+        await elapse(READ_CURSOR_DEBOUNCE_MS * 2);
+        await act(async () => confirmation.resolve(sidebar(readState(7, 1), {}, "user-b")));
+        await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+      } finally {
+        vi.useRealTimers();
+      }
+      await waitFor(() => expect(result.current.state).toMatchObject({ currentUserId: "user-b" }));
+
+      expect(mockMarkConversationRead).not.toHaveBeenCalled();
+      expect(rowB(result.current.state).unreadCount).toBe(7);
+    });
+
+    it("lets a check that outlived its session change nothing in the next one", async () => {
+      const { result } = await ready();
+      const confirmation = deferredValue<ReturnType<typeof sidebar>>();
+      mockFetchSidebarData.mockReturnValueOnce(confirmation.promise);
+      act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+      act(() => setTokens("session-a-rotated", "refresh"));
+      // A logout and a login of C while the check is out.
+      act(() => clearTokens());
+      mockFetchSidebarData.mockResolvedValue(sidebar(readState(4, 2), {}, "user-c"));
+      act(() => setTokens("session-c"));
+      await waitFor(() => expect(result.current.state).toMatchObject({ currentUserId: "user-c" }));
+
+      await act(async () => confirmation.reject(new Error("offline")));
+
+      expect(result.current.state).toMatchObject({ status: "ready", currentUserId: "user-c" });
+      expect(mockMarkConversationRead).not.toHaveBeenCalled();
+      // The first load, the check, C's load — the stale check reloads nothing.
+      expect(mockFetchSidebarData).toHaveBeenCalledTimes(3);
+    });
+
+    it("drops the pending cursor and starts over when the identity cannot be confirmed", async () => {
+      const { result } = await ready();
+      mockFetchSidebarData.mockRejectedValueOnce(new Error("offline"));
+      vi.useFakeTimers();
+      try {
+        act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+        act(() => setTokens("session-a-rotated", "refresh"));
+        await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+      } finally {
+        vi.useRealTimers();
+      }
+      await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+      expect(mockMarkConversationRead).not.toHaveBeenCalled();
+      // The confirmation that failed, then one load — no retry loop.
+      expect(mockFetchSidebarData).toHaveBeenCalledTimes(3);
+      expect(rowB(result.current.state).readThrough).toBeUndefined();
+    });
+
+    it("asks nothing extra for a refresh before anything was loaded", async () => {
+      const first = deferredValue<ReturnType<typeof sidebar>>();
+      mockFetchSidebarData.mockReturnValueOnce(first.promise);
+      const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+      act(() => setTokens("session-a-rotated", "refresh"));
+      await act(async () => first.resolve(sidebar(readState(5, 0))));
+
+      await waitFor(() => expect(result.current.state.status).toBe("ready"));
+      expect(mockFetchSidebarData).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("lets a write in flight when the token is replaced land without touching the new session", async () => {

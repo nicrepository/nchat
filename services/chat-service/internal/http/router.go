@@ -38,6 +38,17 @@ const messageForwardRateLimit = 20
 // pinActionRateLimit is the maximum number of pin/unpin writes per user/minute.
 const pinActionRateLimit = 10
 
+// readCursorRateLimit is the per-user budget for POST …/read (issue #1082,
+// security review SR-002), sized from the read cursor writer's cadence rather
+// than from the pin budget it used to share. The writer coalesces a reading
+// session into at most one write per 400ms window per conversation, plus a
+// round trip — 150 a minute at most with an instant network, ~120 at a 100ms
+// round trip. Only the tab the reader is looking at reads, so tabs do not add
+// up. The headroom above 150 covers what the cadence does not: the terminal
+// flush as a page goes away, a flush as a tab is hidden, and explicit "mark as
+// read" clicks. A client past it is not reading — it is flooding.
+const readCursorRateLimit = 180
+
 // mentionSearchRateLimit limits autocomplete enumeration independently from messages.
 const mentionSearchRateLimit = 30
 
