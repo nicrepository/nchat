@@ -174,14 +174,18 @@ type sidebarDMCounterpartJSON struct {
 // and the same deliberate minimalism as their sidebarChannelJSON counterparts,
 // so one ordering rule serves all three sections.
 type sidebarDMJSON struct {
-	ID            string                    `json:"id"`
-	Type          string                    `json:"type"` // "direct" | "group"
-	Name          string                    `json:"name"` // computed display name
-	Counterpart   *sidebarDMCounterpartJSON `json:"counterpart,omitempty"`
-	CreatedAt     string                    `json:"created_at"`
-	LastMessageAt *string                   `json:"last_message_at"`
-	PinnedAt      *string                   `json:"pinned_at"`
-	UnreadCount   int                       `json:"unread_count"`
+	ID          string                    `json:"id"`
+	Type        string                    `json:"type"` // "direct" | "group"
+	Name        string                    `json:"name"` // computed display name
+	Counterpart *sidebarDMCounterpartJSON `json:"counterpart,omitempty"`
+	// AvatarEmoji is a group's emoji identity (issue #1026), omitted when the
+	// group is Automático — absence is the mode, so an older client that
+	// ignores the field renders exactly what it rendered before.
+	AvatarEmoji   string  `json:"avatar_emoji,omitempty"`
+	CreatedAt     string  `json:"created_at"`
+	LastMessageAt *string `json:"last_message_at"`
+	PinnedAt      *string `json:"pinned_at"`
+	UnreadCount   int     `json:"unread_count"`
 	// Same contract as sidebarChannelJSON's read_through (issue #1082).
 	ReadThrough *readThroughJSON `json:"read_through"`
 	// Muted is this viewer's own notification preference (issue #527), and
@@ -356,6 +360,7 @@ func mapDMs(dms []domain.DMConversationWithParticipantIDs) []sidebarDMJSON {
 			Type:              string(dm.Type),
 			Name:              name,
 			Counterpart:       mapDMCounterpart(dm, name),
+			AvatarEmoji:       dm.AvatarEmoji,
 			CreatedAt:         formatSidebarTime(dm.CreatedAt),
 			LastMessageAt:     formatSidebarTimePtr(dm.LastMessageAt),
 			PinnedAt:          formatSidebarTimePtr(dm.PinnedAt),

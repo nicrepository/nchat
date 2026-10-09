@@ -322,7 +322,9 @@ test.describe("chamada 1:1", () => {
 
     const dialog = page.getByLabel(`Chamada com ${participantName}`);
     await expect(dialog.getByRole("button", { name: "Encerrar chamada" })).toBeVisible();
-    expect(sidebarRequests).toBe(2);
+    // #1048 reconciles the sidebar after subscriptions are acknowledged,
+    // once identity loading has made the conversation targets available.
+    await expect.poll(() => sidebarRequests).toBe(3);
     // RF-23: an active call restored this way (never locally started or
     // accepted by this tab) must not request media on its own, however long
     // identity took to resolve — only the explicit activation click may.

@@ -105,6 +105,8 @@
   position: fixed;
   z-index: 430;
   width: min(248px, calc(100vw - 16px));
+  max-height: calc(100dvh - 16px);
+  overflow-y: auto;
   box-sizing: border-box;
   padding: 6px;
   border: 1px solid var(--color-border, #e8e3f0);
@@ -130,10 +132,15 @@
   background: var(--color-surface-2, #faf8fd);
 }
 .ownership-member-menu .ownership-member-menu__danger {
+  color: var(--color-danger, #b42318);
+}
+.ownership-member-menu .ownership-member-menu__separated {
   margin-top: 4px;
   border-top: 1px solid var(--color-border, #e8e3f0);
   border-radius: 0 0 6px 6px;
-  color: var(--color-danger, #b42318);
+}
+.ownership-member-menu__mobile-heading {
+  display: none;
 }
 .ownership-roster__leave {
   display: block;
@@ -170,7 +177,7 @@
 }
 .ownership-dialog {
   box-sizing: border-box;
-  width: min(440px, calc(100vw - 32px));
+  width: min(480px, calc(100vw - 32px));
   max-height: calc(100dvh - 32px);
   overflow-y: auto;
   padding: 24px;
@@ -188,14 +195,16 @@
   display: flex;
   align-items: center;
   gap: 12px;
-  margin-bottom: 18px;
+  margin-bottom: 20px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--color-border, #e8e3f0);
 }
 .ownership-dialog__icon {
   display: grid;
   place-items: center;
   flex: none;
-  width: 38px;
-  height: 38px;
+  width: 44px;
+  height: 44px;
   border-radius: 10px;
   font-size: 22px;
   color: var(--color-primary, #6d28d9);
@@ -250,20 +259,6 @@
   font: inherit;
   font-size: 13px;
 }
-.ownership-dialog .ownership-dialog__checkbox {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 12px 0;
-  border-top: 1px solid var(--color-border, #e8e3f0);
-  font-weight: 400;
-}
-.ownership-dialog__checkbox input {
-  width: 16px;
-  height: 16px;
-  margin: 0;
-  accent-color: var(--color-primary, #6d28d9);
-}
 .ownership-dialog__buttons {
   display: flex;
   justify-content: flex-end;
@@ -271,7 +266,7 @@
   margin-top: 22px;
 }
 .ownership-dialog__buttons button {
-  min-height: 38px;
+  min-height: 44px;
   padding: 0 16px;
   border: 1px solid var(--color-border, #e8e3f0);
   border-radius: 10px;
@@ -316,5 +311,285 @@
   }
   .ownership-dialog__buttons button {
     flex: 1;
+  }
+}
+/* Reuse the product's PresenceStatusMenu bottom-sheet pattern. */
+@media (max-width: 640px) {
+  .ownership-member-menu {
+    top: auto;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    max-height: 80dvh;
+    border-radius: 12px 12px 0 0;
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
+  }
+  .ownership-member-menu button {
+    min-height: 44px;
+  }
+  .ownership-member-menu__mobile-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding-left: 10px;
+    font-size: 13px;
+    font-weight: 600;
+    overflow-wrap: anywhere;
+  }
+  .ownership-member-menu__mobile-heading button {
+    flex: none;
+    width: 44px;
+    padding: 8px;
+    text-align: center;
+  }
+}
+
+/* Ownership choices use the same surface and primary tokens as chat. */
+.ownership-dialog__subtitle {
+  display: block;
+  margin-top: 5px;
+  color: var(--color-muted, #7c7390);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.ownership-dialog[data-action="leave"] .ownership-dialog__icon {
+  color: var(--color-danger, #b42318);
+  background: var(--color-danger-tint, #fdeceb);
+}
+.ownership-dialog .ownership-dialog__consequence {
+  color: var(--color-ink, #16121f);
+  font-weight: 600;
+}
+.ownership-picker__search-field {
+  position: relative;
+  display: block;
+}
+.ownership-picker__search-field > .material-symbols-outlined {
+  position: absolute;
+  top: 50%;
+  left: 12px;
+  transform: translateY(-50%);
+  font-size: 20px;
+  color: var(--color-muted, #7c7390);
+  pointer-events: none;
+}
+.ownership-dialog input[type="search"] {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  box-sizing: border-box;
+  padding: 10px 12px 10px 40px;
+  border: 1px solid var(--color-border-strong, #d4cde3);
+  border-radius: 10px;
+  background: var(--color-surface, #fff);
+  color: var(--color-ink, #16121f);
+  font: inherit;
+  font-weight: 400;
+  font-size: 13px;
+}
+.ownership-dialog input[type="search"]::placeholder {
+  color: var(--color-muted, #7c7390);
+}
+.ownership-picker,
+.ownership-dialog__roles {
+  border: 0;
+  padding: 0;
+  margin: 20px 0;
+  min-width: 0;
+  font-size: 12px;
+}
+.ownership-picker {
+  max-height: 204px;
+  overflow-y: auto;
+  padding: 2px 4px 4px;
+  margin-inline: -4px;
+  scrollbar-width: thin;
+}
+.ownership-picker legend,
+.ownership-dialog__roles legend {
+  font-weight: 600;
+  margin-bottom: 10px;
+  padding: 0;
+}
+.ownership-dialog .ownership-picker__option,
+.ownership-dialog__roles label {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 60px;
+  box-sizing: border-box;
+  padding: 12px;
+  margin: 0 0 8px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 10px;
+  background: var(--color-surface, #fff);
+  cursor: pointer;
+}
+.ownership-dialog .ownership-picker__option:last-child {
+  margin-bottom: 0;
+}
+.ownership-picker__option .ownership-picker__person {
+  flex: 1;
+}
+.ownership-picker__option:has(input:checked),
+.ownership-dialog__roles label:has(input:checked) {
+  border-color: var(--color-primary, #6d28d9);
+  background: var(--color-primary-tint, #f3ebfb);
+}
+.ownership-picker__option:hover:not(:has(input:disabled)),
+.ownership-dialog__roles label:hover:not(:has(input:disabled)) {
+  border-color: var(--color-primary, #6d28d9);
+}
+.ownership-dialog input[type="radio"] {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--color-primary, #6d28d9);
+}
+.ownership-picker__option:has(input:focus-visible),
+.ownership-dialog__roles label:has(input:focus-visible) {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+.ownership-picker__option:has(input:disabled),
+.ownership-dialog__roles label:has(input:disabled) {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.ownership-picker__person {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.ownership-picker__person > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.ownership-picker__person .user-avatar__image {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+.ownership-picker__person .ownership-picker__avatar {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary-strong, #5b21b6);
+  font-size: 12px;
+  font-weight: 600;
+}
+.ownership-picker__person strong,
+.ownership-picker__person small,
+.ownership-dialog__roles strong,
+.ownership-dialog__roles small {
+  display: block;
+}
+.ownership-picker__person strong {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.ownership-picker__person small,
+.ownership-dialog__roles small {
+  margin-top: 3px;
+  color: var(--color-muted, #7c7390);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.5;
+}
+.ownership-dialog__roles {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.ownership-dialog__roles label {
+  align-items: flex-start;
+  margin: 0;
+}
+.ownership-dialog__roles input {
+  margin-top: 2px;
+}
+.ownership-dialog__successor {
+  margin: 16px 0;
+  padding: 16px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-left: 3px solid var(--color-primary, #6d28d9);
+  border-radius: 10px;
+  background: var(--color-surface-2, #faf8fd);
+}
+.ownership-dialog__successor > span:first-child {
+  display: block;
+  margin-bottom: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-muted, #7c7390);
+}
+.ownership-dialog__successor .ownership-dialog__successor-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border, #e8e3f0);
+  color: var(--color-primary-strong, #5b21b6);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.ownership-dialog__successor-note .material-symbols-outlined {
+  font-size: 16px;
+}
+.ownership-dialog__secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 8px;
+  background: var(--color-surface, #fff);
+  color: var(--color-primary-strong, #5b21b6);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ownership-dialog__secondary .material-symbols-outlined {
+  font-size: 18px;
+}
+.ownership-dialog__secondary:hover:not(:disabled) {
+  background: var(--color-primary-tint, #f3ebfb);
+}
+.ownership-dialog__secondary:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.ownership-dialog__buttons {
+  flex-wrap: wrap;
+  padding-top: 20px;
+  border-top: 1px solid var(--color-border, #e8e3f0);
+}
+@media (max-width: 480px) {
+  .ownership-dialog h3 {
+    font-size: 18px;
+  }
+  .ownership-dialog__roles {
+    grid-template-columns: 1fr;
+  }
+  .ownership-dialog__roles label {
+    min-height: 52px;
+    padding: 10px 12px;
+  }
+  .ownership-picker {
+    max-height: 172px;
   }
 }

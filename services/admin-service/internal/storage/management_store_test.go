@@ -232,17 +232,7 @@ func TestGetUser_NotFound(t *testing.T) {
 // write.
 func TestUpdateUserStatus_ValidatesUnderTheLockAndRevokesSessions(t *testing.T) {
 	mock := newMock(t)
-	mock.ExpectBegin()
-	mock.ExpectExec(`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`).WillReturnResult(pgxmock.NewResult("SET", 0))
-	mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(false))
-	mock.ExpectQuery(`FOR UPDATE`).WithArgs(userA).
-		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
-	// The authorization anchor: a privileged write in flight must not commit
-	// after this suspension. See mutation_authorization.go.
-	mock.ExpectExec(`SELECT 1 FROM auth.admin_principals`).WithArgs(userA).
-		WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	mock.ExpectExec(`UPDATE auth.users`).WithArgs(userA, "suspended").
-		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	expectSuspensionPromotion(mock)
 	mock.ExpectQuery(`UPDATE auth.user_sessions`).WithArgs(userA, "admin_suspension").
 		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(2))
 	mock.ExpectExec(`UPDATE auth.oidc_exchange_codes`).WithArgs(userA).
@@ -257,6 +247,9 @@ func TestUpdateUserStatus_ValidatesUnderTheLockAndRevokesSessions(t *testing.T) 
 	if change.FromStatus != "active" || change.ToStatus != "suspended" || change.RevokedSessions != 2 {
 		t.Fatalf("unexpected change %+v", change)
 	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // Activation restores nothing. No session is resurrected and no OIDC exchange
@@ -265,7 +258,8 @@ func TestUpdateUserStatus_ActivationRestoresNothing(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectBegin()
 	mock.ExpectExec(`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`).WillReturnResult(pgxmock.NewResult("SET", 0))
-	mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(false))
+	mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(true))
+	mock.ExpectExec(`SELECT chat.lock_user_ownership_conversations`).WithArgs(userA).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`FOR UPDATE`).WithArgs(userA).
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("suspended"))
 	mock.ExpectExec(`SELECT 1 FROM auth.admin_principals`).WithArgs(userA).
@@ -340,6 +334,9 @@ func TestRevokeUserSessions_ReportsHowManyEnded(t *testing.T) {
 	}
 	if revoked != 3 {
 		t.Fatalf("expected 3 revoked sessions, got %d", revoked)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }
 

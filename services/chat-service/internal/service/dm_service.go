@@ -64,6 +64,9 @@ type CreateGroupConversationInput struct {
 	CallerID           string
 	ParticipantUserIDs []string
 	Title              string
+	// AvatarEmoji is the optional group identity (issue #1026). Empty is
+	// Automático; anything else must be one catalogued emoji sequence.
+	AvatarEmoji string
 }
 
 // GetDMConversationInput identifies a visible DM conversation read.
@@ -192,7 +195,7 @@ func (s *DMService) CreateGroupConversation(ctx context.Context, input CreateGro
 	if err != nil {
 		return domain.DMConversation{}, err
 	}
-	title, err := normalizeDMTitle(input.Title)
+	title, err := normalizeNewGroupIdentity(input.Title, input.AvatarEmoji)
 	if err != nil {
 		return domain.DMConversation{}, err
 	}
@@ -220,6 +223,7 @@ func (s *DMService) CreateGroupConversation(ctx context.Context, input CreateGro
 		WorkspaceID:        workspaceID,
 		CreatedBy:          callerID,
 		Title:              title,
+		AvatarEmoji:        input.AvatarEmoji,
 		ParticipantUserIDs: canonicalParticipants,
 	})
 	if err != nil {
@@ -736,6 +740,71 @@ func (s *DMService) RenameGroup(ctx context.Context, input RenameGroupInput) (st
 		CallerID:       callerID,
 		Title:          title,
 	})
+}
+
+// GroupAvatarInput carries an actor, a target and, for a set, the emoji. The
+// workspace is the server's; authority is re-derived by the store (#1026).
+type GroupAvatarInput struct {
+	WorkspaceID    string
+	CallerID       string
+	ConversationID string
+	AvatarEmoji    string
+}
+
+// SetGroupAvatar gives a group an emoji identity. The value must be exactly
+// one sequence of the catalog this service already validates reactions with
+// (#496): no trimming, no normalisation, so a ZWJ or skin-tone sequence is
+// stored as the code points the picker produced.
+func (s *DMService) SetGroupAvatar(ctx context.Context, input GroupAvatarInput) error {
+	if err := validateGroupAvatarEmoji(input.AvatarEmoji); err != nil {
+		return err
+	}
+	return s.writeGroupAvatar(ctx, input)
+}
+
+// ClearGroupAvatar returns a group to Automático by removing its emoji.
+func (s *DMService) ClearGroupAvatar(ctx context.Context, input GroupAvatarInput) error {
+	input.AvatarEmoji = ""
+	return s.writeGroupAvatar(ctx, input)
+}
+
+func (s *DMService) writeGroupAvatar(ctx context.Context, input GroupAvatarInput) error {
+	if strings.TrimSpace(input.WorkspaceID) == "" || strings.TrimSpace(input.ConversationID) == "" {
+		return fmt.Errorf("%w: workspace_id and conversation_id are required", domain.ErrInvalidInput)
+	}
+	callerID, err := canonicalizeUserID(input.CallerID)
+	if err != nil {
+		return err
+	}
+	return s.dms.SetGroupAvatarEmoji(ctx, storage.SetGroupAvatarInput{
+		WorkspaceID:    input.WorkspaceID,
+		ConversationID: input.ConversationID,
+		CallerID:       callerID,
+		AvatarEmoji:    input.AvatarEmoji,
+	})
+}
+
+// normalizeNewGroupIdentity validates what a new group is called and drawn
+// with (issue #1026): the optional title, and the optional emoji — absent is
+// Automático, anything else must be one catalogued sequence. It returns the
+// normalised title; the emoji is stored exactly as sent.
+func normalizeNewGroupIdentity(title, avatarEmoji string) (string, error) {
+	if avatarEmoji != "" {
+		if err := validateGroupAvatarEmoji(avatarEmoji); err != nil {
+			return "", err
+		}
+	}
+	return normalizeDMTitle(title)
+}
+
+// validateGroupAvatarEmoji admits exactly one catalogued Unicode sequence.
+// The catalog is the generated authority shared with the web picker; HTML, a
+// shortcode, plain text or two emoji are simply not keys in it.
+func validateGroupAvatarEmoji(emoji string) error {
+	if !IsAllowedReactionEmoji(emoji) {
+		return fmt.Errorf("%w: avatar_emoji must be one supported emoji", domain.ErrInvalidInput)
+	}
+	return nil
 }
 
 // LeaveGroup removes the caller's own participation in a group.

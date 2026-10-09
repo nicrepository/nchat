@@ -1,5 +1,11 @@
-import { describe, expect, it } from "vitest";
-import { parseOwnership } from "./ownershipApi";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { authenticatedFetch } from "../lib/authClient";
+import {
+  assignConversationRole,
+  leaveOwnedConversation,
+  transferConversationOwnership,
+  parseOwnership,
+} from "./ownershipApi";
 
 describe("ownership capabilities", () => {
   it("fails closed for missing and malformed capabilities", () => {
@@ -41,4 +47,52 @@ describe("ownership capabilities", () => {
     expect(parsed?.members[1].actions.assignRole).toBe(false);
     expect(parsed?.leavePreview.blocked).toBe(false);
   });
+});
+
+vi.mock("../lib/authClient", () => ({ authenticatedFetch: vi.fn() }));
+beforeEach(() => vi.mocked(authenticatedFetch).mockReset());
+describe("ownership request contracts", () => {
+  it.each(["channel", "group"] as const)(
+    "uses the %s APIs and only supported inputs",
+    async (kind) => {
+      const root = `/api/chat/${kind === "channel" ? "channels" : "dm"}/conversation`;
+      await assignConversationRole(kind, "conversation", "target", "owner");
+      expect(authenticatedFetch).toHaveBeenLastCalledWith(`${root}/members/target/role`, {
+        method: "PATCH",
+        body: JSON.stringify({ role: "owner" }),
+      });
+      for (const role of ["admin", "member"] as const) {
+        await transferConversationOwnership(
+          kind,
+          "conversation",
+          "target",
+          role,
+          false,
+          "intent-key",
+        );
+        expect(authenticatedFetch).toHaveBeenLastCalledWith(`${root}/ownership/transfer`, {
+          method: "POST",
+          headers: { "Idempotency-Key": "intent-key" },
+          body: JSON.stringify({ new_owner_user_id: "target", actor_new_role: role }),
+        });
+      }
+      await transferConversationOwnership(
+        kind,
+        "conversation",
+        "manual",
+        "member",
+        true,
+        "leave-key",
+      );
+      expect(authenticatedFetch).toHaveBeenLastCalledWith(`${root}/ownership/transfer-and-leave`, {
+        method: "POST",
+        headers: { "Idempotency-Key": "leave-key" },
+        body: JSON.stringify({ new_owner_user_id: "manual", actor_new_role: "member" }),
+      });
+      await leaveOwnedConversation(kind, "conversation");
+      expect(authenticatedFetch).toHaveBeenLastCalledWith(`${root}/membership`, {
+        method: "DELETE",
+      });
+    },
+  );
 });

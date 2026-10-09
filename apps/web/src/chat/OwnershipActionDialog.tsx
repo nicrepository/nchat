@@ -1,152 +1,36 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, type KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
-import { ApiRequestError } from "../lib/api";
-import { randomId } from "../lib/randomId";
-import {
-  assignConversationRole,
-  leaveOwnedConversation,
-  transferConversationOwnership,
-  type OwnershipDetails,
-  type OwnershipMember,
-} from "./ownershipApi";
+import type { OwnershipDetails } from "./ownershipApi";
 import { type OwnershipAction as Action, roleLabels } from "./ownershipPresentation";
+import { ownershipCopy as copy } from "./ownershipDialogState";
+import { useOwnershipSubmit } from "./useOwnershipSubmit";
+import OwnershipTargetPicker, { OwnershipPerson } from "./OwnershipTargetPicker";
+import { useOwnershipSelection } from "./useOwnershipSelection";
+import type { OwnershipSubmitState } from "./ownershipDialogState";
+import "./OwnershipRoster.css";
 
 export interface OwnershipDialogContext {
   kind: "channel" | "group";
   id: string;
   ownership: OwnershipDetails;
   currentUserId: string;
+  workspaceId?: string;
+  projectionStatus?: "ready" | "error";
   reload: () => void;
   onCommitted?: (message: string) => void;
 }
-type Props = OwnershipDialogContext;
 
-function ownershipError(error: unknown): string {
-  if (error instanceof ApiRequestError && error.status === 409)
-    return "A propriedade mudou ou não há sucessor elegível. Atualize os detalhes e tente novamente.";
-  return "Não foi possível concluir. Atualize os detalhes e tente novamente.";
+function title(action: Action) {
+  if (action.type === "role") return `Tornar ${roleLabels[action.role].toLowerCase()}`;
+  return action.type === "transfer" ? "Transferir minha propriedade" : copy.leave;
 }
 
-type TransferSelection = { target: string; actorRole: "admin" | "member"; leave: boolean };
-
-async function performOwnershipAction(
-  action: Action,
-  props: Props,
-  selection: TransferSelection,
-  request: { body: string; key: string },
-) {
-  switch (action.type) {
-    case "role":
-      return assignConversationRole(props.kind, props.id, action.member.userId, action.role);
-    case "leave":
-      return leaveOwnedConversation(props.kind, props.id);
-    case "transfer": {
-      const { target, actorRole, leave } = selection;
-      const body = JSON.stringify([target, actorRole, leave]);
-      if (request.body !== body) {
-        request.body = body;
-        request.key = randomId();
-      }
-      return transferConversationOwnership(
-        props.kind,
-        props.id,
-        target,
-        actorRole,
-        leave,
-        request.key,
-      );
-    }
-  }
-}
-
-function ownershipActionTitle(action: Action): string {
-  switch (action.type) {
-    case "transfer":
-      return "Transferir minha propriedade";
-    case "leave":
-      return "Sair da conversa";
-    case "role":
-      return `Tornar ${roleLabels[action.role].toLowerCase()}`;
-  }
-}
-
-function OwnershipTransferFields({
-  busy,
-  candidates,
-  target,
-  setTarget,
-  actorRole,
-  setActorRole,
-  leave,
-  setLeave,
-}: TransferSelection & {
-  busy: boolean;
-  candidates: OwnershipMember[];
-  setTarget: (value: string) => void;
-  setActorRole: (value: "admin" | "member") => void;
-  setLeave: (value: boolean) => void;
-}) {
-  return (
-    <>
-      <p>O participante escolhido se torna proprietário. Escolha seu papel após a transferência.</p>
-      <label>
-        Novo proprietário
-        <select value={target} onChange={(event) => setTarget(event.target.value)} disabled={busy}>
-          <option value="">Escolha um participante</option>
-          {candidates.map((member) => (
-            <option key={member.userId} value={member.userId}>
-              {member.displayName}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label>
-        Meu papel
-        <select
-          value={actorRole}
-          disabled={busy}
-          onChange={(event) => setActorRole(event.target.value === "admin" ? "admin" : "member")}
-        >
-          <option value="member">Membro</option>
-          <option value="admin">Administrador</option>
-        </select>
-      </label>
-      <label className="ownership-dialog__checkbox">
-        <input
-          type="checkbox"
-          checked={leave}
-          disabled={busy}
-          onChange={(event) => setLeave(event.target.checked)}
-        />
-        Sair após transferir
-      </label>
-    </>
-  );
-}
-
-function OwnershipLeaveWarning({
-  lastOwner,
-  blocked,
-  successor,
-}: {
-  lastOwner: boolean;
-  blocked: boolean;
-  successor?: OwnershipMember;
-}) {
-  return (
-    <>
-      <p>Você perderá acesso à conversa e ao histórico até ser adicionado novamente.</p>
-      {lastOwner && (
-        <p>
-          {successor
-            ? `${successor.displayName} assumirá a propriedade automaticamente.`
-            : blocked
-              ? "Não há sucessor automático elegível. Escolha um proprietário antes de sair."
-              : "Você é o último participante."}
-        </p>
-      )}
-    </>
-  );
+function confirmLabel(action: Action, ownership: OwnershipDetails) {
+  if (action.type === "role") return "Confirmar";
+  if (action.type === "transfer") return copy.transfer;
+  return ownership.leavePreview.lastOwner && ownership.members.length > 1
+    ? copy.leaveTransfer
+    : copy.leave;
 }
 
 export default function OwnershipActionDialog({
@@ -155,123 +39,267 @@ export default function OwnershipActionDialog({
   onClose,
 }: {
   action: Action;
-  props: Props;
+  props: OwnershipDialogContext;
   onClose: () => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
-  const pending = useRef(false);
-  const mounted = useRef(true);
-  useLayoutEffect(() => {
-    mounted.current = true;
-    return () => {
-      mounted.current = false;
-    };
-  }, []);
-  const request = useRef<{ body: string; key: string }>({ body: "", key: "" });
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const [target, setTarget] = useState("");
-  const [actorRole, setActorRole] = useState<"admin" | "member">("member");
-  const [leave, setLeave] = useState(false);
-  const candidates = props.ownership.members.filter(
-    (member) => member.actions.transfer === true && member.userId !== props.currentUserId,
-  );
-  const successor = props.ownership.members.find(
-    (member) => member.userId === props.ownership.leavePreview.successorUserId,
-  );
+  const cancel = useRef<HTMLButtonElement>(null);
+  const ids = useId();
+  function finishClose() {
+    dialog.current?.close();
+    onClose();
+  }
+  const flow = useOwnershipSubmit(action, props, finishClose);
+  const selection = useOwnershipSelection(action, props, flow.state, flow.newIntent);
+  const { busy, refreshing, canSubmit, needsTarget, target, actorRole } = selection;
+  const errorId = "error" in flow.state ? `${ids}-error` : undefined;
   useEffect(() => {
     const element = dialog.current;
     element?.showModal();
+    cancel.current?.focus({ preventScroll: true });
     return () => element?.close();
   }, []);
-  async function submit() {
-    if (pending.current) return;
-    pending.current = true;
-    setBusy(true);
-    setError("");
-    try {
-      await performOwnershipAction(action, props, { target, actorRole, leave }, request.current);
-      if (mounted.current) {
-        props.onCommitted?.("Alteração concluída.");
-        props.reload();
-        onClose();
-      }
-    } catch (failure) {
-      if (mounted.current) {
-        setError(ownershipError(failure));
-      }
-    } finally {
-      pending.current = false;
-      if (mounted.current) setBusy(false);
-    }
+  function close() {
+    if (!flow.pending.current) finishClose();
   }
-  const title = ownershipActionTitle(action);
-  const blocked = action.type === "leave" && props.ownership.leavePreview.blocked;
+  function submit() {
+    if (!canSubmit) return;
+    void flow.submit({ target: needsTarget ? target : "", actorRole });
+  }
   return createPortal(
     <dialog
       ref={dialog}
       className="ownership-dialog chat-theme"
-      aria-labelledby="ownership-dialog-title"
-      aria-describedby="ownership-dialog-description"
+      data-action={action.type}
+      aria-labelledby={`${ids}-title`}
+      aria-describedby={`${ids}-description`}
       aria-modal="true"
       onCancel={(event) => {
         event.preventDefault();
-        if (!busy) onClose();
+        close();
       }}
-      onKeyDown={(event) => event.stopPropagation()}
+      onKeyDown={trapDialogFocus}
     >
       <div className="ownership-dialog__heading">
         <span className="ownership-dialog__icon material-symbols-outlined" aria-hidden="true">
           {ownershipActionIcon(action)}
         </span>
-        <h3 id="ownership-dialog-title">{title}</h3>
+        <div>
+          <h3 id={`${ids}-title`}>{title(action)}</h3>
+          <span className="ownership-dialog__subtitle">Responsabilidade da conversa</span>
+        </div>
       </div>
-      <div id="ownership-dialog-description">
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          submit();
+        }}
+        aria-describedby={errorId}
+        aria-busy={busy || refreshing}
+      >
+        <OwnershipFields action={action} props={props} selection={selection} ids={ids} />
+        <OwnershipNotices
+          state={flow.state}
+          unavailable={selection.unavailable}
+          ids={ids}
+          reload={props.reload}
+        />
+        <div className="ownership-dialog__buttons">
+          <button ref={cancel} type="button" autoFocus disabled={busy} onClick={close}>
+            {copy.cancel}
+          </button>
+          <button
+            type="submit"
+            className={`ownership-dialog__confirm${action.type === "leave" ? " ownership-dialog__confirm--danger" : ""}`}
+            disabled={!canSubmit}
+            aria-describedby={errorId}
+          >
+            {busy ? copy.submitting : confirmLabel(action, props.ownership)}
+          </button>
+        </div>
+      </form>
+    </dialog>,
+    document.body,
+  );
+}
+
+function OwnershipFields({
+  action,
+  props,
+  selection,
+  ids,
+}: {
+  action: Action;
+  props: OwnershipDialogContext;
+  selection: ReturnType<typeof useOwnershipSelection>;
+  ids: string;
+}) {
+  const workspaceId = props.workspaceId ?? "";
+  return (
+    <>
+      <div id={`${ids}-description`}>
         <OwnershipRoleDescription action={action} />
         {action.type === "transfer" && (
-          <OwnershipTransferFields
-            busy={busy}
-            candidates={candidates}
-            target={target}
-            setTarget={setTarget}
-            actorRole={actorRole}
-            setActorRole={setActorRole}
-            leave={leave}
-            setLeave={setLeave}
-          />
+          <p>
+            O participante escolhido se torna proprietário. Você deixa de ser proprietário e assume
+            o papel escolhido.
+          </p>
         )}
         {action.type === "leave" && (
-          <OwnershipLeaveWarning
-            lastOwner={props.ownership.leavePreview.lastOwner}
-            blocked={blocked}
-            successor={successor}
+          <OwnershipLeaveFields
+            ownership={props.ownership}
+            successor={selection.successor}
+            manual={selection.manual}
+            selected={selection.selected}
+            workspaceId={workspaceId}
           />
         )}
       </div>
+      <OwnershipManualChoice action={action} props={props} selection={selection} />
+      {selection.needsTarget && (
+        <OwnershipTargetPicker
+          candidates={selection.candidates}
+          target={selection.selected?.userId ?? ""}
+          onChange={selection.changeTarget}
+          disabled={selection.fieldsDisabled}
+          workspaceId={workspaceId}
+        />
+      )}
+      {action.type === "transfer" && <OwnershipActorRole ids={ids} selection={selection} />}
+    </>
+  );
+}
+function OwnershipManualChoice({
+  action,
+  props,
+  selection,
+}: {
+  action: Action;
+  props: OwnershipDialogContext;
+  selection: ReturnType<typeof useOwnershipSelection>;
+}) {
+  if (
+    action.type !== "leave" ||
+    !props.ownership.leavePreview.lastOwner ||
+    props.ownership.members.length <= 1
+  )
+    return null;
+  return (
+    <button
+      className="ownership-dialog__secondary"
+      type="button"
+      disabled={selection.fieldsDisabled}
+      onClick={selection.toggleManual}
+    >
+      <span className="material-symbols-outlined" aria-hidden="true">
+        swap_horiz
+      </span>
+      {selection.manual ? copy.automatic : copy.chooseAnother}
+    </button>
+  );
+}
+function OwnershipActorRole({
+  ids,
+  selection,
+}: {
+  ids: string;
+  selection: ReturnType<typeof useOwnershipSelection>;
+}) {
+  return (
+    <fieldset className="ownership-dialog__roles" disabled={selection.fieldsDisabled}>
+      <legend>{copy.actorRole}</legend>
+      {(["admin", "member"] as const).map((role) => (
+        <label key={role}>
+          <input
+            type="radio"
+            aria-label={roleLabels[role]}
+            aria-describedby={`${ids}-role-${role}`}
+            name={`${ids}-role`}
+            checked={selection.actorRole === role}
+            onChange={() => selection.changeRole(role)}
+          />
+          <span>
+            <strong>{roleLabels[role]}</strong>
+            <small id={`${ids}-role-${role}`}>{actorRoleHints[role]}</small>
+          </span>
+        </label>
+      ))}
+    </fieldset>
+  );
+}
+function OwnershipNotices({
+  state,
+  unavailable,
+  ids,
+  reload,
+}: {
+  state: OwnershipSubmitState;
+  unavailable: boolean;
+  ids: string;
+  reload: () => void;
+}) {
+  const error = "error" in state ? state.error : "";
+  const refreshing = state.phase === "conflict";
+  return (
+    <>
       {error && (
-        <p className="ownership-dialog__error" role="alert">
+        <p id={`${ids}-error`} className="ownership-dialog__error" role="alert">
           {error}
         </p>
       )}
-      <div className="ownership-dialog__buttons">
-        <button type="button" autoFocus disabled={busy} onClick={onClose}>
-          Cancelar
+      {refreshing && !unavailable && <p role="status">{copy.refreshing}</p>}
+      {unavailable && <p role="alert">{copy.refreshError}</p>}
+      {(refreshing || unavailable) && (
+        <button className="ownership-dialog__secondary" type="button" onClick={reload}>
+          {copy.refresh}
         </button>
-        <button
-          type="button"
-          className={
-            action.type === "leave"
-              ? "ownership-dialog__confirm ownership-dialog__confirm--danger"
-              : "ownership-dialog__confirm"
-          }
-          disabled={busy || blocked || (action.type === "transfer" && target === "")}
-          onClick={() => void submit()}
-        >
-          {busy ? "Confirmando…" : "Confirmar"}
-        </button>
-      </div>
-    </dialog>,
-    document.body,
+      )}
+    </>
+  );
+}
+
+function OwnershipLeaveFields({
+  ownership,
+  successor,
+  manual,
+  selected,
+  workspaceId,
+}: {
+  ownership: OwnershipDetails;
+  successor?: OwnershipDetails["members"][number];
+  manual: boolean;
+  selected?: OwnershipDetails["members"][number];
+  workspaceId: string;
+}) {
+  const preview = ownership.leavePreview;
+  if (!preview.lastOwner) return <p>Você deixará de participar da conversa.</p>;
+  if (ownership.members.length === 1 && !preview.blocked) return <p>{copy.empty}</p>;
+  const person = manual ? selected : successor;
+  return (
+    <>
+      <p className="ownership-dialog__consequence">{copy.lastOwner}</p>
+      {manual ? (
+        <p>O proprietário escolhido assumirá a responsabilidade quando você sair.</p>
+      ) : (
+        <p>
+          {successor
+            ? `Se sair, ${successor.displayName} será promovido automaticamente.`
+            : copy.blocked}
+        </p>
+      )}
+      {person && (
+        <div className="ownership-dialog__successor">
+          <span>{copy.target}</span>
+          <OwnershipPerson member={person} workspaceId={workspaceId} />
+          <span className="ownership-dialog__successor-note">
+            <span className="material-symbols-outlined" aria-hidden="true">
+              key
+            </span>
+            Assumirá a propriedade quando você sair
+          </span>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -282,6 +310,11 @@ const roleDescriptions = {
     "Poderá editar o nome e remover membros comuns. Não poderá alterar papéis nem administrar outros administradores ou proprietários.",
   member:
     "Poderá participar da conversa e adicionar pessoas quando permitido. Não poderá editar o nome, remover participantes ou alterar papéis.",
+};
+
+const actorRoleHints = {
+  admin: "Edite o nome e gerencie membros comuns.",
+  member: "Continue participando da conversa.",
 };
 
 function ownershipActionIcon(action: Action) {
@@ -301,4 +334,26 @@ function OwnershipRoleDescription({ action }: { action: Action }) {
       <p>{roleDescriptions[action.role]}</p>
     </>
   );
+}
+
+// Same boundary handling as the existing AddMembersDialog, including inputs.
+function trapDialogFocus(event: KeyboardEvent<HTMLDialogElement>) {
+  event.stopPropagation();
+  if (event.key !== "Tab") return;
+  const controls = event.currentTarget.querySelectorAll<HTMLElement>(
+    "button:enabled, input:enabled",
+  );
+  if (!controls.length) {
+    event.preventDefault();
+    return;
+  }
+  const first = controls[0];
+  const last = controls[controls.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }

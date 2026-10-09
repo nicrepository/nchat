@@ -30,6 +30,12 @@ type fakeDMProvider struct {
 	lastLeaveGroup    service.LeaveGroupInput
 	leaveGroupCalls   int
 
+	// Group identity (issue #1026).
+	avatarErr       error
+	lastAvatar      service.GroupAvatarInput
+	setAvatarCalls  int
+	clearAvatarCall int
+
 	// Admin participant removal (issue #685).
 	removeParticipantResult storage.RemoveGroupParticipantResult
 	removeParticipantErr    error
@@ -93,6 +99,18 @@ func (f *fakeDMRateLimiter) AllowActionWithLimit(_ context.Context, userID, acti
 }
 
 // RenameGroup and LeaveGroup record what the handler forwarded (issue #527).
+func (f *fakeDMProvider) SetGroupAvatar(_ context.Context, input service.GroupAvatarInput) error {
+	f.setAvatarCalls++
+	f.lastAvatar = input
+	return f.avatarErr
+}
+
+func (f *fakeDMProvider) ClearGroupAvatar(_ context.Context, input service.GroupAvatarInput) error {
+	f.clearAvatarCall++
+	f.lastAvatar = input
+	return f.avatarErr
+}
+
 func (f *fakeDMProvider) RenameGroup(_ context.Context, input service.RenameGroupInput) (storage.RenameGroupResult, error) {
 	f.renameGroupCalls++
 	f.lastRenameGroup = input

@@ -38,6 +38,8 @@ export interface ConversationViewportInput {
   messages: Message[];
   currentUserId: string;
   hasMore: boolean;
+  /** Older pages that have come back, with a page or an error (#1088). */
+  olderPagesSettled: number;
   lastMutation: LastMutation;
   /** `${kind}:${targetId}` — keys the per-conversation viewport anchor. */
   conversationKey: string;
@@ -113,6 +115,7 @@ export function useConversationViewport(input: ConversationViewportInput): Conve
     messages: input.messages,
     currentUserId: input.currentUserId,
     hasMore: input.hasMore,
+    olderPagesSettled: input.olderPagesSettled,
     unreadCountAtOpen: input.unreadCountAtOpen,
     initialAnchor: input.initialAnchor,
     focusMessageId: input.focusMessageId,
@@ -160,11 +163,15 @@ export function useConversationViewport(input: ConversationViewportInput): Conve
     navigator,
   });
 
+  // #1088: a link the opening could not reach settled on another destination.
+  // That request is spent — a page the reader loads by hand later must not yank
+  // them back to it — but asking again for the same message still travels.
   const { highlightedMessageId, jumpToMessage } = useMessageJump(
     core,
     input.messages,
     input.focusMessageId,
     input.focusRequest,
+    resolution.target !== null && resolution.target !== "MESSAGE_TARGET",
   );
 
   useInfiniteTop(core, input.hasMore, input.onLoadMore);

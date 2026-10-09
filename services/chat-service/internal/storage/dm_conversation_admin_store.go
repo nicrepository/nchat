@@ -178,6 +178,85 @@ func (s *PGXDMStore) RenameGroupConversation(ctx context.Context, input RenameGr
 	return RenameGroupResult{Conversation: conversation, Event: event}, nil
 }
 
+// SetGroupAvatarInput is the whole input of a group identity change (issue
+// #1026). AvatarEmoji has already been validated against the catalog by the
+// service; empty clears it back to Automático.
+type SetGroupAvatarInput struct {
+	WorkspaceID    string
+	ConversationID string
+	CallerID       string
+	AvatarEmoji    string
+}
+
+// SetGroupAvatarEmoji sets or clears a group's identity emoji.
+//
+// It is authorized exactly like the rename — the identity is the same kind of
+// metadata as the name: the legacy rule is participation, taken under the same
+// locks as RenameGroupConversation; when the ownership rollout is enabled the
+// actor must also hold EditMetadata, read inside this transaction rather than
+// trusted from an earlier request. A 1:1 conversation is unreachable for the
+// same structural reason (type = 'group') and is ErrNotFound.
+//
+// No system message is written: the identity is presentation, not an event in
+// the conversation's history, and the rename's message already narrates names.
+func (s *PGXDMStore) SetGroupAvatarEmoji(ctx context.Context, input SetGroupAvatarInput) error {
+	if input.CallerID == "" {
+		return domain.ErrForbidden
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin set group avatar: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := lockGroupForActor(ctx, tx, input.ConversationID, input.WorkspaceID, input.CallerID, renameLocks); err != nil {
+		return err
+	}
+	if err := requireGroupMetadataEditor(ctx, tx, input); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE chat.dm_conversations
+		SET avatar_emoji = NULLIF($3, ''), updated_at = now()
+		WHERE id = $1::uuid AND workspace_id = $2::uuid AND status = 'active' AND type = 'group'`,
+		input.ConversationID, input.WorkspaceID, input.AvatarEmoji,
+	)
+	if err != nil {
+		return fmt.Errorf("set group avatar: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit set group avatar: %w", err)
+	}
+	return nil
+}
+
+// requireGroupMetadataEditor applies the ownership half of the rename's rule:
+// with the rollout disabled participation (already locked) is the whole
+// policy; with it enabled the actor needs the same EditMetadata capability
+// the ownership rename requires.
+func requireGroupMetadataEditor(ctx context.Context, tx pgx.Tx, input SetGroupAvatarInput) error {
+	var enabled bool
+	if err := tx.QueryRow(ctx, `SELECT enabled FROM chat.ownership_rollout WHERE singleton`).Scan(&enabled); err != nil {
+		return fmt.Errorf("read ownership rollout: %w", err)
+	}
+	if !enabled {
+		return nil
+	}
+	details, err := readOwnershipDetails(ctx, tx, OwnershipScope{
+		WorkspaceID: input.WorkspaceID, Kind: "dm", ConversationID: input.ConversationID, ActorID: input.CallerID,
+	})
+	if err != nil {
+		return err
+	}
+	if !details.Capabilities.EditMetadata {
+		return domain.ErrForbidden
+	}
+	return nil
+}
+
 // LeaveGroupConversation removes the actor's own participation and records it.
 //
 // Self-leave only: the actor is the row that is updated, so there is no target

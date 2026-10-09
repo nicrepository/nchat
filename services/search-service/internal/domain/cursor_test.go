@@ -155,3 +155,60 @@ func TestLegacyMessageCursorKeepsThePreviousWireFormat(t *testing.T) {
 		t.Fatal("invalid id must not encode")
 	}
 }
+
+func TestLinkCursorRoundTripAndBinding(t *testing.T) {
+	const id, key = "11111111-1111-4111-8111-111111111111", "abababababababababababababababab"
+	created := time.Date(2026, 9, 1, 9, 41, 0, 0, time.UTC)
+	raw, err := EncodeLinkCursor("docs.example.com", 2, created, id, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeLinkCursor(raw, "  docs.example.com ")
+	got.CreatedAt = got.CreatedAt.In(time.UTC)
+	if want := (LinkCursor{CursorVersion, CursorLinks, queryHash("docs.example.com"), 2, created, id, key}); err != nil || got != want {
+		t.Fatalf("got=%+v err=%v", got, err)
+	}
+	// The cursor never carries the URL itself, only the target key.
+	if decoded, _ := base64.RawURLEncoding.DecodeString(raw); strings.Contains(string(decoded), "docs.example.com") {
+		t.Fatalf("cursor leaks the query: %s", decoded)
+	}
+	if _, err := DecodeLinkCursor(raw, "runbook"); err == nil {
+		t.Fatal("link cursor reused with another query")
+	}
+	fileRaw, _ := EncodeFileCursor("docs.example.com", created, id)
+	if _, err := DecodeLinkCursor(fileRaw, "docs.example.com"); err == nil {
+		t.Fatal("file cursor accepted as a link cursor")
+	}
+	if _, err := DecodeFileCursor(raw, "docs.example.com"); err == nil {
+		t.Fatal("link cursor accepted as a file cursor")
+	}
+	if _, err := DecodeLinkCursor("%%%", "docs.example.com"); err == nil {
+		t.Fatal("corrupt cursor accepted")
+	}
+}
+
+func TestLinkCursorRejectsEveryInvalidField(t *testing.T) {
+	const id, key = "11111111-1111-4111-8111-111111111111", "abababababababababababababababab"
+	created := time.Date(2026, 9, 1, 9, 41, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		rank    int
+		created time.Time
+		id, key string
+	}{
+		{-1, created, id, key},
+		{MaxLinkRank + 1, created, id, key},
+		{0, time.Time{}, id, key},
+		{0, created, "not-a-uuid", key},
+		{0, created, id, "short"},
+		{0, created, id, strings.ToUpper(key)},
+		{0, created, id, strings.Repeat("z", 32)},
+	} {
+		if _, err := EncodeLinkCursor("q", tc.rank, tc.created, tc.id, tc.key); err == nil {
+			t.Fatalf("encoded invalid link cursor %+v", tc)
+		}
+		forged, _ := encodeCursor(LinkCursor{CursorVersion, CursorLinks, queryHash("q"), tc.rank, tc.created, tc.id, tc.key})
+		if _, err := DecodeLinkCursor(forged, "q"); err == nil {
+			t.Fatalf("decoded invalid link cursor %+v", tc)
+		}
+	}
+}

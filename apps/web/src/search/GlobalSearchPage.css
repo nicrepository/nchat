@@ -290,6 +290,15 @@
   color: var(--color-muted);
 }
 
+/* A URL has no spaces to wrap at: one line, clipped. The text stays whole. */
+.global-search__result-url {
+  overflow: hidden;
+  font-size: 13px;
+  color: var(--color-ink-2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .global-search__result-snippet {
   font-size: 13px;
   color: var(--color-ink-2);

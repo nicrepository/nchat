@@ -1,6 +1,6 @@
-import { expect, test, type Page, type Route } from "@playwright/test";
+import { expect, test, type Page, type Request, type Route } from "@playwright/test";
 
-import { installPaginatedMessages, TINY_JPEG } from "../helpers/largeConversationFixture";
+import { installPaginatedMessages, list, TINY_JPEG } from "../helpers/largeConversationFixture";
 import {
   GROUP_DM_ID,
   GROUP_DM_NAME,
@@ -22,12 +22,14 @@ import {
  * What only a browser proves is the rest: the overview, every result reaching
  * its real destination — the timeline's MESSAGE_TARGET, the DM flow, the
  * Attachment Viewer — stale answers never winning, and the phone layout.
+ * Issue #1081 adds Links: a POST whose query never reaches the URL, opening
+ * the message the link was shared in through the same MESSAGE_TARGET.
  */
 
 const PHONE = { width: 390, height: 844 };
 const FIELD = "Buscar mensagens, pessoas, canais, grupos e arquivos";
 
-type Category = "messages" | "users" | "channels" | "groups" | "files";
+type Category = "messages" | "users" | "channels" | "groups" | "files" | "links";
 type Results = Partial<Record<Category, unknown[]>>;
 
 const searchField = (page: Page) => page.getByRole("searchbox", { name: FIELD });
@@ -49,10 +51,16 @@ function envelope({ items, next }: Answer) {
   };
 }
 
+/** One request the client sent: its URL and, for the POST of Links, its body. */
+interface SentSearch {
+  url: URL;
+  body: Record<string, unknown> | null;
+}
+
 /**
- * Serves /api/search/** (the V2 message route included): `answer` picks the
- * rows for a category and query.
- * Every request URL is recorded so a spec can assert what the client sent.
+ * Serves /api/search/** (the V2 message route and the POST of Links
+ * included): `answer` picks the rows for a category and query.
+ * Every request is recorded so a spec can assert what the client sent.
  */
 async function installSearch(
   page: Page,
@@ -61,24 +69,79 @@ async function installSearch(
     query: string,
     cursor: string | null,
   ) => unknown[] | Answer | Promise<unknown[]>,
+  onSettled?: (category: Category, query: string) => void,
 ) {
-  const requests: URL[] = [];
+  const requests: SentSearch[] = [];
   await page.route("**/api/search/**", async (route: Route) => {
-    const url = new URL(route.request().url());
-    requests.push(url);
+    const request = route.request();
+    const url = new URL(request.url());
+    const body =
+      request.method() === "POST" ? (request.postDataJSON() as Record<string, unknown>) : null;
+    requests.push({ url, body });
     const category = url.pathname.split("/").pop() as Category;
-    const rows = await answer(
-      category,
-      url.searchParams.get("q") ?? "",
-      url.searchParams.get("cursor"),
-    );
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify(envelope(Array.isArray(rows) ? { items: rows } : rows)),
-    });
+    const field = (name: string) =>
+      body ? ((body[name] as string | undefined) ?? null) : url.searchParams.get(name);
+    const query = field("q") ?? "";
+    const rows = await answer(category, query, field("cursor"));
+    try {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(envelope(Array.isArray(rows) ? { items: rows } : rows)),
+      });
+    } finally {
+      // Called once this route's answer is out of the handler, delivered or
+      // refused because the browser already cancelled the request.
+      onSettled?.(category, query);
+    }
   });
   return requests;
+}
+
+function searchQuery(request: Request): string | null {
+  if (!request.url().includes("/api/search/")) return null;
+  if (request.method() === "POST") return (request.postDataJSON() as { q?: string }).q ?? null;
+  return new URL(request.url()).searchParams.get("q");
+}
+
+/**
+ * A barrier on one held search request: resolves only when BOTH its route
+ * handler has settled (answered after `release`) AND the browser has reported
+ * the request's terminal state — `failed` when the client aborted it, which is
+ * what a superseded query must do. Assertions made after it see the page after
+ * the old request is over, not while it may still be on its way.
+ */
+function heldSearch(page: Page, category: Category, query: string) {
+  let started!: () => void;
+  let release!: () => void;
+  let handlerSettled!: () => void;
+  const requested = new Promise<void>((resolve) => (started = resolve));
+  const released = new Promise<void>((resolve) => (release = resolve));
+  const settledInHandler = new Promise<void>((resolve) => (handlerSettled = resolve));
+  const isHeld = (request: Request) =>
+    new URL(request.url()).pathname.endsWith(`/${category}`) && searchQuery(request) === query;
+  const terminal = new Promise<"finished" | "failed">((resolve) => {
+    page.on("requestfinished", (request) => isHeld(request) && resolve("finished"));
+    page.on("requestfailed", (request) => isHeld(request) && resolve("failed"));
+  });
+  return {
+    requested,
+    release,
+    /** For installSearch's answer: holds this request until `release`. */
+    async hold() {
+      started();
+      await released;
+    },
+    /** For installSearch's onSettled. */
+    onSettled(settledCategory: Category, settledQuery: string) {
+      if (settledCategory === category && settledQuery === query) handlerSettled();
+    },
+    /** The old request is over, in the handler and in the browser. */
+    async settled() {
+      await settledInHandler;
+      return terminal;
+    },
+  };
 }
 
 function conversation(kind: "channel" | "dm", id: string, type: string, name: string) {
@@ -158,7 +221,72 @@ function everyCategory(targetId: string): Results {
         created_at: "2026-07-10T12:03:00.000Z",
       },
     ],
+    links: [
+      linkRow(`${targetId}-m-3`, conversation("channel", targetId, "public", "infraestrutura")),
+    ],
   };
+}
+
+function linkRow(
+  messageId: string,
+  where: ReturnType<typeof conversation>,
+  url = "https://docs.example.com/runbook",
+) {
+  return {
+    message_id: messageId,
+    target_key: "abababababababababababababababab",
+    url,
+    hostname: new URL(url).host,
+    ...where,
+    sender_id: OTHER_USER_ID,
+    sender_display_name: OTHER_USER_NAME,
+    created_at: "2026-07-10T12:03:00.000Z",
+  };
+}
+
+/**
+ * Issue #1088: the `before` cursors of the older pages the timeline asks for,
+ * in order. A deep link to a message outside the first page has to page back
+ * to it — one request per page, never the same page twice.
+ */
+function olderPagesRequested(page: Page, targetId: string): string[] {
+  const cursors: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    const before = url.searchParams.get("before");
+    if (before && url.pathname.endsWith(`/channels/${targetId}/messages`)) cursors.push(before);
+  });
+  return cursors;
+}
+
+/**
+ * Issue #1088: the target was reached through the history it belongs to. A
+ * message spliced in beside the wrong page would sit next to other neighbours,
+ * and the page loaded after the jump would carry the reader away from it — so
+ * this is asserted only once nothing older is left to load. Callers assert
+ * first that the requested pages reached the start of the history.
+ */
+async function expectReachedThroughHistory(
+  page: Page,
+  history: ReturnType<typeof makeMessage>[],
+  index: number,
+) {
+  const target = history[index];
+  await expect(messageBubble(page, target.id)).toBeInViewport();
+  await expect(messageBubble(page, history.at(-1)!.id)).not.toBeInViewport();
+  const order = await list(page).evaluate((element) =>
+    [...element.querySelectorAll<HTMLElement>("[data-testid='chat-msg-bubble']")].map(
+      (bubble) => bubble.dataset.messageId,
+    ),
+  );
+  const at = order.indexOf(target.id);
+  expect(order.slice(at - 1, at + 2)).toEqual(
+    history.slice(index - 1, index + 2).map((message) => message.id),
+  );
+  // Still virtualized (#675): the pages asked for reach the start of the
+  // history, so all of it is loaded — and only a window of it is mounted.
+  await expect(page.getByTestId("chat-virtual-canvas")).toBeAttached();
+  expect(order.length).toBeLessThan(history.length);
 }
 
 test.describe("busca global — resultados categorizados (#900)", () => {
@@ -173,7 +301,7 @@ test.describe("busca global — resultados categorizados (#900)", () => {
 
     await openSearch(page, "backup");
 
-    for (const name of ["Mensagens", "Pessoas", "Canais", "Grupos", "Arquivos"]) {
+    for (const name of ["Mensagens", "Pessoas", "Canais", "Grupos", "Arquivos", "Links"]) {
       await expect(section(page, name)).toBeVisible();
     }
     await expect(page.getByRole("tab", { name: "Tudo" })).toHaveAttribute("aria-selected", "true");
@@ -188,11 +316,16 @@ test.describe("busca global — resultados categorizados (#900)", () => {
       "src",
       /^data:image\/svg\+xml/,
     );
-    // The client sends the query and a limit — never who is asking.
-    for (const url of requests) {
-      expect([...url.searchParams.keys()].sort()).toEqual(["limit", "q"]);
-      expect(url.searchParams.get("limit")).toBe("5");
+    // The client sends the query and a limit — never who is asking. Links
+    // carries them in a POST body, so its URL has no query string at all.
+    for (const { url, body } of requests) {
+      const sent = body ?? Object.fromEntries(url.searchParams);
+      expect(Object.keys(sent).sort()).toEqual(["limit", "q"]);
+      expect(String(sent.limit)).toBe("5");
     }
+    const links = requests.filter(({ url }) => url.pathname === "/api/search/links");
+    expect(links).toHaveLength(1);
+    expect(links[0].url.search).toBe("");
   });
 
   test("mensagem antiga abre na mensagem exata, com destaque, fora da primeira página", async ({
@@ -205,6 +338,8 @@ test.describe("busca global — resultados categorizados (#900)", () => {
     await installSearch(page, (category) => (category === "messages" ? fixture.messages! : []));
     await page.goto(`/chat/channel/${targetId}`);
     await expect(messageBubble(page, history.at(-1)!.id)).toBeVisible();
+
+    const older = olderPagesRequested(page, targetId);
 
     await openSearch(page, "backup");
     const target = history[3];
@@ -223,8 +358,10 @@ test.describe("busca global — resultados categorizados (#900)", () => {
       `/chat/channel/${targetId}?message=${encodeURIComponent(target.id)}`,
     );
     await highlighted;
-    await expect(messageBubble(page, target.id)).toBeInViewport();
-    await expect(messageBubble(page, history.at(-1)!.id)).not.toBeInViewport();
+    // 70..119 opened; 20..69 and then 0..19, which holds the target and ends
+    // the history — so nothing else can be asked for afterwards.
+    expect(older).toEqual([history[70].id, history[20].id]);
+    await expectReachedThroughHistory(page, history, 3);
   });
 
   test("pessoa abre a DM", async ({ page }, testInfo) => {
@@ -261,6 +398,36 @@ test.describe("busca global — resultados categorizados (#900)", () => {
       .getByRole("button", { name: new RegExp(GROUP_DM_NAME) })
       .click();
     await expect(page).toHaveURL(`/chat/dm/${GROUP_DM_ID}`);
+  });
+
+  // Issue #1026: a group result wears the group's canonical identity — the
+  // sidebar's own list, already in memory — and follows it when it changes.
+  test("grupo mostra o emoji da identidade canônica e volta às iniciais após o reset", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "channel");
+    const { scenario } = await openChannelWithHistory(page, targetId);
+    const group = scenario.sidebarDMs.find((dm) => dm.id === GROUP_DM_ID)!;
+    group.avatar_emoji = "🚀";
+    await installSearch(page, (category) => everyCategory(targetId)[category] ?? []);
+    await page.goto(`/chat/channel/${targetId}`);
+
+    await openSearch(page, "backup");
+    const result = section(page, "Grupos").getByRole("button", {
+      name: new RegExp(GROUP_DM_NAME),
+    });
+    await expect(result.locator(".group-avatar")).toHaveText("🚀");
+
+    await page.getByRole("button", { name: `Mais opções para grupo ${GROUP_DM_NAME}` }).click();
+    await page.getByRole("menuitem", { name: "Alterar identidade" }).click();
+    const identity = page.getByRole("dialog", { name: "Identidade do grupo" });
+    await identity.getByRole("radio", { name: "Automático" }).check();
+    await identity.getByRole("button", { name: "Salvar" }).click();
+    await expect(identity).toBeHidden();
+
+    await expect(result.locator(".group-avatar")).toHaveText("EG");
+    await expect(result.locator(".group-avatar")).toHaveAttribute("data-mode", "auto");
+    expect(scenario.requests.groupAvatars).toEqual([{ conversationId: GROUP_DM_ID, emoji: null }]);
   });
 
   test("arquivo abre no Attachment Viewer e fecha de volta para a busca", async ({
@@ -312,83 +479,84 @@ test.describe("busca global — resultados categorizados (#900)", () => {
   }, testInfo) => {
     const targetId = uniqueId(testInfo, "channel");
     await openChannelWithHistory(page, targetId);
-    let releaseOld!: () => void;
-    const oldAnswered = new Promise<void>((resolve) => (releaseOld = resolve));
-    let oldAsked!: () => void;
-    const oldRequested = new Promise<void>((resolve) => (oldAsked = resolve));
-    await installSearch(page, async (category, query) => {
-      if (category !== "users") return [];
-      if (query === "bac") {
-        oldAsked();
-        await oldAnswered;
-        return [{ id: "stale-user", display_name: "Resultado Antigo" }];
-      }
-      return [{ id: OTHER_USER_ID, display_name: OTHER_USER_NAME }];
-    });
+    const old = heldSearch(page, "users", "bac");
+    await installSearch(
+      page,
+      async (category, query) => {
+        if (category !== "users") return [];
+        if (query === "bac") {
+          await old.hold();
+          return [{ id: "stale-user", display_name: "Resultado Antigo" }];
+        }
+        return [{ id: OTHER_USER_ID, display_name: OTHER_USER_NAME }];
+      },
+      old.onSettled,
+    );
     await page.goto(`/chat/channel/${targetId}`);
 
     await openSearch(page, "bac");
-    await oldRequested;
+    await old.requested;
     await searchField(page).fill("backup");
     await expect(section(page, "Pessoas")).toContainText(OTHER_USER_NAME);
 
-    releaseOld();
+    old.release();
+    // The superseded request was cancelled by the client, and its answer has
+    // left the handler: only now can "it did not land" be asserted.
+    expect(await old.settled()).toBe("failed");
     await expect(page.getByText("Resultado Antigo")).toHaveCount(0);
     await expect(section(page, "Pessoas")).toContainText(OTHER_USER_NAME);
   });
 
-  test("web novo com search-service anterior: V2 ausente cai uma vez no legado e navega ao canal", async ({
+  test("web novo com search-service sem POST: cada categoria indisponível, nenhum GET, retry repete o POST", async ({
     page,
   }, testInfo) => {
     const targetId = uniqueId(testInfo, "channel");
     await openChannelWithHistory(page, targetId, 1);
-    const target = `${targetId}-m-0`;
-    const requests: string[] = [];
-    // A search-service from before #900: no /v2/messages (its catch-all 404),
-    // and the channel-only legacy shape on /messages.
+    const requests: Array<{ method: string; url: URL }> = [];
+    // A search-service from before #1081: its modern routes take GET only (a
+    // POST is 405) and it has no /links (404). It would answer a GET — the web
+    // must never send one, whatever the query.
     await page.route("**/api/search/**", async (route: Route) => {
       const url = new URL(route.request().url());
-      requests.push(url.pathname);
-      if (url.pathname.endsWith("/v2/messages")) {
-        await route.fulfill({
-          status: 404,
-          contentType: "application/json",
-          body: JSON.stringify({ error: { code: "not_found", message: "not found" } }),
-        });
-        return;
-      }
-      const legacy = url.pathname.endsWith("/messages")
-        ? [
-            {
-              id: target,
-              channel_id: targetId,
-              channel_name: "infraestrutura",
-              sender_id: OTHER_USER_ID,
-              sender_display_name: OTHER_USER_NAME,
-              body_text: "Mensagem do backup legado",
-              created_at: "2026-07-10T12:00:00.000Z",
-              score: 1,
-            },
-          ]
-        : [];
+      const method = route.request().method();
+      requests.push({ method, url });
+      const answer =
+        method === "GET" && !url.pathname.endsWith("/links")
+          ? { status: 200, body: envelope({ items: [] }) }
+          : url.pathname.endsWith("/links")
+            ? { status: 404, body: { error: { code: "not_found", message: "not found" } } }
+            : {
+                status: 405,
+                body: { error: { code: "bad_request", message: "method not allowed" } },
+              };
       await route.fulfill({
-        status: 200,
+        status: answer.status,
         contentType: "application/json",
-        body: JSON.stringify(envelope({ items: legacy })),
+        body: JSON.stringify(answer.body),
       });
     });
     await page.goto(`/chat/channel/${targetId}`);
 
-    await openSearch(page, "backup");
-    const card = section(page, "Mensagens").getByRole("button", { name: /backup legado/ });
-    await expect(card).toContainText("em #infraestrutura");
-    await expect(card).not.toContainText("undefined");
-    const messageRequests = requests.filter((path) => path.endsWith("/messages"));
-    expect(messageRequests).toEqual(["/api/search/v2/messages", "/api/search/messages"]);
+    await openSearch(page, "ABCDEF1234567890");
+    for (const name of ["Mensagens", "Pessoas", "Canais", "Grupos", "Arquivos", "Links"]) {
+      await expect(section(page, name).getByRole("alert")).toContainText(
+        "Esta busca ainda não está disponível.",
+      );
+    }
+    await expect(page.getByTestId("global-search-empty")).toHaveCount(0);
+    expect(requests).toHaveLength(6);
 
-    await card.click();
-    await expect(page).toHaveURL(`/chat/channel/${targetId}?message=${encodeURIComponent(target)}`);
-    await expect(messageBubble(page, target)).toBeInViewport();
+    await section(page, "Pessoas").getByRole("button", { name: "Tentar novamente" }).click();
+    // The retry is a request of its own: wait for it, then for its answer.
+    await expect.poll(() => requests.length).toBe(7);
+    await expect(section(page, "Pessoas").getByRole("alert")).toContainText(
+      "Esta busca ainda não está disponível.",
+    );
+    expect(requests.at(-1)!.url.pathname).toBe("/api/search/users");
+    for (const { method, url } of requests) {
+      expect(method).toBe("POST");
+      expect(url.search).toBe("");
+    }
   });
 
   test("aba paginada: Carregar mais envia o cursor, anexa sem duplicar e some no fim", async ({
@@ -425,11 +593,11 @@ test.describe("busca global — resultados categorizados (#900)", () => {
     ]);
     await expect(results(page).getByRole("button", { name: "Carregar mais" })).toHaveCount(0);
     await expect(results(page).getByText("3 resultados para “backup”")).toBeVisible();
-    const pages = requests.filter(
-      (url) => url.pathname.endsWith("/users") && url.searchParams.get("limit") === "20",
-    );
-    expect(pages.map((url) => url.searchParams.get("cursor"))).toEqual([null, "page-2"]);
-    expect(pages.every((url) => url.searchParams.get("q") === "backup")).toBe(true);
+    const pages = requests
+      .filter(({ url, body }) => url.pathname.endsWith("/users") && body?.limit === 20)
+      .map(({ body }) => body!);
+    expect(pages.map((body) => body.cursor ?? null)).toEqual([null, "page-2"]);
+    expect(pages.every((body) => body.q === "backup")).toBe(true);
   });
 
   test("teclado: setas, Home e End trocam de aba; Tab segue para o painel", async ({
@@ -453,12 +621,12 @@ test.describe("busca global — resultados categorizados (#900)", () => {
     await expect(tab("Mensagens")).toHaveAttribute("aria-selected", "true");
     await expect(results(page)).toHaveAccessibleName("Mensagens");
     await page.keyboard.press("End");
-    await expect(tab("Arquivos")).toBeFocused();
-    await expect(results(page).getByRole("list", { name: "Arquivos" })).toBeVisible();
+    await expect(tab("Links")).toBeFocused();
+    await expect(results(page).getByRole("list", { name: "Links" })).toBeVisible();
     await page.keyboard.press("ArrowRight");
     await expect(tab("Tudo")).toBeFocused();
     await page.keyboard.press("ArrowLeft");
-    await expect(tab("Arquivos")).toBeFocused();
+    await expect(tab("Links")).toBeFocused();
     await page.keyboard.press("Home");
     await expect(tab("Tudo")).toHaveAttribute("aria-selected", "true");
 
@@ -495,5 +663,254 @@ test.describe("busca global — resultados categorizados (#900)", () => {
       .getByRole("button", { name: new RegExp(GROUP_DM_NAME) })
       .click();
     await expect(page).toHaveURL(`/chat/dm/${GROUP_DM_ID}`);
+  });
+});
+
+test.describe("busca global — links (#1081)", () => {
+  test("link em canal: Tudo, aba Links e a mensagem exata, com destaque", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "channel");
+    const { history } = await openChannelWithHistory(page, targetId, 120);
+    await installPaginatedMessages(page, targetId, history);
+    const target = history[3];
+    const older = olderPagesRequested(page, targetId);
+    const where = conversation("channel", targetId, "public", "infraestrutura");
+    await installSearch(page, (category) =>
+      category === "links" ? [linkRow(target.id, where)] : [],
+    );
+    await page.goto(`/chat/channel/${targetId}`);
+    await expect(messageBubble(page, history.at(-1)!.id)).toBeVisible();
+
+    await openSearch(page, "docs.example.com");
+    await expect(
+      section(page, "Links").getByRole("button", { name: /docs\.example\.com/ }),
+    ).toBeVisible();
+    await page.getByRole("tab", { name: "Links" }).click();
+    const card = results(page)
+      .getByRole("list", { name: "Links" })
+      .getByRole("button", { name: /https:\/\/docs\.example\.com\/runbook/ });
+    await expect(card).toContainText("#infraestrutura");
+    await expect(card).toContainText(OTHER_USER_NAME);
+
+    const highlighted = page.waitForFunction(
+      (id) =>
+        document
+          .querySelector(`[data-message-id="${id}"]`)
+          ?.classList.contains("chat-msg-area__msg--highlight") === true,
+      target.id,
+    );
+    await card.click();
+    await expect(page).toHaveURL(
+      `/chat/channel/${targetId}?message=${encodeURIComponent(target.id)}`,
+    );
+    await highlighted;
+    expect(older).toEqual([history[70].id, history[20].id]);
+    await expectReachedThroughHistory(page, history, 3);
+  });
+
+  test("link em grupo e em DM abrem a mensagem na conversa certa", async ({ page }, testInfo) => {
+    const targetId = uniqueId(testInfo, "channel");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "infraestrutura",
+      messages: [makeMessage({ id: `${targetId}-m-0` })],
+    });
+    const groupMessage = makeMessage({ id: "e2e-group-link", body_text: "runbook do grupo" });
+    const directMessage = makeMessage({ id: "e2e-direct-link", body_text: "runbook da DM" });
+    scenario.messagesByTarget.set(`dm:${GROUP_DM_ID}`, [groupMessage]);
+    scenario.messagesByTarget.set("dm:e2e-dm-other", [directMessage]);
+    await installMessagingMocks(page, scenario);
+    await installSearch(page, (category) =>
+      category === "links"
+        ? [
+            linkRow(groupMessage.id, conversation("dm", GROUP_DM_ID, "group", GROUP_DM_NAME)),
+            linkRow(
+              directMessage.id,
+              conversation("dm", "e2e-dm-other", "direct", OTHER_USER_NAME),
+            ),
+          ]
+        : [],
+    );
+    await page.goto(`/chat/channel/${targetId}`);
+
+    await openSearch(page, "runbook");
+    await section(page, "Links")
+      .getByRole("button", { name: new RegExp(GROUP_DM_NAME) })
+      .click();
+    await expect(page).toHaveURL(`/chat/dm/${GROUP_DM_ID}?message=${groupMessage.id}`);
+    await expect(messageBubble(page, groupMessage.id)).toBeInViewport();
+
+    await page.goBack();
+    await expect(searchField(page)).toHaveValue("runbook");
+    await section(page, "Links")
+      .getByRole("button", { name: new RegExp(`Conversa com ${OTHER_USER_NAME}`) })
+      .click();
+    await expect(page).toHaveURL(`/chat/dm/e2e-dm-other?message=${directMessage.id}`);
+    await expect(messageBubble(page, directMessage.id)).toBeInViewport();
+  });
+
+  test("search-service sem a rota: erro explícito em Links, o resto segue e o retry recupera", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "channel");
+    await openChannelWithHistory(page, targetId);
+    const fixture = everyCategory(targetId);
+    let linksDeployed = false;
+    await page.route("**/api/search/**", async (route: Route) => {
+      const category = new URL(route.request().url()).pathname.split("/").pop() as Category;
+      if (category === "links" && !linksDeployed) {
+        await route.fulfill({
+          status: 404,
+          contentType: "application/json",
+          body: JSON.stringify({ error: { code: "not_found", message: "not found" } }),
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(envelope({ items: fixture[category] ?? [] })),
+      });
+    });
+    await page.goto(`/chat/channel/${targetId}`);
+
+    await openSearch(page, "backup");
+    const links = section(page, "Links");
+    await expect(links.getByRole("alert")).toContainText("Esta busca ainda não está disponível.");
+    await expect(section(page, "Mensagens")).toBeVisible();
+    await expect(page.getByTestId("global-search-empty")).toHaveCount(0);
+
+    linksDeployed = true;
+    await links.getByRole("button", { name: "Tentar novamente" }).click();
+    await expect(links.getByRole("button", { name: /docs\.example\.com/ })).toBeVisible();
+    await expect(links.getByRole("alert")).toHaveCount(0);
+  });
+
+  test("resposta atrasada de Links para a busca antiga nunca substitui a atual", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "channel");
+    await openChannelWithHistory(page, targetId);
+    const where = conversation("channel", targetId, "public", "infraestrutura");
+    const old = heldSearch(page, "links", "docs");
+    await installSearch(
+      page,
+      async (category, query) => {
+        if (category !== "links") return [];
+        if (query === "docs") {
+          await old.hold();
+          return [linkRow("stale-link", where, "https://antigo.example.com/velho")];
+        }
+        return [linkRow(`${targetId}-m-0`, where)];
+      },
+      old.onSettled,
+    );
+    await page.goto(`/chat/channel/${targetId}`);
+
+    await openSearch(page, "docs");
+    await old.requested;
+    await searchField(page).fill("docs.example.com");
+    await expect(section(page, "Links")).toContainText("https://docs.example.com/runbook");
+
+    old.release();
+    // The superseded POST was cancelled by the client, and its answer has left
+    // the handler: only now can "it did not land" be asserted.
+    expect(await old.settled()).toBe("failed");
+    await expect(page.getByText("antigo.example.com")).toHaveCount(0);
+    await expect(section(page, "Links")).toContainText("https://docs.example.com/runbook");
+  });
+
+  for (const secretQuery of [
+    "https://example.test/reset/token?signature=SECRET123",
+    "ABCDEF1234567890",
+  ]) {
+    test(`${secretQuery} em Tudo e em cada aba: só POST, nenhuma request com query string`, async ({
+      page,
+    }, testInfo) => {
+      const targetId = uniqueId(testInfo, "channel");
+      await openChannelWithHistory(page, targetId);
+      const requests = await installSearch(page, () => []);
+      const methods: string[] = [];
+      page.on("request", (request) => {
+        if (request.url().includes("/api/search/")) methods.push(request.method());
+      });
+      await page.goto(`/chat/channel/${targetId}`);
+
+      await openSearch(page, secretQuery);
+      await expect(page.getByTestId("global-search-empty")).toBeVisible();
+      for (const name of ["Mensagens", "Pessoas", "Canais", "Grupos", "Arquivos", "Links"]) {
+        await page.getByRole("tab", { name }).click();
+        await expect(page.getByTestId("global-search-empty")).toBeVisible();
+      }
+
+      // 6 overview sections + 6 tabs, every one a POST carrying it in its body.
+      expect(requests).toHaveLength(12);
+      expect(methods).toEqual(Array(12).fill("POST"));
+      for (const { url, body } of requests) {
+        expect(url.search).toBe("");
+        expect(body?.q).toBe(secretQuery);
+      }
+    });
+  }
+
+  test("teclado: aba Links pelas setas e Enter abre a mensagem", async ({ page }, testInfo) => {
+    const targetId = uniqueId(testInfo, "channel");
+    const { history } = await openChannelWithHistory(page, targetId, 1);
+    const where = conversation("channel", targetId, "public", "infraestrutura");
+    await installSearch(page, (category) =>
+      category === "links" ? [linkRow(history[0].id, where)] : [],
+    );
+    await page.goto(`/chat/channel/${targetId}`);
+
+    await openSearch(page, "docs");
+    await expect(section(page, "Links")).toBeVisible();
+    await page.getByRole("tab", { name: "Tudo" }).focus();
+    await page.keyboard.press("End");
+    await expect(page.getByRole("tab", { name: "Links" })).toHaveAttribute("aria-selected", "true");
+    // The tab loads its own list: until it renders, the panel holds only a
+    // skeleton and there is no card for the second Tab to reach.
+    await expect(results(page).getByRole("list", { name: "Links" })).toBeVisible();
+    await page.keyboard.press("Tab");
+    await expect(results(page)).toBeFocused();
+    await page.keyboard.press("Tab");
+    const card = results(page).getByRole("button", { name: /docs\.example\.com/ });
+    await expect(card).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(page).toHaveURL(
+      `/chat/channel/${targetId}?message=${encodeURIComponent(history[0].id)}`,
+    );
+  });
+
+  test("celular: URL longa recortada sem rolagem lateral, seleção sem hover", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize(PHONE);
+    const targetId = uniqueId(testInfo, "channel");
+    const { history } = await openChannelWithHistory(page, targetId, 1);
+    const longUrl = `https://docs.example.com/${"segmento-muito-longo/".repeat(40)}fim?ref=abc`;
+    const where = conversation("channel", targetId, "public", "infraestrutura");
+    await installSearch(page, (category) =>
+      category === "links" ? [linkRow(history[0].id, where, longUrl)] : [],
+    );
+    await page.goto(`/chat/channel/${targetId}`);
+
+    await page.getByTestId("chat-nav-toggle").click();
+    await openSearch(page, "docs");
+    await page.getByRole("tab", { name: "Links" }).click();
+    const card = results(page).getByRole("button", { name: /docs\.example\.com/ });
+    await expect(card).toBeVisible();
+    await expect(card).toHaveAccessibleName(/fim\?ref=abc/);
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+    ).toBe(true);
+    const box = await card.boundingBox();
+    expect(box!.x + box!.width).toBeLessThanOrEqual(PHONE.width);
+
+    await card.click();
+    await expect(page).toHaveURL(
+      `/chat/channel/${targetId}?message=${encodeURIComponent(history[0].id)}`,
+    );
   });
 });

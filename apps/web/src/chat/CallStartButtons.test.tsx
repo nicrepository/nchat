@@ -88,3 +88,15 @@ it("hides the channel call buttons entirely when resourceCall is absent (e.g. no
   ).not.toBeInTheDocument();
   expect(screen.queryByText("Chamada ativa")).not.toBeInTheDocument();
 });
+
+// Issue #1026: a group's header shows the group's identity — its emoji, or the
+// initials of its name on the neutral background — never a person's avatar.
+it("draws a group header with GroupAvatar", () => {
+  const { container, rerender } = render(
+    <HeaderDM name="Equipe Infra" conversation={{ type: "group" }} />,
+  );
+  expect(container.querySelector(".group-avatar")?.textContent).toBe("EI");
+  expect(container.querySelector(".chat-msg-area__header-avatar")).toBeNull();
+  rerender(<HeaderDM name="Equipe Infra" conversation={{ type: "group", avatarEmoji: "🚀" }} />);
+  expect(container.querySelector(".group-avatar")?.textContent).toBe("🚀");
+});

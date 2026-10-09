@@ -15,6 +15,7 @@ import {
   type ConversationDetailsTarget,
 } from "./useConversationDetails";
 import type { ChannelAttachment, ChannelDetails, DirectDetails, GroupDetails } from "./chatTypes";
+import { parseOwnership } from "./ownershipApi";
 import type { AttachmentPage } from "./filesApi";
 
 const {
@@ -1476,18 +1477,47 @@ describe("useConversationDetails — metadata não vaza entre conversas", () => 
 
 // ── The administrable channel roster (issue #469) ───────────────────────────
 //
-// It is a third section of the same load, and the capability in the details
-// payload is what decides whether it is requested at all: a reader who cannot
-// remove anybody would otherwise spend a guaranteed 403 on every channel they
-// open.
+// Ownership-enabled channels use the members in their details projection.
+// Public channels and ownership-disabled private channels keep the legacy roster.
 describe("useConversationDetails channel roster", () => {
-  it("loads the roster for every visible channel member", async () => {
-    mockFetchChannelMembers.mockResolvedValue({ memberCount: 1, members: [] });
+  it.each([
+    { name: "ownership-enabled private", type: "private" as const, enabled: true },
+    { name: "ownership-disabled private", type: "private" as const, enabled: false },
+    { name: "public", type: "public" as const, enabled: false },
+  ])("selects the participant source for $name channels", async ({ type, enabled }) => {
+    const ownership = parseOwnership({
+      enabled,
+      members: [
+        {
+          user_id: "owner",
+          display_name: "Owner",
+          role: "owner",
+          actions: { assign_role: true, transfer: false, remove: false },
+        },
+      ],
+    });
+    mockFetchChannelDetails.mockResolvedValue(details({ type, ownership }));
+    mockFetchChannelMembers.mockResolvedValue({
+      memberCount: 1,
+      members: [{ userId: "legacy", displayName: "Legacy participant", role: "member" }],
+    });
     const { result } = renderHook(() => useConversationDetails({ kind: "channel", id: "ch-1" }));
-
     await waitFor(() => expect(result.current.details.status).toBe("ready"));
-    await waitFor(() => expect(result.current.roster.status).toBe("ready"));
-    expect(mockFetchChannelMembers).toHaveBeenCalledWith("ch-1", expect.any(AbortSignal));
+    if (enabled) {
+      expect(result.current.details).toMatchObject({ status: "ready", data: { ownership } });
+      expect(mockFetchChannelMembers).not.toHaveBeenCalled();
+      act(() => result.current.reload());
+      await waitFor(() => expect(mockFetchChannelDetails).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(result.current.details.status).toBe("ready"));
+      expect(mockFetchChannelMembers).not.toHaveBeenCalled();
+    } else {
+      await waitFor(() => expect(result.current.roster.status).toBe("ready"));
+      expect(mockFetchChannelMembers).toHaveBeenCalledWith("ch-1", expect.any(AbortSignal));
+      expect(result.current.roster).toMatchObject({
+        status: "ready",
+        data: { members: [{ displayName: "Legacy participant" }] },
+      });
+    }
   });
 
   it("loads the roster for a caller the server says may remove members", async () => {

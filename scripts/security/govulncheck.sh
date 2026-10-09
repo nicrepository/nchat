@@ -3,6 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
+# shellcheck source=govulncheck-retry.sh
+source "$ROOT/scripts/security/govulncheck-retry.sh"
+
 # `go` itself may be installed outside the shell's default PATH (e.g. a
 # tarball install at /usr/local/go or a custom GOROOT). Without it,
 # govulncheck fails internally and misreports "no go.mod file" even when
@@ -24,7 +27,8 @@ fi
 if ! command -v govulncheck >/dev/null 2>&1; then
   GOVULNCHECK_FALLBACK="${GOPATH:-$HOME/go}/bin/govulncheck"
   if [[ -x "$GOVULNCHECK_FALLBACK" ]]; then
-    export PATH="$(dirname "$GOVULNCHECK_FALLBACK"):$PATH"
+    PATH="$(dirname "$GOVULNCHECK_FALLBACK"):$PATH"
+    export PATH
   fi
 fi
 
@@ -48,10 +52,11 @@ while IFS= read -r module; do
   # reach, not a reason to stop scanning the remaining modules. Anything else
   # non-zero is govulncheck itself failing, and that still aborts here: a scan
   # that did not run must never read as a scan that found nothing.
-  set +e
-  (cd "$ROOT/$module" && govulncheck -format json ./...) >"$report"
-  status=$?
-  set -e
+  if (cd "$ROOT/$module" && govulncheck_retry "$report" "$report.stderr" govulncheck -format json ./...); then
+    status=0
+  else
+    status=$?
+  fi
   if [[ "$status" -ne 0 && "$status" -ne 3 ]]; then
     echo "govulncheck failed to scan $module (exit $status)" >&2
     exit "$status"

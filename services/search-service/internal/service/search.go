@@ -15,6 +15,7 @@ type Store interface {
 	Channels(context.Context, string, string, int, domain.NameCursor) ([]domain.ChannelResult, error)
 	Groups(context.Context, string, string, int, domain.NameCursor) ([]domain.GroupResult, error)
 	Files(context.Context, string, string, int, domain.TimeCursor) ([]domain.FileResult, error)
+	Links(context.Context, string, string, int, domain.LinkCursor) ([]domain.LinkResult, error)
 }
 type Search struct {
 	store Store
@@ -118,6 +119,18 @@ func (s *Search) SearchFiles(ctx context.Context, userID, query string, limit in
 		},
 		func(last domain.FileResult) (string, error) {
 			return domain.EncodeFileCursor(query, last.CreatedAt, last.ID)
+		})
+}
+
+// SearchLinks serves POST /api/search/links.
+func (s *Search) SearchLinks(ctx context.Context, userID, query string, limit int, raw string) (domain.LinkPage, error) {
+	return paginate("links", raw, limit,
+		func(r string) (domain.LinkCursor, error) { return domain.DecodeLinkCursor(r, query) },
+		func(c domain.LinkCursor) ([]domain.LinkResult, error) {
+			return s.store.Links(ctx, userID, query, limit+1, c)
+		},
+		func(last domain.LinkResult) (string, error) {
+			return domain.EncodeLinkCursor(query, last.Rank, last.CreatedAt, last.MessageID, last.TargetKey)
 		})
 }
 

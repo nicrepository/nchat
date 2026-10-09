@@ -8,8 +8,15 @@
 
 import type { AttachmentPreviewStatus, AttachmentStatus } from "../chat/chatTypes";
 
-/** The five result kinds, in the fixed order the overview shows them. */
-export const SEARCH_CATEGORIES = ["messages", "users", "channels", "groups", "files"] as const;
+/** The result kinds, in the fixed order the overview shows them. */
+export const SEARCH_CATEGORIES = [
+  "messages",
+  "users",
+  "channels",
+  "groups",
+  "files",
+  "links",
+] as const;
 export type SearchCategory = (typeof SEARCH_CATEGORIES)[number];
 export type SearchTab = "all" | SearchCategory;
 
@@ -19,23 +26,7 @@ export type ConversationType = "public" | "private" | "direct" | "group";
 
 // ── Wire shapes (search-service JSON) ──────────────────────────────────────────
 
-/**
- * GET /api/search/messages, the pre-#900 contract: public channel messages
- * only. Read solely as a rollout fallback when /v2/messages does not exist
- * (see searchApi.ts and docs/api/search.md).
- */
-export interface LegacyMessageResultResponse {
-  id: string;
-  channel_id: string;
-  channel_name: string;
-  sender_id: string;
-  sender_display_name: string;
-  body_text: string;
-  created_at: string;
-  score: number;
-}
-
-/** GET /api/search/v2/messages. */
+/** POST /api/search/v2/messages. */
 export interface MessageResultResponse {
   id: string;
   conversation_kind: string;
@@ -85,6 +76,26 @@ export interface FileResultResponse {
   conversation_id: string;
   conversation_type: string;
   conversation_name: string;
+  created_at: string;
+}
+
+/**
+ * POST /api/search/links (#1081): one occurrence of a URL in a message the
+ * caller may read. `url` is the canonical target chat-service recorded; a
+ * malicious target is never returned.
+ */
+export interface LinkResultResponse {
+  message_id: string;
+  target_key: string;
+  url: string;
+  hostname: string;
+  conversation_kind: string;
+  conversation_id: string;
+  conversation_type: string;
+  conversation_name: string;
+  sender_id: string;
+  sender_display_name: string;
+  sender_avatar_url?: string | null;
   created_at: string;
 }
 
@@ -165,12 +176,25 @@ export interface FileSearchResult {
   createdAt: string;
 }
 
+/** A link occurrence; `id` is the message and target together, unique per row. */
+export interface LinkSearchResult {
+  id: string;
+  messageId: string;
+  url: string;
+  hostname: string;
+  conversation: ConversationRef;
+  senderId: string;
+  senderDisplayName: string;
+  createdAt: string;
+}
+
 export interface SearchResultByCategory {
   messages: MessageSearchResult;
   users: UserSearchResult;
   channels: ChannelSearchResult;
   groups: GroupSearchResult;
   files: FileSearchResult;
+  links: LinkSearchResult;
 }
 
 export interface SearchResultPage<T> {
@@ -180,4 +204,9 @@ export interface SearchResultPage<T> {
 }
 
 /** Classification of a failed search request, for status-specific UI copy. */
-export type SearchErrorKind = "bad_request" | "forbidden" | "server_error" | "unknown";
+export type SearchErrorKind =
+  | "bad_request"
+  | "forbidden"
+  | "unavailable"
+  | "server_error"
+  | "unknown";

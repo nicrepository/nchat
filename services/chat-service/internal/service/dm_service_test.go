@@ -831,6 +831,10 @@ type fakeDMStore struct {
 	counterpartErr   error
 	counterpartCalls []dmCounterpartCall
 
+	lastAvatarInput storage.SetGroupAvatarInput
+	avatarCalls     int
+	avatarErr       error
+
 	lastDirectInput   storage.CreateDirectConversationInput
 	lastGroupInput    storage.CreateGroupConversationInput
 	createDirectCalls int
@@ -878,6 +882,13 @@ type groupCandidateCall struct {
 	CallerID       string
 	Query          string
 	Limit          int
+}
+
+// Group identity (issue #1026): records what the service forwarded.
+func (f *fakeDMStore) SetGroupAvatarEmoji(_ context.Context, input storage.SetGroupAvatarInput) error {
+	f.avatarCalls++
+	f.lastAvatarInput = input
+	return f.avatarErr
 }
 
 // Group rename and self-leave (issue #527). The fake records what the service

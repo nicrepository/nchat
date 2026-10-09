@@ -44,7 +44,14 @@ const {
   mockGetOrCreateDirectDM:
     vi.fn<(userId: string, signal?: AbortSignal) => Promise<DirectDMResult>>(),
   mockCreateGroupDM:
-    vi.fn<(userIds: string[], title: string, signal?: AbortSignal) => Promise<string>>(),
+    vi.fn<
+      (
+        userIds: string[],
+        title: string,
+        avatarEmoji: string | undefined,
+        signal?: AbortSignal,
+      ) => Promise<string>
+    >(),
   mockCreateChannel: vi.fn<
     (
       input: {
@@ -82,8 +89,12 @@ vi.mock("./chatApi", () => ({
     mockSearchDMCandidates(query, signal),
   getOrCreateDirectDM: (userId: string, signal?: AbortSignal) =>
     mockGetOrCreateDirectDM(userId, signal),
-  createGroupDM: (userIds: string[], title: string, signal?: AbortSignal) =>
-    mockCreateGroupDM(userIds, title, signal),
+  createGroupDM: (
+    userIds: string[],
+    title: string,
+    avatarEmoji: string | undefined,
+    signal?: AbortSignal,
+  ) => mockCreateGroupDM(userIds, title, avatarEmoji, signal),
   createChannel: (
     input: { slug: string; displayName: string; type: "public" | "private"; categoryId?: string },
     signal?: AbortSignal,
@@ -529,17 +540,28 @@ describe("ChatSidebar — DMs", () => {
     expect(screen.queryByRole("option", { name: /EI/ })).toBeNull();
   });
 
-  it("still composes participant avatars when a group carries participants", async () => {
+  // Issue #1026: a group is drawn by its own identity only — the initials of its
+  // name on the neutral background, or its emoji — never by its participants.
+  it("draws a group with its own identity, never with participant avatars", async () => {
     mockFetchSidebarData.mockResolvedValue({
       currentUserId: "user-a",
       channels: [],
-      dms: SAMPLE_DMS,
+      dms: [
+        ...SAMPLE_DMS,
+        { id: "dm-emoji", type: "group", name: "Plataforma", participants: [], avatarEmoji: "🚀" },
+      ],
     });
     renderChat();
 
     const option = await screen.findByRole("option", { name: "Grupo Equipe Infra" });
-    expect(option.textContent).toContain("JL");
-    expect(option.textContent).toContain("CA");
+    const auto = option.querySelector(".group-avatar") as HTMLElement;
+    expect(auto.textContent).toBe("EI");
+    expect(auto.dataset.mode).toBe("auto");
+    expect(option.textContent).not.toContain("JL");
+    expect(option.querySelector("[class*='chat-sidebar__avatar--']")).toBeNull();
+
+    const emoji = screen.getByRole("option", { name: "Grupo Plataforma" });
+    expect(emoji.querySelector(".group-avatar")?.textContent).toBe("🚀");
   });
 
   it("shows the counterpart avatar in a 1:1 DM", async () => {
@@ -987,6 +1009,7 @@ async function openGroupModeAndSelectBoth(user: ReturnType<typeof userEvent.setu
   await user.type(screen.getByRole("searchbox"), "eq");
   await user.click(await screen.findByRole("button", { name: "Juliane Lino" }));
   await user.click(screen.getByRole("button", { name: "Caio Almeida" }));
+  await user.click(screen.getByRole("button", { name: "Continuar" }));
 }
 
 describe("ChatSidebar — ad-hoc group creation", () => {
@@ -1010,6 +1033,7 @@ describe("ChatSidebar — ad-hoc group creation", () => {
     expect(mockCreateGroupDM).toHaveBeenCalledWith(
       ["juliane", "caio"],
       "  Equipe Infra  ",
+      undefined,
       expect.any(AbortSignal),
     );
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -1059,6 +1083,7 @@ describe("ChatSidebar — ad-hoc group creation", () => {
     expect(mockCreateGroupDM).toHaveBeenCalledWith(
       ["juliane", "caio"],
       "",
+      undefined,
       expect.any(AbortSignal),
     );
     expect(await screen.findByRole("option", { name: "Grupo Grupo DM" })).toBeInTheDocument();
@@ -1082,10 +1107,12 @@ describe("ChatSidebar — ad-hoc group creation", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Não foi possível criar o grupo");
     expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-dm")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Voltar" }));
     expect(screen.getByRole("list", { name: "Pessoas selecionadas" })).toHaveTextContent(
       "Juliane Lino",
     );
-    expect(screen.queryByTestId("chat-dm")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Continuar" }));
 
     await user.click(screen.getByRole("button", { name: "Criar grupo" }));
     await waitFor(() => expect(screen.getByTestId("chat-dm")).toBeInTheDocument());
@@ -3262,6 +3289,7 @@ describe("ChatSidebar — row action menu", () => {
     markRead?: (target: { kind: "channel" | "dm"; targetId: string }) => void;
     renameChannel?: (channelId: string, displayName: string) => Promise<void>;
     renameGroup?: (conversationId: string, title: string) => Promise<void>;
+    setGroupAvatar?: (conversationId: string, emoji: string | undefined) => Promise<void>;
     setMuted?: (
       target: { kind: "channel" | "dm"; targetId: string },
       muted: boolean,
@@ -3271,31 +3299,33 @@ describe("ChatSidebar — row action menu", () => {
     draftSummaries?: ReadonlyMap<string, DraftSummary>;
   }
 
+  // Every row action, as a resolving mock. A test overrides only the ones it
+  // inspects; the rest exist so the menu offers the full set.
+  const sidebarActions = () => ({
+    setPinned: vi.fn().mockResolvedValue(undefined),
+    markRead: vi.fn(),
+    renameChannel: vi.fn().mockResolvedValue(undefined),
+    renameGroup: vi.fn().mockResolvedValue(undefined),
+    setGroupAvatar: vi.fn().mockResolvedValue(undefined),
+    setMuted: vi.fn().mockResolvedValue(undefined),
+    leaveConversation: vi.fn().mockResolvedValue(undefined),
+    onOpenDetails: vi.fn(),
+  });
+
   const renderSidebar = ({
     channels = [],
     dms = [],
     path = "/chat",
-    setPinned = vi.fn().mockResolvedValue(undefined),
-    markRead = vi.fn(),
-    renameChannel = vi.fn().mockResolvedValue(undefined),
-    renameGroup = vi.fn().mockResolvedValue(undefined),
-    setMuted = vi.fn().mockResolvedValue(undefined),
-    leaveConversation = vi.fn().mockResolvedValue(undefined),
-    onOpenDetails = vi.fn(),
     draftSummaries,
+    ...actions
   }: RenderOptions = {}) =>
     render(
       <MemoryRouter initialEntries={[path]}>
         <ChatSidebar
           state={readyState(channels, dms)}
           retry={() => {}}
-          setPinned={setPinned}
-          markRead={markRead}
-          renameChannel={renameChannel}
-          renameGroup={renameGroup}
-          setMuted={setMuted}
-          leaveConversation={leaveConversation}
-          onOpenDetails={onOpenDetails}
+          {...sidebarActions()}
+          {...actions}
           draftSummaries={draftSummaries}
         />
       </MemoryRouter>,
@@ -3499,6 +3529,31 @@ describe("ChatSidebar — row action menu", () => {
     ]);
   });
 
+  // Issue #1026: the identity is changed from the group's own menu, persisted
+  // through the hook, and the row is never patched optimistically.
+  it("changes a group's identity from its menu, back to Automático", async () => {
+    const user = userEvent.setup();
+    const setGroupAvatar = vi.fn().mockResolvedValue(undefined);
+    renderSidebar({
+      dms: [dm("Equipe", "group", { avatarEmoji: "🎉" })],
+      setGroupAvatar,
+    });
+
+    await user.click(trigger("grupo Equipe"));
+    await user.click(screen.getByRole("menuitem", { name: "Alterar identidade" }));
+    const dialog = screen.getByRole("dialog", { name: "Identidade do grupo" });
+    await user.click(within(dialog).getByRole("radio", { name: "Automático" }));
+    // Still the persisted emoji on the row until the server confirms.
+    expect(
+      screen.getByRole("option", { name: "Grupo Equipe" }).querySelector(".group-avatar")
+        ?.textContent,
+    ).toBe("🎉");
+    await user.click(within(dialog).getByRole("button", { name: "Salvar" }));
+
+    expect(setGroupAvatar).toHaveBeenCalledWith("Equipe", undefined);
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+
   it("offers the full menu on a group, including rename", async () => {
     const user = userEvent.setup();
     renderSidebar({ dms: [dm("Equipe", "group", { unreadCount: 1 })] });
@@ -3510,6 +3565,7 @@ describe("ChatSidebar — row action menu", () => {
       "Marcar como lido",
       "Silenciar notificações",
       "Renomear grupo",
+      "Alterar identidade",
       "Detalhes do grupo",
       "Sair do grupo",
     ]);

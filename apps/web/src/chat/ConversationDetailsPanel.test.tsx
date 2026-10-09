@@ -36,6 +36,7 @@ vi.mock("./chatApi", () => ({
   addGroupParticipants,
 }));
 
+import { parseOwnership } from "./ownershipApi";
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
 import type {
   ChannelAttachment,
@@ -375,6 +376,47 @@ describe("ConversationDetailsPanel — canal: membros", () => {
       presence: "online" as const,
     },
   ];
+
+  it.each([
+    { type: "private" as const, enabled: true },
+    { type: "private" as const, enabled: false },
+    { type: "public" as const, enabled: false },
+  ])(
+    "renders the authoritative source for $type channels with ownership=$enabled",
+    ({ type, enabled }) => {
+      const ownership = parseOwnership({
+        enabled,
+        members: [
+          {
+            user_id: currentUserId,
+            display_name: "Ownership participant",
+            role: "owner",
+            actions: { assign_role: true, transfer: false, remove: false },
+          },
+        ],
+      });
+      renderPanel({
+        state: state({
+          details: { status: "ready", data: channelDetails({ type, ownership }) },
+          roster: {
+            status: "ready",
+            data: {
+              memberCount: 1,
+              members: [{ userId: "legacy", displayName: "Legacy participant", role: "member" }],
+            },
+          },
+        }),
+      });
+      expect(
+        screen.getByText(enabled ? "Ownership participant" : "Legacy participant", { exact: true }),
+      ).toBeVisible();
+      expect(
+        screen.queryByText(enabled ? "Legacy participant" : "Ownership participant", {
+          exact: true,
+        }),
+      ).not.toBeInTheDocument();
+    },
+  );
 
   it("marks the authenticated user by id, not by name", () => {
     renderPanel({

@@ -16,6 +16,7 @@ import {
   addGroupParticipants,
   createChannel,
   createGroupDM,
+  setGroupAvatarEmoji,
   deleteMessage,
   editMessage,
   favoriteMessage,
@@ -693,6 +694,33 @@ describe("fetchDMs", () => {
     // Per-item tolerance, like the other list parsers here: one bad row does not
     // cost the user the rest of their conversations.
     expect(dms).toHaveLength(2);
+  });
+
+  // Issue #1026: only a group carries an identity, and only a non-empty string
+  // is one; everything else reads as Automático (no avatarEmoji at all).
+  it("maps a group's avatar_emoji and treats anything else as Automático", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [
+          { id: "g-emoji", type: "group", name: "Infra", avatar_emoji: "🧑‍🚀" },
+          { id: "g-auto", type: "group", name: "Ops" },
+          { id: "g-empty", type: "group", name: "Vazio", avatar_emoji: "" },
+          { id: "g-number", type: "group", name: "Número", avatar_emoji: 7 },
+          { id: "d-emoji", type: "direct", name: "Ana", avatar_emoji: "🎉" },
+        ],
+      }),
+    );
+
+    const dms = await fetchDMs();
+
+    expect(dms.map((dm) => [dm.id, dm.avatarEmoji])).toEqual([
+      ["g-emoji", "🧑‍🚀"],
+      ["g-auto", undefined],
+      ["g-empty", undefined],
+      ["g-number", undefined],
+      ["d-emoji", undefined],
+    ]);
+    expect(dms[1]).not.toHaveProperty("avatarEmoji");
   });
 
   it("returns empty array when dm_conversations list is empty", async () => {
@@ -1423,9 +1451,9 @@ describe("direct DM contracts", () => {
     mockAuthFetch.mockResolvedValue({ data: { conversation_id: "dm-group" } });
     const controller = new AbortController();
 
-    await expect(createGroupDM(["user-2", "user-3"], "  Infra  ", controller.signal)).resolves.toBe(
-      "dm-group",
-    );
+    await expect(
+      createGroupDM(["user-2", "user-3"], "  Infra  ", undefined, controller.signal),
+    ).resolves.toBe("dm-group");
     expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dms/group", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1443,7 +1471,7 @@ describe("direct DM contracts", () => {
 
     for (const blank of ["", "   "]) {
       mockAuthFetch.mockClear();
-      await createGroupDM(["user-2", "user-3"], blank);
+      await createGroupDM(["user-2", "user-3"], blank, undefined);
       const [, init] = mockAuthFetch.mock.calls[0] as [string, { body: string }];
       expect(init.body).toBe(JSON.stringify({ participant_user_ids: ["user-2", "user-3"] }));
     }
@@ -1453,13 +1481,76 @@ describe("direct DM contracts", () => {
     mockAuthFetch.mockResolvedValue({ data: { conversation_id: "dm-group" } });
     const emojiTitle = Array.from({ length: 120 }, () => "🙂").join("");
 
-    await createGroupDM(["user-2", "user-3"], `  ${emojiTitle}  `);
+    await createGroupDM(["user-2", "user-3"], `  ${emojiTitle}  `, undefined);
 
     const [, init] = mockAuthFetch.mock.calls[0] as [string, { body: string }];
     const sent = JSON.parse(init.body) as { title: string };
     expect(sent.title).toBe(emojiTitle);
     // The server measures runes: 120 code points must survive serialisation.
     expect(Array.from(sent.title)).toHaveLength(120);
+  });
+
+  // Issue #1026: Automático persists nothing; Emoji sends exactly the sequence.
+  it("sends no identity for an Automático group and only avatar_emoji for an Emoji one", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { conversation_id: "dm-group" } });
+
+    await createGroupDM(["user-2", "user-3"], "Infra", undefined);
+    await createGroupDM(["user-2", "user-3"], "Infra", "👩‍💻");
+
+    const bodies = mockAuthFetch.mock.calls.map(
+      ([, init]) => JSON.parse((init as { body: string }).body) as Record<string, unknown>,
+    );
+    expect(bodies[0]).toEqual({ participant_user_ids: ["user-2", "user-3"], title: "Infra" });
+    expect(bodies[1]).toEqual({
+      participant_user_ids: ["user-2", "user-3"],
+      title: "Infra",
+      avatar_emoji: "👩‍💻",
+    });
+    for (const body of bodies) {
+      for (const derived of ["initials", "avatar_color", "color", "mode"]) {
+        expect(body).not.toHaveProperty(derived);
+      }
+    }
+  });
+
+  it("propagates a refused creation", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new Error("400"));
+    await expect(createGroupDM(["user-2", "user-3"], "Infra", "<b>x</b>")).rejects.toThrow("400");
+  });
+});
+
+describe("setGroupAvatarEmoji", () => {
+  beforeEach(() => mockAuthFetch.mockReset());
+
+  it("PUTs exactly the emoji to the group's avatar route, with the signal", async () => {
+    mockAuthFetch.mockResolvedValue(undefined);
+    const controller = new AbortController();
+
+    await setGroupAvatarEmoji("dm/1", "🎉", controller.signal);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/dm%2F1/avatar", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ emoji: "🎉" }),
+      signal: controller.signal,
+    });
+  });
+
+  it("returns to Automático with an explicit DELETE and no body", async () => {
+    mockAuthFetch.mockResolvedValue(undefined);
+    const controller = new AbortController();
+
+    await setGroupAvatarEmoji("dm-1", undefined, controller.signal);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/dm-1/avatar", {
+      method: "DELETE",
+      signal: controller.signal,
+    });
+  });
+
+  it("propagates a refusal", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new Error("403"));
+    await expect(setGroupAvatarEmoji("dm-1", "🎉")).rejects.toThrow("403");
   });
 });
 

@@ -23,9 +23,12 @@ import {
   type ConversationActionId,
   type ConversationTarget,
 } from "./conversationActions";
+import GroupAvatar from "./GroupAvatar";
+import GroupIdentityDialog from "./GroupIdentityDialog";
+import { useGroupIdentityDialog } from "./useGroupIdentityDialog";
 import LeaveConversationDialog from "./LeaveConversationDialog";
 import RenameChannelDialog from "./RenameChannelDialog";
-import { avatarColorFor, initialsFrom } from "./messageDisplay";
+import { avatarColorFor } from "./messageDisplay";
 import NewConversationDialog from "./NewConversationDialog";
 import { presenceTargetKey, usePresenceDetail, type PresenceState } from "./presence";
 import { describePresence } from "./presenceDescription";
@@ -182,43 +185,6 @@ function Avatar({
         presenceRingColor="var(--cs-sidebar-bg)"
         imageClassName="chat-sidebar__avatar-img"
       />
-    </span>
-  );
-}
-
-function GroupAvatars({ dm }: { dm: DMConversation }) {
-  const first = dm.participants[0];
-  const second = dm.participants[1];
-  // The sidebar payload carries no participants (chatApi maps them to []), so
-  // without this every group reserved the avatar slot and left it empty
-  // (BUG #395). The group name is already on the row, so its initials come from
-  // the same canonical rule the 1:1 rows use — no second rule, no empty space.
-  if (!first) {
-    return (
-      <span
-        className={`chat-sidebar__avatar chat-sidebar__avatar--${avatarColorFor(dm.id)} chat-sidebar__avatar--sm`}
-        aria-hidden="true"
-      >
-        {initialsFrom(dm.name)}
-      </span>
-    );
-  }
-  return (
-    <span className="chat-sidebar__group-avatars" aria-hidden="true">
-      {first && (
-        <span
-          className={`chat-sidebar__avatar chat-sidebar__avatar--${first.color} chat-sidebar__avatar--sm chat-sidebar__avatar--group-back`}
-        >
-          {first.initials}
-        </span>
-      )}
-      {second && (
-        <span
-          className={`chat-sidebar__avatar chat-sidebar__avatar--${second.color} chat-sidebar__avatar--sm chat-sidebar__avatar--group-front`}
-        >
-          {second.initials}
-        </span>
-      )}
     </span>
   );
 }
@@ -624,7 +590,7 @@ function DMRow({
           one, with initials otherwise — so the row height never shifts
           depending on whether a counterpart has an avatar. */}
         {isGroup ? (
-          <GroupAvatars dm={dm} />
+          <GroupAvatar name={dm.name} emoji={dm.avatarEmoji} />
         ) : (
           <Avatar
             userId={counterpart?.userId ?? ""}
@@ -761,6 +727,40 @@ function SidebarRenameDialog({
       currentName={conversation.name}
       onClose={onClose}
       onRename={rename}
+    />
+  );
+}
+
+/**
+ * Resolves the group an identity dialog is open for (issue #1026). Same shape
+ * as the rename host: the current identity is read from the canonical list, and
+ * a group the refetch removed closes its dialog.
+ */
+function SidebarIdentityDialog({
+  dms,
+  targetId,
+  currentUserId,
+  onClose,
+  onSave,
+}: {
+  dms: DMConversation[] | undefined;
+  targetId: string | null;
+  /** Absent until the sidebar is ready; the dialog needs the reader's history. */
+  currentUserId: string | undefined;
+  onClose: () => void;
+  onSave?: (conversationId: string, emoji: string | undefined) => Promise<void>;
+}) {
+  const group = dms?.find((candidate) => candidate.id === targetId && candidate.type === "group");
+  if (!group || !onSave || !currentUserId) return null;
+  return (
+    <GroupIdentityDialog
+      key={group.id}
+      groupId={group.id}
+      name={group.name}
+      avatarEmoji={group.avatarEmoji}
+      currentUserId={currentUserId}
+      onClose={onClose}
+      onSave={onSave}
     />
   );
 }
@@ -1032,6 +1032,8 @@ interface ChatSidebarProps {
   renameChannel?: (channelId: string, displayName: string) => Promise<void>;
   /** Persists a group's new title; rejects with the API error (issue #527). */
   renameGroup?: (conversationId: string, title: string) => Promise<void>;
+  /** Sets a group's emoji, or with none returns it to Automático (#1026). */
+  setGroupAvatar?: (conversationId: string, emoji: string | undefined) => Promise<void>;
   /** Silences or restores one conversation for this viewer (issue #527). */
   setMuted?: (
     target: { kind: "channel" | "dm"; targetId: string },
@@ -1089,6 +1091,7 @@ export default function ChatSidebar({
   markRead,
   renameChannel,
   renameGroup,
+  setGroupAvatar,
   setMuted,
   leaveConversation,
   onOpenDetails,
@@ -1116,9 +1119,10 @@ export default function ChatSidebar({
   // useSidebarSectionPreferences for how it stays correct on the first ready
   // render and drops any stale value when the user or workspace changes,
   // without ever calling setState during this render.
+  const readyUserId = state.status === "ready" ? state.currentUserId : undefined;
   const { prefs: sectionPrefs, toggleCollapsed: toggleSectionCollapsed } =
     useSidebarSectionPreferences(
-      state.status === "ready" ? state.currentUserId : undefined,
+      readyUserId,
       state.status === "ready" ? state.workspaceId : undefined,
     );
 
@@ -1143,6 +1147,7 @@ export default function ChatSidebar({
   // at render time, so a refetch that removed the conversation closes the
   // dialog instead of leaving one open over nothing.
   const [leavingId, setLeavingId] = useState<string | null>(null);
+  const identityDialog = useGroupIdentityDialog();
 
   useEffect(() => {
     if (!newConversationOpen && state.status === "ready" && restoreFocusRef.current) {
@@ -1360,6 +1365,7 @@ export default function ChatSidebar({
       mute: () => handleMute(target, true),
       unmute: () => handleMute(target, false),
       rename: () => setRenamingId(target.id),
+      identity: () => identityDialog.open(target.id, trigger),
       // The trigger travels with the request: the panel opens somewhere else
       // entirely, and closing it has to know which row to hand focus back to
       // (issue #467, code quality review).
@@ -1555,6 +1561,13 @@ export default function ChatSidebar({
           onClose={() => setRenamingId(null)}
           onRenameChannel={renameChannel}
           onRenameGroup={renameGroup}
+        />
+        <SidebarIdentityDialog
+          dms={dms}
+          targetId={identityDialog.targetId}
+          currentUserId={readyUserId}
+          onClose={identityDialog.close}
+          onSave={setGroupAvatar}
         />
         <SidebarLeaveDialog
           channels={channels}

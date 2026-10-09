@@ -1,3 +1,4 @@
+import OwnershipDialogs from "./OwnershipDialogs";
 import OwnershipRoster from "./OwnershipRoster";
 import { renameChannel, renameGroup } from "./chatApi";
 /**
@@ -1146,7 +1147,6 @@ function peopleSectionWords(
  */
 function administrableRoster(
   kind: "channel" | "group",
-  _canRemove: boolean,
   roster: ConversationDetailsState["roster"],
 ): ChannelRoster | null {
   if (kind !== "channel" || roster.status !== "ready") return null;
@@ -1270,7 +1270,7 @@ function PeopleSection({
     reload,
     fallbackFocusRef: addMembersButtonRef,
   });
-  const requestedRoster = administrableRoster(kind, canRemove, roster);
+  const requestedRoster = administrableRoster(kind, roster);
   const [loadedRoster, setLoadedRoster] = useState<{
     base: ChannelRoster | null;
     value: ChannelRoster;
@@ -1322,127 +1322,149 @@ function PeopleSection({
     });
   }
 
+  function renderLegacyParticipants() {
+    return (
+      <ExpandableDetailsSection
+        key={`people-${targetId}`}
+        title={sectionWords.heading}
+        listLabel={sectionWords.label}
+        /*
+          Left undefined whenever the preview is the whole collection, which is
+          what keeps "Ver todos" as the default wording for every section that
+          can genuinely show everything.
+        */
+        expandLabel={channelRoster?.nextCursor ? "Carregar mais" : shortfall.expandLabel}
+        onExpand={channelRoster?.nextCursor ? loadMoreMembers : undefined}
+        content={peopleContent({
+          kind,
+          details,
+          roster: channelRoster,
+          rosterState: roster,
+          context: { presence, currentUserId, openDM },
+          workspaceId,
+          removal: rowRemoval,
+        })}
+      >
+        {/*
+          Named before the actions, directly under the list it is about: how many
+          of the conversation's people this client is holding. The heading above
+          already says how many there are.
+        */}
+        <RosterShortfallNote note={shortfall.note} />
+        {/*
+          Rendered only once the server has answered and said this caller may
+          add members. Loading, error and "not permitted" all leave it absent —
+          the safe default, since canAddMembers is false unless the server sent
+          exactly true. Hiding it is not the security boundary.
+        */}
+        {canAdd && (
+          <button
+            ref={addMembersButtonRef}
+            type="button"
+            className="chat-details__wide-action"
+            onClick={() => setPickerFor(targetId)}
+            data-testid="chat-details-add-members"
+          >
+            <span className="material-symbols-outlined" aria-hidden="true">
+              person_add
+            </span>
+            {copy.addAction}
+          </button>
+        )}
+      </ExpandableDetailsSection>
+    );
+  }
+
   const ownership = ownershipProjection(details);
   return (
-    <>
-      {/*
+    <OwnershipDialogs
+      status={details.status}
+      context={
+        ownership
+          ? {
+              kind,
+              id: targetId,
+              ownership,
+              currentUserId,
+              workspaceId,
+              reload,
+              onCommitted: (text) => setAddedNotice({ targetId, text }),
+            }
+          : undefined
+      }
+    >
+      {(openOwnershipAction) => (
+        <>
+          {/*
         Keyed by the conversation. The panel is deliberately not remounted on a
         target switch, so without this the roster expanded for one conversation
         would stay expanded under the next one's name — and that expansion is a
         statement about a list that no longer exists. The remount React already
         offers is the whole mechanism; there is no reset protocol to maintain.
       */}
-      {ownership ? (
-        <OwnershipRoster
-          key={`ownership-${kind}-${targetId}`}
-          kind={kind}
-          id={targetId}
-          ownership={ownership}
-          addButtonRef={addMembersButtonRef}
-          presence={presence}
-          onOpenDM={directMessageAction(openDM)}
-          workspaceId={workspaceId}
-          currentUserId={currentUserId}
-          reload={reload}
-          onCommitted={(text) => setAddedNotice({ targetId, text })}
-          onAdd={() => setPickerFor(targetId)}
-          onRemove={(member, trigger) => removal.request({ ...member, subtitle: "" }, trigger)}
-        />
-      ) : (
-        <ExpandableDetailsSection
-          key={`people-${targetId}`}
-          title={sectionWords.heading}
-          listLabel={sectionWords.label}
-          /*
-          Left undefined whenever the preview is the whole collection, which is
-          what keeps "Ver todos" as the default wording for every section that
-          can genuinely show everything.
-        */
-          expandLabel={channelRoster?.nextCursor ? "Carregar mais" : shortfall.expandLabel}
-          onExpand={channelRoster?.nextCursor ? loadMoreMembers : undefined}
-          content={peopleContent({
-            kind,
-            details,
-            roster: channelRoster,
-            rosterState: roster,
-            context: { presence, currentUserId, openDM },
-            workspaceId,
-            removal: rowRemoval,
-          })}
-        >
-          {/*
-          Named before the actions, directly under the list it is about: how many
-          of the conversation's people this client is holding. The heading above
-          already says how many there are.
-        */}
-          <RosterShortfallNote note={shortfall.note} />
-          {/*
-          Rendered only once the server has answered and said this caller may
-          add members. Loading, error and "not permitted" all leave it absent —
-          the safe default, since canAddMembers is false unless the server sent
-          exactly true. Hiding it is not the security boundary.
-        */}
-          {canAdd && (
-            <button
-              ref={addMembersButtonRef}
-              type="button"
-              className="chat-details__wide-action"
-              onClick={() => setPickerFor(targetId)}
-              data-testid="chat-details-add-members"
-            >
-              <span className="material-symbols-outlined" aria-hidden="true">
-                person_add
-              </span>
-              {copy.addAction}
-            </button>
+          {ownership ? (
+            <OwnershipRoster
+              key={`ownership-${kind}-${targetId}`}
+              ownership={ownership}
+              addButtonRef={addMembersButtonRef}
+              presence={presence}
+              onOpenDM={directMessageAction(openDM)}
+              workspaceId={workspaceId}
+              currentUserId={currentUserId}
+              onAdd={() => setPickerFor(targetId)}
+              onAction={openOwnershipAction}
+              onRemove={(member, trigger) => removal.request({ ...member, subtitle: "" }, trigger)}
+            />
+          ) : (
+            renderLegacyParticipants()
           )}
-        </ExpandableDetailsSection>
-      )}
 
-      {addedNotice?.targetId === targetId && (
-        <p className="chat-details__note" role="status">
-          {addedNotice.text}
-        </p>
-      )}
-      {removal.notice !== "" && (
-        /*
+          {addedNotice?.targetId === targetId && (
+            <p className="chat-details__note" role="status">
+              {addedNotice.text}
+            </p>
+          )}
+          {removal.notice !== "" && (
+            /*
             A removal is announced rather than only seen (issue #469): the row
             it happened to is gone from the list, and focus has moved to the
             control above — neither of which says anything to someone who is
             not looking at the panel.
           */
-        <p className="chat-details__note" role="status">
-          {removal.notice}
-        </p>
-      )}
+            <p className="chat-details__note" role="status">
+              {removal.notice}
+            </p>
+          )}
 
-      <MemberRemovalDialog
-        kind={kind}
-        details={details}
-        conversationName={conversationName}
-        removal={removal}
-      />
+          <MemberRemovalDialog
+            kind={kind}
+            details={details}
+            conversationName={conversationName}
+            removal={removal}
+          />
 
-      {pickerOpen && (
-        <AddMembersDialog
-          workspaceId={workspaceId}
-          target={
-            kind === "channel"
-              ? { kind: "channel", channelId: targetId }
-              : { kind: "group", conversationId: targetId }
-          }
-          /*
+          {pickerOpen && (
+            <AddMembersDialog
+              workspaceId={workspaceId}
+              target={
+                kind === "channel"
+                  ? { kind: "channel", channelId: targetId }
+                  : { kind: "group", conversationId: targetId }
+              }
+              /*
             Only the viewer. Current members are excluded by the search endpoint
             itself, in SQL — this list deliberately does not carry the rendered
             roster, because both sections are capped previews and passing them
             made members they could not show appear as selectable.
           */
-          excludedUserIds={currentUserId ? [currentUserId] : []}
-          onClose={closePicker}
-          onAdded={handleAdded}
-        />
+              excludedUserIds={currentUserId ? [currentUserId] : []}
+              onClose={closePicker}
+              onAdded={handleAdded}
+            />
+          )}
+        </>
       )}
-    </>
+    </OwnershipDialogs>
   );
 }
 

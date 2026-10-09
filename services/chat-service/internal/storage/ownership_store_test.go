@@ -7,6 +7,7 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 	pgxmock "github.com/pashagolub/pgxmock/v2"
 	"testing"
+	"time"
 )
 
 // Failures before admission must roll back without changing roles or leaving
@@ -124,7 +125,7 @@ func expectOwnershipOutboxFailure(mock pgxmock.PgxPoolIface, phase string, failu
 	if phase == "query" {
 		query.WillReturnError(failure)
 	} else {
-		query.WillReturnRows(pgxmock.NewRows([]string{"id", "workspace", "kind", "conversation"}).AddRow(int64(1), "ws", "dm", "id").RowError(0, failure))
+		query.WillReturnRows(pgxmock.NewRows([]string{"id", "workspace", "kind", "conversation", "attempts"}).AddRow(int64(1), "ws", "dm", "id", 0).RowError(0, failure))
 	}
 	mock.ExpectRollback()
 }
@@ -140,5 +141,36 @@ func TestOwnershipInvalidMutationsNeverOpenTransaction(t *testing.T) {
 		if _, err := storage.NewPGXOwnershipStore(nil).Mutate(t.Context(), input); err == nil {
 			t.Fatalf("invalid mutation admitted: %+v", input)
 		}
+	}
+}
+
+func TestOwnershipOutboxTimeoutPersistsCappedRetry(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mock.Close()
+	columns := []string{"id", "workspace", "kind", "conversation", "attempts"}
+	mock.ExpectBegin()
+	mock.ExpectQuery("FROM chat.ownership_outbox").WillReturnRows(pgxmock.NewRows(columns).AddRow(int64(1), "ws", "dm", "id", 100))
+	mock.ExpectExec("UPDATE chat.ownership_outbox").WithArgs(int64(1), 60, "publish_timeout").WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectCommit()
+	mock.ExpectRollback()
+	mock.ExpectBegin()
+	mock.ExpectQuery("FROM chat.ownership_outbox").WillReturnRows(pgxmock.NewRows(columns))
+	mock.ExpectRollback()
+	publish := func(ctx context.Context, _, _, _ string) error {
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) > 5*time.Second {
+			t.Error("publish has no bounded deadline")
+		}
+		return context.DeadlineExceeded
+	}
+	err = storage.NewPGXOwnershipStore(mock).DispatchOwnershipChanges(t.Context(), publish)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timeout lost: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }

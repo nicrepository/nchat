@@ -68,6 +68,7 @@ export function useMessageJump(
   messages: Message[],
   focusMessageId?: string,
   focusRequest = "",
+  focusMissed = false,
 ): MessageJumpState {
   const { scrollToMessage, hasRow, beginJump, endJump } = commands;
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
@@ -106,6 +107,16 @@ export function useMessageJump(
   // never counts as new: it is how a navigation that only keeps the query
   // arrives.
   const followedRef = useRef({ messageId: "", request: "" });
+
+  // #1088: the opening could not reach this message and settled elsewhere. The
+  // request that asked for it is spent, so the page that later brings the
+  // message in by itself does not travel — only asking again does. Registered
+  // before the effect below, which therefore always sees it spent.
+  useEffect(() => {
+    if (!focusMissed || !focusMessageId) return;
+    if (followedRef.current.messageId === focusMessageId) return;
+    followedRef.current = { messageId: focusMessageId, request: focusRequest };
+  }, [focusMissed, focusMessageId, focusRequest]);
 
   // The deep link's claim on the scrollport, taken in the layout phase so no
   // frame between this commit and the scroll below is read as a position.

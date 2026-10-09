@@ -97,6 +97,7 @@ function idleLists(): SearchLists {
     channels: idleList(),
     groups: idleList(),
     files: idleList(),
+    links: idleList(),
   };
 }
 
@@ -196,7 +197,7 @@ function reducer(state: GlobalSearchState, action: Action): GlobalSearchState {
   }
 }
 
-/** The slots the current view needs; "Tudo" needs all five overviews. */
+/** The slots the current view needs; "Tudo" needs every category's overview. */
 function slotsInView(tab: SearchTab): Array<[SearchScope, SearchCategory]> {
   return tab === "all"
     ? SEARCH_CATEGORIES.map((category) => ["overview", category])

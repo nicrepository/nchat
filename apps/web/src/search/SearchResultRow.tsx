@@ -3,6 +3,7 @@ import type { ComponentType } from "react";
 import ChannelResultRow from "./ChannelResultRow";
 import FileResultRow from "./FileResultRow";
 import GroupResultRow from "./GroupResultRow";
+import LinkResultRow from "./LinkResultRow";
 import MessageResultRow from "./MessageResultRow";
 import UserResultRow from "./UserResultRow";
 import type { SearchCategory, SearchResultByCategory } from "./searchTypes";
@@ -15,6 +16,7 @@ const ROWS: {
   channels: ChannelResultRow,
   groups: GroupResultRow,
   files: FileResultRow,
+  links: LinkResultRow,
 };
 
 /** One result card, the same in the overview and in its own tab. */

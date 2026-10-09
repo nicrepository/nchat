@@ -899,6 +899,45 @@ func TestSidebarHandler_DM_GroupName_UsesTitle(t *testing.T) {
 	}
 }
 
+// Issue #1026: a group's emoji travels as avatar_emoji; an Automático group
+// omits the field entirely (absence is the mode), and nothing derived — no
+// initials, no colour — is ever part of the payload.
+func TestSidebarHandler_DM_GroupIdentity(t *testing.T) {
+	v := makeTestValidator(t)
+	svc := &stubSidebarProvider{data: service.SidebarData{
+		Workspace: domain.Workspace{ID: "ws-1", Name: "NIC Labs", Slug: "default", Status: domain.WorkspaceStatusActive},
+		DMs: []domain.DMConversationWithParticipantIDs{
+			{DMConversation: domain.DMConversation{ID: "dm-emoji", Type: domain.DMConversationTypeGroup, Title: "Infra", AvatarEmoji: "🧑‍🚀"}},
+			{DMConversation: domain.DMConversation{ID: "dm-auto", Type: domain.DMConversationTypeGroup, Title: "Ops"}},
+		},
+	}}
+	rr := httptest.NewRecorder()
+	sidebarRouter(v, svc).ServeHTTP(rr, authGet(t))
+
+	var envelope struct {
+		Data struct {
+			DMs []map[string]any `json:"dm_conversations"`
+		} `json:"data"`
+	}
+	mustDecode(t, rr, &envelope)
+	if len(envelope.Data.DMs) != 2 {
+		t.Fatalf("dm_conversations = %v", envelope.Data.DMs)
+	}
+	if got := envelope.Data.DMs[0]["avatar_emoji"]; got != "🧑‍🚀" {
+		t.Fatalf("emoji group avatar_emoji = %v", got)
+	}
+	if _, present := envelope.Data.DMs[1]["avatar_emoji"]; present {
+		t.Fatalf("automatic group must omit avatar_emoji: %v", envelope.Data.DMs[1])
+	}
+	for _, dm := range envelope.Data.DMs {
+		for _, derived := range []string{"initials", "avatar_color", "color"} {
+			if _, present := dm[derived]; present {
+				t.Fatalf("derived field %q leaked: %v", derived, dm)
+			}
+		}
+	}
+}
+
 // TestSidebarHandler_InternalError_Returns500WithoutDetails verifies that
 // internal error details are not exposed in the response body.
 func TestSidebarHandler_InternalError_Returns500WithoutDetails(t *testing.T) {

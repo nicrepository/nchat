@@ -13,7 +13,14 @@ vi.mock("./searchApi", async () => {
 });
 
 import GlobalSearchPage from "./GlobalSearchPage";
-import { fileResult, groupResult, messageResult, resultPage, userResult } from "./searchFixtures";
+import {
+  fileResult,
+  groupResult,
+  linkResult,
+  messageResult,
+  resultPage,
+  userResult,
+} from "./searchFixtures";
 import type { SearchCategory } from "./searchTypes";
 
 const FIELD = "Buscar mensagens, pessoas, canais, grupos e arquivos";
@@ -24,6 +31,7 @@ const results: Record<SearchCategory, ReturnType<typeof resultPage>> = {
   channels: resultPage([]),
   groups: resultPage([groupResult(), groupResult({ id: "g2", title: "Backup Squad" })]),
   files: resultPage([fileResult()]),
+  links: resultPage([linkResult()]),
 };
 
 function Elsewhere() {
@@ -74,7 +82,7 @@ afterEach(() => {
 });
 
 describe("GlobalSearchPage", () => {
-  it("opens on Tudo with six tabs, a focused labelled field and no request", () => {
+  it("opens on Tudo with seven tabs, a focused labelled field and no request", () => {
     renderPage();
     const tabs = screen.getAllByRole("tab");
     expect(tabs.map((tab) => tab.textContent)).toEqual([
@@ -84,6 +92,7 @@ describe("GlobalSearchPage", () => {
       "Canais",
       "Grupos",
       "Arquivos",
+      "Links",
     ]);
     expect(screen.getByRole("tab", { name: "Tudo" })).toHaveAttribute("aria-selected", "true");
     expect(tabs.every((tab) => tab.getAttribute("aria-controls") === "global-search-panel")).toBe(
@@ -137,7 +146,7 @@ describe("GlobalSearchPage", () => {
       vi.advanceTimersByTime(200);
     });
     await flush();
-    expect(mockSearchCategory).toHaveBeenCalledTimes(5);
+    expect(mockSearchCategory).toHaveBeenCalledTimes(6);
     expect(mockSearchCategory.mock.calls.every(([, query]) => query === "outra")).toBe(true);
   });
 
@@ -153,7 +162,7 @@ describe("GlobalSearchPage", () => {
     await search("backup");
 
     const headings = screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent);
-    expect(headings).toEqual(["Mensagens", "Pessoas", "Grupos", "Arquivos"]);
+    expect(headings).toEqual(["Mensagens", "Pessoas", "Grupos", "Arquivos", "Links"]);
     const people = screen.getByRole("region", { name: "Pessoas" });
     expect(within(people).getByText("1 resultado")).toBeInTheDocument();
     const groups = screen.getByRole("region", { name: "Grupos" });
@@ -215,7 +224,7 @@ describe("GlobalSearchPage", () => {
     mockSearchCategory.mockReturnValue(new Promise(() => {}));
     renderPage();
     await search("backup");
-    expect(screen.getAllByTestId("global-search-skeleton")).toHaveLength(5);
+    expect(screen.getAllByTestId("global-search-skeleton")).toHaveLength(6);
     expect(screen.getByRole("status")).toHaveTextContent("Buscando…");
   });
 
@@ -227,11 +236,11 @@ describe("GlobalSearchPage", () => {
     expect(screen.getByRole("tab", { name: "Mensagens" })).toHaveFocus();
     expect(screen.getByRole("tab", { name: "Mensagens" })).toHaveAttribute("tabindex", "0");
     fireEvent.keyDown(document.activeElement!, { key: "End" });
-    expect(screen.getByRole("tab", { name: "Arquivos" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "Links" })).toHaveAttribute("aria-selected", "true");
     fireEvent.keyDown(document.activeElement!, { key: "ArrowRight" });
     expect(screen.getByRole("tab", { name: "Tudo" })).toHaveFocus();
     fireEvent.keyDown(document.activeElement!, { key: "ArrowLeft" });
-    expect(screen.getByRole("tab", { name: "Arquivos" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Links" })).toHaveFocus();
     fireEvent.keyDown(document.activeElement!, { key: "Home" });
     expect(screen.getByRole("tab", { name: "Tudo" })).toHaveFocus();
     fireEvent.keyDown(document.activeElement!, { key: "a" });
@@ -323,5 +332,68 @@ describe("GlobalSearchPage", () => {
     expect(screen.getByRole("searchbox", { name: FIELD })).toHaveValue("backup");
     expect(screen.getByRole("tab", { name: "Grupos" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("button", { name: /Grupo Backup Squad/ })).toBeInTheDocument();
+  });
+
+  it("Links: a section in Tudo, its own paginated tab, and no section when empty", async () => {
+    const more = linkResult({ id: "m8:k", messageId: "m8", url: "https://docs.example.com/b" });
+    mockSearchCategory.mockImplementation((category: SearchCategory, _q: string, options) =>
+      Promise.resolve(
+        category !== "links"
+          ? results[category]
+          : options?.cursor
+            ? resultPage([more])
+            : resultPage([linkResult()], options?.limit === 5 ? null : "links-2"),
+      ),
+    );
+    renderPage();
+    await search("docs.example.com");
+    const section = screen.getByRole("region", { name: "Links" });
+    expect(within(section).getByText("1 resultado")).toBeInTheDocument();
+    expect(within(section).getByRole("button", { name: /Link docs\.example\.com/ })).toBeVisible();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Links" }));
+    await flush();
+    const list = screen.getByRole("list", { name: "Links" });
+    expect(within(list).getAllByRole("listitem")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Carregar mais" }));
+    await flush();
+    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
+    expect(mockSearchCategory).toHaveBeenLastCalledWith(
+      "links",
+      "docs.example.com",
+      expect.objectContaining({ cursor: "links-2", limit: 20 }),
+    );
+
+    mockSearchCategory.mockImplementation((category: SearchCategory) =>
+      Promise.resolve(category === "links" ? resultPage([]) : results[category]),
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "Tudo" }));
+    await search("backup");
+    expect(screen.queryByRole("region", { name: "Links" })).toBeNull();
+    expect(screen.getByRole("region", { name: "Arquivos" })).toBeInTheDocument();
+  });
+
+  it("Links on a search-service without the route is an explicit, retryable error", async () => {
+    mockSearchCategory.mockImplementation((category: SearchCategory) =>
+      category === "links"
+        ? Promise.reject(new ApiRequestError(404, "not_found", "x"))
+        : Promise.resolve(results[category]),
+    );
+    renderPage();
+    await search("backup");
+    const section = screen.getByRole("region", { name: "Links" });
+    expect(within(section).getByRole("alert")).toHaveTextContent(
+      "Esta busca ainda não está disponível.",
+    );
+    expect(screen.getByRole("region", { name: "Mensagens" })).toBeInTheDocument();
+
+    mockSearchCategory.mockClear().mockResolvedValue(resultPage([linkResult()]));
+    fireEvent.click(within(section).getByRole("button", { name: "Tentar novamente" }));
+    await flush();
+    expect(mockSearchCategory).toHaveBeenCalledTimes(1);
+    expect(mockSearchCategory).toHaveBeenCalledWith("links", "backup", expect.anything());
+    expect(
+      within(screen.getByRole("region", { name: "Links" })).getByText("1 resultado"),
+    ).toBeInTheDocument();
   });
 });

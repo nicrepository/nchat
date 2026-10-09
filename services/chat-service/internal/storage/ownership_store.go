@@ -485,6 +485,9 @@ func executeOwnershipMutation(ctx context.Context, tx pgx.Tx, input OwnershipMut
 	if err = authorizeOwnershipMutation(input, details); err != nil {
 		return OwnershipMutationResult{}, err
 	}
+	if err = prepareOwnershipDeparture(ctx, tx, input); err != nil {
+		return OwnershipMutationResult{}, err
+	}
 	eventID, applyErr := applyOwnershipMutation(ctx, tx, input)
 	if applyErr != nil {
 		return OwnershipMutationResult{}, applyErr

@@ -931,3 +931,40 @@ func TestPGXUserStore_ListWorkspaceUsers_CarriesNoTextualSortKey(t *testing.T) {
 		}
 	}
 }
+
+func TestPGXUserStore_OwnershipInvalidationRetryRecalculates(t *testing.T) {
+	for _, state := range []string{"40001", "40P01"} {
+		t.Run(state, func(t *testing.T) {
+			mock, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mock.Close()
+			expectAccountInvalidationSnapshot(mock, "conversation-before", "candidate-before")
+			mock.ExpectQuery(`UPDATE auth\.users`).WithArgs("uid-1", "suspended").WillReturnError(&pgconn.PgError{Code: state})
+			mock.ExpectRollback()
+			expectAccountInvalidationSnapshot(mock, "conversation-after", "candidate-after")
+			mock.ExpectQuery(`UPDATE auth\.users`).WithArgs("uid-1", "suspended").WillReturnRows(userRow())
+			mock.ExpectExec(`WITH revoked AS`).WithArgs("uid-1").WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+			mock.ExpectExec(`UPDATE auth\.oidc_exchange_codes`).WithArgs("uid-1").WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+			mock.ExpectCommit()
+			mock.ExpectRollback()
+			if _, err := storage.NewPGXUserStore(mock).UpdateUserStatus(t.Context(), "uid-1", "suspended"); err != nil {
+				t.Fatal(err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func expectAccountInvalidationSnapshot(mock pgxmock.PgxPoolIface, conversation, candidate string) {
+	mock.ExpectBegin()
+	mock.ExpectExec(`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`).WillReturnResult(pgxmock.NewResult("SET", 0))
+	mock.ExpectQuery(`SELECT to_regprocedure`).WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(true))
+	mock.ExpectExec(`SELECT chat.lock_user_ownership_conversations`).WithArgs("uid-1").WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectQuery(`SELECT status FROM auth\.users`).WithArgs("uid-1").WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
+	mock.ExpectQuery(`WITH affected AS`).WithArgs("", "", "", "uid-1", true).WillReturnRows(pgxmock.NewRows([]string{"workspace", "kind", "conversation", "members", "owners", "candidate"}).AddRow("workspace", "dm", conversation, 1, 0, candidate))
+	mock.ExpectExec(`SELECT chat.assign_ownership`).WithArgs("dm", conversation, candidate, "owner", "", "invalidation").WillReturnResult(pgxmock.NewResult("SELECT", 1))
+}

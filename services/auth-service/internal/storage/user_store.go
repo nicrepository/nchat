@@ -284,7 +284,8 @@ func (s *PGXUserStore) updateUserStatusOnce(ctx context.Context, id, newStatus s
 		return domain.User{}, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	if err := prepareOwnershipInvalidation(ctx, tx, id); err != nil {
+	available, err := prepareOwnershipInvalidation(ctx, tx, id)
+	if err != nil {
 		return domain.User{}, err
 	}
 
@@ -307,6 +308,10 @@ func (s *PGXUserStore) updateUserStatusOnce(ctx context.Context, id, newStatus s
 		return domain.User{}, err
 	}
 
+	if err := succeedAccountSuspension(ctx, tx, id, newStatus, available); err != nil {
+		return domain.User{}, err
+	}
+
 	var u domain.User
 	err = tx.QueryRow(ctx, `
 		UPDATE auth.users
@@ -322,41 +327,8 @@ func (s *PGXUserStore) updateUserStatusOnce(ctx context.Context, id, newStatus s
 		return domain.User{}, fmt.Errorf("update user status: %w", err)
 	}
 
-	// Revoke all active sessions and refresh tokens in the same transaction so that
-	// a suspension always produces a consistent state (status suspended + no active sessions).
-	// Also invalidate pending OIDC exchange codes for the user, because a code created before
-	// suspension could otherwise be consumed after reactivation to return pre-suspension tokens.
-	if newStatus == "suspended" {
-		if _, err := tx.Exec(ctx, `
-			WITH revoked AS (
-			    UPDATE auth.user_sessions
-			    SET revoked_at = now(), revoked_reason = 'admin_suspension'
-			    WHERE user_id = $1 AND revoked_at IS NULL
-			    RETURNING id
-			)
-			UPDATE auth.refresh_token_history
-			SET status = 'revoked', revoked_at = now()
-			WHERE session_id IN (SELECT id FROM revoked)
-			  AND status = 'active'`,
-			id,
-		); err != nil {
-			return domain.User{}, fmt.Errorf("revoke sessions on suspension: %w", err)
-		}
-
-		// Invalidate any pending OIDC exchange codes for this user.
-		// user_json->>'id' stores the user UUID as text; no migration required.
-		// Activation intentionally does NOT reset used_at — a code invalidated by
-		// suspension cannot be replayed even if the user is later reactivated.
-		if _, err := tx.Exec(ctx, `
-			UPDATE auth.oidc_exchange_codes
-			SET used_at = now()
-			WHERE used_at IS NULL
-			  AND expires_at > now()
-			  AND user_json->>'id' = $1`,
-			id,
-		); err != nil {
-			return domain.User{}, fmt.Errorf("invalidate oidc exchange codes on suspension: %w", err)
-		}
+	if err := closeOutSuspendedAccess(ctx, tx, id, newStatus); err != nil {
+		return domain.User{}, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -544,17 +516,55 @@ func (s *PGXUserStore) ListWorkspaceUsers(ctx context.Context, workspaceID strin
 	return users, nil
 }
 
-func prepareOwnershipInvalidation(ctx context.Context, tx pgx.Tx, userID string) error {
+func prepareOwnershipInvalidation(ctx context.Context, tx pgx.Tx, userID string) (bool, error) {
 	if _, err := tx.Exec(ctx, conversationownership.SerializableSQL); err != nil {
-		return err
+		return false, err
 	}
 	var available bool
 	if err := tx.QueryRow(ctx, conversationownership.AvailabilitySQL).Scan(&available); err != nil {
-		return err
+		return false, err
 	}
 	if !available {
-		return nil
+		return false, nil
 	}
 	_, err := tx.Exec(ctx, conversationownership.LockUserSQL, userID)
-	return err
+	return true, err
+}
+
+// Session revocation and OIDC invalidation remain in the status transaction.
+func closeOutSuspendedAccess(ctx context.Context, tx pgx.Tx, id, newStatus string) error {
+	if newStatus != "suspended" {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `
+			WITH revoked AS (
+			    UPDATE auth.user_sessions
+			    SET revoked_at = now(), revoked_reason = 'admin_suspension'
+			    WHERE user_id = $1 AND revoked_at IS NULL
+			    RETURNING id
+			)
+			UPDATE auth.refresh_token_history
+			SET status = 'revoked', revoked_at = now()
+			WHERE session_id IN (SELECT id FROM revoked)
+			  AND status = 'active'`,
+		id,
+	); err != nil {
+		return fmt.Errorf("revoke sessions on suspension: %w", err)
+	}
+
+	// Invalidate any pending OIDC exchange codes for this user.
+	// user_json->>'id' stores the user UUID as text; no migration required.
+	// Activation intentionally does NOT reset used_at — a code invalidated by
+	// suspension cannot be replayed even if the user is later reactivated.
+	if _, err := tx.Exec(ctx, `
+			UPDATE auth.oidc_exchange_codes
+			SET used_at = now()
+			WHERE used_at IS NULL
+			  AND expires_at > now()
+			  AND user_json->>'id' = $1`,
+		id,
+	); err != nil {
+		return fmt.Errorf("invalidate oidc exchange codes on suspension: %w", err)
+	}
+	return nil
 }

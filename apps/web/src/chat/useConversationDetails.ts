@@ -550,9 +550,9 @@ function reconcileReducer(state: ReconcileWindow, action: ReconcileAction): Reco
 }
 
 /**
- * Issues the authoritative roster request for every visible channel. The
- * server applies the same visibility check as channel details, while action
- * capabilities only decide which controls each row receives.
+ * Loads the legacy roster when the channel has no enabled ownership projection.
+ * With ownership enabled, the panel uses ownership.members exclusively.
+ * Public channels and ownership-disabled conversations retain this request.
  *
  * It shares the details request's AbortController, so a target switch or an
  * unmount cancels an in-flight roster exactly like everything else here, and a
@@ -564,7 +564,7 @@ function loadChannelRoster(
   controller: AbortController,
   dispatch: (action: Action) => void,
 ) {
-  if (details.kind !== "channel") return;
+  if (details.kind !== "channel" || details.ownership?.enabled === true) return;
   fetchChannelMembers(details.id, controller.signal).then(
     (roster) => {
       if (controller.signal.aborted) return;
@@ -886,7 +886,10 @@ export function useConversationDetails(
   useEffect(
     () =>
       listenDetailsInvalidation((event) => {
-        if (event.target_type === (kind === "channel" ? "channel" : "dm") && event.target_id === id)
+        if (
+          event === null ||
+          (event.target_type === (kind === "channel" ? "channel" : "dm") && event.target_id === id)
+        )
           reload();
       }),
     [kind, id, reload],

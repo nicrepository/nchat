@@ -306,7 +306,7 @@ test.describe("Blobatar determinístico (#1016)", () => {
       directProfileFixture(targetId, { user_id: OTHER_USER_ID, display_name: OTHER_USER_NAME }),
     );
     await installMessagingMocks(page, scenario);
-    await page.route("**/api/search/users?*", (route) =>
+    await page.route("**/api/search/users", (route) =>
       route.fulfill({
         json: {
           data: {
@@ -316,8 +316,8 @@ test.describe("Blobatar determinístico (#1016)", () => {
         },
       }),
     );
-    for (const kind of ["v2/messages", "messages", "channels", "groups", "files"]) {
-      await page.route(`**/api/search/${kind}?*`, (route) =>
+    for (const kind of ["v2/messages", "channels", "groups", "files", "links"]) {
+      await page.route(`**/api/search/${kind}`, (route) =>
         route.fulfill({
           json: {
             data: { data: [], pagination: { limit: 20, next_cursor: null, has_more: false } },

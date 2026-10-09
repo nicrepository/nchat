@@ -7,6 +7,7 @@ export const TAB_LABELS: Record<SearchTab, string> = {
   channels: "Canais",
   groups: "Grupos",
   files: "Arquivos",
+  links: "Links",
 };
 
 export const SEARCH_PANEL_ID = "global-search-panel";
@@ -47,4 +48,5 @@ export const CATEGORY_EMPTY: Record<SearchCategory, string> = {
   channels: "Nenhum canal encontrado",
   groups: "Nenhum grupo encontrado",
   files: "Nenhum arquivo encontrado",
+  links: "Nenhum link encontrado",
 };

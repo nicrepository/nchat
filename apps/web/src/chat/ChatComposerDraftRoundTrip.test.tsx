@@ -36,6 +36,9 @@ vi.mock("./filesApi", async () => {
   };
 });
 
+import OwnershipDialogs from "./OwnershipDialogs";
+import * as ownershipApi from "./ownershipApi";
+import { ApiRequestError } from "../lib/api";
 import ChatComposer from "./ChatComposer";
 import type { SendResult } from "./useMessages";
 import { useConversationDrafts, type ConversationDraftsApi } from "./useConversationDrafts";
@@ -950,4 +953,74 @@ describe("a send attempted in the same turn as the clear (#929 review 6)", () =>
       content: [{ content: [{ text: "T2" }] }],
     });
   });
+});
+
+it("preserves the finished voice draft, reply and editor through ownership conflict and cancellation (#1050)", async () => {
+  const onSend = vi.fn<SendFn>();
+  const { getDrafts } = mount(onSend);
+  await screen.findByTestId("chat-composer-record-btn");
+  act(() => getDrafts().setReply(keyA, "R1"));
+  await type("Rascunho de voz");
+  await recordVoice();
+  const voiceNode = screen.getByTestId("chat-voice-recorder");
+  const composerBox = screen.getByTestId("chat-composer-box");
+  const draft = getDrafts().getDraft(keyA);
+  const transfer = vi
+    .spyOn(ownershipApi, "transferConversationOwnership")
+    .mockRejectedValueOnce(new ApiRequestError(409, "conflict", "changed"));
+  Object.defineProperty(HTMLDialogElement.prototype, "showModal", {
+    configurable: true,
+    value() {
+      this.setAttribute("open", "");
+    },
+  });
+  Object.defineProperty(HTMLDialogElement.prototype, "close", {
+    configurable: true,
+    value() {
+      this.removeAttribute("open");
+    },
+  });
+  const ownership: ownershipApi.OwnershipDetails = {
+    enabled: true,
+    capabilities: { leave: true, manageRoles: true, addMembers: true, editMetadata: true },
+    leavePreview: { lastOwner: true, blocked: false, successorUserId: "b" },
+    members: [
+      {
+        userId: "b",
+        displayName: "Caio",
+        role: "member",
+        actions: { transfer: true, assignRole: true, remove: true },
+      },
+    ],
+  };
+  const reload = vi.fn();
+  const modalHost = render(
+    <OwnershipDialogs
+      status="ready"
+      context={{ kind: "group", id: "caio", currentUserId: "a", ownership, reload }}
+    >
+      {(open) => (
+        <button
+          onClick={(event) =>
+            open({ type: "transfer", member: ownership.members[0] }, event.currentTarget)
+          }
+        >
+          Transferir minha propriedade
+        </button>
+      )}
+    </OwnershipDialogs>,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Transferir minha propriedade" }));
+  fireEvent.click(screen.getByRole("button", { name: "Transferir propriedade" }));
+  await screen.findByRole("alert");
+  expect(reload).toHaveBeenCalledOnce();
+  expect(getDrafts().getDraft(keyA)).toBe(draft);
+  expect(screen.getByTestId("chat-voice-recorder")).toBe(voiceNode);
+  expect(screen.getByTestId("chat-composer-box")).toBe(composerBox);
+  fireEvent.click(screen.getByRole("button", { name: "Cancelar" }));
+  expect(getDrafts().getDraft(keyA)).toBe(draft);
+  expect(URL.revokeObjectURL).not.toHaveBeenCalled();
+  expect(onSend).not.toHaveBeenCalled();
+  modalHost.unmount();
+  transfer.mockRestore();
 });

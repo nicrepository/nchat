@@ -48,22 +48,27 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 # chat-service entries are restricted to named families: the rest of its
 # PostgreSQL suites belong to Go Coverage or have no owner yet (see above).
 # The first entry shares CHAT_TEST_DATABASE_URL between the channel membership
-# contract, the presence store, the call/presence orderings (issue #798) and the
-# read cursor family (issue #1082);
+# contract, the presence store, the call/presence orderings (issue #798), the
+# group identity family (issue #1026) and the read cursor family (issue #1082);
 # they reset the chat schema per test and run sequentially, so they cannot
 # collide. The #1025 private-channel creation family also resets the chat
 # schema, so it gets a database of its own through
 # CHANNEL_CREATION_TEST_DATABASE_URL; it is not in the Go Coverage profile
 # (chat-service clears 90% without it).
+# search-service has one entry per family on the same SEARCH_TEST_DATABASE_URL
+# (both reset the schemas on setup and the entries run one after the other):
+# an exact `^Name$` each, so the "matches no test" refusal below holds for each
+# family on its own instead of passing while the other still matches.
 # media-service carries a `//go:build integration` tag, so without `-tags` its
 # suite is not even compiled.
 SUITES=(
-  "services/chat-service|CHAT_TEST_DATABASE_URL|./internal/storage|-run ^(TestChannelMembershipContractPostgreSQL_|TestPresenceStorePostgreSQL_|TestCallPresencePG_|TestConversationReadStatePostgreSQL_)"
+  "services/chat-service|CHAT_TEST_DATABASE_URL|./internal/storage|-run ^(TestChannelMembershipContractPostgreSQL_|TestPresenceStorePostgreSQL_|TestCallPresencePG_|TestGroupIdentityPostgreSQL_|TestConversationReadStatePostgreSQL_)"
   "services/chat-service|CHANNEL_CREATION_TEST_DATABASE_URL|./internal/storage|-run ^TestChannelCreationPostgreSQL_"
   "services/admin-service|ADMIN_TEST_DATABASE_URL|./internal/storage|"
   "services/auth-service|AUTH_TEST_DATABASE_URL|./internal/storage|"
   "services/media-service|MEDIA_TEST_DATABASE_URL|./internal/storage|-tags integration"
   "services/search-service|SEARCH_TEST_DATABASE_URL|./internal/storage|-run ^TestSearchAuthorizationPostgreSQL$"
+  "services/search-service|SEARCH_TEST_DATABASE_URL|./internal/storage|-run ^TestSearchLinksPostgreSQL$"
 )
 
 for suite in "${SUITES[@]}"; do

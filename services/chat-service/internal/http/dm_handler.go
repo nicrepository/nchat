@@ -32,6 +32,9 @@ type dmProvider interface {
 	// set of call-participant user IDs, scoped to this group conversation
 	// (issue #612).
 	GetGroupCallParticipantProfiles(ctx context.Context, input service.GroupCallParticipantProfilesInput) ([]domain.CallParticipantProfile, error)
+	// SetGroupAvatar and ClearGroupAvatar change a group's identity (#1026).
+	SetGroupAvatar(ctx context.Context, input service.GroupAvatarInput) error
+	ClearGroupAvatar(ctx context.Context, input service.GroupAvatarInput) error
 	// RenameGroup sets a group's title (issue #527). Group conversations only.
 	RenameGroup(ctx context.Context, input service.RenameGroupInput) (storage.RenameGroupResult, error)
 	// LeaveGroup removes the caller's own participation (issue #527).
@@ -121,6 +124,9 @@ type createDirectDMResponse struct {
 type createGroupDMRequest struct {
 	ParticipantUserIDs []string `json:"participant_user_ids"`
 	Title              string   `json:"title"`
+	// AvatarEmoji is the optional group identity (issue #1026). Absent or
+	// empty is Automático; DMService validates anything else.
+	AvatarEmoji string `json:"avatar_emoji"`
 }
 
 type createGroupDMResponse struct {
@@ -634,6 +640,7 @@ func (h *DMHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 		CallerID:           callerID,
 		ParticipantUserIDs: request.ParticipantUserIDs,
 		Title:              request.Title,
+		AvatarEmoji:        request.AvatarEmoji,
 	})
 	if err != nil {
 		writeDMConversationError(w, err)
@@ -930,6 +937,72 @@ func (h *DMHandler) RenameGroup(w http.ResponseWriter, r *http.Request) {
 		ID:    result.Conversation.ID,
 		Title: result.Conversation.Title,
 	})
+}
+
+// setGroupAvatarRequest is the whole accepted body: the emoji and nothing else.
+// The strict decoder refuses a workspace, an actor or any other field.
+type setGroupAvatarRequest struct {
+	Emoji string `json:"emoji"`
+}
+
+type setGroupAvatarResponse struct {
+	ID          string `json:"id"`
+	AvatarEmoji string `json:"avatar_emoji"`
+}
+
+// SetGroupAvatar handles PUT /api/chat/dm/{conversationID}/avatar (#1026).
+//
+// Same transport, budget and refusals as RenameGroup; the catalog check is the
+// service's and the authority the store's. Every participant's sidebar is told
+// to refetch, which is how the new identity reaches them.
+func (h *DMHandler) SetGroupAvatar(w http.ResponseWriter, r *http.Request) {
+	conversationID, callerID, workspaceID, ok := h.beginGroupAdmin(w, r, true)
+	if !ok {
+		return
+	}
+	var request setGroupAvatarRequest
+	if !decodeStrictJSON(w, r, &request) {
+		return
+	}
+	err := h.dms.SetGroupAvatar(r.Context(), service.GroupAvatarInput{
+		WorkspaceID:    workspaceID,
+		CallerID:       callerID,
+		ConversationID: conversationID,
+		AvatarEmoji:    request.Emoji,
+	})
+	if err != nil {
+		writeGroupAdminError(w, err)
+		return
+	}
+	h.publishGroupIdentity(r.Context(), workspaceID, conversationID)
+	httputil.WriteJSON(w, http.StatusOK, setGroupAvatarResponse{ID: conversationID, AvatarEmoji: request.Emoji})
+}
+
+// ClearGroupAvatar handles DELETE /api/chat/dm/{conversationID}/avatar: the
+// explicit return to Automático. Idempotent — clearing a group that has no
+// emoji is the same 204.
+func (h *DMHandler) ClearGroupAvatar(w http.ResponseWriter, r *http.Request) {
+	conversationID, callerID, workspaceID, ok := h.beginGroupAdmin(w, r, false)
+	if !ok {
+		return
+	}
+	err := h.dms.ClearGroupAvatar(r.Context(), service.GroupAvatarInput{
+		WorkspaceID:    workspaceID,
+		CallerID:       callerID,
+		ConversationID: conversationID,
+	})
+	if err != nil {
+		writeGroupAdminError(w, err)
+		return
+	}
+	h.publishGroupIdentity(r.Context(), workspaceID, conversationID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *DMHandler) publishGroupIdentity(ctx context.Context, workspaceID, conversationID string) {
+	if h.broadcast != nil {
+		h.broadcast.PublishConversationUpdated(ctx, workspaceID, "dm", conversationID)
+	}
 }
 
 // LeaveGroup handles DELETE /api/chat/dm/{conversationID}/membership (#527).

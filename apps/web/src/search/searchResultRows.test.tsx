@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactElement } from "react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import { MemoryRouter, Outlet, Route, Routes, useLocation } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { mockPresence } = vi.hoisted(() => ({ mockPresence: vi.fn() }));
@@ -11,6 +11,7 @@ vi.mock("../chat/presence", async () => {
   return { ...actual, usePresence: (...args: unknown[]) => mockPresence(...args) };
 });
 
+import type { DMConversation } from "../chat/chatTypes";
 import ChannelResultRow from "./ChannelResultRow";
 import GroupResultRow from "./GroupResultRow";
 import MessageResultRow from "./MessageResultRow";
@@ -134,8 +135,81 @@ describe("GroupResultRow", () => {
     );
     const card = screen.getByRole("button");
     expect(card).toHaveTextContent("1 participante · última atividade");
+    // Issue #1026: the group's own neutral identity, never a colour by id.
+    const avatar = card.querySelector(".group-avatar") as HTMLElement;
+    expect(avatar.dataset.mode).toBe("auto");
+    expect(card.querySelector("[class*='global-search__avatar--']")).toBeNull();
     await userEvent.click(card);
     expect(screen.getByTestId("landing")).toHaveTextContent("/chat/dm/g1");
+  });
+});
+
+// Issue #1026: a group result is drawn from the sidebar's canonical list, the
+// one the chat outlet already holds — no request per row. The list is what the
+// sidebar refetches on realtime updates, so a new list is a new identity.
+function renderInChat(row: ReactElement, dms: DMConversation[]) {
+  const tree = (list: DMConversation[]) => (
+    <MemoryRouter initialEntries={["/chat/search"]}>
+      <Routes>
+        <Route element={<Outlet context={{ workspaceId: "ws-1", dms: list }} />}>
+          <Route path="/chat/search" element={row} />
+        </Route>
+      </Routes>
+    </MemoryRouter>
+  );
+  const view = render(tree(dms));
+  return { refetched: (list: DMConversation[]) => view.rerender(tree(list)) };
+}
+
+const sidebarGroup = (overrides: Partial<DMConversation> = {}): DMConversation => ({
+  id: "g1",
+  type: "group",
+  name: "Projeto NChat",
+  participants: [],
+  ...overrides,
+});
+
+const groupAvatar = () => screen.getByRole("button").querySelector(".group-avatar") as HTMLElement;
+
+describe("GroupResultRow identity (issue #1026)", () => {
+  it("shows the canonical emoji, and the initials once a refetch returns it to Automático", () => {
+    const { refetched } = renderInChat(<GroupResultRow result={groupResult()} query="" />, [
+      sidebarGroup({ avatarEmoji: "🚀" }),
+    ]);
+    expect(groupAvatar()).toHaveTextContent("🚀");
+    expect(groupAvatar().dataset.mode).toBe("emoji");
+
+    refetched([sidebarGroup()]);
+    expect(groupAvatar()).toHaveTextContent("PN");
+    expect(groupAvatar().dataset.mode).toBe("auto");
+  });
+
+  it.each([
+    ["an Automático group", [sidebarGroup()]],
+    ["a group the list does not hold yet", [sidebarGroup({ id: "other", avatarEmoji: "🚀" })]],
+    ["a 1:1 that happens to share the id", [sidebarGroup({ type: "1:1", avatarEmoji: "🚀" })]],
+  ])("falls back to Automático for %s", (_case, dms) => {
+    renderInChat(<GroupResultRow result={groupResult()} query="" />, dms);
+    expect(groupAvatar()).toHaveTextContent("PN");
+    expect(groupAvatar().dataset.mode).toBe("auto");
+  });
+
+  it("keeps a person on UserAvatar and a channel on its own icon", () => {
+    renderInChat(<UserResultRow result={userResult()} query="" />, [
+      sidebarGroup({ avatarEmoji: "🚀" }),
+    ]);
+    const person = screen.getByRole("button");
+    expect(person.querySelector(".global-search__avatar")).not.toBeNull();
+    expect(person.querySelector(".group-avatar")).toBeNull();
+  });
+
+  it("draws a channel without any avatar", () => {
+    renderInChat(<ChannelResultRow result={channelResult()} query="" />, [
+      sidebarGroup({ avatarEmoji: "🚀" }),
+    ]);
+    const channel = screen.getByRole("button");
+    expect(channel).toHaveTextContent("tag");
+    expect(channel.querySelector(".group-avatar, .global-search__avatar")).toBeNull();
   });
 });
 

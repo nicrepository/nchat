@@ -110,6 +110,7 @@ export default function ConversationTimeline(props: ConversationTimelineProps) {
       systemScope={systemScopeFor(props.detailsKind, kind)}
       hasMore={state.nextCursor !== ""}
       loadingMore={state.loadingMore}
+      olderPagesSettled={state.olderPagesSettled}
       lastMutation={state.lastMutation}
       onLoadMore={props.onLoadMore}
       actions={{
