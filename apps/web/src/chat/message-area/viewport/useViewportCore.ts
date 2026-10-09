@@ -87,7 +87,7 @@ export interface ViewportCore {
   /** #492: AT_FIRST_UNREAD lands on the separator, not on the message below it. */
   unreadDividerRef: RefObject<HTMLDivElement | null>;
   /** The mounted message rows, by message id. */
-  messageRefs: RefObject<Map<string, HTMLDivElement>>;
+  messageRefs: RefObject<Map<string, HTMLElement>>;
   /** #675: row index by key, so an unmounted row can still be reached. */
   rowIndexRef: RefObject<Map<string, number>>;
   /** The virtualizer while virtualized, null while the plain path renders. */
@@ -136,6 +136,13 @@ export interface ViewportCore {
    */
   navigationRef: RefObject<Navigation | null>;
   /**
+   * #1082: a programmatic jump to one message — a deep link, a quote, a pin —
+   * in flight, or null. Like a navigation, it owns the scrollport until its
+   * destination has landed, and the reader can take it back at any moment; the
+   * frames it scrolls through are nobody's reading position.
+   */
+  jumpRef: RefObject<{ messageId: string } | null>;
+  /**
    * Whether the bottom sentinel is on screen, as the IntersectionObserver last
    * reported it. Half of the tail's arrival condition (see tailConfirmed).
    */
@@ -149,7 +156,7 @@ export interface ViewportCore {
 
   /** Callback ref for the scroll container; also publishes it as scrollRoot. */
   attachList: (element: HTMLDivElement | null) => void;
-  setMessageRef: (messageId: string, el: HTMLDivElement | null) => void;
+  setMessageRef: (messageId: string, el: HTMLElement | null) => void;
   setPhase: (phase: ViewportPhase) => void;
   /** #675: the row model the positions below are expressed against. */
   setRowModel: (
@@ -192,6 +199,16 @@ export interface ViewportCore {
   endNavigation: (navigation: Navigation) => boolean;
   /** The bottom sentinel's own report, for the tail's arrival condition. */
   noteTailSentinel: (visible: boolean) => void;
+  /** #1082: a jump takes the scrollport until its destination lands. */
+  beginJump: (messageId: string) => void;
+  /** Ends whatever jump is in flight: it landed, or the reader took over. */
+  endJump: () => void;
+  /**
+   * Whether something other than the reader is positioning the scrollport —
+   * a navigation, a prepend restoration or a jump. While it is, no frame is a
+   * reading position.
+   */
+  ownsScrollport: () => boolean;
   /**
    * Puts a message on screen, and says whether it could (#675).
    *
@@ -232,7 +249,7 @@ export function useViewportCore(): ViewportCoreState {
   const bottomRef = useRef<HTMLDivElement>(null);
   const topSentinelRef = useRef<HTMLDivElement>(null);
   const unreadDividerRef = useRef<HTMLDivElement>(null);
-  const messageRefs = useRef(new Map<string, HTMLDivElement>());
+  const messageRefs = useRef(new Map<string, HTMLElement>());
   const rowIndexRef = useRef<Map<string, number>>(new Map());
   const virtualizerRef = useRef<Virtualizer<HTMLDivElement, Element> | null>(null);
   const followTailRef = useRef(true);
@@ -242,6 +259,7 @@ export function useViewportCore(): ViewportCoreState {
   const prependRestoreRef = useRef<PrependRestore | null>(null);
   const navigationRef = useRef<Navigation | null>(null);
   const navigationGenerationRef = useRef(0);
+  const jumpRef = useRef<{ messageId: string } | null>(null);
   const tailSentinelVisibleRef = useRef(false);
   const currentAnchorRef = useRef<ViewportAnchorPoint | null>(null);
   const anchorStaleRef = useRef(false);
@@ -251,7 +269,7 @@ export function useViewportCore(): ViewportCoreState {
     setScrollRoot(element);
   }, []);
 
-  const setMessageRef = useCallback((messageId: string, el: HTMLDivElement | null) => {
+  const setMessageRef = useCallback((messageId: string, el: HTMLElement | null) => {
     if (el) messageRefs.current.set(messageId, el);
     else messageRefs.current.delete(messageId);
   }, []);
@@ -376,6 +394,19 @@ export function useViewportCore(): ViewportCoreState {
     tailSentinelVisibleRef.current = visible;
   }, []);
 
+  const beginJump = useCallback((messageId: string) => {
+    jumpRef.current = { messageId };
+  }, []);
+
+  const endJump = useCallback(() => {
+    jumpRef.current = null;
+  }, []);
+
+  const ownsScrollport = useCallback(
+    () => Boolean(navigationRef.current || prependRestoreRef.current || jumpRef.current),
+    [],
+  );
+
   const scrollToMessage = useCallback((messageId: string) => {
     const el = messageRefs.current.get(messageId);
     if (el) {
@@ -413,6 +444,7 @@ export function useViewportCore(): ViewportCoreState {
     prevScrollHeightRef,
     prependRestoreRef,
     navigationRef,
+    jumpRef,
     tailSentinelVisibleRef,
     currentAnchorRef,
     anchorStaleRef,
@@ -435,6 +467,9 @@ export function useViewportCore(): ViewportCoreState {
     noteNavigationWrite,
     endNavigation,
     noteTailSentinel,
+    beginJump,
+    endJump,
+    ownsScrollport,
     scrollToMessage,
     hasRow,
   }));

@@ -23,8 +23,6 @@ interface Params {
   currentUserId: string;
   channels: Channel[];
   dms: DMConversation[];
-  /** Marks the conversation read; called only on a confirmed arrival at the tail. */
-  markRead?: (target: { kind: "channel" | "dm"; targetId: string }) => void;
 }
 
 export interface ViewportAnchorsState {
@@ -35,7 +33,6 @@ export interface ViewportAnchorsState {
   /** The anchor to open at: this tab's own cache first, then sessionStorage. */
   initialAnchor: ViewportAnchor | null;
   onCaptureAnchor: (key: string, anchor: ViewportAnchor) => void;
-  onReachedBottom: () => void;
 }
 
 export function useViewportAnchors({
@@ -44,7 +41,6 @@ export function useViewportAnchors({
   currentUserId,
   channels,
   dms,
-  markRead,
 }: Params): ViewportAnchorsState {
   // A Map held in useState (its setter never called) rather than useRef:
   // react-hooks/refs forbids reading a ref's .current during render — even a
@@ -77,10 +73,5 @@ export function useViewportAnchors({
     [viewportAnchors, currentUserId, kind, targetId],
   );
 
-  const onReachedBottom = useCallback(() => {
-    if (!targetId) return;
-    markRead?.({ kind, targetId });
-  }, [markRead, kind, targetId]);
-
-  return { conversationKey, unreadCountAtOpen, initialAnchor, onCaptureAnchor, onReachedBottom };
+  return { conversationKey, unreadCountAtOpen, initialAnchor, onCaptureAnchor };
 }

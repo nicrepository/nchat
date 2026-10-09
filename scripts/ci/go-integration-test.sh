@@ -48,7 +48,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 # chat-service entries are restricted to named families: the rest of its
 # PostgreSQL suites belong to Go Coverage or have no owner yet (see above).
 # The first entry shares CHAT_TEST_DATABASE_URL between the channel membership
-# contract, the presence store and the call/presence orderings (issue #798);
+# contract, the presence store, the call/presence orderings (issue #798) and the
+# read cursor family (issue #1082);
 # they reset the chat schema per test and run sequentially, so they cannot
 # collide. The #1025 private-channel creation family also resets the chat
 # schema, so it gets a database of its own through
@@ -57,7 +58,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 # media-service carries a `//go:build integration` tag, so without `-tags` its
 # suite is not even compiled.
 SUITES=(
-  "services/chat-service|CHAT_TEST_DATABASE_URL|./internal/storage|-run ^(TestChannelMembershipContractPostgreSQL_|TestPresenceStorePostgreSQL_|TestCallPresencePG_)"
+  "services/chat-service|CHAT_TEST_DATABASE_URL|./internal/storage|-run ^(TestChannelMembershipContractPostgreSQL_|TestPresenceStorePostgreSQL_|TestCallPresencePG_|TestConversationReadStatePostgreSQL_)"
   "services/chat-service|CHANNEL_CREATION_TEST_DATABASE_URL|./internal/storage|-run ^TestChannelCreationPostgreSQL_"
   "services/admin-service|ADMIN_TEST_DATABASE_URL|./internal/storage|"
   "services/auth-service|AUTH_TEST_DATABASE_URL|./internal/storage|"

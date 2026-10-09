@@ -15,7 +15,15 @@ import { useMessageJump } from "./useMessageJump";
 const noMessages: Message[] = [];
 
 function renderJump(initial: { messageId: string; request: string }) {
-  const commands = { scrollToMessage: vi.fn(() => true), hasRow: vi.fn(() => true) };
+  const commands = {
+    scrollToMessage: vi.fn(() => true),
+    hasRow: vi.fn(() => true),
+    beginJump: vi.fn(),
+    endJump: vi.fn(),
+    jumpRef: { current: null },
+    listRef: { current: null },
+    messageRefs: { current: new Map<string, HTMLElement>() },
+  };
   const hook = renderHook(
     ({ messageId, request }) => useMessageJump(commands, noMessages, messageId, request),
     { initialProps: initial },

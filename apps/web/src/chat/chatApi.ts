@@ -14,6 +14,7 @@ import { parseOwnership } from "./ownershipApi";
 import { authenticatedFetch } from "../lib/authClient";
 import { safeAvatarUrl } from "./avatarUrl";
 import { parseMessageLinks } from "./messageLinks";
+import type { TimelinePosition } from "./messages/messageOrder";
 import { ApiRequestError } from "../lib/api";
 import { onAuthChange } from "../lib/authSession";
 import {
@@ -56,6 +57,7 @@ import {
   type ConversationEventPayload,
   type ConversationEventTargetUser,
   type ConversationEventType,
+  type ConversationReadState,
 } from "./chatTypes";
 
 const CHAT_BASE = import.meta.env.VITE_CHAT_API_BASE_URL ?? "/api/chat";
@@ -89,6 +91,8 @@ interface SidebarChannelResponse {
   last_message_at?: unknown;
   pinned_at?: unknown;
   unread_count?: unknown;
+  /** Issue #1082: the point unread_count is counted from; absent on older servers. */
+  read_through?: unknown;
 }
 
 interface SidebarDMCounterpartResponse {
@@ -109,6 +113,8 @@ interface SidebarDMResponse {
   last_message_at?: unknown;
   pinned_at?: unknown;
   unread_count?: unknown;
+  /** Issue #1082: see SidebarChannelResponse.read_through. */
+  read_through?: unknown;
   /** This viewer's own notification preference (issue #527). */
   muted?: unknown;
   /** The level half of that preference (issue #136); absent on older servers. */
@@ -132,6 +138,8 @@ interface SidebarResponse {
    * that predates the field, which is read as "off" — the compatible answer.
    */
   conversation_notification_levels_enabled?: unknown;
+  /** Issue #1082: the server implements the precise read cursor. */
+  precise_read_cursor?: unknown;
 }
 
 interface SidebarEnvelope {
@@ -254,6 +262,7 @@ function mapSidebarChannel(ch: SidebarChannelResponse): Channel {
     lastMessageAt: sidebarTimestamp(ch.last_message_at),
     ...(pinnedAt ? { pinnedAt } : {}),
     ...(isUnreadCount(ch.unread_count) ? { unreadCount: ch.unread_count } : {}),
+    ...readStateFieldOf(ch),
   };
 }
 
@@ -272,6 +281,43 @@ function parseNotificationLevel(value: unknown): ConversationNotificationLevel {
 
 function isUnreadCount(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * The server's read point off the wire (issue #1082): a message position, an
+ * instant (`message_id` null), or null when the viewer never read here.
+ * Anything malformed is treated as absent, never as a position.
+ */
+function parseReadThrough(raw: unknown): TimelinePosition | null | undefined {
+  if (raw === null) return null;
+  if (typeof raw !== "object") return undefined;
+  const { created_at: createdAt, message_id: messageId } = raw as Record<string, unknown>;
+  if (typeof createdAt !== "string" || createdAt === "") return undefined;
+  if (messageId !== null && typeof messageId !== "string") return undefined;
+  return { createdAt, id: messageId };
+}
+
+/** The read-state fields every server answer about a conversation shares. */
+interface ReadStateResponse {
+  unread_count?: unknown;
+  read_through?: unknown;
+}
+
+/**
+ * The read state a server answer carries (issue #1082), or undefined from a
+ * server that sends none — its count is then all there is, and a malformed
+ * point is never taken for one.
+ */
+function readStateOf(raw: ReadStateResponse): ConversationReadState | undefined {
+  const readThrough = parseReadThrough(raw.read_through);
+  if (readThrough === undefined || !isUnreadCount(raw.unread_count)) return undefined;
+  return { unreadCount: raw.unread_count, readThrough };
+}
+
+/** Spread into a sidebar row: present only when this server sent a read state. */
+function readStateFieldOf(raw: ReadStateResponse): { readState?: ConversationReadState } {
+  const readState = readStateOf(raw);
+  return readState ? { readState } : {};
 }
 
 /**
@@ -323,6 +369,7 @@ function mapSidebarDM(dm: SidebarDMResponse): DMConversation | undefined {
     notificationLevel: parseNotificationLevel(dm.notification_level),
     ...(pinnedAt ? { pinnedAt } : {}),
     ...(isUnreadCount(dm.unread_count) ? { unreadCount: dm.unread_count } : {}),
+    ...readStateFieldOf(dm),
   };
 }
 
@@ -414,6 +461,11 @@ export async function fetchSidebarData(): Promise<{
   // Optional in the signature for the same reason the limits above are: a
   // caller with a partial fixture reads it as absent, and absent is "off".
   notificationLevelsEnabled?: boolean;
+  /**
+   * Issue #1082: whether this server implements the precise read cursor. Only
+   * then does the client persist reading progressively; absent is "no".
+   */
+  preciseReadCursor?: boolean;
   channels: Channel[];
   dms: DMConversation[];
   categories: ChannelCategory[];
@@ -477,6 +529,7 @@ export async function fetchSidebarData(): Promise<{
     // same answer on every write, so a client that got this wrong would only
     // change which error it receives (issue #136).
     notificationLevelsEnabled: sidebar.conversation_notification_levels_enabled === true,
+    preciseReadCursor: sidebar.precise_read_cursor === true,
     channels,
     dms,
     categories,
@@ -495,24 +548,41 @@ export async function setSidebarConversationPinned(
   await authenticatedFetch(target, { method: pinned ? "POST" : "DELETE" });
 }
 
+export type { ConversationReadState } from "./chatTypes";
+
+/**
+ * Advances the read cursor to `lastReadMessageId`, or marks the whole
+ * conversation read without one. Resolves to the server's read state after the
+ * write, or undefined from a server that predates that answer (204).
+ *
+ * A cursor travels with `read_cursor: "message"`, which a server without the
+ * cursor refuses (400) instead of reading the request as "everything is read".
+ *
+ * `keepalive` lets the request outlive the page (issue #1082): a cursor read
+ * just before the tab closes still reaches the server, authenticated like any
+ * other call — which is why this is a keepalive fetch and not a beacon.
+ */
 export async function markConversationRead(
   targetType: "channel" | "dm",
   targetId: string,
   lastReadMessageId?: string,
-): Promise<void> {
+  options: { keepalive?: boolean } = {},
+): Promise<ConversationReadState | undefined> {
   const target =
     targetType === "channel"
       ? `${CHAT_BASE}/channels/${encodeURIComponent(targetId)}/read`
       : `${CHAT_BASE}/dm/${encodeURIComponent(targetId)}/read`;
-  await authenticatedFetch(target, {
+  const res = await authenticatedFetch<{ data?: ReadStateResponse }>(target, {
     method: "POST",
+    ...(options.keepalive ? { keepalive: true } : {}),
     ...(lastReadMessageId
       ? {
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ last_read_message_id: lastReadMessageId }),
+          body: JSON.stringify({ last_read_message_id: lastReadMessageId, read_cursor: "message" }),
         }
       : {}),
   });
+  return res?.data ? readStateOf(res.data) : undefined;
 }
 
 /**

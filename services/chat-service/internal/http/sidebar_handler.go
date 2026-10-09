@@ -50,7 +50,31 @@ type sidebarCapabilityProvider interface {
 }
 
 type sidebarReadProvider interface {
-	MarkConversationRead(ctx context.Context, userID, targetType, targetID string, lastReadMessageID *string) error
+	MarkConversationRead(ctx context.Context, userID, targetType, targetID string, lastReadMessageID *string) (domain.ConversationReadState, error)
+}
+
+// readThroughJSON is the point unread_count is counted from (issue #1082):
+// that message's (created_at, id) position, or — with message_id null — an
+// instant, everything created at or before it. created_at keeps its full
+// fraction for the same reason formatSidebarTime explains: the client orders
+// by it.
+type readThroughJSON struct {
+	CreatedAt string  `json:"created_at"`
+	MessageID *string `json:"message_id"`
+}
+
+func mapReadThrough(point *domain.ReadThrough) *readThroughJSON {
+	if point == nil {
+		return nil
+	}
+	return &readThroughJSON{CreatedAt: formatSidebarTime(point.CreatedAt), MessageID: point.MessageID}
+}
+
+// conversationReadStateJSON answers POST …/read: the read state as it stands
+// after the write, which is what the client reconciles its projection with.
+type conversationReadStateJSON struct {
+	UnreadCount int              `json:"unread_count"`
+	ReadThrough *readThroughJSON `json:"read_through"`
 }
 
 // sidebarWorkspaceJSON is the JSON shape for workspace info in the sidebar response.
@@ -123,6 +147,9 @@ type sidebarChannelJSON struct {
 	LastMessageAt *string `json:"last_message_at"`
 	PinnedAt      *string `json:"pinned_at"`
 	UnreadCount   *int    `json:"unread_count,omitempty"`
+	// ReadThrough is the point UnreadCount is counted from (issue #1082); null
+	// when the viewer has never read here.
+	ReadThrough *readThroughJSON `json:"read_through"`
 }
 
 // sidebarDMCounterpartJSON is the identity of the other participant of a 1:1
@@ -155,6 +182,8 @@ type sidebarDMJSON struct {
 	LastMessageAt *string                   `json:"last_message_at"`
 	PinnedAt      *string                   `json:"pinned_at"`
 	UnreadCount   int                       `json:"unread_count"`
+	// Same contract as sidebarChannelJSON's read_through (issue #1082).
+	ReadThrough *readThroughJSON `json:"read_through"`
 	// Muted is this viewer's own notification preference (issue #527), and
 	// NotificationLevel its other, independent half (issue #136). Same contract
 	// and same reasoning as sidebarChannelJSON's pair.
@@ -182,6 +211,13 @@ type sidebarResponseBody struct {
 	// "off", which is the compatible behaviour rather than an offer the server
 	// would refuse.
 	ConversationNotificationLevelsEnabled bool `json:"conversation_notification_levels_enabled"`
+	// PreciseReadCursor says this server implements the read cursor of issue
+	// #1082: POST …/read with read_cursor "message" advances to that message and
+	// no further, and every row carries read_through.
+	// A client only reads progressively when it sees this; against a server
+	// without it — one an open tab may meet during a rollback — it keeps the
+	// behaviour that server understands. Never omitempty: absent means "no".
+	PreciseReadCursor bool `json:"precise_read_cursor"`
 	// Deprecated: retained for compatibility with older clients. Active
 	// workspace members can create channels (BUG #393), so a 200 here already
 	// implies true. Never omitempty — a client that predates the change reads a
@@ -272,6 +308,7 @@ func (h *SidebarHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		DMConvs:                               mapDMs(data.DMs),
 		CanCreateChannel:                      data.CanCreateChannel,
 		ConversationNotificationLevelsEnabled: h.conversationNotificationLevelsEnabled(),
+		PreciseReadCursor:                     true,
 	}
 	// Ensure arrays are never null in JSON output.
 	if body.Channels == nil {
@@ -301,6 +338,7 @@ func mapChannels(channels []service.SidebarChannel) []sidebarChannelJSON {
 			LastMessageAt:     formatSidebarTimePtr(sidebarChannel.LastMessageAt),
 			PinnedAt:          formatSidebarTimePtr(sidebarChannel.PinnedAt),
 			UnreadCount:       &unreadCount,
+			ReadThrough:       mapReadThrough(sidebarChannel.ReadThrough),
 			Muted:             sidebarChannel.Muted,
 			NotificationLevel: sidebarChannel.NotificationLevel,
 		})
@@ -322,6 +360,7 @@ func mapDMs(dms []domain.DMConversationWithParticipantIDs) []sidebarDMJSON {
 			LastMessageAt:     formatSidebarTimePtr(dm.LastMessageAt),
 			PinnedAt:          formatSidebarTimePtr(dm.PinnedAt),
 			UnreadCount:       dm.UnreadCount,
+			ReadThrough:       mapReadThrough(dm.ReadThrough),
 			Muted:             dm.Muted,
 			NotificationLevel: dm.NotificationLevel,
 		})
@@ -456,9 +495,20 @@ func (h *SidebarHandler) setNotificationPreference(
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// markConversationReadRequest is the optional body of POST …/read.
+//
+// ReadCursor ("message") declares that last_read_message_id is a precise read
+// cursor (issue #1082). Its job is to be refused: a server that predates the
+// cursor decodes this body strictly, so it answers 400 and writes nothing,
+// instead of reading the request as "everything is read until now" — which
+// would consume messages the reader never saw.
 type markConversationReadRequest struct {
 	LastReadMessageID *string `json:"last_read_message_id"`
+	ReadCursor        *string `json:"read_cursor"`
 }
+
+// readCursorMessage is the one read_cursor value this server implements.
+const readCursorMessage = "message"
 
 func (h *SidebarHandler) MarkChannelRead(w http.ResponseWriter, r *http.Request) {
 	h.markConversationRead(w, r, service.ReadTargetChannel, r.PathValue("channelID"), "channel_id")
@@ -482,18 +532,37 @@ func (h *SidebarHandler) markConversationRead(w http.ResponseWriter, r *http.Req
 		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
 		return
 	}
-	var body markConversationReadRequest
-	if r.ContentLength > 0 && !decodeStrictJSON(w, r, &body) {
+	lastReadMessageID, ok := decodeMarkReadRequest(w, r)
+	if !ok {
 		return
 	}
-	if body.LastReadMessageID != nil && !validateTargetID(w, *body.LastReadMessageID, "last_read_message_id") {
-		return
-	}
-	if err := reads.MarkConversationRead(r.Context(), userID, targetType, targetID, body.LastReadMessageID); err != nil {
+	state, err := reads.MarkConversationRead(r.Context(), userID, targetType, targetID, lastReadMessageID)
+	if err != nil {
 		mapServiceError(w, err)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	httputil.WriteJSON(w, http.StatusOK, conversationReadStateJSON{
+		UnreadCount: state.UnreadCount,
+		ReadThrough: mapReadThrough(state.ReadThrough),
+	})
+}
+
+// decodeMarkReadRequest reads the optional body of POST …/read: the message
+// read through, or nil for "the whole conversation". It writes the 400 itself
+// and reports false for a body the endpoint refuses.
+func decodeMarkReadRequest(w http.ResponseWriter, r *http.Request) (*string, bool) {
+	var body markConversationReadRequest
+	if r.ContentLength > 0 && !decodeStrictJSON(w, r, &body) {
+		return nil, false
+	}
+	if body.LastReadMessageID != nil && !validateTargetID(w, *body.LastReadMessageID, "last_read_message_id") {
+		return nil, false
+	}
+	if body.ReadCursor != nil && *body.ReadCursor != readCursorMessage {
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "read_cursor must be \"message\"")
+		return nil, false
+	}
+	return body.LastReadMessageID, true
 }
 
 func (h *SidebarHandler) pinConversation(w http.ResponseWriter, r *http.Request, targetType, targetID, targetParam string, pinned bool) {

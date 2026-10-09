@@ -7,12 +7,14 @@ import type {
   ShowBrowserMessageNotificationInput,
   ShowBrowserMessageNotificationResult,
 } from "./browserNotification";
-import { clearTokens } from "../lib/authSession";
+import { ApiRequestError } from "../lib/api";
+import { clearTokens, setTokens } from "../lib/authSession";
 import { REALTIME_LEDGER_CAPACITY, retainedRealtimeIdCount } from "./realtimeMessageLedger";
 import { SOUND_COOLDOWN_MS } from "./notificationBurst";
-import { parseInstant } from "./sidebarOrder";
+import { parseInstant } from "./instant";
 import { savePersistedUnread } from "./sidebarUnreadPersistence";
 import type { WSMessageCreatedEvent, WSNotificationPolicy } from "./useChatWebSocket";
+import { READ_CURSOR_DEBOUNCE_MS } from "./readCursorWriter";
 import { useChatSidebar, type SidebarState } from "./useChatSidebar";
 
 const {
@@ -509,7 +511,7 @@ describe("useChatSidebar realtime unread", () => {
     expect(unreadCounts(result.current.state).channelA).toBe(0);
   });
 
-  it("does not increment unread for the active conversation", async () => {
+  it("counts unseen arrivals in the active conversation on a legacy server", async () => {
     const { result } = renderHook(() => useChatSidebar(), {
       wrapper: wrapper(`/chat/channel/${channelA}`),
     });
@@ -517,7 +519,7 @@ describe("useChatSidebar realtime unread", () => {
 
     act(() => websocket.onMessageCreated?.(messageCreated("message-active", channelA)));
 
-    expect(unreadCounts(result.current.state).channelA).toBe(0);
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
   });
 
   it("updates only the target conversation across channel and DM events", async () => {
@@ -533,12 +535,9 @@ describe("useChatSidebar realtime unread", () => {
     expect(unreadCounts(result.current.state)).toEqual({ channelA: 1, channelB: 0, dmC: 1 });
   });
 
-  // #492: opening a conversation's route is navigation, not a read receipt —
-  // the badge (and its mention flag) survive until something explicitly
-  // marks it read. The route still suppresses *further* increments for the
-  // conversation currently open, which is a separate, still-active rule
-  // (countsAsUnread's activeTarget check, independent of target_opened).
-  it("does not clear a conversation's badge on opening it, but still suppresses new unread while it stays open", async () => {
+  // Opening is navigation, not reading; legacy arrivals remain unread until
+  // explicit mark-all or a server answer proves otherwise.
+  it("keeps the badge on opening and counts subsequent unseen arrivals", async () => {
     const { Wrapper, navigateRef } = navigableWrapper("/chat");
     const { result } = renderHook(() => useChatSidebar(), { wrapper: Wrapper });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
@@ -572,7 +571,7 @@ describe("useChatSidebar realtime unread", () => {
     }
 
     act(() => websocket.onMessageCreated?.(messageCreated("while-open", channelA)));
-    expect(unreadCounts(result.current.state).channelA).toBe(1);
+    expect(unreadCounts(result.current.state).channelA).toBe(2);
     expect(unreadCounts(result.current.state).channelB).toBe(1);
   });
 });
@@ -1451,13 +1450,8 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
     expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
-  // Combines the two rules directly above into one session: badge
-  // suppression for the active conversation holds identically whether or not
-  // sound actually fired — it isn't merely a byproduct of "sound stayed
-  // silent". No existing test carries a channel-target mention through the
-  // active+unfocused path (the DM variant is covered above at "plays a sound
-  // for a DM in the active conversation...").
-  it("keeps the active conversation's badge suppressed across a STANDARD-then-MENTION sequence, independent of the sound outcome", async () => {
+  // Sound presentation never decides whether an unseen legacy arrival counts.
+  it("counts active STANDARD and MENTION arrivals independently of their sound outcome", async () => {
     const visibility = vi.spyOn(document, "visibilityState", "get");
     visibility.mockReturnValue("hidden");
     const { result } = renderHook(() => useChatSidebar(), {
@@ -1469,7 +1463,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
       websocket.onMessageCreated?.(messageCreated("active-seq-standard", channelA, "other-1")),
     );
     expect(mockPlayNotificationSound).not.toHaveBeenCalled();
-    expect(unreadCounts(result.current.state).channelA).toBe(0);
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
 
     act(() =>
       websocket.onMessageCreated?.(
@@ -1484,12 +1478,14 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
       ),
     );
     expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
-    // Badge stays 0 even on the message that DID play.
-    expect(unreadCounts(result.current.state).channelA).toBe(0);
+    // Both arrivals are unread, including the one that played a sound.
+    expect(unreadCounts(result.current.state).channelA).toBe(2);
+    // The mention is remembered, though: the tab is hidden, nobody has read it,
+    // and only the cursor passing it may clear it.
     if (result.current.state.status === "ready") {
-      expect(
-        result.current.state.channels.find((c) => c.id === channelA)?.hasMentionUnread,
-      ).toBeFalsy();
+      expect(result.current.state.channels.find((c) => c.id === channelA)?.hasMentionUnread).toBe(
+        true,
+      );
     }
   });
 
@@ -2736,7 +2732,7 @@ describe("useChatSidebar — conversa recém-disponível", () => {
 // The gates covered above (own message, active conversation, dedup, sound
 // preference) are unaffected by persistence — mergeUnread only changes what a
 // "loaded" dispatch does with unread/mention fields, never message_created or
-// target_opened. These tests cover the persistence contract itself.
+// read_progress. These tests cover the persistence contract itself.
 describe("useChatSidebar — badge persistence", () => {
   const workspaceId = "workspace-1";
   const otherWorkspaceId = "workspace-2";
@@ -3026,7 +3022,12 @@ describe("useChatSidebar — ações do menu de conversa", () => {
     expect(unreadCounts(result.current.state).channelA).toBe(0);
     // The conversation that was not named keeps its badge.
     expect(unreadCounts(result.current.state).dmC).toBe(3);
-    expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelA);
+    // No message named: the server resolves "everything" itself (#1082).
+    await waitFor(() =>
+      expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelA, undefined, {
+        keepalive: false,
+      }),
+    );
   });
 
   // A failed receipt is not a UI failure: the badge stays cleared locally and
@@ -4069,5 +4070,1025 @@ describe("the in-app surface is not created for an unfocused window", () => {
     vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
     expect(result.current.inAppAlert).toBeNull();
+  });
+});
+
+// ── #1082: the row is a projection of the read cursor ───────────────────────
+
+describe("useChatSidebar — read cursor (#1082)", () => {
+  const at = (minute: number, second = 0) =>
+    `2026-07-28T12:${String(minute).padStart(2, "0")}:${String(second).padStart(2, "0")}Z`;
+  const position = (minute: number) => ({ id: `m-${minute}`, createdAt: at(minute) });
+  const channelBTarget = { kind: "channel" as const, targetId: channelB };
+
+  /** A server read state: `unread` counted from m{point}. */
+  const readState = (unread: number, point: number | null) => ({
+    unreadCount: unread,
+    readThrough: point === null ? null : position(point),
+  });
+
+  function sidebar(
+    state: ReturnType<typeof readState> | null,
+    extra: Record<string, unknown> = {},
+    user = currentUserId,
+  ) {
+    return {
+      currentUserId: user,
+      workspaceId: "workspace-1",
+      preciseReadCursor: state !== null,
+      channels: [
+        { id: channelA, name: "A", type: "public", canWrite: true, unreadCount: 0 },
+        {
+          id: channelB,
+          name: "B",
+          type: "public",
+          canWrite: true,
+          unreadCount: state?.unreadCount ?? 0,
+          ...(state ? { readState: state } : {}),
+          ...extra,
+        },
+      ],
+      dms: [{ id: dmC, type: "1:1", name: "C", participants: [], unreadCount: 0 }],
+      categories: [],
+    };
+  }
+
+  /** A server without the precise cursor: a count and nothing else. */
+  const legacySidebar = (unread: number) => sidebar(null, { unreadCount: unread });
+
+  /** Progress as the open timeline reports it. */
+  /** Progress as the open timeline reports it: the cursor it reached. */
+  const progress = (through: number) => ({
+    readThrough: position(through),
+  });
+
+  function rowB(state: SidebarState) {
+    if (state.status !== "ready") throw new Error("sidebar not ready");
+    return state.channels.find(({ id }) => id === channelB)!;
+  }
+
+  async function ready(path = `/chat/channel/${channelB}`) {
+    const hook = renderHook(() => useChatSidebar(), { wrapper: wrapper(path) });
+    await waitFor(() => expect(hook.result.current.state.status).toBe("ready"));
+    return hook;
+  }
+
+  /** A refetch whose answer the test releases. */
+  function heldRefetch() {
+    const held = deferredValue<ReturnType<typeof sidebar>>();
+    mockFetchSidebarData.mockReturnValueOnce(held.promise);
+    act(() => websocket.onConversationAvailable?.());
+    return held;
+  }
+
+  async function elapse(ms = READ_CURSOR_DEBOUNCE_MS) {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+  }
+
+  beforeEach(() => {
+    // The unread cache is per (user, workspace) and outlives a render; a row
+    // persisted by an earlier test would otherwise stand in for the fixture.
+    localStorage.clear();
+    setTokens("session-a");
+    mockFetchSidebarData.mockReset();
+    mockMarkConversationRead.mockReset();
+    mockMarkConversationRead.mockResolvedValue(undefined);
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(5, 0)));
+  });
+
+  it("leaves the unread count alone when a conversation is merely opened", async () => {
+    const { result } = await ready();
+    expect(rowB(result.current.state).unreadCount).toBe(5);
+    expect(mockMarkConversationRead).not.toHaveBeenCalled();
+  });
+
+  /** A server whose answer to a write through m{n} is the count left of five. */
+  function answersOutOfFive() {
+    mockMarkConversationRead.mockImplementation(
+      (_kind: string, _id: string, through: string | undefined) => {
+        const n = Number(through?.slice(2) ?? 5);
+        return Promise.resolve(readState(5 - n, n));
+      },
+    );
+  }
+
+  // The heart of #1082: the badge follows what was read, as the server
+  // acknowledges it — never the tail, and never a guess.
+  it("follows the server's acknowledgement of what is read: 5 → 3 → 1 → 0, one write per burst", async () => {
+    answersOutOfFive();
+    const { result } = await ready();
+    const before = result.current.state;
+    if (before.status !== "ready") throw new Error("sidebar not ready");
+    vi.useFakeTimers();
+    try {
+      for (const [through, expected] of [
+        [2, 3],
+        [4, 1],
+        [5, 0],
+      ] as const) {
+        act(() => result.current.reportReadProgress(channelBTarget, progress(through)));
+        // The cursor moved; the count waits for the server.
+        expect(rowB(result.current.state).readThrough).toEqual(position(through));
+        await elapse(READ_CURSOR_DEBOUNCE_MS);
+        expect(rowB(result.current.state).unreadCount).toBe(expected);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(mockMarkConversationRead.mock.calls.map((call) => call[2])).toEqual([
+      "m-2",
+      "m-4",
+      "m-5",
+    ]);
+    // Only the named row changed.
+    const after = result.current.state;
+    if (after.status !== "ready") throw new Error("sidebar not ready");
+    expect(after.channels[0]).toBe(before.channels[0]);
+    expect(after.dms).toBe(before.dms);
+  });
+
+  it("coalesces a quick read of everything into one write, and shows its answer", async () => {
+    answersOutOfFive();
+    const { result } = await ready();
+    for (const through of [1, 2, 3, 4, 5]) {
+      act(() => result.current.reportReadProgress(channelBTarget, progress(through)));
+    }
+    expect(rowB(result.current.state).unreadCount).toBe(5);
+    await waitFor(() => expect(rowB(result.current.state).unreadCount).toBe(0));
+    expect(mockMarkConversationRead).toHaveBeenCalledTimes(1);
+    expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelB, "m-5", {
+      keepalive: false,
+    });
+  });
+
+  it("does not re-render for a report that changes nothing", async () => {
+    const { result } = await ready();
+    act(() => result.current.reportReadProgress(channelBTarget, progress(2)));
+    const settled = result.current.state;
+    act(() => result.current.reportReadProgress(channelBTarget, progress(2)));
+    expect(result.current.state).toBe(settled);
+  });
+
+  // R3: new messages the server counted are never hidden behind what this
+  // session read meanwhile — the refetch's count stands until the write answers.
+  it("shows the refetch's 9 when 4 new messages land unseen after 3 of 5 were read, then the write's 6", async () => {
+    const write = deferredValue<ReturnType<typeof readState>>();
+    mockMarkConversationRead.mockReturnValue(write.promise);
+    const { result } = await ready();
+    act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+    // The reads move the cursor; the count is the server's until it answers.
+    expect(rowB(result.current.state).unreadCount).toBe(5);
+    await waitFor(() => expect(mockMarkConversationRead).toHaveBeenCalledTimes(1));
+
+    // The write is still on its way; the refetch counts four more (m6..m9).
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(9, 0)));
+    act(() => websocket.onConversationAvailable?.());
+    await waitFor(() => expect(rowB(result.current.state).unreadCount).toBe(9));
+
+    await act(async () => write.resolve(readState(6, 3)));
+    expect(rowB(result.current.state).unreadCount).toBe(6);
+  });
+
+  // A late commit announced in realtime while a refetch is out is never lost.
+  it("keeps counting a late commit that reaches this client after the refetch started", async () => {
+    const write = deferredValue<ReturnType<typeof readState>>();
+    mockMarkConversationRead.mockReturnValue(write.promise);
+    const { result } = await ready();
+    act(() => result.current.reportReadProgress(channelBTarget, progress(4)));
+    expect(rowB(result.current.state).unreadCount).toBe(5);
+
+    const held = heldRefetch();
+    // Committed late, positioned between m4 and m5 — before the newest message.
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageCreated("m-4b", channelB, "other-1", "channel", at(4, 30)),
+      ),
+    );
+    expect(rowB(result.current.state).unreadCount).toBe(6);
+
+    // The refetch read the database before m-4b committed: its 5 stands, and
+    // the arrival on top — it may or may not have counted it, so 6 is an upper
+    // bound, and the row asks for exactly one more refetch.
+    const fetchesBefore = mockFetchSidebarData.mock.calls.length;
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(6, 0)));
+    await act(async () => held.resolve(sidebar(readState(5, 0))));
+    expect(rowB(result.current.state).unreadCount).toBeGreaterThanOrEqual(6);
+    await waitFor(() => expect(rowB(result.current.state).reconcileAfter).toBeUndefined());
+    expect(rowB(result.current.state).unreadCount).toBe(6);
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(fetchesBefore + 1);
+
+    // The write for m4 settles it: m-4b and m5.
+    await waitFor(() => expect(mockMarkConversationRead).toHaveBeenCalledTimes(1));
+    await act(async () => write.resolve(readState(2, 4)));
+    expect(rowB(result.current.state).unreadCount).toBe(2);
+  });
+
+  // A deletion moves the newest message back; the newer answer is taken.
+  it("takes the lower count after a deletion, high in between, never low", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(4, 1)));
+    const write = deferredValue<ReturnType<typeof readState>>();
+    mockMarkConversationRead.mockReturnValue(write.promise);
+    const { result } = await ready();
+    act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+    await waitFor(() => expect(mockMarkConversationRead).toHaveBeenCalledTimes(1));
+    expect(rowB(result.current.state).unreadCount).toBe(4);
+
+    // m5 is deleted; a refetch reads the database before the write commits.
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(3, 1)));
+    act(() => websocket.onConversationAvailable?.());
+    await waitFor(() => expect(rowB(result.current.state).unreadCount).toBe(3));
+
+    // The write commits after the deletion: only m4 is left.
+    await act(async () => write.resolve(readState(1, 3)));
+    expect(rowB(result.current.state).unreadCount).toBe(1);
+  });
+
+  // H1: an answer computed before a confirmed write never undoes it.
+  it("does not let a refetch computed before a confirmed mark-all bring its unread back", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(2, 3)));
+    const write = deferredValue<ReturnType<typeof readState>>();
+    mockMarkConversationRead.mockReturnValue(write.promise);
+    const { result } = await ready("/chat");
+    act(() => result.current.markRead(channelBTarget));
+    await waitFor(() => expect(mockMarkConversationRead).toHaveBeenCalledTimes(1));
+
+    // A refetch starts after the write left, and reads before it commits.
+    const held = heldRefetch();
+    await act(async () => write.resolve(readState(0, 5)));
+    expect(rowB(result.current.state).unreadCount).toBe(0);
+
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(0, 5)));
+    await act(async () => held.resolve(sidebar(readState(2, 3))));
+    expect(rowB(result.current.state).unreadCount).toBe(0);
+    expect(rowB(result.current.state).serverRead?.readThrough).toEqual(position(5));
+
+    // One refetch, started after the confirmation, converges — and no more.
+    await waitFor(() => expect(mockFetchSidebarData).toHaveBeenCalledTimes(3));
+    await act(async () => {});
+    expect(rowB(result.current.state)).toMatchObject({ unreadCount: 0, reconcileAfter: undefined });
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(3);
+  });
+
+  // #1082 seventh review: the badge follows the server, so its latency is the
+  // writer's window plus a round trip — measured, never hidden, never lower.
+  describe("latency", () => {
+    /** A server answering a write through m{n} of `total` after `rtt` ms. */
+    function answersAfter(rtt: number, total = 5) {
+      mockMarkConversationRead.mockImplementation(
+        (_kind: string, _id: string, through: string | undefined) =>
+          new Promise((resolve) => {
+            const n = Number(through?.slice(2) ?? total);
+            setTimeout(() => resolve(readState(total - n, n)), rtt);
+          }),
+      );
+    }
+
+    it.each([100, 1000])(
+      "shows the first read after the window plus a %ims round trip — never sooner, never lower",
+      async (rtt) => {
+        answersAfter(rtt);
+        const { result } = await ready();
+        vi.useFakeTimers();
+        try {
+          act(() => result.current.reportReadProgress(channelBTarget, progress(2)));
+          await elapse(READ_CURSOR_DEBOUNCE_MS + rtt - 1);
+          expect(rowB(result.current.state).unreadCount).toBe(5);
+          await elapse(1);
+          expect(rowB(result.current.state).unreadCount).toBe(3);
+        } finally {
+          vi.useRealTimers();
+        }
+      },
+    );
+
+    it("keeps pace with a reader who never stops, without a write per message or a low count", async () => {
+      mockFetchSidebarData.mockResolvedValue(sidebar(readState(50, 0)));
+      answersAfter(100, 50);
+      const { result } = await ready();
+      vi.useFakeTimers();
+      try {
+        // One message read every 60ms for three seconds.
+        for (let n = 1; n <= 50; n++) {
+          act(() => result.current.reportReadProgress(channelBTarget, progress(n)));
+          await elapse(60);
+          // Never below what is still unread past the cursor.
+          expect(rowB(result.current.state).unreadCount).toBeGreaterThanOrEqual(50 - n);
+          // Following the reader while they read, not only once they stop.
+          if (n === 25) expect(rowB(result.current.state).unreadCount).toBeLessThan(50);
+        }
+        await elapse(READ_CURSOR_DEBOUNCE_MS + 100);
+        expect(rowB(result.current.state).unreadCount).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+      const writes = mockMarkConversationRead.mock.calls.map((call) => call[2]);
+      expect(writes.length).toBeLessThanOrEqual(Math.ceil(3500 / (READ_CURSOR_DEBOUNCE_MS + 100)));
+      expect(writes.at(-1)).toBe("m-50");
+    });
+
+    it("keeps the server's count when the write fails, and writes the next read", async () => {
+      mockMarkConversationRead.mockRejectedValueOnce(new Error("offline"));
+      answersAfter(0);
+      const { result } = await ready();
+      vi.useFakeTimers();
+      try {
+        act(() => result.current.reportReadProgress(channelBTarget, progress(2)));
+        await elapse();
+        expect(rowB(result.current.state)).toMatchObject({
+          unreadCount: 5,
+          readThrough: position(2),
+        });
+        act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+        await elapse(READ_CURSOR_DEBOUNCE_MS + 1);
+        expect(rowB(result.current.state).unreadCount).toBe(2);
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(mockMarkConversationRead.mock.calls.map((call) => call[2])).toEqual(["m-2", "m-3"]);
+    });
+
+    it("shows a write's answer while a later cursor waits, then the later one's", async () => {
+      const write = deferredValue<ReturnType<typeof readState>>();
+      mockMarkConversationRead.mockReturnValueOnce(write.promise);
+      answersAfter(0);
+      const { result } = await ready();
+      vi.useFakeTimers();
+      try {
+        act(() => result.current.reportReadProgress(channelBTarget, progress(2)));
+        await elapse();
+        act(() => result.current.reportReadProgress(channelBTarget, progress(4)));
+        await act(async () => write.resolve(readState(3, 2)));
+        expect(rowB(result.current.state)).toMatchObject({
+          unreadCount: 3,
+          readThrough: position(4),
+        });
+        await elapse(READ_CURSOR_DEBOUNCE_MS + 1);
+        expect(rowB(result.current.state).unreadCount).toBe(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("settles a conversation left before its write answered", async () => {
+      answersAfter(300);
+      const { result } = await ready();
+      vi.useFakeTimers();
+      try {
+        act(() => result.current.reportReadProgress(channelBTarget, progress(2)));
+        // The reader moves on to another conversation and reads there.
+        act(() =>
+          result.current.reportReadProgress({ kind: "channel", targetId: channelA }, progress(1)),
+        );
+        await elapse(READ_CURSOR_DEBOUNCE_MS + 300);
+        expect(rowB(result.current.state).unreadCount).toBe(3);
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelB, "m-2", {
+        keepalive: false,
+      });
+    });
+
+    it("sends the read as the page goes away, and takes its answer if the page lives on", async () => {
+      answersAfter(200);
+      const { result } = await ready();
+      vi.useFakeTimers();
+      try {
+        act(() => result.current.reportReadProgress(channelBTarget, progress(4)));
+        act(() => {
+          window.dispatchEvent(new Event("pagehide"));
+        });
+        await elapse(0);
+        expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelB, "m-4", {
+          keepalive: true,
+        });
+        await elapse(200);
+        expect(rowB(result.current.state).unreadCount).toBe(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  // #1082 seventh review: holding a message is no proof the count included it.
+  it("never shows fewer than what is left unread when a held message was deleted without an event", async () => {
+    const write = deferredValue<ReturnType<typeof readState>>();
+    mockMarkConversationRead.mockReturnValue(write.promise);
+    const { result } = await ready();
+    // The open timeline holds m1..m5, all unread. m1 is deleted on the server and no event reaches this client: the next
+    // refetch counts 4 — m2..m5.
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(4, 0)));
+    act(() => websocket.onConversationAvailable?.());
+    await waitFor(() => expect(rowB(result.current.state).unreadCount).toBe(4));
+
+    // The reader sees m1, m2 and m3: m4 and m5 are still unread. Nothing is
+    // taken off the server's 4 — the browser cannot prove m1 was in it.
+    act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+    expect(rowB(result.current.state).unreadCount).toBeGreaterThanOrEqual(2);
+    expect(rowB(result.current.state).unreadCount).toBe(4);
+
+    // The read is persisted, and the server's answer is the count shown.
+    await waitFor(() =>
+      expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelB, "m-3", {
+        keepalive: false,
+      }),
+    );
+    await act(async () => write.resolve(readState(2, 3)));
+    expect(rowB(result.current.state).unreadCount).toBe(2);
+  });
+
+  // #1082 seventh review: an unconfirmed count never clears a mention it cannot place.
+  it("keeps an unknown mention through a deletion without an event and the reads after it", async () => {
+    savePersistedUnread(currentUserId, "workspace-1", [
+      { id: channelB, type: "channel", unreadCount: 5, hasMentionUnread: true },
+    ]);
+    const write = deferredValue<ReturnType<typeof readState>>();
+    mockMarkConversationRead.mockReturnValue(write.promise);
+    const { result } = await ready();
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(4, 0)));
+    act(() => websocket.onConversationAvailable?.());
+    await waitFor(() => expect(rowB(result.current.state).unreadCount).toBe(4));
+
+    act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+    expect(rowB(result.current.state)).toMatchObject({ unreadCount: 4, unknownMention: true });
+
+    await waitFor(() => expect(mockMarkConversationRead).toHaveBeenCalledTimes(1));
+    await act(async () => write.resolve(readState(2, 3)));
+    expect(rowB(result.current.state)).toMatchObject({ unreadCount: 2, unknownMention: true });
+  });
+
+  // #1082 sixth review (A): a timeline with a gap is no evidence about the gap.
+  it("keeps 3 when a deep-linked message across a gap is read, before and after the write", async () => {
+    // The base counted m3b, m4 and m5 past m2. m3 was committed later and is
+    // what the deep link brought in, alone; m3b sits in the gap.
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(3, 2)));
+    const write = deferredValue<ReturnType<typeof readState>>();
+    mockMarkConversationRead.mockReturnValue(write.promise);
+    const { result } = await ready();
+    act(() => result.current.reportReadProgress(channelBTarget, { readThrough: position(3) }));
+    expect(rowB(result.current.state).unreadCount).toBe(3);
+
+    // The read is still persisted.
+    await waitFor(() =>
+      expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelB, "m-3", {
+        keepalive: false,
+      }),
+    );
+    await act(async () => write.resolve(readState(3, 3)));
+    expect(rowB(result.current.state).unreadCount).toBe(3);
+  });
+
+  // #1082 sixth review (B): a projected zero never clears a mention it cannot place.
+  it("keeps an unknown mention through a gap that leaves nothing loaded unread", async () => {
+    savePersistedUnread(currentUserId, "workspace-1", [
+      { id: channelB, type: "channel", unreadCount: 3, hasMentionUnread: true },
+    ]);
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(3, 2)));
+    mockMarkConversationRead.mockResolvedValue(readState(1, 3));
+    const { result } = await ready();
+    expect(rowB(result.current.state)).toMatchObject({ unknownMention: true });
+
+    // Everything loaded is read; the rest of the base sits in a gap.
+    act(() => result.current.reportReadProgress(channelBTarget, { readThrough: position(3) }));
+    expect(rowB(result.current.state)).toMatchObject({
+      unreadCount: 3,
+      unknownMention: true,
+      hasMentionUnread: true,
+    });
+
+    // The server says one is still unread: the mention stays.
+    await waitFor(() => expect(rowB(result.current.state).unreadCount).toBe(1));
+    expect(rowB(result.current.state)).toMatchObject({
+      unknownMention: true,
+      hasMentionUnread: true,
+    });
+  });
+
+  // #1082 sixth review (C): an upper bound taken from two concurrent answers converges.
+  it("takes the higher of two concurrent answers at one point, and one refetch settles it", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(2, 3)));
+    const write = deferredValue<ReturnType<typeof readState>>();
+    mockMarkConversationRead.mockReturnValue(write.promise);
+    const { result } = await ready("/chat");
+    // A refetch starts; then the reader confirms m3 and its write leaves.
+    const held = heldRefetch();
+    act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+    await waitFor(() => expect(mockMarkConversationRead).toHaveBeenCalledTimes(1));
+    await act(async () => write.resolve(readState(2, 3)));
+
+    // The refetch, out since before that answer, says 4 at the same point.
+    const reconciling = deferredValue<ReturnType<typeof sidebar>>();
+    mockFetchSidebarData.mockReturnValueOnce(reconciling.promise);
+    await act(async () => held.resolve(sidebar(readState(4, 3))));
+    expect(rowB(result.current.state).unreadCount).toBe(4);
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(3);
+
+    // Exactly one more refetch, and its answer is final.
+    await act(async () => reconciling.resolve(sidebar(readState(2, 3))));
+    expect(rowB(result.current.state)).toMatchObject({ unreadCount: 2, reconcileAfter: undefined });
+    await act(async () => {});
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(3);
+  });
+
+  // #1082 sixth review (E): several upper bounds, one refetch.
+  it("coalesces the reconciliation of three conversations into one refetch", async () => {
+    const everyone = (unread: number) => ({
+      currentUserId,
+      workspaceId: "workspace-1",
+      preciseReadCursor: true,
+      channels: [channelA, channelB].map((id) => ({
+        id,
+        name: id,
+        type: "public",
+        canWrite: true,
+        unreadCount: unread,
+        readState: readState(unread, 0),
+      })),
+      dms: [
+        {
+          id: dmC,
+          type: "1:1",
+          name: "C",
+          participants: [],
+          unreadCount: unread,
+          readState: readState(unread, 0),
+        },
+      ],
+      categories: [],
+    });
+    mockFetchSidebarData.mockResolvedValue(everyone(0));
+    const { result } = await ready("/chat");
+
+    const held = deferredValue<ReturnType<typeof everyone>>();
+    mockFetchSidebarData.mockReturnValueOnce(held.promise);
+    act(() => websocket.onConversationAvailable?.());
+    act(() => {
+      websocket.onMessageCreated?.(messageCreated("a-1", channelA, "other-1", "channel", at(1)));
+      websocket.onMessageCreated?.(messageCreated("b-1", channelB, "other-1", "channel", at(1)));
+      websocket.onMessageCreated?.(messageCreated("c-1", dmC, "other-1", "dm", at(1)));
+    });
+
+    // Each count may or may not include its arrival: three upper bounds.
+    const reconciling = deferredValue<ReturnType<typeof everyone>>();
+    mockFetchSidebarData.mockReturnValueOnce(reconciling.promise);
+    await act(async () => held.resolve(everyone(1)));
+    expect(unreadCounts(result.current.state)).toEqual({ channelA: 2, channelB: 2, dmC: 2 });
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(3);
+
+    await act(async () => reconciling.resolve(everyone(1)));
+    expect(unreadCounts(result.current.state)).toEqual({ channelA: 1, channelB: 1, dmC: 1 });
+    await act(async () => {});
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(3);
+  });
+
+  // H2: reads are never subtracted from a base they were not measured against.
+  it("shows 4, never 1, when a read message is deleted before the write lands", async () => {
+    const write = deferredValue<ReturnType<typeof readState>>();
+    mockMarkConversationRead.mockReturnValue(write.promise);
+    const { result } = await ready();
+    act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+    expect(rowB(result.current.state).unreadCount).toBe(5);
+    await waitFor(() => expect(mockMarkConversationRead).toHaveBeenCalledTimes(1));
+
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(4, 0)));
+    act(() => websocket.onConversationAvailable?.());
+    await waitFor(() => expect(rowB(result.current.state).unreadCount).toBe(4));
+
+    await act(async () => write.resolve(readState(2, 3)));
+    expect(rowB(result.current.state).unreadCount).toBe(2);
+  });
+
+  // H3: a message loaded late is persisted, not subtracted from an older base.
+  it("keeps 2 when a message committed after the base is read, and writes it", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(2, 2)));
+    const write = deferredValue<ReturnType<typeof readState>>();
+    mockMarkConversationRead.mockReturnValue(write.promise);
+    const { result } = await ready();
+    act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+    expect(rowB(result.current.state).unreadCount).toBe(2);
+
+    await waitFor(() =>
+      expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelB, "m-3", {
+        keepalive: false,
+      }),
+    );
+    await act(async () => write.resolve(readState(2, 3)));
+    expect(rowB(result.current.state).unreadCount).toBe(2);
+  });
+
+  // R4: an older answer never replaces a newer one.
+  it("keeps a newer answer's read point over a late answer from an older write", async () => {
+    const write = deferredValue<ReturnType<typeof readState>>();
+    mockMarkConversationRead.mockReturnValue(write.promise);
+    const { result } = await ready();
+    act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+    await waitFor(() => expect(mockMarkConversationRead).toHaveBeenCalledTimes(1));
+
+    // Another device read through m4; a refetch started now reports it.
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(1, 4)));
+    act(() => websocket.onConversationAvailable?.());
+    await waitFor(() => expect(rowB(result.current.state).unreadCount).toBe(1));
+
+    await act(async () => write.resolve(readState(2, 3)));
+    expect(rowB(result.current.state)).toMatchObject({ unreadCount: 1 });
+    expect(rowB(result.current.state).serverRead?.readThrough).toEqual(position(4));
+  });
+
+  it("converges on another device reading further", async () => {
+    const { result } = await ready();
+    act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(0, 9)));
+    act(() => websocket.onConversationAvailable?.());
+    await waitFor(() => expect(rowB(result.current.state).unreadCount).toBe(0));
+  });
+
+  // R1: a server without the cursor would read any write as "everything is
+  // read until now" — so it never receives a progressive one.
+  it("persists nothing progressively against a server without the precise cursor", async () => {
+    mockFetchSidebarData.mockResolvedValue(legacySidebar(5));
+    const { result } = await ready();
+    vi.useFakeTimers();
+    try {
+      act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+      await elapse(READ_CURSOR_DEBOUNCE_MS * 2);
+      expect(mockMarkConversationRead).not.toHaveBeenCalled();
+      // An incomplete timeline cannot replace the legacy server's count.
+      expect(rowB(result.current.state).unreadCount).toBe(5);
+      act(() =>
+        websocket.onMessageCreated?.(messageCreated("m-6", channelB, "other-1", "channel", at(6))),
+      );
+      expect(rowB(result.current.state).unreadCount).toBe(6);
+
+      // m4 is absent from a focused window: seeing m3 and m5 is not mark-all.
+      act(() => result.current.reportReadProgress(channelBTarget, progress(5)));
+      await elapse();
+      expect(mockMarkConversationRead).not.toHaveBeenCalled();
+      expect(rowB(result.current.state).unreadCount).toBe(6);
+
+      // Explicit intent still supports the old endpoint.
+      act(() => result.current.markRead(channelBTarget));
+      expect(rowB(result.current.state).unreadCount).toBe(0);
+      await elapse();
+      expect(mockMarkConversationRead).toHaveBeenCalledTimes(1);
+      expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelB, undefined, {
+        keepalive: false,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // HIGH 3 (E, F): a rollback reaches the tab as a refetch.
+  it("shows a legacy server's count instead of the precise projection, then converges back", async () => {
+    const { result } = await ready();
+    act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+    expect(rowB(result.current.state)).toMatchObject({ unreadCount: 5, readThrough: position(3) });
+
+    mockFetchSidebarData.mockResolvedValue(legacySidebar(9));
+    act(() => websocket.onConversationAvailable?.());
+    await waitFor(() => expect(rowB(result.current.state).unreadCount).toBe(9));
+    expect(rowB(result.current.state)).toMatchObject({ arrivals: undefined });
+    expect(rowB(result.current.state).serverRead).toBeUndefined();
+
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(6, 3)));
+    act(() => websocket.onConversationAvailable?.());
+    await waitFor(() => expect(rowB(result.current.state).unreadCount).toBe(6));
+    expect(rowB(result.current.state).serverRead?.readThrough).toEqual(position(3));
+  });
+
+  // HIGH 5 (K): the capability can go away while a position waits.
+  it("sends no position queued before a refetch reports the capability gone", async () => {
+    const { result } = await ready();
+    vi.useFakeTimers();
+    try {
+      act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+      mockFetchSidebarData.mockResolvedValue(legacySidebar(5));
+      act(() => websocket.onConversationAvailable?.());
+      await elapse(0);
+      await elapse(READ_CURSOR_DEBOUNCE_MS * 2);
+      expect(mockMarkConversationRead).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // HIGH 5 (M): any refetch — reconnect included — carries the capability.
+  it("drops a pending position on a page-restore refetch without the capability, and resumes after", async () => {
+    const { result } = await ready();
+    vi.useFakeTimers();
+    try {
+      act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+      mockFetchSidebarData.mockResolvedValue(legacySidebar(5));
+      act(() => {
+        window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+      });
+      await elapse(READ_CURSOR_DEBOUNCE_MS * 2);
+      expect(mockMarkConversationRead).not.toHaveBeenCalled();
+
+      mockFetchSidebarData.mockResolvedValue(sidebar(readState(5, 0)));
+      act(() => {
+        window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+      });
+      await elapse(0);
+      act(() => result.current.reportReadProgress(channelBTarget, progress(4)));
+      await elapse();
+      expect(mockMarkConversationRead).toHaveBeenCalledTimes(1);
+      expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelB, "m-4", {
+        keepalive: false,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // HIGH 5 (L): a position already on the wire meets a server without the cursor.
+  it("treats a 400 to a position as a downgrade: no acknowledgement, no retry, one reconciliation", async () => {
+    mockMarkConversationRead.mockRejectedValueOnce(
+      new ApiRequestError(400, "bad_request", "unknown field read_cursor"),
+    );
+    const { result } = await ready();
+    mockFetchSidebarData.mockResolvedValue(legacySidebar(5));
+    act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+    await waitFor(() => expect(mockMarkConversationRead).toHaveBeenCalledTimes(1));
+
+    // The authority is asked for once, and its legacy count replaces the projection.
+    await waitFor(() => expect(mockFetchSidebarData).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(rowB(result.current.state).unreadCount).toBe(5));
+
+    vi.useFakeTimers();
+    try {
+      act(() => result.current.reportReadProgress(channelBTarget, progress(4)));
+      await elapse(READ_CURSOR_DEBOUNCE_MS * 2);
+      expect(mockMarkConversationRead).toHaveBeenCalledTimes(1);
+      expect(mockFetchSidebarData).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // HIGH 4 (G): read state belongs to the session that produced it.
+  it("shows account B's own count after a switch from A on the same channel id", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(2, 3)));
+    const { result } = await ready("/chat");
+    expect(rowB(result.current.state).unreadCount).toBe(2);
+
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(5, 0), {}, "user-b"));
+    act(() => setTokens("session-b"));
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    expect(rowB(result.current.state)).toMatchObject({
+      unreadCount: 5,
+      serverRead: { readThrough: position(0) },
+    });
+  });
+
+  // HIGH 4 (I): a new session of the same user starts from the server too.
+  it("does not carry the projection into a relogin of the same user and workspace", async () => {
+    const { result } = await ready();
+    act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+    expect(rowB(result.current.state).readThrough).toEqual(position(3));
+
+    // The write never landed: the server still says 5.
+    act(() => setTokens("session-a-again"));
+    await waitFor(() => expect(mockFetchSidebarData).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    expect(rowB(result.current.state).unreadCount).toBe(5);
+    expect(rowB(result.current.state).readThrough).toBeUndefined();
+  });
+
+  // HIGH 4 (H): a fetch started under A lands nowhere once B is in.
+  it("ignores a sidebar answer for the previous session that arrives after the switch", async () => {
+    const { result } = await ready("/chat");
+    const late = heldRefetch();
+
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(7, 0), {}, "user-b"));
+    act(() => setTokens("session-b"));
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    expect(rowB(result.current.state).unreadCount).toBe(7);
+
+    await act(async () => late.resolve(sidebar(readState(2, 3))));
+    expect(rowB(result.current.state).unreadCount).toBe(7);
+  });
+
+  // HIGH 4: a logout ends the session with nothing to load for.
+  it("drops the read state on logout and asks for nothing without a token", async () => {
+    const { result } = await ready();
+    act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+
+    act(() => clearTokens());
+    await act(async () => {});
+
+    expect(result.current.state.status).toBe("loading");
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(1);
+  });
+
+  // J: a refresh rotation is the same session.
+  it("keeps the read state across a refresh rotation", async () => {
+    const { result } = await ready();
+    act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+    const before = result.current.state;
+
+    act(() => setTokens("session-a-rotated", "refresh"));
+    await act(async () => {});
+
+    expect(result.current.state).toBe(before);
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(1);
+  });
+
+  // R5: the writer's lifetime is the auth session's.
+  it("drops a pending cursor the moment the session's token is replaced", async () => {
+    const { result } = await ready();
+    vi.useFakeTimers();
+    try {
+      act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+      // Session B, before any refetch of the sidebar.
+      act(() => setTokens("session-b"));
+      await elapse(READ_CURSOR_DEBOUNCE_MS * 2);
+      expect(mockMarkConversationRead).not.toHaveBeenCalled();
+
+      // The new session writes normally once its sidebar is in.
+      act(() => result.current.reportReadProgress(channelBTarget, progress(4)));
+      await elapse();
+      expect(mockMarkConversationRead).toHaveBeenCalledTimes(1);
+      expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelB, "m-4", {
+        keepalive: false,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a pending cursor across a refresh rotation: same session, new token", async () => {
+    const { result } = await ready();
+    vi.useFakeTimers();
+    try {
+      act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+      act(() => setTokens("session-a-rotated", "refresh"));
+      await elapse();
+      expect(mockMarkConversationRead).toHaveBeenCalledTimes(1);
+      expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelB, "m-3", {
+        keepalive: false,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("lets a write in flight when the token is replaced land without touching the new session", async () => {
+    const write = deferredValue<ReturnType<typeof readState>>();
+    mockMarkConversationRead.mockReturnValueOnce(write.promise);
+    const { result } = await ready();
+    act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+    await waitFor(() => expect(mockMarkConversationRead).toHaveBeenCalledTimes(1));
+
+    act(() => setTokens("session-b"));
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    const before = rowB(result.current.state);
+    await act(async () => write.resolve(readState(0, 9)));
+
+    expect(rowB(result.current.state)).toBe(before);
+  });
+
+  // R8: the page going away, and coming back.
+  it("sends a pending cursor as keepalive the moment the page is hidden away", async () => {
+    const { result } = await ready();
+    act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+    expect(mockMarkConversationRead).not.toHaveBeenCalled();
+
+    act(() => {
+      window.dispatchEvent(new Event("pagehide"));
+    });
+    await act(async () => {});
+
+    expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelB, "m-3", {
+      keepalive: true,
+    });
+  });
+
+  it("asks the server again when the page is restored from the back/forward cache", async () => {
+    await ready();
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: false }));
+    });
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+    });
+    await waitFor(() => expect(mockFetchSidebarData).toHaveBeenCalledTimes(2));
+  });
+
+  // R7: "Marcar como lida" invents no read point.
+  it("keeps a mention that lands during a mark-all, on the same instant with a later id", async () => {
+    const write = deferredValue<ReturnType<typeof readState>>();
+    mockMarkConversationRead.mockReturnValue(write.promise);
+    const { result } = await ready("/chat");
+    act(() => result.current.markRead(channelBTarget));
+    expect(rowB(result.current.state)).toMatchObject({ unreadCount: 0 });
+    expect(rowB(result.current.state).markAllSince).toBeDefined();
+    await waitFor(() => expect(mockMarkConversationRead).toHaveBeenCalledTimes(1));
+
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageCreated(
+          "m-5-late",
+          channelB,
+          "other-1",
+          "channel",
+          at(5),
+          `oi ${mentionToken(currentUserId)}`,
+        ),
+      ),
+    );
+    expect(rowB(result.current.state)).toMatchObject({ unreadCount: 1, hasMentionUnread: true });
+
+    // The server resolved "everything" to m-5 and counts the late mention past
+    // it — but the write left before the mention arrived, so this client does
+    // not know that answer saw it: it errs on showing one more, never fewer.
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(1, 5)));
+    await act(async () => write.resolve(readState(1, 5)));
+    expect(rowB(result.current.state)).toMatchObject({
+      hasMentionUnread: true,
+      markAllSince: undefined,
+    });
+    expect(rowB(result.current.state).unreadCount).toBeGreaterThanOrEqual(1);
+    expect(rowB(result.current.state).serverRead?.readThrough).toEqual(position(5));
+
+    // The mention arrived while the write was out: one refetch settles whether
+    // its count had it — 1, the mention kept.
+    await waitFor(() => expect(mockFetchSidebarData).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(rowB(result.current.state).reconcileAfter).toBeUndefined());
+    expect(rowB(result.current.state)).toMatchObject({ unreadCount: 1, hasMentionUnread: true });
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a mention until the cursor passes the newest one", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(0, 0)));
+    const { result } = await ready("/chat");
+    const mention = `oi ${mentionToken(currentUserId)}`;
+    act(() => {
+      websocket.onMessageCreated?.(
+        messageCreated("m-2", channelB, "other-1", "channel", at(2), mention),
+      );
+      websocket.onMessageCreated?.(messageCreated("m-3", channelB, "other-1", "channel", at(3)));
+      websocket.onMessageCreated?.(
+        messageCreated("m-5", channelB, "other-1", "channel", at(5), mention),
+      );
+    });
+    expect(rowB(result.current.state)).toMatchObject({ unreadCount: 3, hasMentionUnread: true });
+
+    act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+    expect(rowB(result.current.state)).toMatchObject({ unreadCount: 1, hasMentionUnread: true });
+
+    act(() => result.current.reportReadProgress(channelBTarget, progress(5)));
+    expect(rowB(result.current.state).hasMentionUnread).toBe(false);
+  });
+
+  it("keeps a restored mention of unknown position when an older known one is read", async () => {
+    savePersistedUnread(currentUserId, "workspace-1", [
+      { id: channelB, type: "channel", unreadCount: 3, hasMentionUnread: true },
+    ]);
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(3, 0)));
+    const { result } = await ready("/chat");
+    expect(rowB(result.current.state)).toMatchObject({
+      hasMentionUnread: true,
+      unknownMention: true,
+    });
+
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageCreated(
+          "m-2",
+          channelB,
+          "other-1",
+          "channel",
+          at(2),
+          `oi ${mentionToken(currentUserId)}`,
+        ),
+      ),
+    );
+    act(() => result.current.reportReadProgress(channelBTarget, progress(2)));
+    expect(rowB(result.current.state)).toMatchObject({
+      hasMentionUnread: true,
+      unknownMention: true,
+      unreadMention: undefined,
+    });
+  });
+
+  it("counts an arrival in any conversation, the open one until its timeline reads it", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebar(readState(0, 0)));
+    const { result } = await ready(`/chat/channel/${channelB}`);
+    act(() => {
+      websocket.onMessageCreated?.(messageCreated("m-1", channelB, "other-1", "channel", at(1)));
+      websocket.onMessageCreated?.(
+        messageCreated("m-3", channelB, currentUserId, "channel", at(3)),
+      );
+    });
+    expect(rowB(result.current.state).unreadCount).toBe(1);
+    act(() => result.current.reportReadProgress(channelBTarget, progress(1)));
+    expect(unreadCounts(result.current.state)).toEqual({ channelA: 0, channelB: 0, dmC: 0 });
   });
 });

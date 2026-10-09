@@ -231,6 +231,8 @@ export function useNavigator({
    * waits on a scroll event that may never come.
    */
   const yieldToReader = useCallback(() => {
+    // #1082: whatever was carrying the scrollport to a message gives it back too.
+    core.endJump();
     const navigation = core.navigationRef.current;
     const el = core.listRef.current;
     if (!navigation || !el || !core.endNavigation(navigation)) return;

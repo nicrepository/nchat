@@ -58,8 +58,8 @@ export interface SystemMessagePresentation {
   text: string;
   /**
    * A Material Symbols Outlined ligature name (issue #685 visual pass), e.g.
-   * "call". Purely decorative — the event this build cannot describe already
-   * renders nothing above, so there is no icon-only fallback to invent here.
+   * "call". Purely decorative; an unrecognized event uses "info" beside its
+   * neutral fallback text.
    */
   icon: string;
   /**
@@ -229,14 +229,16 @@ function callEndedText(
 }
 
 /**
- * The presentation for one system message, or null when there is nothing to
- * show.
+ * The presentation for one system message, or null when it is not one.
  *
- * Null covers every shape this build cannot describe honestly: a message that
- * is not a system one, an event type from a newer server, a rename with no
- * new name, and a member change with no targets. The timeline renders
- * nothing for those rather than an empty line or a guess — an unknown event
- * must never break the messages around it.
+ * Every conversation event gets a line. One this build cannot phrase — an
+ * event type from a newer server, a rename with no new name, a member change
+ * with no targets — gets a neutral event label. Its type may have been dropped
+ * by API normalization, so the fallback does not assume an action or actor.
+ * It used to render nothing at all, but an
+ * event from someone else counts as unread, and an unread message with
+ * nothing on screen could never be seen — so it could never honestly be read
+ * (issue #1082). A generic line claims nothing it cannot know.
  *
  * `viewerId` is the reader's own user id, used only to pick which of the
  * "você" variants applies — it never changes which event is described, only
@@ -249,7 +251,7 @@ export function systemMessagePresentation(
   scope: SystemMessageScope,
   viewerId = "",
 ): SystemMessagePresentation | null {
-  if (message.kind !== "system" || !message.eventType) return null;
+  if (message.kind !== "system") return null;
   const actor = message.senderDisplayName.trim() || unknownActor;
   const actorIsViewer = !!viewerId && message.senderId === viewerId;
   const builders: Record<ConversationEventType, () => string | null> = {
@@ -264,9 +266,9 @@ export function systemMessagePresentation(
     call_started: () => callStartedText(actorIsViewer, actor, message.eventPayload),
     call_ended: () => callEndedText(actorIsViewer, actor, message.eventPayload),
   };
-  const text = builders[message.eventType]?.() ?? null;
-  if (!text) return null;
   const eventType = message.eventType;
+  const text = eventType ? builders[eventType]?.() : null;
+  if (!eventType || !text) return { text: "Evento da conversa", icon: "info", tone: "neutral" };
   const tone = eventType === "call_started" || eventType === "call_ended" ? "call" : "neutral";
   return { text, icon: eventIcon[eventType], tone };
 }

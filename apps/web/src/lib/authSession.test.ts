@@ -93,11 +93,13 @@ describe("onAuthChange", () => {
     unsubB();
   });
 
-  it("listener is called with no arguments (no token payload)", () => {
+  it("listener is told only why the session changed, never the token", () => {
     const listener = vi.fn();
     const unsub = onAuthChange(listener);
     setTokens("at");
-    expect(listener).toHaveBeenCalledWith();
+    setTokens("rotated", "refresh");
+    clearTokens();
+    expect(listener.mock.calls).toEqual([["session"], ["refresh"], ["session"]]);
     unsub();
   });
 });

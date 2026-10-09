@@ -360,3 +360,23 @@ export function scrollButtonState(input: ScrollButtonInput): ScrollButtonState {
     count: input.unreadCount,
   };
 }
+
+/** How far from its centred position a jumped-to row may sit and count as landed. */
+export const JUMP_LANDED_TOLERANCE_PX = 2;
+
+/**
+ * Whether a jump to one message has landed (#1082): the row sits where a
+ * centring scroll puts it, or as close as the scroll range allows. A trip still
+ * animating towards the row is, by this rule, not there yet — which is what
+ * keeps the frames it passes through from being read as a reading position.
+ */
+export function jumpLanded(
+  row: { top: number; height: number },
+  listTopPx: number,
+  scroll: { scrollTop: number; scrollHeight: number; clientHeight: number },
+): boolean {
+  const offsetToCentre = row.top + row.height / 2 - (listTopPx + scroll.clientHeight / 2);
+  const maxScrollTop = Math.max(0, scroll.scrollHeight - scroll.clientHeight);
+  const centred = Math.min(maxScrollTop, Math.max(0, scroll.scrollTop + offsetToCentre));
+  return Math.abs(centred - scroll.scrollTop) <= JUMP_LANDED_TOLERANCE_PX;
+}

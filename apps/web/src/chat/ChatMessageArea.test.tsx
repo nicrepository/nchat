@@ -34,6 +34,9 @@ import { isCatalogedEmoji, loadEmojiCatalog, resetEmojiCatalogCache } from "./em
 import { avatarColorFor } from "./messageDisplay";
 import type { Message, MessagePage, MessageSecuritySnapshot } from "./chatTypes";
 import type { MessageLink } from "./messageLinks";
+import type { ReadProgress } from "./readCursor";
+import type { ReadTarget } from "./readCursorWriter";
+import { acceptServerRead, applyReadProgress, type ReadRow } from "./sidebarReadState";
 import type {
   WSClientErrorEvent,
   WSMessageCreatedEvent,
@@ -7078,6 +7081,18 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
     vi.unstubAllGlobals();
   });
 
+  // #1082: the page-attention spies a read-cursor test installs (see attended()).
+  const attention: { mockRestore: () => void }[] = [];
+  afterEach(() => {
+    for (const spy of attention.splice(0)) spy.mockRestore();
+  });
+  // A test that leaves the reader in history persists that anchor when it
+  // unmounts — after every afterEach here — so the next test opening the same
+  // conversation starts from a clean slate instead.
+  beforeEach(() => {
+    sessionStorage.clear();
+  });
+
   function bottomSentinelCallback(): IntersectionObserverCallback {
     const sentinel = screen.getByTestId("chat-bottom-sentinel");
     const instance = ioInstances.find((i) => i.element === sentinel);
@@ -7124,6 +7139,50 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
       </MemoryRouter>,
     );
   }
+
+  // #1082 seventh round: a direct link can mount the timeline before the
+  // sidebar has loaded. The opening position needs the conversation's unread
+  // count, so the timeline waits for it instead of settling on a guessed 0 —
+  // which opened such a conversation at the tail, with no "Novas mensagens".
+  it("waits for the sidebar before deciding where a conversation opens", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({ id: "m1", senderId: "other-1", bodyText: "Lida 1" }),
+        makeMessage({ id: "m2", senderId: "other-1", bodyText: "Não lida 1" }),
+        makeMessage({ id: "m3", senderId: "other-1", bodyText: "Não lida 2" }),
+      ]),
+    );
+    const tree = (
+      ctx: Partial<ChatOutletContext> & Pick<ChatOutletContext, "currentUserId" | "channels">,
+    ) => (
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={<ParentWithContext ctx={{ dms: [], workspaceId: "workspace-1", ...ctx }} />}
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>
+    );
+    // The sidebar is still loading: no user, no rows, and the shell says so.
+    const { rerender } = render(tree({ currentUserId: "", channels: [], sidebarLoading: true }));
+    await waitFor(() => expect(mockFetchChannelMessages).toHaveBeenCalled());
+    await act(async () => {});
+    expect(screen.getByRole("status", { name: "Carregando mensagens" })).toBeInTheDocument();
+    expect(screen.queryByText("Não lida 1")).not.toBeInTheDocument();
+
+    // The sidebar arrives: two unread.
+    rerender(
+      tree({
+        currentUserId: "me-123",
+        channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 2 }],
+      }),
+    );
+    await screen.findByText("Não lida 1");
+    expect(screen.getByRole("separator", { name: "Novas mensagens" })).toBeInTheDocument();
+  });
 
   it("opens directly at the bottom, without smooth scroll, when there is no unread", async () => {
     mockFetchChannelMessages.mockResolvedValue(
@@ -7179,45 +7238,533 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
     expect(scrollMock).not.toHaveBeenCalledWith(expect.objectContaining({ behavior: "smooth" }));
   });
 
-  it("does not call mark-read just from opening a conversation with unread", async () => {
+  // ── #1082: read state follows what was seen, not the tail ────────────────
+
+  const minute = (n: number) => `2026-07-15T10:${String(n).padStart(2, "0")}:00.000Z`;
+  const fromOther = (n: number, overrides: Partial<Message> = {}) =>
+    makeMessage({
+      id: `m${n}`,
+      senderId: "other-1",
+      bodyText: `Mensagem ${n}`,
+      createdAt: minute(n),
+      ...overrides,
+    });
+
+  /**
+   * The boxes a browser would report: the list spans 0..400, and each listed
+   * message row sits where the test says. Anything else falls back to the
+   * suite's default layout.
+   */
+  function layOutRows(rows: Record<string, [top: number, bottom: number]>) {
+    layoutSpy.mockImplementation(function (this: Element) {
+      if (this.classList.contains("chat-msg-area__list")) {
+        return domRect({ top: 0, bottom: 400, right: 1024, width: 1024, height: 400 });
+      }
+      const box = rows[this.getAttribute("data-message-id") ?? ""];
+      if (box) {
+        return domRect({
+          top: box[0],
+          bottom: box[1],
+          right: 400,
+          width: 400,
+          height: box[1] - box[0],
+        });
+      }
+      return layoutRect.call(this);
+    });
+  }
+
+  function attended(visibility: DocumentVisibilityState = "visible", focused = true) {
+    attention.push(
+      vi.spyOn(document, "visibilityState", "get").mockReturnValue(visibility),
+      vi.spyOn(document, "hasFocus").mockReturnValue(focused),
+    );
+  }
+
+  const readProgressSpy = () => vi.fn<(target: ReadTarget, progress: ReadProgress) => void>();
+
+  function openWithUnread(reportReadProgress: ReturnType<typeof readProgressSpy>, unreadCount = 4) {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([fromOther(1), fromOther(2), fromOther(3), fromOther(4), fromOther(5)]),
+    );
+    return renderWithContext("geral", {
+      currentUserId: "me-123",
+      workspaceId: "workspace-1",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount }],
+      reportReadProgress,
+    });
+  }
+
+  it("does not report any reading just from opening a conversation with unread", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    openWithUnread(reportReadProgress);
+
+    await screen.findByText("Mensagem 2");
+    // Nothing has a box on screen yet: nothing was seen.
+    expect(reportReadProgress).not.toHaveBeenCalled();
+  });
+
+  it("advances the cursor to the latest row actually seen, long before the tail", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    openWithUnread(reportReadProgress);
+    await screen.findByText("Mensagem 2");
+
+    // m2 and m3 are on screen; m4 is mounted but below the fold, m5 further.
+    layOutRows({ m1: [-60, -20], m2: [100, 140], m3: [200, 240], m4: [420, 460], m5: [480, 520] });
+    fireEvent.scroll(screen.getByRole("log"));
+
+    await waitFor(() =>
+      expect(reportReadProgress).toHaveBeenLastCalledWith(
+        { kind: "channel", targetId: "geral" },
+        expect.objectContaining({
+          readThrough: expect.objectContaining({ id: "m3" }),
+        }),
+      ),
+    );
+
+    // Further down: the cursor keeps advancing with each row seen.
+    layOutRows({ m3: [-60, -20], m4: [100, 140], m5: [200, 240] });
+    fireEvent.scroll(screen.getByRole("log"));
+    await waitFor(() =>
+      expect(reportReadProgress).toHaveBeenLastCalledWith(
+        { kind: "channel", targetId: "geral" },
+        expect.objectContaining({
+          readThrough: expect.objectContaining({ id: "m5" }),
+        }),
+      ),
+    );
+
+    // Back up into history: reading never goes backwards.
+    const reports = reportReadProgress.mock.calls.length;
+    layOutRows({ m1: [100, 140], m2: [200, 240] });
+    fireEvent.scroll(screen.getByRole("log"));
+    expect(reportReadProgress).toHaveBeenCalledTimes(reports);
+  });
+
+  it("reads nothing while the tab is hidden, and catches up when it becomes visible", async () => {
+    attended("hidden");
+    const reportReadProgress = readProgressSpy();
+    openWithUnread(reportReadProgress);
+    await screen.findByText("Mensagem 2");
+    layOutRows({ m2: [100, 140], m3: [200, 240] });
+    fireEvent.scroll(screen.getByRole("log"));
+    expect(reportReadProgress).not.toHaveBeenCalled();
+
+    attended("visible");
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+
+    expect(reportReadProgress).toHaveBeenLastCalledWith(
+      { kind: "channel", targetId: "geral" },
+      { readThrough: expect.objectContaining({ id: "m3" }) },
+    );
+  });
+
+  it("reads nothing while the window has no focus, and catches up when it regains it", async () => {
+    attended("visible", false);
+    const reportReadProgress = readProgressSpy();
+    openWithUnread(reportReadProgress);
+    await screen.findByText("Mensagem 2");
+    layOutRows({ m2: [100, 140] });
+    fireEvent.scroll(screen.getByRole("log"));
+    expect(reportReadProgress).not.toHaveBeenCalled();
+
+    attended("visible", true);
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    expect(reportReadProgress).toHaveBeenLastCalledWith(
+      { kind: "channel", targetId: "geral" },
+      { readThrough: expect.objectContaining({ id: "m2" }) },
+    );
+  });
+
+  it("does not let the reader's own message carry the cursor past unseen messages", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
     mockFetchChannelMessages.mockResolvedValue(
       messagePage([
-        makeMessage({ id: "m1", senderId: "other-1", bodyText: "Não lida 1" }),
-        makeMessage({ id: "m2", senderId: "other-1", bodyText: "Não lida 2" }),
+        fromOther(1),
+        fromOther(2),
+        fromOther(3),
+        fromOther(4, { senderId: "me-123", bodyText: "Minha resposta" }),
       ]),
     );
-    const markRead = vi.fn();
-
     renderWithContext("geral", {
       currentUserId: "me-123",
       workspaceId: "workspace-1",
       channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 2 }],
-      markRead,
+      reportReadProgress,
     });
+    await screen.findByText("Minha resposta");
 
-    await screen.findByText("Não lida 1");
-    expect(markRead).not.toHaveBeenCalled();
+    // Only the own message is on screen; m2 and m3 are not.
+    layOutRows({ m2: [-200, -160], m3: [-120, -80], m4: [100, 140] });
+    fireEvent.scroll(screen.getByRole("log"));
+
+    expect(reportReadProgress).not.toHaveBeenCalled();
   });
 
-  it("calls markRead once the bottom sentinel confirms the real tail was reached", async () => {
-    mockFetchChannelMessages.mockResolvedValue(
-      messagePage([makeMessage({ id: "m1", senderId: "other-1", bodyText: "Última" })]),
-    );
-    const markRead = vi.fn();
+  it("does not take the tail sentinel alone as reading", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    openWithUnread(reportReadProgress, 1);
+    await screen.findByText("Mensagem 5");
 
+    // The tail is confirmed, but no row has been exposed by the rule.
+    fireBottomSentinel(true);
+
+    expect(reportReadProgress).not.toHaveBeenCalled();
+  });
+
+  // Finding 9 (#1082 review): a rendered conversation event has a box, and is
+  // read by it — the tail has nothing to do with it.
+  it("reads a conversation event on screen by its own geometry, nowhere near the tail", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        fromOther(1),
+        fromOther(2),
+        fromOther(3, {
+          kind: "system",
+          eventType: "conversation_renamed",
+          eventPayload: { oldName: "a", newName: "b" },
+          bodyText: "",
+        }),
+        fromOther(4),
+      ]),
+    );
     renderWithContext("geral", {
       currentUserId: "me-123",
       workspaceId: "workspace-1",
-      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 1 }],
-      markRead,
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 3 }],
+      reportReadProgress,
     });
+    await screen.findByText("Mensagem 2");
 
-    await screen.findByText("Última");
-    expect(markRead).not.toHaveBeenCalled();
+    // The event row is on screen; m4 is below the fold. No sentinel fires.
+    layOutRows({ m2: [100, 140], m3: [200, 230], m4: [450, 490] });
+    fireEvent.scroll(screen.getByRole("log"));
 
-    fireBottomSentinel(true);
+    expect(reportReadProgress).toHaveBeenLastCalledWith(
+      { kind: "channel", targetId: "geral" },
+      { readThrough: expect.objectContaining({ id: "m3" }) },
+    );
+  });
 
-    expect(markRead).toHaveBeenCalledWith({ kind: "channel", targetId: "geral" });
+  // R6 (#1082 third review): an event is read only by its own exposure. One
+  // this build has no copy for still draws a row, and a neighbour's exposure —
+  // even the reader's own message right after it — does not read it.
+  it("does not read an event by adjacency, even one this build has no copy for", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        fromOther(1),
+        fromOther(2),
+        fromOther(3, {
+          kind: "system",
+          eventType: "conversation_from_the_future" as Message["eventType"],
+          bodyText: "",
+        }),
+        fromOther(4, { senderId: "me-123", bodyText: "Minha resposta" }),
+      ]),
+    );
+    renderWithContext("geral", {
+      currentUserId: "me-123",
+      workspaceId: "workspace-1",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 2 }],
+      reportReadProgress,
+    });
+    await screen.findByText("Minha resposta");
+    expect(screen.getByRole("log").querySelector('[data-message-id="m3"]')).not.toBeNull();
+
+    // m2 and the own m4 are on screen; the event between them is not.
+    layOutRows({ m2: [100, 140], m3: [-60, -40], m4: [200, 240] });
+    fireEvent.scroll(screen.getByRole("log"));
+    expect(reportReadProgress).toHaveBeenLastCalledWith(
+      { kind: "channel", targetId: "geral" },
+      { readThrough: expect.objectContaining({ id: "m2" }) },
+    );
+
+    layOutRows({ m2: [100, 140], m3: [160, 180], m4: [200, 240] });
+    fireEvent.scroll(screen.getByRole("log"));
+    expect(reportReadProgress).toHaveBeenLastCalledWith(
+      { kind: "channel", targetId: "geral" },
+      { readThrough: expect.objectContaining({ id: "m3" }) },
+    );
+  });
+
+  it("does not re-raise the badge when a row it already read grows", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    openWithUnread(reportReadProgress);
+    await screen.findByText("Mensagem 2");
+    layOutRows({ m2: [100, 140], m3: [200, 240], m4: [420, 460] });
+    fireEvent.scroll(screen.getByRole("log"));
+    await waitFor(() =>
+      expect(reportReadProgress).toHaveBeenLastCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          readThrough: expect.objectContaining({ id: "m3" }),
+        }),
+      ),
+    );
+    const reports = reportReadProgress.mock.calls.length;
+
+    // An image in m3 finishes loading: it grows and pushes m3's top out of view.
+    layOutRows({ m2: [-300, -260], m3: [-200, 380], m4: [420, 460] });
+    fireEvent.scroll(screen.getByRole("log"));
+
+    // Nothing was un-read, and nothing new was claimed.
+    expect(reportReadProgress).toHaveBeenCalledTimes(reports);
+  });
+
+  it("does not move the cursor back for a deep link into read history", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([fromOther(1), fromOther(2), fromOther(3), fromOther(4), fromOther(5)]),
+    );
+    renderWithContext("geral?message=m1", {
+      currentUserId: "me-123",
+      workspaceId: "workspace-1",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 0 }],
+      reportReadProgress,
+    });
+    await screen.findByText("Mensagem 1");
+
+    layOutRows({ m1: [100, 140], m2: [200, 240] });
+    fireEvent.scroll(screen.getByRole("log"));
+
+    expect(reportReadProgress).not.toHaveBeenCalled();
+  });
+
+  it("advances to a deep-linked newer message only once it is actually seen", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([fromOther(1), fromOther(2), fromOther(3), fromOther(4), fromOther(5)]),
+    );
+    renderWithContext("geral?message=m5", {
+      currentUserId: "me-123",
+      workspaceId: "workspace-1",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 3 }],
+      reportReadProgress,
+    });
+    await screen.findByText("Mensagem 5");
+    // Loaded and mounted, but nothing exposed yet: the jump alone reads nothing.
+    fireEvent.scroll(screen.getByRole("log"));
+    expect(reportReadProgress).not.toHaveBeenCalled();
+
+    layOutRows({ m5: [180, 220] });
+    fireEvent.scroll(screen.getByRole("log"));
+
+    expect(reportReadProgress).toHaveBeenLastCalledWith(
+      { kind: "channel", targetId: "geral" },
+      { readThrough: expect.objectContaining({ id: "m5" }) },
+    );
+  });
+
+  // #1082 sixth review (H3), through the real loader: a deep link loads the
+  // recent page and the focused message on its own, leaving a gap between
+  // them. What the timeline holds is no evidence about the gap.
+  it("reports a deep-linked read across a gap, which the sidebar does not take off its base", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    // The base counted m3b, m4 and m5 past m2. m3 was committed later. The
+    // recent page holds m4 and m5, with older pages behind it; m3 is fetched
+    // alone, and m3b stays in the gap.
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [fromOther(4), fromOther(5)],
+      nextCursor: "older-page",
+    });
+    mockFetchChannelMessage.mockResolvedValue(fromOther(3));
+    const base = { unreadCount: 3, readThrough: { id: "m2", createdAt: minute(2) } };
+    renderWithContext("geral?message=m3", {
+      currentUserId: "me-123",
+      workspaceId: "workspace-1",
+      channels: [
+        {
+          id: "geral",
+          name: "Geral",
+          type: "public",
+          canWrite: true,
+          unreadCount: 3,
+          serverRead: { ...base, startedAt: 1, receivedAt: 2 },
+        },
+      ],
+      reportReadProgress,
+    });
+    await screen.findByText("Mensagem 3");
+    const held = [...screen.getByRole("log").querySelectorAll("[data-message-id]")].map((row) =>
+      row.getAttribute("data-message-id"),
+    );
+    expect(held).toEqual(["m3", "m4", "m5"]);
+
+    layOutRows({ m3: [180, 220] });
+    fireEvent.scroll(screen.getByRole("log"));
+    const progress = reportReadProgress.mock.lastCall![1];
+    expect(progress).toEqual({ readThrough: expect.objectContaining({ id: "m3" }) });
+
+    // The sidebar row on that base: the cursor moves (and goes to the writer),
+    // the count stays the server's 3 — the loaded messages say nothing about m3b.
+    let row = acceptServerRead({ id: "geral" } as ReadRow, base, { startedAt: 1, receivedAt: 2 });
+    row = applyReadProgress(row, progress);
+    expect(row).toMatchObject({
+      unreadCount: 3,
+      readThrough: expect.objectContaining({ id: "m3" }),
+    });
+  });
+
+  /**
+   * The list's scroll geometry, which jsdom never computes: every list element
+   * reads these values, and writes to scrollTop land in them.
+   */
+  function stubListScroll(geometry: {
+    scrollTop: number;
+    scrollHeight: number;
+    clientHeight: number;
+  }) {
+    const isList = (el: Element) => el.classList.contains("chat-msg-area__list");
+    for (const key of ["scrollHeight", "clientHeight"] as const) {
+      Object.defineProperty(HTMLElement.prototype, key, {
+        configurable: true,
+        get(this: HTMLElement) {
+          return isList(this) ? geometry[key] : 0;
+        },
+      });
+    }
+    Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return isList(this) ? geometry.scrollTop : 0;
+      },
+      set(this: HTMLElement, value: number) {
+        if (isList(this)) geometry.scrollTop = value;
+      },
+    });
+    return () => {
+      for (const key of ["scrollHeight", "clientHeight", "scrollTop"]) {
+        Reflect.deleteProperty(HTMLElement.prototype, key);
+      }
+    };
+  }
+
+  // Finding 7 (#1082 review): a deep link owns the scrollport until it lands.
+  it("does not read the frames a deep link scrolls through before it lands", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    const geometry = { scrollTop: 0, scrollHeight: 2000, clientHeight: 400 };
+    const restoreScroll = stubListScroll(geometry);
+    try {
+      // m3 is on screen where the timeline starts; m5, the link, is far below.
+      layOutRows({ m3: [100, 140], m5: [1500, 1540] });
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([fromOther(1), fromOther(2), fromOther(3), fromOther(4), fromOther(5)]),
+      );
+      renderWithContext("geral?message=m5", {
+        currentUserId: "me-123",
+        workspaceId: "workspace-1",
+        channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 3 }],
+        reportReadProgress,
+      });
+      await screen.findByText("Mensagem 5");
+
+      // Mid-trip: m3 is exposed, but nobody chose to look at it.
+      fireEvent.scroll(screen.getByRole("log"));
+      expect(reportReadProgress).not.toHaveBeenCalled();
+
+      // Landed: m5 is centred where the jump sent it.
+      geometry.scrollTop = 1320;
+      layOutRows({ m3: [-1220, -1180], m5: [180, 220] });
+      fireEvent.scroll(screen.getByRole("log"));
+
+      expect(reportReadProgress).toHaveBeenLastCalledWith(
+        { kind: "channel", targetId: "geral" },
+        expect.objectContaining({
+          readThrough: expect.objectContaining({ id: "m5" }),
+        }),
+      );
+    } finally {
+      restoreScroll();
+    }
+  });
+
+  // Finding 6 (#1082 review): the timeline follows the server's later point.
+  it("adopts a later server read point without writing it back", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([fromOther(1), fromOther(2), fromOther(3), fromOther(4), fromOther(5)]),
+    );
+    const tree = (serverReadThrough?: { id: string; createdAt: string }) => (
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  workspaceId: "workspace-1",
+                  dms: [],
+                  channels: [
+                    {
+                      id: "geral",
+                      name: "Geral",
+                      type: "public",
+                      canWrite: true,
+                      unreadCount: serverReadThrough ? 0 : 2,
+                      serverRead: serverReadThrough && {
+                        unreadCount: 0,
+                        readThrough: serverReadThrough,
+                        startedAt: 1,
+                        receivedAt: 2,
+                      },
+                    },
+                  ],
+                  reportReadProgress,
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>
+    );
+    const { rerender } = render(tree());
+    await screen.findByText("Mensagem 2");
+    scrollAwayFromBottom(screen.getByRole("log"));
+    expect(await screen.findByRole("button", { name: /2 novas mensagens/ })).toBeInTheDocument();
+
+    // Another device read everything: the sidebar row now says so.
+    rerender(tree({ id: "m5", createdAt: minute(5) }));
+
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    ).toBeInTheDocument();
+    // Adopted, not echoed: the server already holds that point.
+    expect(reportReadProgress).not.toHaveBeenCalled();
+  });
+
+  it("shows the reader's progress on the control, not a count frozen at opening", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    openWithUnread(reportReadProgress);
+    await screen.findByText("Mensagem 2");
+    const list = screen.getByRole("log");
+
+    layOutRows({ m2: [100, 140] });
+    scrollAwayFromBottom(list);
+
+    expect(await screen.findByRole("button", { name: /3 novas mensagens/ })).toBeInTheDocument();
   });
 
   it("shows the go-to-bottom button once the user scrolls away from the bottom threshold", async () => {

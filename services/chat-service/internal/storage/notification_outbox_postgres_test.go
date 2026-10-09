@@ -977,15 +977,15 @@ func TestNotificationOutboxLeavesUnreadIndependentPostgreSQL(t *testing.T) {
 		notifyConversation, 0, "producing a notification must not write read state")
 
 	readState := storage.NewPGXConversationReadStateStore(pool)
-	if err := readState.MarkRead(ctx, notifyWorkspace, notifyPeer, "dm", notifyConversation, &msg.ID); err != nil {
+	if _, err := readState.MarkRead(ctx, notifyWorkspace, notifyPeer, "dm", notifyConversation, &msg.ID); err != nil {
 		t.Fatalf("mark read: %v", err)
 	}
-	unread, err := readState.UnreadCounts(ctx, notifyWorkspace, notifyPeer)
+	states, err := readState.ReadStates(ctx, notifyWorkspace, notifyPeer)
 	if err != nil {
-		t.Fatalf("unread counts: %v", err)
+		t.Fatalf("read states: %v", err)
 	}
-	if unread["dm:"+notifyConversation] != 0 {
-		t.Fatalf("unread = %v, want the conversation read", unread)
+	if states["dm\x00"+notifyConversation].UnreadCount != 0 {
+		t.Fatalf("unread = %v, want the conversation read", states)
 	}
 
 	// The notification is still pending. Nothing about reading a message

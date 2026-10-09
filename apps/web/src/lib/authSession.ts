@@ -1,6 +1,14 @@
 const ACCESS_TOKEN_KEY = "nchat_at";
 
-type AuthChangeListener = () => void;
+/**
+ * Why the stored session changed. "refresh" is a rotation of the session that
+ * was already installed — same user, same session, a new access token — and
+ * every other change is "session". Both advance the generation; the reason is
+ * for listeners whose state belongs to the session rather than to the token.
+ */
+export type AuthChange = "session" | "refresh";
+
+type AuthChangeListener = (change: AuthChange) => void;
 
 const listeners = new Set<AuthChangeListener>();
 
@@ -28,9 +36,9 @@ export function getSessionGeneration(): number {
   return sessionGeneration;
 }
 
-function notifyAuthChange(): void {
+function notifyAuthChange(change: AuthChange): void {
   for (const listener of listeners) {
-    listener();
+    listener(change);
   }
 }
 
@@ -55,14 +63,14 @@ export function _resetListeners(): void {
  * The refresh token is managed server-side via an HttpOnly cookie — it is
  * never stored in Web Storage.
  */
-export function setTokens(accessToken: string): void {
+export function setTokens(accessToken: string, change: AuthChange = "session"): void {
   sessionStorage.setItem(ACCESS_TOKEN_KEY, accessToken);
   // Bumped unconditionally, before notifying: a listener reading the generation
   // during the notification must already see the new one. Installing over an
   // existing token is a replacement, not a no-op, even when the token is
   // identical — sameness of string is not sameness of session.
   sessionGeneration += 1;
-  notifyAuthChange();
+  notifyAuthChange(change);
 }
 
 export function getAccessToken(): string | null {
@@ -75,7 +83,7 @@ export function clearTokens(): void {
   // generation too. Without this, logging out and back in as the same user
   // could land on the generation the first session already used.
   sessionGeneration += 1;
-  notifyAuthChange();
+  notifyAuthChange("session");
 }
 
 export function isAuthenticated(): boolean {
