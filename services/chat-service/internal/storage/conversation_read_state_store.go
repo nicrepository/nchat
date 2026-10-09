@@ -15,7 +15,7 @@ const (
 	ConversationReadTargetDM      = "dm"
 )
 
-// A read state row holds two independent claims (issue #1082, migration 000068):
+// A read state row holds two independent claims (issue #1082, migration 000069):
 //
 //   - the legacy boundary, last_read_at: everything created at or before it is
 //     read. last_read_message_id beside it is informational and never compared;

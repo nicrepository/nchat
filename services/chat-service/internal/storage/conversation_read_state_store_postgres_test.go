@@ -525,7 +525,7 @@ func TestConversationReadStatePostgreSQL_RollingBackNeverMarksUnseenMessagesRead
 	t.Run("M: the down migration leaves only what the old release can read", func(t *testing.T) {
 		pool, store := readStatePostgres(t)
 		requireReadThrough(t, store, channel, rsChannel, rsC3)
-		if _, err := pool.Exec(t.Context(), readChatMigration(t, "000068_conversation_read_cursor.down.sql")); err != nil {
+		if _, err := pool.Exec(t.Context(), readChatMigration(t, "000069_conversation_read_cursor.down.sql")); err != nil {
 			t.Fatalf("apply down migration: %v", err)
 		}
 		requireOldUnread(t, pool, 3)

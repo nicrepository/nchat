@@ -21,7 +21,7 @@ UUID alone.
 ## Read state rows
 
 A row of `chat.conversation_read_state` holds two independent claims. Migration
-`000068` adds the second one; nothing is inferred from the values.
+`000069` adds the second one; nothing is inferred from the values.
 
 | Claim           | Columns                                                       | Meaning                                                                                                                           |
 | --------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
