@@ -72,6 +72,10 @@ type fakeDMStore struct {
 
 // Group rename and self-leave are not part of subscription authorization; these
 // exist so the fake still satisfies storage.DMStore (issue #527).
+func (f *fakeDMStore) SetGroupAvatarEmoji(context.Context, storage.SetGroupAvatarInput) error {
+	return nil
+}
+
 func (f *fakeDMStore) RenameGroupConversation(context.Context, storage.RenameGroupInput) (storage.RenameGroupResult, error) {
 	return storage.RenameGroupResult{}, nil
 }

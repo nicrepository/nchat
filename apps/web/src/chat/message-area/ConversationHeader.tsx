@@ -13,7 +13,7 @@ import { forwardRef, type RefObject } from "react";
 
 import type { ResourceCallHeaderState } from "../../calls/resourceCallTypes";
 import type { ChatOutletContext } from "../ChatShell";
-import type { DMCounterpart } from "../chatTypes";
+import type { DMConversation, DMCounterpart } from "../chatTypes";
 import { conversationDetailsPanelId } from "../conversationDetailsDisplay";
 import { avatarColorFor } from "../messageDisplay";
 import { usePresenceDetail, type PresenceState } from "../presence";
@@ -22,6 +22,7 @@ import { presenceNeedsClock, usePresenceClock } from "../usePresenceClock";
 import { UserAvatar } from "../UserAvatar";
 import type { ConversationDetailsPanelState } from "../useConversationDetailsPanel";
 import ChannelIcon from "../ChannelIcon";
+import GroupAvatar from "../GroupAvatar";
 import { channelAccessibleName } from "../channelIdentity";
 
 interface DetailsToggleProps {
@@ -170,6 +171,12 @@ interface HeaderDMProps {
   workspaceId?: string;
   /** Same structured counterpart the sidebar uses — never a second request. */
   counterpart?: DMCounterpart;
+  /**
+   * The conversation as the sidebar holds it (issue #1026). A group is drawn
+   * with its own identity, never with a person's avatar or a colour derived
+   * from its name.
+   */
+  conversation?: Pick<DMConversation, "type" | "avatarEmoji">;
   onStartCall?: (targetUserId: string, callType: "audio" | "video") => boolean;
   /**
    * RF-24/#622: a group's shared call room state. Always absent for a 1:1
@@ -227,10 +234,31 @@ function HeaderAvatar({
   );
 }
 
+/**
+ * The header's identity: a group's own (GroupAvatar), or the counterpart's.
+ * The one place the header tells the two apart, by the server's discriminator.
+ */
+function DMHeaderAvatar({
+  conversation,
+  ...person
+}: {
+  conversation: Pick<DMConversation, "type" | "avatarEmoji"> | undefined;
+  name: string;
+  counterpart: DMCounterpart | undefined;
+  presence: PresenceState;
+  workspaceId: string;
+}) {
+  if (conversation?.type === "group") {
+    return <GroupAvatar name={person.name} emoji={conversation.avatarEmoji} size="md" />;
+  }
+  return <HeaderAvatar {...person} />;
+}
+
 export function HeaderDM({
   name,
   workspaceId = "",
   counterpart,
+  conversation,
   onStartCall,
   resourceCall,
   detailsToggle,
@@ -242,7 +270,8 @@ export function HeaderDM({
 
   return (
     <header className="chat-msg-area__header" data-testid="chat-msg-header">
-      <HeaderAvatar
+      <DMHeaderAvatar
+        conversation={conversation}
         name={name}
         counterpart={counterpart}
         presence={presence}
@@ -279,6 +308,7 @@ interface ConversationHeaderProps {
   /** Only meaningful for a channel. */
   isPrivate: boolean;
   counterpart: DMCounterpart | undefined;
+  conversation?: Pick<DMConversation, "type" | "avatarEmoji">;
   presenceTarget: string | undefined;
   onStartCall: ChatOutletContext["startCall"];
   resourceCall: ResourceCallHeaderState | undefined;
@@ -293,6 +323,7 @@ export default function ConversationHeader({
   name,
   isPrivate,
   counterpart,
+  conversation,
   presenceTarget,
   onStartCall,
   resourceCall,
@@ -322,6 +353,7 @@ export default function ConversationHeader({
       name={name}
       workspaceId={workspaceId}
       counterpart={counterpart}
+      conversation={conversation}
       presenceTarget={presenceTarget}
       onStartCall={onStartCall}
       resourceCall={resourceCall}

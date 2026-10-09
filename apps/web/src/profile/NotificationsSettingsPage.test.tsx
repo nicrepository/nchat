@@ -126,6 +126,7 @@ function makeContext(
     markRead: vi.fn(),
     renameChannel: vi.fn(async () => {}),
     renameGroup: vi.fn(async () => {}),
+    setGroupAvatar: vi.fn(async () => {}),
     setMuted: overrides.setMuted ?? vi.fn(async () => {}),
     setNotificationMode: overrides.setNotificationMode ?? vi.fn(async () => {}),
     leaveConversation: vi.fn(async () => {}),

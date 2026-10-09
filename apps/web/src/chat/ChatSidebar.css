@@ -758,29 +758,6 @@
    every surface, so the sidebar cannot drift from the details panel again. The
    avatar passes its own background as the dot's ring colour. */
 
-/* ── Group avatars ───────────────────────────────────────────────────────────── */
-
-.chat-sidebar__group-avatars {
-  position: relative;
-  width: 28px;
-  height: 24px;
-  flex-shrink: 0;
-}
-
-.chat-sidebar__avatar--group-back {
-  position: absolute;
-  left: 0;
-  top: 0;
-  opacity: 0.8;
-}
-
-.chat-sidebar__avatar--group-front {
-  position: absolute;
-  left: 8px;
-  top: 0;
-  border: 1.5px solid var(--cs-sidebar-bg);
-}
-
 /* ── Unread badge ────────────────────────────────────────────────────────────── */
 
 .chat-sidebar__unread-badge {
@@ -1188,7 +1165,8 @@ button.chat-sidebar__user[aria-expanded="true"] {
   white-space: nowrap;
 }
 
-.new-dm-dialog__mode label {
+.new-dm-dialog__mode label,
+.group-identity__mode label {
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -1201,13 +1179,15 @@ button.chat-sidebar__user[aria-expanded="true"] {
   cursor: pointer;
 }
 
-.new-dm-dialog__mode-option--on {
+.new-dm-dialog__mode-option--on,
+.group-identity__mode-option--on {
   border-color: var(--new-dm-primary);
   background: #f3ebfb;
   color: var(--new-dm-primary-strong);
 }
 
-.new-dm-dialog__mode input:focus-visible {
+.new-dm-dialog__mode input:focus-visible,
+.group-identity__mode input:focus-visible {
   outline: 2px solid var(--new-dm-primary);
   outline-offset: 2px;
 }
@@ -1302,7 +1282,7 @@ button.chat-sidebar__user[aria-expanded="true"] {
   padding-right: 11px;
 }
 
-.new-dm-dialog__search input#new-dm-group-name {
+.new-dm-dialog input#new-dm-group-name {
   width: 100%;
   height: 42px;
   padding: 0 12px;
@@ -1314,7 +1294,7 @@ button.chat-sidebar__user[aria-expanded="true"] {
   font-size: 14px;
 }
 
-.new-dm-dialog__search input#new-dm-group-name:focus {
+.new-dm-dialog input#new-dm-group-name:focus {
   border-color: var(--new-dm-primary);
   background: #fff;
   outline: 0;
@@ -1357,7 +1337,8 @@ button.chat-sidebar__user[aria-expanded="true"] {
   cursor: not-allowed;
 }
 
-.new-dm-dialog__search label {
+.new-dm-dialog__search label,
+.new-dm-dialog__identity > label {
   display: block;
   margin-bottom: 7px;
   font-size: 12px;
@@ -1502,6 +1483,99 @@ button.chat-sidebar__user[aria-expanded="true"] {
 .new-dm-dialog input:focus-visible {
   outline: 2px solid var(--new-dm-primary);
   outline-offset: 2px;
+}
+
+/* Issue #1026: the Identidade step of a group, and the identity picker it
+   shares with the "Alterar identidade" dialog. */
+.new-dm-dialog__identity {
+  min-width: 0;
+  padding: 0 24px 18px;
+}
+
+.new-dm-dialog__back {
+  padding: 10px 16px;
+  border: 1px solid #d4cde3;
+  border-radius: 11px;
+  background: #fff;
+  color: #3d3550;
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.new-dm-dialog__back:hover:not(:disabled) {
+  background: #f3ebfb;
+}
+
+.new-dm-dialog__back:focus-visible {
+  outline: 2px solid var(--new-dm-primary);
+  outline-offset: 2px;
+}
+
+.group-identity {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+  margin-top: 16px;
+}
+
+/* The preview's neutral background is a tint of this text colour. */
+.group-identity__preview {
+  display: flex;
+  color: #3d3550;
+}
+
+.group-identity__mode {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.group-identity__mode legend {
+  margin-bottom: 7px;
+  padding: 0;
+  color: #3d3550;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.group-identity__hint {
+  margin: 0;
+  color: #7c7390;
+  font-size: 12.5px;
+}
+
+.group-identity__picker {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 7px;
+  border: 1px solid #e8e3f0;
+  border-radius: 12px;
+}
+
+/* The picker makes this dialog taller than a rename; it scrolls, never clips. */
+.group-identity-dialog {
+  box-sizing: border-box;
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+}
+
+.group-identity__picker .chat-emoji-picker {
+  width: 100%;
+  max-height: 18rem;
+}
+
+@media (max-width: 560px) {
+  .new-dm-dialog__identity {
+    padding-left: 18px;
+    padding-right: 18px;
+  }
 }
 
 @media (max-width: 560px) {

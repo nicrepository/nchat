@@ -106,6 +106,16 @@ export default function EmojiTonePalette({
       onDismiss();
       return;
     }
+    // A sub-overlay with a single Tab stop (the tones are roving, moved with
+    // the arrows). It is portalled to <body>, so a Tab let through would leave
+    // the end of the document — and the modal hosting the picker with it.
+    // Tab therefore stays here; Escape or a choice is the way out, and both
+    // hand focus back to the emoji (issue #1026).
+    if (event.key === "Tab") {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     const target = nextTone(event.key, active);
     if (target === null) return;
     event.preventDefault();

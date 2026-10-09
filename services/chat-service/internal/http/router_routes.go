@@ -207,6 +207,10 @@ func (r *routeSet) registerDMRoutes(dms *DMHandler) {
 	r.handle("DELETE "+RouteDMMembership, nil, dms.ownershipAware("leave", dms.LeaveGroup))
 	// Admin removal (issue #685), the counterpart to self-leave.
 	r.handle("DELETE "+RouteDMParticipant, nil, dms.ownershipAware("remove", dms.RemoveParticipant))
+	// Group identity (issue #1026). Not ownershipAware: the store applies the
+	// ownership capability itself, inside the write's transaction.
+	r.handle("PUT "+RouteDMAvatar, nil, dms.SetGroupAvatar)
+	r.handle("DELETE "+RouteDMAvatar, nil, dms.ClearGroupAvatar)
 	r.handle("GET "+RouteDMMemberCandidates, nil, dms.ParticipantCandidates)
 	// Group details (issue #441) and the 1:1 profile panel (issue #443) are
 	// reads on the same resource, so they share the listing budget.

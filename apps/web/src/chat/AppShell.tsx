@@ -376,6 +376,7 @@ export default function AppShell() {
     markRead,
     renameChannel,
     renameGroup,
+    setGroupAvatar,
     setMuted,
     leaveConversation,
     inAppAlert,
@@ -551,6 +552,7 @@ export default function AppShell() {
         markRead={markRead}
         renameChannel={renameChannel}
         renameGroup={renameGroup}
+        setGroupAvatar={setGroupAvatar}
         setMuted={setMuted}
         leaveConversation={leaveConversation}
         onOpenDetails={openSidebarDetails}

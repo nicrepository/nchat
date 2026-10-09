@@ -11,6 +11,7 @@ import {
   markConversationRead,
   renameChannel as renameChannelRequest,
   renameGroup as renameGroupRequest,
+  setGroupAvatarEmoji,
   setConversationMuted,
   setConversationNotificationMode,
   setSidebarConversationPinned,
@@ -918,6 +919,20 @@ export function useChatSidebar() {
   );
 
   /**
+   * Sets or clears a group's identity (issue #1026), under the rename's rule:
+   * no optimism, the refetch after the server confirmed it is what changes
+   * every surface — and the same refetch the realtime signal triggers for
+   * everyone else in the group.
+   */
+  const setGroupAvatar = useCallback(
+    async (conversationId: string, emoji: string | undefined) => {
+      await setGroupAvatarEmoji(conversationId, emoji);
+      refreshSidebar();
+    },
+    [refreshSidebar],
+  );
+
+  /**
    * Removes this user from a channel or group and drops it from the sidebar.
    *
    * The refetch is the removal: membership is the server's to decide, so the row
@@ -955,6 +970,7 @@ export function useChatSidebar() {
     markRead,
     renameChannel,
     renameGroup,
+    setGroupAvatar,
     setMuted,
     setNotificationMode,
     leaveConversation,

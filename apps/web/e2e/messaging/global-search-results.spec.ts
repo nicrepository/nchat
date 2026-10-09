@@ -400,6 +400,36 @@ test.describe("busca global — resultados categorizados (#900)", () => {
     await expect(page).toHaveURL(`/chat/dm/${GROUP_DM_ID}`);
   });
 
+  // Issue #1026: a group result wears the group's canonical identity — the
+  // sidebar's own list, already in memory — and follows it when it changes.
+  test("grupo mostra o emoji da identidade canônica e volta às iniciais após o reset", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "channel");
+    const { scenario } = await openChannelWithHistory(page, targetId);
+    const group = scenario.sidebarDMs.find((dm) => dm.id === GROUP_DM_ID)!;
+    group.avatar_emoji = "🚀";
+    await installSearch(page, (category) => everyCategory(targetId)[category] ?? []);
+    await page.goto(`/chat/channel/${targetId}`);
+
+    await openSearch(page, "backup");
+    const result = section(page, "Grupos").getByRole("button", {
+      name: new RegExp(GROUP_DM_NAME),
+    });
+    await expect(result.locator(".group-avatar")).toHaveText("🚀");
+
+    await page.getByRole("button", { name: `Mais opções para grupo ${GROUP_DM_NAME}` }).click();
+    await page.getByRole("menuitem", { name: "Alterar identidade" }).click();
+    const identity = page.getByRole("dialog", { name: "Identidade do grupo" });
+    await identity.getByRole("radio", { name: "Automático" }).check();
+    await identity.getByRole("button", { name: "Salvar" }).click();
+    await expect(identity).toBeHidden();
+
+    await expect(result.locator(".group-avatar")).toHaveText("EG");
+    await expect(result.locator(".group-avatar")).toHaveAttribute("data-mode", "auto");
+    expect(scenario.requests.groupAvatars).toEqual([{ conversationId: GROUP_DM_ID, emoji: null }]);
+  });
+
   test("arquivo abre no Attachment Viewer e fecha de volta para a busca", async ({
     page,
   }, testInfo) => {

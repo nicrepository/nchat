@@ -366,6 +366,47 @@ describe("EmojiPicker skin tone", () => {
     expect(onSelect).not.toHaveBeenCalled();
   });
 
+  // Issue #1026: the palette is portalled to <body>, so a Tab let through
+  // would leave the document's end — and any modal hosting the picker. With
+  // one roving Tab stop, Tab and Shift+Tab stay on it and are not handed to an
+  // enclosing focus trap.
+  it("keeps Tab and Shift+Tab on the palette without propagating them", async () => {
+    // The palette is a React child of the host even though it is portalled, so
+    // an unhandled key would reach the host's handler — like GroupIdentityDialog's.
+    const onHostKeyDown = vi.fn<(event: { key: string }) => void>();
+    render(
+      <div onKeyDown={onHostKeyDown}>
+        <EmojiPicker usage={emptyEmojiUsage} onToneChange={vi.fn()} onSelect={vi.fn()} />
+      </div>,
+    );
+    await waitFor(() => expect(searchBox()).toHaveFocus());
+    await search("polegar para cima");
+    await userEvent.click(await screen.findByRole("button", { name: "polegar para cima" }));
+    const options = within(screen.getByRole("dialog", { name: /Tom de pele/ })).getAllByRole(
+      "button",
+    );
+    await waitFor(() => expect(options[0]).toHaveFocus());
+    onHostKeyDown.mockClear();
+
+    await userEvent.keyboard("{Tab}");
+    expect(options[0]).toHaveFocus();
+    await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
+    expect(options[0]).toHaveFocus();
+    const keysSeenByHost = onHostKeyDown.mock.calls.map(([event]) => event.key);
+    expect(keysSeenByHost).not.toContain("Tab");
+  });
+
+  it("gives focus back to the emoji when a tone is chosen", async () => {
+    const { onSelect, cell } = await openToneFor("polegar para cima");
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "polegar para cima — Morena escura" }),
+    );
+
+    expect(onSelect).toHaveBeenCalledWith("👍🏾");
+    expect(cell).toHaveFocus();
+  });
+
   it("jumps to the ends with Home and End, and refuses to leave them", async () => {
     const { onSelect } = await openToneFor("polegar para cima");
     const palette = screen.getByRole("dialog", { name: /Tom de pele/ });

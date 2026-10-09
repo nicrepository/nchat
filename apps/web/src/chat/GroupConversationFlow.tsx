@@ -1,14 +1,11 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { ApiRequestError } from "../lib/api";
 import { createGroupDM, searchDMCandidates } from "./chatApi";
 import type { DMCandidate } from "./chatTypes";
-import {
-  limitGroupTitleInput,
-  MAX_GROUP_MEMBERS,
-  MIN_GROUP_MEMBERS,
-  toggleGroupMember,
-} from "./dmGroupForm";
+import { MAX_GROUP_MEMBERS, MIN_GROUP_MEMBERS, toggleGroupMember } from "./dmGroupForm";
+import { AUTOMATIC_IDENTITY, type GroupIdentity, persistedEmoji } from "./groupIdentity";
+import GroupIdentityStep from "./GroupIdentityStep";
 import { CandidateIdentity, PeopleSearchField, PeopleSearchResults } from "./PeopleSearch";
 import { useMemberSearch } from "./useMemberPicker";
 import { useSingleSubmission } from "./useSingleSubmission";
@@ -36,11 +33,10 @@ function groupErrorMessage(error: unknown): string {
 
 interface GroupMemberChipsProps {
   members: DMCandidate[];
-  disabled: boolean;
   onRemove: (member: DMCandidate) => void;
 }
 
-function GroupMemberChips({ members, disabled, onRemove }: GroupMemberChipsProps) {
+function GroupMemberChips({ members, onRemove }: GroupMemberChipsProps) {
   if (members.length === 0) return null;
   return (
     <ul className="new-dm-dialog__chips" aria-label="Pessoas selecionadas">
@@ -50,7 +46,6 @@ function GroupMemberChips({ members, disabled, onRemove }: GroupMemberChipsProps
           <button
             type="button"
             aria-label={`Remover ${member.displayName}`}
-            disabled={disabled}
             onClick={() => onRemove(member)}
           >
             <span className="material-symbols-outlined" aria-hidden="true">
@@ -63,14 +58,13 @@ function GroupMemberChips({ members, disabled, onRemove }: GroupMemberChipsProps
   );
 }
 
-interface GroupSubmitFooterProps {
+interface GroupContinueFooterProps {
   selectedCount: number;
-  pending: boolean;
   disabled: boolean;
-  onSubmit: () => void;
+  onContinue: () => void;
 }
 
-function GroupSubmitFooter({ selectedCount, pending, disabled, onSubmit }: GroupSubmitFooterProps) {
+function GroupContinueFooter({ selectedCount, disabled, onContinue }: GroupContinueFooterProps) {
   return (
     <footer className="new-dm-dialog__footer">
       <p className="new-dm-dialog__footer-hint">
@@ -82,10 +76,9 @@ function GroupSubmitFooter({ selectedCount, pending, disabled, onSubmit }: Group
         type="button"
         className="new-dm-dialog__submit"
         disabled={disabled}
-        aria-busy={pending}
-        onClick={onSubmit}
+        onClick={onContinue}
       >
-        {pending ? "Criando…" : "Criar grupo"}
+        Continuar
       </button>
     </footer>
   );
@@ -101,10 +94,12 @@ interface GroupConversationFlowProps {
 }
 
 /**
- * "Nova conversa" → Grupo (RF-02): pick people, optionally name the group,
- * create it.
+ * "Nova conversa" → Grupo (RF-02): pick people (Participantes), then name the
+ * group and choose its identity (Identidade, issue #1026), then create it.
  *
- * The draft — selection, title and query — is plain local state. The shell
+ * The draft — selection, query, title and identity — is plain local state
+ * held here, above both steps, so moving between them loses nothing and no
+ * request is made before "Criar grupo". The shell
  * keeps this flow mounted (hidden) while another mode is visited, so the draft
  * survives a detour and disappears with the dialog; nothing reaches a store.
  * Hidden is not idle by itself, so `active` turns the search off meanwhile.
@@ -130,11 +125,27 @@ export default function GroupConversationFlow({
   const submission = useSingleSubmission(onPendingChange);
   const [selected, setSelected] = useState<DMCandidate[]>([]);
   const [title, setTitle] = useState("");
+  const [identity, setIdentity] = useState<GroupIdentity>(AUTOMATIC_IDENTITY);
+  const [step, setStep] = useState<"participants" | "identity">("participants");
+  const searchRef = useRef<HTMLInputElement>(null);
+  const returnedRef = useRef(false);
   const busy = submission.pending;
   const atCapacity = selected.length >= MAX_GROUP_MEMBERS;
 
-  function toggle(candidate: DMCandidate) {
+  // Back from Identidade, focus lands where the person left off: the search.
+  // Only on that return — the first render must not take focus from the mode
+  // selector, and the Identidade step focuses its own first field.
+  useEffect(() => {
+    if (step === "participants" && returnedRef.current) searchRef.current?.focus();
+  }, [step]);
+
+  function goTo(next: "participants" | "identity") {
     submission.setError("");
+    returnedRef.current = next === "participants";
+    setStep(next);
+  }
+
+  function toggle(candidate: DMCandidate) {
     setSelected((current) => toggleGroupMember(current, candidate));
   }
 
@@ -144,6 +155,7 @@ export default function GroupConversationFlow({
         createGroupDM(
           selected.map((member) => member.userId),
           title,
+          persistedEmoji(identity),
           signal,
         ),
       onOpened,
@@ -151,42 +163,43 @@ export default function GroupConversationFlow({
     );
   }
 
+  if (step === "identity") {
+    return (
+      <GroupIdentityStep
+        title={title}
+        identity={identity}
+        currentUserId={currentUserId}
+        pending={busy}
+        submitError={submission.error}
+        onTitleChange={setTitle}
+        onIdentityChange={setIdentity}
+        onBack={() => goTo("participants")}
+        onSubmit={submit}
+      />
+    );
+  }
+
   return (
     <>
       <PeopleSearchField
         inputId="new-dm-group-search"
+        inputRef={searchRef}
         search={search}
         onEdit={() => submission.setError("")}
       >
-        <GroupMemberChips members={selected} disabled={busy} onRemove={toggle} />
-
-        <label className="new-dm-dialog__group-name" htmlFor="new-dm-group-name">
-          Nome do grupo (opcional)
-        </label>
-        {/* Truncation is by Unicode code point, the unit the server counts;
-        the maxLength attribute would count UTF-16 units and cut an
-        emoji-heavy name in half of its allowance. */}
-        <input
-          id="new-dm-group-name"
-          type="text"
-          autoComplete="off"
-          placeholder="Ex.: Infraestrutura"
-          value={title}
-          disabled={busy}
-          onChange={(event) => setTitle(limitGroupTitleInput(event.target.value))}
-        />
+        <GroupMemberChips members={selected} onRemove={toggle} />
       </PeopleSearchField>
 
       <PeopleSearchResults
         search={search}
-        submitError={submission.error}
+        submitError=""
         renderCandidate={(candidate) => {
           const picked = selected.some((member) => member.userId === candidate.userId);
           return (
             <button
               type="button"
               aria-pressed={picked}
-              disabled={busy || (atCapacity && !picked)}
+              disabled={atCapacity && !picked}
               onClick={() => toggle(candidate)}
             >
               <CandidateIdentity candidate={candidate} workspaceId={workspaceId} />
@@ -195,11 +208,10 @@ export default function GroupConversationFlow({
         }}
       />
 
-      <GroupSubmitFooter
+      <GroupContinueFooter
         selectedCount={selected.length}
-        pending={busy}
-        disabled={selected.length < MIN_GROUP_MEMBERS || busy}
-        onSubmit={submit}
+        disabled={selected.length < MIN_GROUP_MEMBERS}
+        onContinue={() => goTo("identity")}
       />
     </>
   );
