@@ -673,6 +673,55 @@ describe("useChatWebSocket", () => {
     expect(socket.readyState).toBe(FakeWebSocket.CLOSED);
   });
 
+  /**
+   * Issue #1103: a group discovered through conversation.available joins the
+   * targets only after the sidebar refetch. Its first message may be persisted
+   * before that subscription exists, so the hook must resync once the new target
+   * is acknowledged — and route that target's later events normally.
+   */
+  it("resyncs after a later-added target is acknowledged, then routes its events", () => {
+    const onSubscribed = vi.fn();
+    const onMessageCreated = vi.fn();
+    const { rerender } = renderHook(
+      ({ additionalTargets }: { additionalTargets: WSSubscriptionTarget[] }) =>
+        useChatWebSocket({
+          kind: "channel",
+          targetId: "ch-a",
+          additionalTargets,
+          onMessageCreated,
+          onSubscribed,
+        }),
+      { initialProps: { additionalTargets: [] as WSSubscriptionTarget[] } },
+    );
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(subscribed("channel", "ch-a")));
+    expect(onSubscribed).toHaveBeenCalledOnce();
+
+    act(() => rerender({ additionalTargets: [{ kind: "dm", targetId: "dm-new" }] }));
+    expect(subscriptionCountFor(socket, "dm", "dm-new")).toBe(1);
+    expect(onSubscribed).toHaveBeenCalledOnce();
+
+    act(() => socket.simulateMessage(subscribed("dm", "dm-new")));
+    expect(onSubscribed).toHaveBeenCalledTimes(2);
+
+    act(() =>
+      socket.simulateMessage({
+        type: "message.created",
+        workspace_id: "ws-1",
+        target_type: "dm",
+        target_id: "dm-new",
+        message_id: "msg-first",
+        event_id: "evt-first",
+        created_at: new Date().toISOString(),
+      }),
+    );
+    expect(onMessageCreated).toHaveBeenCalledOnce();
+    expect(onMessageCreated).toHaveBeenCalledWith(
+      expect.objectContaining({ message_id: "msg-first" }),
+    );
+  });
+
   it.each([
     ["wrong operation", { ...subscribed(), operation: "unsubscribe" }],
     ["wrong target type", subscribed("dm", "ch-1")],

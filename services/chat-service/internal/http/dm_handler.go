@@ -19,7 +19,7 @@ import (
 type dmProvider interface {
 	SearchDMCandidates(ctx context.Context, input service.SearchDMCandidatesInput) ([]domain.DMCandidate, error)
 	GetOrCreateDirectConversation(ctx context.Context, input service.CreateDirectConversationInput) (service.CreateDirectConversationOutput, error)
-	CreateGroupConversation(ctx context.Context, input service.CreateGroupConversationInput) (domain.DMConversation, error)
+	CreateGroupConversation(ctx context.Context, input service.CreateGroupConversationInput) (service.CreateGroupConversationOutput, error)
 	// AddGroupParticipants adds people to an existing group conversation (#398).
 	AddGroupParticipants(ctx context.Context, input service.AddGroupParticipantsInput) (storage.AddMembersResult, error)
 	// GetGroupDetails is the read-only projection the group panel renders.
@@ -635,7 +635,7 @@ func (h *DMHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	conversation, err := h.dms.CreateGroupConversation(r.Context(), service.CreateGroupConversationInput{
+	result, err := h.dms.CreateGroupConversation(r.Context(), service.CreateGroupConversationInput{
 		WorkspaceID:        workspaceID,
 		CallerID:           callerID,
 		ParticipantUserIDs: request.ParticipantUserIDs,
@@ -646,7 +646,29 @@ func (h *DMHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 		writeDMConversationError(w, err)
 		return
 	}
-	httputil.WriteJSON(w, http.StatusCreated, createGroupDMResponse{ConversationID: conversation.ID})
+	h.announceCreatedGroup(r.Context(), workspaceID, result)
+	httputil.WriteJSON(w, http.StatusCreated, createGroupDMResponse{ConversationID: result.Conversation.ID})
+}
+
+// announceCreatedGroup tells the people a new group was created for that it now
+// exists (issue #1103) — the group counterpart of announceNewDirectConversation
+// and announceCreatedChannel, through the same signal and for the same reason:
+// nobody is subscribed to a conversation that did not exist, so no room event,
+// message.created included, can reach them.
+//
+// Called only after CreateGroupConversation returned successfully, which means
+// the store committed; a refused or rolled-back create announces nothing. The
+// recipients are the service's eligibility-resolved participants minus the
+// creator, who already holds the group they just opened — never the body's
+// list. A publish failure is not reported: the group is persisted, and the hub
+// treats the bus copy as best-effort exactly as for the other two.
+func (h *DMHandler) announceCreatedGroup(
+	ctx context.Context, workspaceID string, result service.CreateGroupConversationOutput,
+) {
+	if h.broadcast == nil || len(result.InvitedUserIDs) == 0 {
+		return
+	}
+	h.broadcast.PublishConversationAvailable(ctx, workspaceID, "dm", result.Conversation.ID, result.InvitedUserIDs)
 }
 
 // AddParticipants handles POST /api/chat/dm/{conversationID}/members.

@@ -193,7 +193,7 @@ func TestDMHandler_CreateGroup_ForwardsTheOptionalAvatarEmoji(t *testing.T) {
 		{name: "emoji", body: `{"participant_user_ids":["a","b"],"title":"Infra","avatar_emoji":"🚀"}`, want: "🚀"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			provider := &fakeDMProvider{groupOutput: domain.DMConversation{ID: dmConversationID}}
+			provider := &fakeDMProvider{groupOutput: service.CreateGroupConversationOutput{Conversation: domain.DMConversation{ID: dmConversationID}}}
 			recorder := httptest.NewRecorder()
 			r := requestWithUser(http.MethodPost, "/api/chat/dms/group", strings.NewReader(test.body))
 			r.Header.Set("Content-Type", "application/json")
