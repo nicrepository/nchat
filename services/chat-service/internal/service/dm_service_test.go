@@ -225,7 +225,7 @@ func TestDMService_CreateGroupConversation_SucceedsWithActiveMembersAndAddsCalle
 	if err != nil {
 		t.Fatalf("CreateGroupConversation: %v", err)
 	}
-	if got.ID != "dm-group" || got.Type != domain.DMConversationTypeGroup {
+	if got.Conversation.ID != "dm-group" || got.Conversation.Type != domain.DMConversationTypeGroup {
 		t.Fatalf("unexpected conversation: %+v", got)
 	}
 	if dms.createGroupCalls != 1 {
@@ -235,6 +235,41 @@ func TestDMService_CreateGroupConversation_SucceedsWithActiveMembersAndAddsCalle
 		t.Fatalf("service must own created_by and normalize title, input=%+v", dms.lastGroupInput)
 	}
 	assertSameStringSet(t, dms.lastGroupInput.ParticipantUserIDs, []string{user1, user2, user3})
+}
+
+// Issue #1103: the people the post-commit conversation.available is addressed
+// to. The caller is never among them — they hold the group they just opened —
+// and every ID is the canonical one the eligibility lookup resolved, even when
+// the request spelled it, or the caller, differently.
+func TestDMService_CreateGroupConversation_ReportsResolvedInviteesWithoutTheCaller(t *testing.T) {
+	ms := newFakeMemberStore()
+	for _, uid := range []string{user1, user2, user3} {
+		ms.workspaceMembers[wmKey("ws-1", uid)] = activeMembership("ws-1", uid)
+	}
+	dms := &fakeDMStore{createdConversation: domain.DMConversation{ID: "dm-group", Type: domain.DMConversationTypeGroup}}
+
+	got, err := service.NewDMService(dms, ms).CreateGroupConversation(context.Background(), service.CreateGroupConversationInput{
+		WorkspaceID: "ws-1", CallerID: user1Up, ParticipantUserIDs: []string{user2Up, user3, user1, user2},
+	})
+	if err != nil {
+		t.Fatalf("CreateGroupConversation: %v", err)
+	}
+	assertSameStringSet(t, got.InvitedUserIDs, []string{user2, user3})
+}
+
+// A refused or failed create reports nobody, so there is nobody to announce to.
+func TestDMService_CreateGroupConversation_ReportsNoInviteesWhenTheStoreFails(t *testing.T) {
+	ms := newFakeMemberStore()
+	for _, uid := range []string{user1, user2, user3} {
+		ms.workspaceMembers[wmKey("ws-1", uid)] = activeMembership("ws-1", uid)
+	}
+	got, err := service.NewDMService(&fakeDMStore{createGroupErr: errors.New("rollback")}, ms).CreateGroupConversation(
+		context.Background(), service.CreateGroupConversationInput{
+			WorkspaceID: "ws-1", CallerID: user1, ParticipantUserIDs: []string{user2, user3},
+		})
+	if err == nil || len(got.InvitedUserIDs) != 0 {
+		t.Fatalf("err=%v invited=%v, want an error and nobody", err, got.InvitedUserIDs)
+	}
 }
 
 func TestDMService_CreateGroupConversation_InvalidInputsDenied(t *testing.T) {

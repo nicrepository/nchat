@@ -840,21 +840,18 @@ export function messagesFor(
   return emptyMessages;
 }
 
-export async function emitMessageCreated(
-  page: Page,
-  scenario: MessagingScenario,
-  options: {
-    kind: TargetKind;
-    targetId: string;
-    message: RawMessage;
-    eventId?: string;
-  },
-) {
-  const messages = messagesFor(scenario, options.kind, options.targetId);
-  if (!messages.some((message) => message.id === options.message.id)) {
-    messages.push(options.message);
-  }
-  const event = {
+/**
+ * The message.created frame the server fans out for one persisted message —
+ * exposed so a spec acting as the shared server can deliver it to sockets that
+ * may not be subscribed yet (issue #1103), which emitMessageCreated never does.
+ */
+export function messageCreatedEvent(options: {
+  kind: TargetKind;
+  targetId: string;
+  message: RawMessage;
+  eventId?: string;
+}) {
+  return {
     schema_version: 1,
     type: "message.created",
     workspace_id: "e2e-workspace",
@@ -886,6 +883,23 @@ export async function emitMessageCreated(
       links: options.message.links,
     },
   };
+}
+
+export async function emitMessageCreated(
+  page: Page,
+  scenario: MessagingScenario,
+  options: {
+    kind: TargetKind;
+    targetId: string;
+    message: RawMessage;
+    eventId?: string;
+  },
+) {
+  const messages = messagesFor(scenario, options.kind, options.targetId);
+  if (!messages.some((message) => message.id === options.message.id)) {
+    messages.push(options.message);
+  }
+  const event = messageCreatedEvent(options);
   await page.waitForFunction(
     ({ kind, targetId }) =>
       (
@@ -2268,19 +2282,7 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
     route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({
-        data: {
-          current_user_id: CURRENT_USER_ID,
-          // Same id the simulated realtime events already carry as
-          // workspace_id — the real contract always includes this object
-          // (chatApi.ts reads sidebar.workspace?.id), so a mock that omits it
-          // is not exercising the real shape.
-          workspace: { id: "e2e-workspace", name: "E2E Workspace", slug: "e2e-workspace" },
-          channels: scenario.sidebarChannels.map((row) => withReadState(scenario, "channel", row)),
-          dm_conversations: scenario.sidebarDMs.map((row) => withReadState(scenario, "dm", row)),
-          precise_read_cursor: true,
-        },
-      }),
+      body: sidebarResponseBody(scenario),
     }),
   );
 
@@ -2624,6 +2626,30 @@ function readStateAt(messages: RawMessage[], cursor: number): ReadStateFixture {
       .length,
     read_through: positionOf(messages[cursor]),
   };
+}
+
+/**
+ * GET /api/chat/sidebar as the server would answer it right now, for the given
+ * viewer. A function rather than inline so a spec that holds a response (issue
+ * #1103) can take it at the moment the request arrived and deliver it later.
+ */
+export function sidebarResponseBody(
+  scenario: MessagingScenario,
+  currentUserId: string = CURRENT_USER_ID,
+): string {
+  return JSON.stringify({
+    data: {
+      current_user_id: currentUserId,
+      // Same id the simulated realtime events already carry as
+      // workspace_id — the real contract always includes this object
+      // (chatApi.ts reads sidebar.workspace?.id), so a mock that omits it
+      // is not exercising the real shape.
+      workspace: { id: "e2e-workspace", name: "E2E Workspace", slug: "e2e-workspace" },
+      channels: scenario.sidebarChannels.map((row) => withReadState(scenario, "channel", row)),
+      dm_conversations: scenario.sidebarDMs.map((row) => withReadState(scenario, "dm", row)),
+      precise_read_cursor: true,
+    },
+  });
 }
 
 /** A sidebar row as served: with its read state when it has a server cursor. */
