@@ -82,6 +82,33 @@ describe("buildTimelineRows", () => {
     expect(grouped).toEqual([false, true, false]);
   });
 
+  it("never groups a message under the system event its author triggered (issue #1104)", () => {
+    // A group or channel opens with conversation_created, recorded with the
+    // creator as sender. The creator's first words right after are a new run:
+    // grouping them would hide their avatar and name for every reader.
+    const built = rows([
+      message({
+        id: "created",
+        kind: "system",
+        senderId: "creator",
+        createdAt: "2026-07-15T12:00:05.000Z",
+      }),
+      message({ id: "a", senderId: "creator", createdAt: "2026-07-15T12:00:10.000Z" }),
+      message({ id: "b", senderId: "creator", createdAt: "2026-07-15T12:00:20.000Z" }),
+      message({ id: "c", senderId: "member", createdAt: "2026-07-15T12:00:30.000Z" }),
+    ]);
+
+    const grouped = built
+      .filter((row): row is Extract<TimelineRow, { type: "msg" }> => row.type === "msg")
+      .map((row) => [row.key, row.isGrouped]);
+    expect(grouped).toEqual([
+      ["created", false],
+      ["a", false],
+      ["b", true],
+      ["c", false],
+    ]);
+  });
+
   it("never groups across a day divider", () => {
     const built = rows([
       message({ id: "a", senderId: "u1", createdAt: "2026-07-14T12:00:00.000Z" }),
