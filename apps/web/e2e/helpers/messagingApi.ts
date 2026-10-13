@@ -868,6 +868,7 @@ export function messageCreatedEvent(options: {
         : { dm_conversation_id: options.targetId }),
       sender_id: options.message.sender_id,
       sender_display_name: options.message.sender_display_name,
+      sender_avatar_url: options.message.sender_avatar_url,
       kind: options.message.kind,
       body_text: options.message.body_text ?? "",
       body_format: options.message.body_format,
