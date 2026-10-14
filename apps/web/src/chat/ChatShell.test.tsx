@@ -11,6 +11,7 @@ import ChatShell, { type ChatOutletContext } from "./ChatShell";
 import CallSessionProvider from "../calls/CallSessionProvider";
 import { _resetChatSocket } from "./chatSocket";
 import { requestMediaPermission, type MediaPermissionResult } from "./mediaPermission";
+import GlobalSearchPage from "../search/GlobalSearchPage";
 import { NAV_DRAWER_QUERY } from "./useNavDrawer";
 import { useCallMedia } from "./useCallMedia";
 
@@ -201,6 +202,33 @@ afterEach(() => {
   global.WebSocket = OriginalWebSocket;
   clearTokens();
   vi.clearAllMocks();
+});
+
+describe("ChatShell opening readiness", () => {
+  it("stops waiting for unread data when the sidebar request fails", async () => {
+    const sidebar = deferredValue<Awaited<ReturnType<typeof fetchSidebarData>>>();
+    vi.mocked(fetchSidebarData).mockReturnValue(sidebar.promise);
+    function OpeningStatus() {
+      const { sidebarLoading } = useOutletContext<ChatOutletContext>();
+      return <div data-testid="opening-status">{sidebarLoading ? "waiting" : "usable"}</div>;
+    }
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/chan-1"]}>
+        <CallSessionProvider>
+          <Routes>
+            <Route element={<AppShell />}>
+              <Route path="/chat" element={<ChatShell />}>
+                <Route path="channel/:id" element={<OpeningStatus />} />
+              </Route>
+            </Route>
+          </Routes>
+        </CallSessionProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("opening-status")).toHaveTextContent("waiting");
+    await act(async () => sidebar.reject(new Error("sidebar unavailable")));
+    expect(screen.getByTestId("opening-status")).toHaveTextContent("usable");
+  });
 });
 
 describe("ChatShell call identity bootstrap", () => {
@@ -1638,8 +1666,9 @@ describe("ChatShell — leaving the conversation on screen", () => {
 // the sidebar's own "Marcar como lida" menu action, so it can call it once it
 // has evidence the user reached the real bottom — not a second read-state
 // mechanism, the same one, reached through ChatShell's own outlet context.
-describe("ChatShell — forwards markRead through its own outlet context", () => {
+describe("ChatShell — forwards reportReadProgress through its own outlet context (#1082)", () => {
   const readingId = "00000000-0000-4000-8000-0000000005e1";
+  const readMessageId = "00000000-0000-4000-8000-0000000005e2";
 
   function renderShellAt(path: string) {
     return render(
@@ -1667,14 +1696,21 @@ describe("ChatShell — forwards markRead through its own outlet context", () =>
     return (
       <button
         type="button"
-        onClick={() => ctx.markRead?.({ kind: "channel", targetId: readingId })}
+        onClick={() =>
+          ctx.reportReadProgress?.(
+            { kind: "channel", targetId: readingId },
+            {
+              readThrough: { id: readMessageId, createdAt: "2026-07-15T10:00:00Z" },
+            },
+          )
+        }
       >
-        Marcar como lida
+        Li até aqui
       </button>
     );
   }
 
-  it("hands the real useChatSidebar markRead down, not a second implementation", async () => {
+  it("hands the real useChatSidebar read progress down, not a second implementation", async () => {
     const user = userEvent.setup();
     vi.mocked(fetchSidebarData).mockResolvedValue({
       currentUserId,
@@ -1690,12 +1726,20 @@ describe("ChatShell — forwards markRead through its own outlet context", () =>
       ],
       dms: [],
       categories: [],
+      // A server with the read cursor: only then is reading persisted
+      // progressively (#1082).
+      preciseReadCursor: true,
     });
 
     renderShellAt(`/chat/channel/${readingId}`);
-    await user.click(await screen.findByRole("button", { name: "Marcar como lida" }));
+    await user.click(await screen.findByRole("button", { name: "Li até aqui" }));
 
-    await waitFor(() => expect(markConversationRead).toHaveBeenCalledWith("channel", readingId));
+    // The read cursor travels to the server as the message read through.
+    await waitFor(() =>
+      expect(markConversationRead).toHaveBeenCalledWith("channel", readingId, readMessageId, {
+        keepalive: false,
+      }),
+    );
   });
 });
 
@@ -1820,34 +1864,33 @@ describe("ChatShell — trava de rolagem do documento", () => {
   });
 });
 
+/**
+ * A MediaQueryList stand-in: jsdom does not implement matchMedia, so without
+ * this every query simply never matches — which is exactly the wide-viewport
+ * answer the tests that omit it rely on.
+ */
+function stubViewport(startsAsDrawer: boolean) {
+  let drawer = startsAsDrawer;
+  const listeners = new Set<() => void>();
+  window.matchMedia = ((query: string) => ({
+    get matches() {
+      return query === NAV_DRAWER_QUERY && drawer;
+    },
+    media: query,
+    addEventListener: (_event: string, callback: () => void) => void listeners.add(callback),
+    removeEventListener: (_event: string, callback: () => void) => void listeners.delete(callback),
+  })) as unknown as typeof window.matchMedia;
+  return {
+    resizeTo(nextIsDrawer: boolean) {
+      drawer = nextIsDrawer;
+      act(() => listeners.forEach((callback) => callback()));
+    },
+  };
+}
+
 describe("ChatShell — navegação responsiva", () => {
   const readingId = "00000000-0000-4000-8000-0000000005b1";
   const otherId = "00000000-0000-4000-8000-0000000005b2";
-
-  /**
-   * A MediaQueryList stand-in: jsdom does not implement matchMedia, so without
-   * this every query simply never matches — which is exactly the wide-viewport
-   * answer the tests that omit it rely on.
-   */
-  function stubViewport(startsAsDrawer: boolean) {
-    let drawer = startsAsDrawer;
-    const listeners = new Set<() => void>();
-    window.matchMedia = ((query: string) => ({
-      get matches() {
-        return query === NAV_DRAWER_QUERY && drawer;
-      },
-      media: query,
-      addEventListener: (_event: string, callback: () => void) => void listeners.add(callback),
-      removeEventListener: (_event: string, callback: () => void) =>
-        void listeners.delete(callback),
-    })) as unknown as typeof window.matchMedia;
-    return {
-      resizeTo(nextIsDrawer: boolean) {
-        drawer = nextIsDrawer;
-        act(() => listeners.forEach((callback) => callback()));
-      },
-    };
-  }
 
   function renderShellAt(path: string) {
     return render(
@@ -2031,5 +2074,147 @@ describe("ChatShell — navegação responsiva", () => {
       "aria-selected",
       "true",
     );
+  });
+});
+
+describe("ChatShell — ponto de entrada da busca global (#550)", () => {
+  const readingId = "00000000-0000-4000-8000-000000000551";
+  const otherId = "00000000-0000-4000-8000-000000000552";
+
+  // The real search page: its autoFocus and its Escape are part of the flow
+  // under test. With no query typed it requests nothing.
+  function renderShell() {
+    return render(
+      <MemoryRouter initialEntries={[`/chat/channel/${readingId}`]}>
+        <Routes>
+          <Route element={<AppShell />}>
+            <Route
+              path="/chat"
+              element={
+                <CallSessionProvider>
+                  <ChatShell />
+                </CallSessionProvider>
+              }
+            >
+              <Route path="channel/:channelId" element={<div>mensagens</div>} />
+              <Route path="search" element={<GlobalSearchPage />} />
+            </Route>
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  afterEach(() => {
+    // @ts-expect-error -- jsdom does not define this by default; restore that.
+    delete window.matchMedia;
+  });
+
+  const searchButton = () => screen.getByRole("button", { name: "Buscar no NChat" });
+  const searchField = () =>
+    screen.findByRole("searchbox", {
+      name: "Buscar mensagens, pessoas, canais, grupos e arquivos",
+    });
+
+  beforeEach(() => {
+    vi.mocked(fetchSidebarData).mockResolvedValue({
+      currentUserId,
+      workspaceId: "workspace-1",
+      channels: [
+        { id: readingId, name: "Plataforma", type: "public", canWrite: true },
+        { id: otherId, name: "Infra", type: "public", canWrite: true },
+      ],
+      dms: [],
+      categories: [],
+    });
+  });
+
+  it("o botão abre a busca com o campo focado e Escape volta à conversa com o foco no botão", async () => {
+    const user = userEvent.setup();
+    renderShell();
+    await screen.findByRole("option", { name: /Plataforma/ });
+    const sockets = FakeWebSocket.instances.length;
+    const sidebarFetches = vi.mocked(fetchSidebarData).mock.calls.length;
+
+    await user.click(searchButton());
+    expect(await searchField()).toHaveFocus();
+    expect(screen.queryByText("mensagens")).not.toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+
+    expect(await screen.findByText("mensagens")).toBeInTheDocument();
+    expect(searchButton()).toHaveFocus();
+    expect(screen.getByRole("option", { name: /Plataforma/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    // Opening and closing the search is navigation only: no new connection,
+    // no sidebar refetch.
+    expect(FakeWebSocket.instances).toHaveLength(sockets);
+    expect(vi.mocked(fetchSidebarData).mock.calls).toHaveLength(sidebarFetches);
+  });
+
+  it("Ctrl+K abre a mesma busca e Escape devolve o foco a quem o tinha", async () => {
+    const user = userEvent.setup();
+    renderShell();
+    const newConversation = screen.getByRole("button", { name: "Nova conversa" });
+    await waitFor(() => expect(newConversation).toBeEnabled());
+    newConversation.focus();
+
+    await user.keyboard("{Control>}k{/Control}");
+    expect(await searchField()).toHaveFocus();
+
+    await user.keyboard("{Escape}");
+
+    expect(await screen.findByText("mensagens")).toBeInTheDocument();
+    expect(newConversation).toHaveFocus();
+  });
+
+  it("acionar Buscar com a busca já aberta não empilha outra entrada: Escape volta à conversa", async () => {
+    const user = userEvent.setup();
+    renderShell();
+    await screen.findByRole("option", { name: /Plataforma/ });
+
+    await user.click(searchButton());
+    await searchField();
+    await user.click(searchButton());
+    // Still the same search, handed straight back to its field.
+    expect(await searchField()).toHaveFocus();
+
+    await user.keyboard("{Escape}");
+
+    expect(await screen.findByText("mensagens")).toBeInTheDocument();
+    expect(searchButton()).toHaveFocus();
+  });
+
+  it("drawer: Escape logo após abrir a busca devolve o foco ao toggle, não ao botão do drawer", async () => {
+    stubViewport(true);
+    const user = userEvent.setup();
+    renderShell();
+    await screen.findByRole("option", { name: /Plataforma/ });
+
+    await user.click(screen.getByTestId("chat-nav-toggle"));
+    await user.click(searchButton());
+    expect(await searchField()).toHaveFocus();
+    await user.keyboard("{Escape}");
+
+    expect(await screen.findByText("mensagens")).toBeInTheDocument();
+    // The drawer closed when the search opened: its button is not where focus
+    // may land, whatever its visibility at this instant.
+    expect(screen.getByTestId("chat-nav-toggle")).toHaveFocus();
+  });
+
+  it("escolher outra conversa a partir da busca não devolve o foco ao botão", async () => {
+    const user = userEvent.setup();
+    renderShell();
+    await screen.findByRole("option", { name: /Infra/ });
+
+    await user.click(searchButton());
+    await searchField();
+    await user.click(screen.getByRole("option", { name: /Infra/ }));
+
+    expect(await screen.findByText("mensagens")).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Infra/ })).toHaveAttribute("aria-selected", "true");
+    expect(searchButton()).not.toHaveFocus();
   });
 });

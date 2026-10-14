@@ -43,10 +43,23 @@ type PresenceChange struct {
 	Status  PresenceStatus
 	At      time.Time
 	Changed bool
+	// Lingering reports that the user's last local connection just closed and
+	// the tracker is holding their state through the disconnect grace instead of
+	// declaring them offline (issue #798). The caller still owns the audience the
+	// eventual offline will need.
+	Lingering bool
+	// Generation identifies the lifecycle the change belongs to: the local
+	// presence of one person from its first connection to the offline its last
+	// disconnect ends in (issue #798). A reconnection inside the grace is the
+	// same lifecycle; one after it is a new one. It fences the person's shared
+	// reach (UserPresenceStore), so a departure decided for one lifecycle can
+	// never retract the next. Zero for a person this tracker never held.
+	Generation uint64
 }
 
 // PresenceObserver is notified of transitions the tracker makes *on its own* —
-// today only online → away, driven by the background inactivity check.
+// online → away, driven by the background inactivity check, and → offline when
+// a disconnect grace runs out without a reconnect (issue #798).
 //
 // Transitions caused by Connect, Disconnect and RecordActivity are deliberately
 // not reported here: they are returned to the caller that caused them, which is
@@ -56,7 +69,9 @@ type PresenceChange struct {
 // observer could look them up.
 //
 // It is called without p.mu held and must not call back into the tracker.
-type PresenceObserver func(workspaceID, userID string, status PresenceStatus, at time.Time)
+// generation is the lifecycle the transition belongs to — for an offline, the
+// one it ended.
+type PresenceObserver func(workspaceID, userID string, status PresenceStatus, at time.Time, generation uint64)
 
 // PresenceTracker tracks online/away/offline state per (workspaceID, userID).
 //
@@ -73,7 +88,11 @@ type PresenceObserver func(workspaceID, userID string, status PresenceStatus, at
 // different workspaces are tracked independently and never share state.
 type PresenceTracker struct {
 	awayTimeout time.Duration
-	now         func() time.Time // injectable clock for tests
+	// grace is how long a user whose last connection closed keeps their state
+	// before becoming offline (issue #798). Zero disables it: the last
+	// disconnect is offline at once.
+	grace time.Duration
+	now   func() time.Time // injectable clock for tests
 
 	mu     sync.RWMutex
 	conns  map[presenceKey]map[string]time.Time // key → connID → lastActivity
@@ -82,7 +101,14 @@ type PresenceTracker struct {
 	// ordering key that travels with every presence event, so it is written
 	// under the same lock as the status it describes and never derived later.
 	changedAt map[presenceKey]time.Time
-	observer  PresenceObserver
+	// lingering holds, for users with no connection left, when their grace
+	// ends. A key is never in both conns and lingering.
+	lingering map[presenceKey]time.Time
+	// generations holds the lifecycle of every person with a connection or a
+	// grace; generationSeq issues them, monotonic for the life of the process.
+	generations   map[presenceKey]uint64
+	generationSeq uint64
+	observer      PresenceObserver
 
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -97,22 +123,34 @@ type PresenceTracker struct {
 //
 // Call Stop to shut down the background goroutine.
 func NewPresenceTracker(awayTimeout time.Duration) *PresenceTracker {
-	return newPresenceTrackerWithClock(awayTimeout, time.Now)
+	return newPresenceTrackerWithClock(awayTimeout, 0, time.Now)
 }
 
-func newPresenceTrackerWithClock(awayTimeout time.Duration, now func() time.Time) *PresenceTracker {
+// NewPresenceTrackerWithGrace is NewPresenceTracker with a disconnect grace
+// (issue #798): a user whose last connection closes keeps their state for grace
+// and becomes offline only if no connection comes back within it.
+func NewPresenceTrackerWithGrace(awayTimeout, grace time.Duration) *PresenceTracker {
+	return newPresenceTrackerWithClock(awayTimeout, grace, time.Now)
+}
+
+func newPresenceTrackerWithClock(awayTimeout, grace time.Duration, now func() time.Time) *PresenceTracker {
 	p := &PresenceTracker{
 		awayTimeout: awayTimeout,
+		grace:       grace,
 		now:         now,
 		conns:       make(map[presenceKey]map[string]time.Time),
 		status:      make(map[presenceKey]PresenceStatus),
 		changedAt:   make(map[presenceKey]time.Time),
+		lingering:   make(map[presenceKey]time.Time),
 		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
 	}
 	go p.run()
 	return p
 }
+
+// DisconnectGrace is the configured grace. Read-only after construction.
+func (p *PresenceTracker) DisconnectGrace() time.Duration { return p.grace }
 
 // SetObserver installs the callback for tracker-driven transitions. Passing nil
 // removes it. Safe to call at any time; the observer is read under p.mu and
@@ -147,10 +185,15 @@ func (p *PresenceTracker) Connect(workspaceID, userID, connID string) PresenceCh
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// A connection inside the grace resumes the user: nothing was published
+	// when the previous one left, so nothing has to be taken back — and it is
+	// the same lifecycle. Any other first connection starts a new one.
+	delete(p.lingering, key)
 	if p.conns[key] == nil {
 		p.conns[key] = make(map[string]time.Time)
 	}
 	p.conns[key][connID] = now
+	p.beginGenerationLocked(key)
 	return p.setStatusLocked(key, PresenceOnline, now)
 }
 
@@ -177,20 +220,61 @@ func (p *PresenceTracker) Disconnect(workspaceID, userID, connID string) Presenc
 
 	conns, ok := p.conns[key]
 	if !ok {
-		return PresenceChange{Status: PresenceOffline, At: p.changedAt[key]}
+		return p.currentLocked(key)
 	}
 	delete(conns, connID)
 	if len(conns) > 0 {
 		return p.setStatusLocked(key, p.deriveConnectedStateLocked(conns, now), now)
 	}
 	delete(p.conns, key)
-	// Delete the status entry rather than setting PresenceOffline, so the
-	// status map doesn't accumulate stale entries for users that have
-	// disconnected. Status() returns PresenceOffline for absent keys.
+	if p.grace > 0 {
+		// The last connection is gone, but a dropped socket is not yet a user
+		// who left: a Wi-Fi switch, a proxy reconnect or a deploy all look like
+		// this for a few seconds. The state is kept and the decision deferred to
+		// the sweep, which declares offline only if nothing reconnected.
+		p.lingering[key] = now.Add(p.grace)
+		change := p.currentLocked(key)
+		change.Lingering = true
+		return change
+	}
+	return p.forgetLocked(key, now)
+}
+
+// beginGenerationLocked gives a person who had no lifecycle here a new one.
+func (p *PresenceTracker) beginGenerationLocked(key presenceKey) {
+	if _, live := p.generations[key]; live {
+		return
+	}
+	if p.generations == nil {
+		p.generations = make(map[presenceKey]uint64)
+	}
+	p.generationSeq++
+	p.generations[key] = p.generationSeq
+}
+
+// currentLocked is the tracker's answer for a user, with nothing changed.
+func (p *PresenceTracker) currentLocked(key presenceKey) PresenceChange {
+	if status, ok := p.status[key]; ok {
+		return PresenceChange{Status: status, At: p.changedAt[key], Generation: p.generations[key]}
+	}
+	return PresenceChange{Status: PresenceOffline, At: p.changedAt[key], Generation: p.generations[key]}
+}
+
+// forgetLocked declares a user with no connection offline.
+//
+// The status entry is deleted rather than set to PresenceOffline, so the status
+// map doesn't accumulate stale entries for users that have disconnected.
+// Status() returns PresenceOffline for absent keys.
+func (p *PresenceTracker) forgetLocked(key presenceKey, now time.Time) PresenceChange {
 	previous, tracked := p.status[key]
+	ended := p.generations[key]
 	delete(p.status, key)
 	delete(p.changedAt, key)
-	return PresenceChange{Status: PresenceOffline, At: now, Changed: tracked && previous != PresenceOffline}
+	delete(p.lingering, key)
+	delete(p.generations, key)
+	return PresenceChange{
+		Status: PresenceOffline, At: now, Changed: tracked && previous != PresenceOffline, Generation: ended,
+	}
 }
 
 // RecordActivity records user activity on a specific connection.
@@ -245,11 +329,11 @@ func (p *PresenceTracker) deriveConnectedStateLocked(conns map[string]time.Time,
 // setStatusLocked writes a status and stamps it. p.mu must be held.
 func (p *PresenceTracker) setStatusLocked(key presenceKey, status PresenceStatus, now time.Time) PresenceChange {
 	if current, ok := p.status[key]; ok && current == status {
-		return PresenceChange{Status: status, At: p.changedAt[key]}
+		return PresenceChange{Status: status, At: p.changedAt[key], Generation: p.generations[key]}
 	}
 	p.status[key] = status
 	p.changedAt[key] = now
-	return PresenceChange{Status: status, At: now, Changed: true}
+	return PresenceChange{Status: status, At: now, Changed: true, Generation: p.generations[key]}
 }
 
 // Status returns the current presence status for (workspaceID, userID).
@@ -276,6 +360,15 @@ func (p *PresenceTracker) StatusAt(workspaceID, userID string) (PresenceStatus, 
 		return s, p.changedAt[key]
 	}
 	return PresenceOffline, time.Time{}
+}
+
+// Lifecycle is StatusAt plus the generation the answer belongs to (zero when
+// this tracker holds no lifecycle for the person).
+func (p *PresenceTracker) Lifecycle(workspaceID, userID string) PresenceChange {
+	key := presenceKey{workspaceID: workspaceID, userID: userID}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.currentLocked(key)
 }
 
 // OnlineUserIDs returns every user in workspaceID whose presence is currently
@@ -313,23 +406,56 @@ func (p *PresenceTracker) OnlineUserIDs(workspaceID string) []string {
 func (p *PresenceTracker) run() {
 	defer close(p.done)
 
-	interval := p.awayTimeout / 4
-	// Floor at 1 second so very short test timeouts don't produce a
-	// near-zero ticker interval, which would thrash the scheduler.
-	if interval < time.Second {
-		interval = time.Second
-	}
-
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(p.sweepInterval())
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
 			p.checkAway()
+			p.expireGraces()
 		case <-p.stop:
 			return
 		}
+	}
+}
+
+// sweepInterval is a quarter of the away timeout, tightened to a third of the
+// grace so an expired grace is noticed within a third of its own length.
+// Floored at 1 second so very short test timeouts don't produce a near-zero
+// ticker interval, which would thrash the scheduler.
+func (p *PresenceTracker) sweepInterval() time.Duration {
+	interval := p.awayTimeout / 4
+	if p.grace > 0 && p.grace/3 < interval {
+		interval = p.grace / 3
+	}
+	return max(interval, time.Second)
+}
+
+// expireGraces declares offline every lingering user whose grace has run out,
+// and reports each transition to the observer after p.mu is released. Called
+// from the run goroutine and directly in tests.
+func (p *PresenceTracker) expireGraces() {
+	now := p.now()
+
+	p.mu.Lock()
+	expired := map[presenceKey]uint64{}
+	for key, until := range p.lingering {
+		if now.Before(until) {
+			continue
+		}
+		if change := p.forgetLocked(key, now); change.Changed {
+			expired[key] = change.Generation
+		}
+	}
+	observer := p.observer
+	p.mu.Unlock()
+
+	if observer == nil {
+		return
+	}
+	for key, generation := range expired {
+		observer(key.workspaceID, key.userID, PresenceOffline, now, generation)
 	}
 }
 
@@ -347,6 +473,7 @@ func (p *PresenceTracker) checkAway() {
 
 	p.mu.Lock()
 	var transitioned []presenceKey
+	generations := map[presenceKey]uint64{}
 	for key, connMap := range p.conns {
 		if p.status[key] != PresenceOnline {
 			continue
@@ -355,6 +482,7 @@ func (p *PresenceTracker) checkAway() {
 			p.status[key] = PresenceAway
 			p.changedAt[key] = now
 			transitioned = append(transitioned, key)
+			generations[key] = p.generations[key]
 		}
 	}
 	observer := p.observer
@@ -364,6 +492,6 @@ func (p *PresenceTracker) checkAway() {
 		return
 	}
 	for _, key := range transitioned {
-		observer(key.workspaceID, key.userID, PresenceAway, now)
+		observer(key.workspaceID, key.userID, PresenceAway, now, generations[key])
 	}
 }

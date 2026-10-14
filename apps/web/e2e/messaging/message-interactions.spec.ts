@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import type { Locator, Page } from "@playwright/test";
 
+import { captureBrowserErrors, expectNoUnexpectedBrowserErrors } from "../helpers/browserErrors";
 import {
   CURRENT_USER_ID,
   CURRENT_USER_NAME,
@@ -142,6 +143,7 @@ test.describe("interações de mensagem — reação, favorito e pin", () => {
   test("recebe message.created de outro participante uma única vez na DM correta", async ({
     page,
   }, testInfo) => {
+    captureBrowserErrors(page);
     const targetId = uniqueId(testInfo, "dm-realtime");
     const initial = makeMessage({ id: `${targetId}-initial`, body_text: "estado inicial da DM" });
     const incoming = makeMessage({
@@ -179,6 +181,7 @@ test.describe("interações de mensagem — reação, favorito e pin", () => {
       .click();
     await expect(page).toHaveURL(`/chat/dm/${GROUP_DM_ID}`);
     await expect(messageBubble(page, incoming.id)).toHaveCount(0);
+    expectNoUnexpectedBrowserErrors(page);
   });
 
   test("atualiza unread de grupo não selecionado e limpa ao abrir", async ({ page }, testInfo) => {

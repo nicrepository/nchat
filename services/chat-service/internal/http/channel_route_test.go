@@ -162,20 +162,20 @@ func (s *routeChannelStore) GetVisibleChannelByID(_ context.Context, workspaceID
 	return channel, nil
 }
 
-func (s *routeChannelStore) CreateChannelForActiveMember(_ context.Context, input storage.CreateChannelInput) (domain.Channel, error) {
+func (s *routeChannelStore) CreateChannelForActiveMember(_ context.Context, input storage.CreateChannelInput) (storage.CreateChannelResult, error) {
 	if s.workspace.ID != input.WorkspaceID || s.workspace.Status != domain.WorkspaceStatusActive {
-		return domain.Channel{}, domain.ErrForbidden
+		return storage.CreateChannelResult{}, domain.ErrForbidden
 	}
 	if !s.present || s.member.Status != domain.MemberStatusActive ||
 		s.member.WorkspaceID != input.WorkspaceID || s.member.UserID != input.CreatedBy {
-		return domain.Channel{}, domain.ErrForbidden
+		return storage.CreateChannelResult{}, domain.ErrForbidden
 	}
 	s.created = append(s.created, input)
-	return domain.Channel{
+	return storage.CreateChannelResult{Channel: domain.Channel{
 		ID: createdChannelID, WorkspaceID: input.WorkspaceID, Slug: input.Slug,
 		DisplayName: input.DisplayName, Type: input.Type, Status: domain.ChannelStatusActive,
 		CreatedBy: input.CreatedBy,
-	}, nil
+	}}, nil
 }
 
 // ── harness ───────────────────────────────────────────────────────────────────

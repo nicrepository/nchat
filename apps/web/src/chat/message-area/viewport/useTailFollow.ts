@@ -14,9 +14,8 @@
  * and noticing when the reader leaves.
  */
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
-import type { ViewportPhase } from "../../chatViewportState";
 import type { LastMutation } from "../../useMessages";
 import type { Message } from "../../chatTypes";
 import { movedByReader, tailConfirmed } from "./navigation";
@@ -30,77 +29,50 @@ import type { ViewportCore } from "./useViewportCore";
  *
  * Two things can observe the arrival — the sentinel, and the navigation's own
  * confirmation pass — and both mean exactly the same thing to the rest of the
- * app: the tail is on screen, the pending badge is spent, and #492 item G's
- * single mark-read trigger has fired. Writing it once is what keeps the two
- * from disagreeing, and the guard is what keeps a sentinel that reports every
- * frame from sending a receipt per frame.
+ * viewport: the tail is on screen. Writing it once is what keeps the two from
+ * disagreeing.
+ *
+ * #1082: arriving is navigation state only. It used to be the single trigger
+ * of the read receipt, which is what made the badge wait for the last pixel;
+ * reading is the read cursor's now, decided by what was actually seen.
  */
 export interface TailArrival {
-  /** The tail is confirmed on screen. Idempotent until the reader leaves it. */
+  /** The tail is confirmed on screen. */
   arrive: () => void;
-  /** The tail is no longer on screen: the next arrival is a new one. */
-  leave: () => void;
 }
 
-export function useTailArrival(
-  core: ViewportCore,
-  onReachedBottom: () => void,
-  clearUnread: () => void,
-): TailArrival {
-  const firedRef = useRef(false);
-  const onReachedBottomRef = useRef(onReachedBottom);
-  const clearUnreadRef = useRef(clearUnread);
-  useLayoutEffect(() => {
-    onReachedBottomRef.current = onReachedBottom;
-    clearUnreadRef.current = clearUnread;
-  });
-
+export function useTailArrival(core: ViewportCore): TailArrival {
   const arrive = useCallback(() => {
     // #788: the tail being confirmed is also what re-arms the follow-the-tail
     // intent after any reading position — the recovery path the first version
     // never had.
     core.confirmAtTail();
     core.setPhase("AT_BOTTOM");
-    clearUnreadRef.current();
-    if (firedRef.current) return;
-    firedRef.current = true;
-    onReachedBottomRef.current();
   }, [core]);
 
-  const leave = useCallback(() => {
-    firedRef.current = false;
-  }, []);
-
-  // One identity for as long as the two callbacks are the same ones: the
-  // sentinel's observer takes this as a dependency, and a fresh object every
-  // render would tear that observer down and build it again on each one.
-  return useMemo(() => ({ arrive, leave }), [arrive, leave]);
+  // One identity for as long as `core` is the same: the sentinel's observer
+  // takes this as a dependency, and a fresh object every render would tear
+  // that observer down and build it again on each one.
+  return useMemo(() => ({ arrive }), [arrive]);
 }
 
 interface Params {
   core: ViewportCore;
-  phase: ViewportPhase;
   messages: Message[];
-  currentUserId: string;
   lastMutation: LastMutation;
   /** Whether the opening position has been decided; mutations wait for it. */
   resolved: boolean;
   arrival: TailArrival;
   navigator: NavigatorState;
-  /** A message arrived behind the reader: the unread count is the caller's. */
-  onUnreadArrival: () => void;
 }
 
 export function useTailFollow({
   core,
-  phase,
   messages,
-  currentUserId,
   lastMutation,
   resolved,
   arrival,
   navigator,
-  onUnreadArrival,
 }: Params): void {
   const [countedMessages, setCountedMessages] = useState(messages);
   const [ownSendRequest, setOwnSendRequest] = useState(0);
@@ -117,15 +89,8 @@ export function useTailFollow({
   // a re-render with no new array does nothing at all.
   if (countedMessages !== messages) {
     setCountedMessages(messages);
-    const response = decideTailMutation({
-      messages,
-      currentUserId,
-      lastMutation,
-      phase,
-      resolved,
-    });
-    if (response.kind === "count-unread") onUnreadArrival();
-    else if (response.kind === "return-to-bottom") setOwnSendRequest((n) => n + 1);
+    const response = decideTailMutation({ lastMutation, resolved });
+    if (response.kind === "return-to-bottom") setOwnSendRequest((n) => n + 1);
   }
 
   // Consumes an own send's request (set during render above). #880 item 13:
@@ -220,9 +185,7 @@ function applyReadingPhase(core: ViewportCore, nearBottom: boolean) {
 /**
  * Bottom sentinel: the same node a tail navigation aims at also tells us,
  * authoritatively, when the real tail is on screen — surviving remeasure from
- * late-loading media instead of trusting a scroll command's mere return. This
- * is also the single place mark-read is triggered from (#492 G): never from
- * opening the route, only from confirmed arrival.
+ * late-loading media instead of trusting a scroll command's mere return.
  *
  * #880: "intersecting" alone is not that confirmation under virtualization.
  * The sentinel is positioned by the canvas, whose height is a commit behind a
@@ -244,10 +207,7 @@ function useBottomConfirmation(core: ViewportCore, arrival: TailArrival, request
       (entries) => {
         const visible = Boolean(entries[0]?.isIntersecting);
         core.noteTailSentinel(visible);
-        if (!visible) {
-          arrival.leave();
-          return;
-        }
+        if (!visible) return;
         if (core.navigationRef.current) {
           requestPass();
           return;

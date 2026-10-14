@@ -24,6 +24,7 @@ import { formatTime } from "./messageDisplay";
  */
 export interface MessageAcknowledgementProps {
   messageId: string;
+  workspaceId?: string;
   /** Absent while the summary is still being read; the strip then draws nothing. */
   acknowledgement?: MessageAcknowledgement;
   /**
@@ -142,6 +143,7 @@ function SenderSummary({
   acknowledgement,
   onOpenDetails,
   resolveIdentities,
+  workspaceId,
 }: {
   messageId: string;
   acknowledgement: MessageAcknowledgement;
@@ -150,6 +152,7 @@ function SenderSummary({
     userIds: string[],
     signal?: AbortSignal,
   ) => Promise<CallParticipantProfile[]>;
+  workspaceId: string;
 }) {
   const { total, acknowledged, recipients } = acknowledgement;
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -191,6 +194,7 @@ function SenderSummary({
       )}
       {detailsOpen && resolveIdentities ? (
         <MessageAcknowledgementDetails
+          workspaceId={workspaceId}
           total={total}
           acknowledged={acknowledged}
           recipients={recipients}
@@ -256,6 +260,7 @@ export default function MessageAcknowledgementStrip({
   onAcknowledge,
   onOpenDetails,
   resolveIdentities,
+  workspaceId = "",
 }: MessageAcknowledgementProps) {
   // Nothing to draw until the server has answered, and nothing to draw for a
   // message whose request it reports as asking nobody.
@@ -280,6 +285,7 @@ export default function MessageAcknowledgementStrip({
           acknowledgement={acknowledgement}
           onOpenDetails={onOpenDetails}
           resolveIdentities={resolveIdentities}
+          workspaceId={workspaceId}
         />
       )}
     </div>

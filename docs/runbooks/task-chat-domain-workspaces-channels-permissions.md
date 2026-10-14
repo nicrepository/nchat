@@ -6,7 +6,7 @@
 > **Historical runbook.** It records the state at the time of the original task.
 > Two of its rules have since been superseded and are corrected in place below,
 > marked "superseded": channel-creation authorization (BUG #393, then RF-74) and
-> the `#geral` membership sync (RF-74, migration 000022 — guests are excluded).
+> the `#geral` membership sync (RF-18/#882 — eligible guests are included).
 > The current authority is
 > [docs/security/rbac-matrix.md](../security/rbac-matrix.md) for roles and
 > [docs/architecture/chat-domain-model.md](../architecture/chat-domain-model.md)
@@ -35,17 +35,12 @@
 - Archive is a status change (`status='archived'`), not a hard delete.
 - `#geral` is immutable through CRUD: callers cannot create slug `geral`, set
   `is_general`, edit the general channel, or archive it.
-- Mandatory `#geral` membership sync **(superseded by RF-74)**: active workspace
+- Mandatory `#geral` membership sync **(consolidated by #882)**: active workspace
   members are inserted into that workspace's `#geral` `channel_members` row
   during join/reactivation, and `SyncGeneralMemberships(ctx, workspaceID)`
-  backfills missing rows. Since migration 000022 the sync covers the roles
-  `generalMembershipRoles` names — active `owner`, `admin`, `moderator` and
-  `member` — and **excludes `guest`**: a guest's workspace membership grants no
-  channel on its own, so it reaches only the channels it holds an explicit
-  `channel_members` row for. The backfill never removes a row, so a guest that
-  already holds one keeps it. RF-18 ("every user joins `#geral` automatically")
-  and this RF-74 exclusion have not been reconciled; issue #882 owns that
-  decision, and the current behaviour is characterized in
+  backfills missing rows for every active member with an eligible account,
+  including guest. This structural row does not grant a guest implicit reach to
+  other public channels. The current behaviour is characterized in
   [chat-membership-contracts.md](../architecture/chat-membership-contracts.md).
 - Disabled workspaces deny channel list/read/write, category/channel creation,
   workspace membership auto-sync, and channel membership changes.
@@ -142,15 +137,14 @@ reactivates a workspace member, `chat-service` uses the storage transaction to:
 1. verify the workspace is active;
 2. create or activate the `workspace_members` row;
 3. load the active public general channel by the same `workspace_id`;
-4. under CURRENT RF-74, insert the `channel_members` row with
-   `ON CONFLICT DO NOTHING` only for owner/admin/moderator/member; guest is
-   excluded by `generalMembershipRoles`.
+4. insert the `channel_members` row with `ON CONFLICT DO NOTHING` for every
+   active member whose account remains eligible, including guest.
 
 The join/reactivation and `#geral` insert are atomic in the pgx store. If the
 general channel is missing, the service returns `ErrGeneralChannelMissing`; it
 does not create `#geral` in the membership path. Unexpected database errors are
 propagated, and newly active members eligible for sync are not silently left
-unsynced. Guests remain excluded. Duplicate
+unsynced. Duplicate
 membership conflicts remain idempotent.
 
 Suspended and left workspace members are not synced into `#geral`. Disabled

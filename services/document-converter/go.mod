@@ -1,6 +1,6 @@
 module github.com/nicrepository/nchat/services/document-converter
 
-go 1.25.13
+go 1.26.9
 
 require (
 	github.com/nicrepository/nchat/libs/go/platform v0.0.0

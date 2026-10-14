@@ -114,6 +114,7 @@ type mentionProvider interface {
 // MessageHandler handles message list and create endpoints for channels and DMs.
 type MessageHandler struct {
 	workspaces     workspaceResolver
+	presence       *PresenceHandler
 	messages       messageProvider
 	mentions       mentionProvider
 	favorites      favoriteProvider
@@ -175,6 +176,12 @@ func (h *MessageHandler) WithLinkReconcile(
 
 // WithFavorites enables the RF-06 favorite endpoints. Returns the handler for
 // chaining; when never called, favorite routes answer 503.
+// WithPresence attaches the caller's own manual presence routes (issue #798).
+func (h *MessageHandler) WithPresence(presence *PresenceHandler) *MessageHandler {
+	h.presence = presence
+	return h
+}
+
 func (h *MessageHandler) WithFavorites(favorites favoriteProvider) *MessageHandler {
 	h.favorites = favorites
 	return h
@@ -600,10 +607,17 @@ func (h *MessageHandler) checkMentionDeps(w http.ResponseWriter) bool {
 // workspace a message is rate-limited against and the workspace it is written
 // to are the same one, with no second lookup that could answer differently.
 func (h *MessageHandler) resolveWorkspaceID(ctx context.Context, w http.ResponseWriter) (string, bool) {
+	return resolveRequestWorkspace(ctx, w, h.workspaces)
+}
+
+// resolveRequestWorkspace is the server-side answer to "which workspace is this
+// request in": the one the anti-spam guard already resolved, or the default
+// workspace. Writes the error and returns false when there is none.
+func resolveRequestWorkspace(ctx context.Context, w http.ResponseWriter, workspaces workspaceResolver) (string, bool) {
 	if id := contextWorkspaceID(ctx); id != "" {
 		return id, true
 	}
-	ws, err := h.workspaces.GetDefaultWorkspace(ctx)
+	ws, err := workspaces.GetDefaultWorkspace(ctx)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "workspace not found")

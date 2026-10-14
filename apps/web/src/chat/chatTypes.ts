@@ -1,3 +1,6 @@
+import type { OwnershipDetails } from "./ownershipApi";
+import type { TimelinePosition } from "./messages/messageOrder";
+import type { ReadPosition } from "./readCursor";
 // ── Chat domain types ────────────────────────────────────────────────────────
 
 export type ChannelType = "public" | "private";
@@ -27,7 +30,7 @@ export interface ConversationActivity {
   pinnedAt?: string | null;
 }
 
-export interface Channel extends ConversationActivity {
+export interface Channel extends ConversationActivity, ConversationReadProjection {
   id: string;
   name: string;
   type: ChannelType;
@@ -123,12 +126,17 @@ export interface DMCounterpart {
   avatarUrl?: string;
 }
 
-export interface DMConversation extends ConversationActivity {
+export interface DMConversation extends ConversationActivity, ConversationReadProjection {
   id: string;
   type: DMType;
   name: string;
   participants: DMParticipant[];
   counterpart?: DMCounterpart;
+  /**
+   * A group's emoji identity (issue #1026). Absent is Automático: GroupAvatar
+   * derives initials from `name`, so nothing derived is ever held here.
+   */
+  avatarEmoji?: string;
   unreadCount?: number;
   /** True once the unread count includes a message that mentions the current user. */
   hasMentionUnread?: boolean;
@@ -425,6 +433,72 @@ export interface ConversationEventPayload {
   callId?: string;
   callType?: "audio" | "video";
   callDurationSeconds?: number;
+}
+
+/**
+ * A server answer about one conversation's read state (issue #1082): the
+ * unread count, and the read point it is counted from.
+ */
+export interface ConversationReadState {
+  unreadCount: number;
+  readThrough: TimelinePosition | null;
+}
+
+/**
+ * Client-only (#1082): the server read state a sidebar row is based on, and
+ * when — on this session's request clock — the request that brought it
+ * started and its answer arrived.
+ */
+export interface ServerReadSnapshot extends ConversationReadState {
+  startedAt: number;
+  receivedAt: number;
+}
+
+/** Client-only (#1082): a message announced in realtime, at the tick it arrived. */
+export interface RealtimeArrival extends ReadPosition {
+  at: number;
+}
+
+/** The read state a sidebar row carries (#1082); shared by channels and DMs. */
+export interface ConversationReadProjection {
+  /**
+   * The read state this very payload reported, as the server sent it. Absent
+   * from a server without the read cursor.
+   */
+  readState?: ConversationReadState;
+  /**
+   * Client-only: the server read state this row is based on. Its read point is
+   * the confirmed read frontier, which never moves back.
+   */
+  serverRead?: ServerReadSnapshot;
+  /** Client-only: when the answer that last moved that frontier arrived. */
+  confirmedAt?: number;
+  /** Client-only: realtime messages the base may not account for. */
+  arrivals?: RealtimeArrival[];
+  /**
+   * Client-only: the tick from which the row holds an answer it could not
+   * settle — refused, or taken as a conservative upper bound. Only an answer
+   * to a request started later settles it.
+   */
+  reconcileAfter?: number;
+  /** Client-only: "Marcar como lida" asked for at this tick, not yet answered. */
+  markAllSince?: number;
+  /**
+   * Client-only: the furthest this session has read here, in the timeline's
+   * canonical order.
+   */
+  readThrough?: TimelinePosition;
+  /**
+   * Client-only: the newest unread message known to mention this user, so that
+   * mention can clear once the cursor passes it.
+   */
+  unreadMention?: ReadPosition;
+  /**
+   * Client-only: a mention is unread somewhere this client cannot place —
+   * restored from the local cache, or reported without a position. Only
+   * "nothing unread at all" can clear it.
+   */
+  unknownMention?: boolean;
 }
 
 export interface Message {
@@ -810,6 +884,7 @@ export interface ChannelMemberProfile {
  * up on screen as a fallback for the name that was missing.
  */
 export interface ChannelDetails {
+  ownership?: OwnershipDetails;
   id: string;
   slug: string;
   name: string;
@@ -820,8 +895,10 @@ export interface ChannelDetails {
   memberCount: number;
   onlineCount: number;
   onlineMembers: ChannelMemberProfile[];
+  /** Access-based add capability; absent from an older server means false. */
+  canAddMembers?: boolean;
   /**
-   * Whether the server would let this caller add participants (issue #398).
+   * Legacy administrative channel-membership capability.
    *
    * A rendering hint, never a control: `POST .../members` re-derives the same
    * decision from the session on every call, so hiding the action protects
@@ -927,6 +1004,7 @@ export interface GroupParticipantProfile {
  * `participants.length`: that array is a capped preview.
  */
 export interface GroupDetails {
+  ownership?: OwnershipDetails;
   id: string;
   name: string;
   description: string;
@@ -974,6 +1052,11 @@ export interface DirectProfile {
   displayName: string;
   avatarUrl?: string;
   presence?: OnlineStatus;
+  /**
+   * When the server last published this person as offline, in epoch ms
+   * (issue #798). Present only while they are offline.
+   */
+  lastSeenAt?: number;
   email?: string;
   jobTitle?: string;
   department?: string;

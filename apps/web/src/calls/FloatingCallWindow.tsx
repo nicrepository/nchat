@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { avatarColorFor, initialsFrom } from "../chat/messageDisplay";
-import { PersonAvatarImage } from "../chat/PersonAvatarImage";
+import { UserAvatar } from "../chat/UserAvatar";
 import CallControls, { type CallControlProps } from "./CallControls";
 import {
   clampPosition,
@@ -28,6 +28,8 @@ export interface FloatingActiveSpeaker {
 
 interface FloatingCallWindowProps {
   title: string;
+  workspaceId?: string;
+  isResourceCall?: boolean;
   status: "connecting" | "connected" | "reconnecting" | "failed";
   participantCount: number;
   activeSpeaker?: FloatingActiveSpeaker;
@@ -103,6 +105,8 @@ function storedCorner(): FloatingCorner {
 
 export default function FloatingCallWindow({
   title,
+  workspaceId = "",
+  isResourceCall = false,
   status,
   participantCount,
   activeSpeaker,
@@ -117,7 +121,6 @@ export default function FloatingCallWindow({
   hasLocalVideo,
   localSeed,
   localName,
-  localInitials,
   localAvatarUrl,
   testId = "floating-call-window",
   activationRequired = false,
@@ -263,11 +266,17 @@ export default function FloatingCallWindow({
                 className={`floating-call__avatar call-avatar call-avatar--${avatarColorFor(remoteSeed)}`}
                 aria-hidden="true"
               >
-                <PersonAvatarImage
-                  src={avatarUrl}
-                  initials={initialsFrom(title)}
-                  imgClassName="call-avatar__img"
-                />
+                {isResourceCall ? (
+                  initialsFrom(title)
+                ) : (
+                  <UserAvatar
+                    userId={remoteSeed}
+                    workspaceId={workspaceId}
+                    displayName={title}
+                    avatarUrl={avatarUrl}
+                    imageClassName="call-avatar__img"
+                  />
+                )}
               </div>
             </div>
           )}
@@ -282,10 +291,12 @@ export default function FloatingCallWindow({
               role="img"
               aria-label={localName}
             >
-              <PersonAvatarImage
-                src={localAvatarUrl}
-                initials={localInitials}
-                imgClassName="call-avatar__img"
+              <UserAvatar
+                userId={localSeed}
+                workspaceId={workspaceId}
+                displayName={localName}
+                avatarUrl={localAvatarUrl}
+                imageClassName="call-avatar__img"
               />
             </div>
           )}

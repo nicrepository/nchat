@@ -641,8 +641,17 @@ type AttachmentStatusPayload struct {
 // and it is server time on every path, so a client that reconciles two events
 // never has to trust a browser clock, its own or anyone else's.
 type PresencePayload struct {
-	UserID    string `json:"user_id"`
-	State     string `json:"state"`
+	UserID string `json:"user_id"`
+	// State is the RF-58 reachability (online, away, offline), kept for clients
+	// that predate issue #798. It is always the projection of Availability.
+	State string `json:"state"`
+	// Availability is the effective presence (issue #798): available, busy,
+	// dnd, brb, away or offline. Appearing offline is offline here, with nothing
+	// that tells it apart from a real disconnect.
+	Availability string `json:"availability,omitempty"`
+	// Activity is public context for a busy or dnd state: in_call today,
+	// in_meeting or presenting when a source for them exists. Empty otherwise.
+	Activity  string `json:"activity,omitempty"`
 	UpdatedAt string `json:"updated_at"`
 }
 

@@ -109,6 +109,10 @@ const (
 	// RecipientPreferenceUnavailable is a read that did not succeed. Alerts are
 	// decided fail-closed for it; the message is not affected.
 	RecipientPreferenceUnavailable
+	// RecipientPreferenceDoNotDisturb is a recipient in Do Not Disturb (issue
+	// #798). It silences every alert whatever the conversation preference
+	// says, so it collapses them the way a mute collapses the level.
+	RecipientPreferenceDoNotDisturb
 )
 
 // WithRecipientPolicy makes message.created decisions per recipient.

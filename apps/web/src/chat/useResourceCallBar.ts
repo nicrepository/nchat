@@ -86,12 +86,18 @@ function participatingBarProps(
 ): ActiveResourceCallBarProps {
   const session = input.ctx.resourceCallSession;
   if (!session) {
-    return { mode: "participating-info", title: barTitle(input), startedAt };
+    return {
+      mode: "participating-info",
+      title: barTitle(input),
+      startedAt,
+      workspaceId: input.ctx.workspaceId,
+    };
   }
   return {
     mode: "participating-local",
     title: barTitle(input),
     startedAt,
+    workspaceId: input.ctx.workspaceId,
     participants: session.participants,
     localId: session.localId,
     localName: session.localName,

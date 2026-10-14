@@ -15,6 +15,8 @@
  * layer at all.
  */
 
+import { useState } from "react";
+
 import { isAudioAttachment } from "./attachmentAudioRules";
 import type { ChannelAttachment } from "./chatTypes";
 import { fetchAttachmentContent } from "./filesApi";
@@ -87,4 +89,38 @@ export function attachmentDownloadFilename(attachment: ChannelAttachment): strin
   const stored = attachment.filename || "audio";
   const withoutExtension = stored.replace(/\.[a-z0-9]{1,8}$/i, "");
   return `${withoutExtension || "audio"}.mp3`;
+}
+
+export type AttachmentDownloadState = "idle" | "loading" | "failed";
+
+/**
+ * One attachment's Baixar, with the state every surface that offers it shows:
+ * busy while the bytes travel, a failure afterwards. Shared by the message card
+ * and the details panel's recent files (issue #897), so both save the same
+ * name through the same route and neither can start a second download while
+ * one is running.
+ *
+ * Offer it only for a clean attachment; file-service refuses anything else
+ * regardless, and a refusal lands here as "failed".
+ */
+export function useAttachmentDownload(attachment: ChannelAttachment): {
+  state: AttachmentDownloadState;
+  download: () => Promise<void>;
+} {
+  const [state, setState] = useState<AttachmentDownloadState>("idle");
+
+  const download = async () => {
+    if (state === "loading") return;
+    setState("loading");
+    try {
+      await saveAttachmentToDisk(attachment.id, attachmentDownloadFilename(attachment));
+      setState("idle");
+    } catch {
+      // No server text is surfaced: it may carry detail that does not belong
+      // in the UI, and every failure means the same thing here.
+      setState("failed");
+    }
+  };
+
+  return { state, download };
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/nicrepository/nchat/libs/go/platform/conversationownership"
 
 	"github.com/nicrepository/nchat/services/admin-service/internal/domain"
 )
@@ -387,7 +388,15 @@ const lockUserQuery = `
 //
 // Suspension revokes every session; activation restores none. There is no path
 // here that resurrects a credential.
-func (s *PGXUserDirectoryStore) UpdateUserStatus(ctx context.Context, userID string, newStatus string) (domain.UserStatusChange, error) {
+func (s *PGXUserDirectoryStore) UpdateUserStatus(ctx context.Context, userID, newStatus string) (domain.UserStatusChange, error) {
+	value, err := conversationownership.Retry(ctx, func() (domain.UserStatusChange, error) { return s.updateUserStatusOnce(ctx, userID, newStatus) })
+	if conversationownership.SQLState(err) == "P0953" {
+		return domain.UserStatusChange{}, domain.ErrConversationOwnershipConflict
+	}
+	return value, err
+}
+
+func (s *PGXUserDirectoryStore) updateUserStatusOnce(ctx context.Context, userID string, newStatus string) (domain.UserStatusChange, error) {
 	if s == nil || s.pool == nil {
 		return domain.UserStatusChange{}, domain.ErrUnavailable
 	}
@@ -396,9 +405,17 @@ func (s *PGXUserDirectoryStore) UpdateUserStatus(ctx context.Context, userID str
 		return domain.UserStatusChange{}, fmt.Errorf("begin status transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	available, err := prepareOwnershipInvalidation(ctx, tx, userID)
+	if err != nil {
+		return domain.UserStatusChange{}, err
+	}
 
 	current, err := lockUserForStatusChange(ctx, tx, userID, newStatus)
 	if err != nil {
+		return domain.UserStatusChange{}, err
+	}
+
+	if err := succeedAccountSuspension(ctx, tx, userID, newStatus, available); err != nil {
 		return domain.UserStatusChange{}, err
 	}
 
@@ -410,13 +427,12 @@ func (s *PGXUserDirectoryStore) UpdateUserStatus(ctx context.Context, userID str
 	}
 
 	change := domain.UserStatusChange{TargetUserID: userID, FromStatus: current, ToStatus: newStatus}
-	if newStatus == domain.UserStatusSuspended {
-		revoked, err := closeOutSuspendedAccess(ctx, tx, userID)
-		if err != nil {
-			return domain.UserStatusChange{}, err
-		}
-		change.RevokedSessions = revoked
+	revoked, err := revokeSuspendedAccess(ctx, tx, userID, newStatus)
+	if err != nil {
+		return domain.UserStatusChange{}, err
 	}
+	change.RevokedSessions = revoked
+
 	if err := tx.Commit(ctx); err != nil {
 		return domain.UserStatusChange{}, fmt.Errorf("commit status transaction: %w", err)
 	}
@@ -429,8 +445,9 @@ func (s *PGXUserDirectoryStore) UpdateUserStatus(ctx context.Context, userID str
 // The user row first, because that is what serializes two status changes and
 // what a login re-validates against. Then the administrative anchor: suspending
 // an administrator takes their authority away, and a privileged write already
-// in flight must not be able to commit after it. The anchor is always the last
-// lock this service acquires — see mutation_authorization.go for the order.
+// in flight must not be able to commit after it. Conversation locks have
+// already been taken; the anchor precedes succession and session writes.
+// See mutation_authorization.go for administrative authorization locks.
 //
 // The transition is checked under the user lock, so a status read here cannot
 // be stale by the time it is written.
@@ -772,4 +789,26 @@ func nullableCursorTime(cursor domain.Cursor) any {
 		return nil
 	}
 	return cursor.At
+}
+
+func prepareOwnershipInvalidation(ctx context.Context, tx pgx.Tx, userID string) (bool, error) {
+	if _, err := tx.Exec(ctx, conversationownership.SerializableSQL); err != nil {
+		return false, err
+	}
+	var available bool
+	if err := tx.QueryRow(ctx, conversationownership.AvailabilitySQL).Scan(&available); err != nil {
+		return false, err
+	}
+	if !available {
+		return false, nil
+	}
+	_, err := tx.Exec(ctx, conversationownership.LockUserSQL, userID)
+	return true, err
+}
+
+func revokeSuspendedAccess(ctx context.Context, tx pgx.Tx, userID, newStatus string) (int, error) {
+	if newStatus != domain.UserStatusSuspended {
+		return 0, nil
+	}
+	return closeOutSuspendedAccess(ctx, tx, userID)
 }

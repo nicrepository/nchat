@@ -2,10 +2,12 @@
 package domain
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -158,9 +160,10 @@ const MaxFilenameBytes = 255
 
 // Listing bounds for a destination's recent attachments (issue #435).
 //
-// The list is a recency preview, not a paginated archive: there is no cursor,
-// so the ceiling is what stops a caller from asking for a whole channel's
-// history in one request. A missing or out-of-range limit becomes the default.
+// The ceiling is what stops a caller from asking for a whole channel's history
+// in one request; anything older is reached page by page through an
+// AttachmentListCursor (issue #897). A missing or out-of-range limit becomes
+// the default.
 const (
 	DefaultAttachmentListLimit = 20
 	MaxAttachmentListLimit     = 50
@@ -176,6 +179,53 @@ func NormalizeAttachmentListLimit(limit int) int {
 		return MaxAttachmentListLimit
 	}
 	return limit
+}
+
+// AttachmentListCursor is the position of the last attachment a listing page
+// returned, in the listing's own order: (created_at, id), newest first. The
+// next page starts strictly after it, so a file uploaded while someone pages
+// through older ones can neither repeat a row nor push one out of reach.
+type AttachmentListCursor struct {
+	CreatedAt time.Time
+	ID        string
+}
+
+// EncodeAttachmentListCursor serialises a cursor into the opaque token clients
+// send back as ?before=. Same layout as chat-service's message cursor — URL-safe
+// base64 of RFC3339Nano "|" UUID — so the project has one cursor shape, not two.
+//
+// It carries only what the caller was just shown: the timestamp and id of a row
+// in a destination they are authorized to list.
+func EncodeAttachmentListCursor(c AttachmentListCursor) string {
+	raw := c.CreatedAt.UTC().Format(time.RFC3339Nano) + "|" + c.ID
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+// DecodeAttachmentListCursor parses a token produced by
+// EncodeAttachmentListCursor. Anything else is ErrInvalidInput: the token is
+// request input, and a malformed one is refused rather than read as "no cursor",
+// so a client never believes it received a page it did not ask for.
+func DecodeAttachmentListCursor(token string) (AttachmentListCursor, error) {
+	invalid := fmt.Errorf("%w: invalid cursor", ErrInvalidInput)
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return AttachmentListCursor{}, invalid
+	}
+	stamp, id, found := strings.Cut(string(raw), "|")
+	if !found {
+		return AttachmentListCursor{}, invalid
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, stamp)
+	if err != nil {
+		return AttachmentListCursor{}, invalid
+	}
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return AttachmentListCursor{}, invalid
+	}
+	// Canonical form, so the SQL cast never sees one of the alternate spellings
+	// uuid.Parse is lenient about.
+	return AttachmentListCursor{CreatedAt: createdAt.UTC(), ID: parsed.String()}, nil
 }
 
 // Listable reports whether an attachment in this status belongs in a

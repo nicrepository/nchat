@@ -4,8 +4,8 @@
  * QA reproduced a bug where a message's avatar always rendered as initials,
  * even for a sender with a valid personalized avatar, in DMs and groups. The
  * contract this file guards: personalized avatar when present and loadable,
- * initials as the only fallback, and no broken-image glyph — implemented by
- * delegating to PersonAvatarImage, the same image-or-initials state machine
+ * a deterministic Blobatar fallback, and no broken-image glyph — implemented by
+ * delegating to UserAvatar, the same image-or-Blobatar state machine
  * every other avatar in the app already uses.
  */
 
@@ -43,6 +43,7 @@ function messageWith(overrides: Partial<Message> = {}): Message {
 
 function renderBubble(overrides: Partial<MessageBubbleProps> = {}) {
   const props: MessageBubbleProps = {
+    workspaceId: "workspace-1",
     message: messageWith(),
     isMine: false,
     onToggleReaction: vi.fn(),
@@ -81,8 +82,7 @@ describe("MessageBubble avatar", () => {
 
   it("falls back to initials when the sender has no avatar", () => {
     renderBubble({ message: messageWith({ senderAvatarUrl: undefined }) });
-    expect(avatarBox().querySelector("img")).not.toBeInTheDocument();
-    expect(avatarBox()).toHaveTextContent("AS");
+    expect(avatarBox().querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
   });
 
   it("falls back to initials, with no broken-image glyph, once the image fails to load", () => {
@@ -91,8 +91,7 @@ describe("MessageBubble avatar", () => {
     });
     const img = avatarBox().querySelector("img")!;
     fireEvent.error(img);
-    expect(avatarBox().querySelector("img")).not.toBeInTheDocument();
-    expect(avatarBox()).toHaveTextContent("AS");
+    expect(avatarBox().querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
   });
 
   it("retries a changed avatar URL after a previous one failed to load", () => {
@@ -100,7 +99,7 @@ describe("MessageBubble avatar", () => {
       message: messageWith({ id: "msg-1", senderAvatarUrl: "/media/avatars/broken.png" }),
     });
     fireEvent.error(avatarBox().querySelector("img")!);
-    expect(avatarBox().querySelector("img")).not.toBeInTheDocument();
+    expect(avatarBox().querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
 
     const props: MessageBubbleProps = {
       message: messageWith({ id: "msg-1", senderAvatarUrl: "/media/avatars/new.png" }),
@@ -129,7 +128,7 @@ describe("MessageBubble avatar", () => {
     renderBubble({
       message: messageWith({ senderDisplayName: "Álvaro Ferreira", senderAvatarUrl: undefined }),
     });
-    expect(avatarBox()).toHaveTextContent("ÁF");
+    expect(avatarBox().querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
   });
 
   it("never renders an avatar for the viewer's own message, with or without an avatar URL", () => {

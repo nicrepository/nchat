@@ -37,7 +37,7 @@ interface AttachmentResponse {
 }
 
 interface AttachmentsEnvelope {
-  data: { attachments?: unknown };
+  data: { attachments?: unknown; next_cursor?: unknown };
 }
 
 // The two status parsers live in chatTypes so chatApi, which reads the same
@@ -66,7 +66,19 @@ function mapAttachment(raw: unknown): ChannelAttachment | undefined {
 }
 
 /**
- * Lists one destination's most recent attachments, newest first.
+ * One page of a destination's attachments (issue #897).
+ *
+ * `nextCursor` is the server's own statement that something older exists, not
+ * a guess from the page being full: the listing reads one row past the page to
+ * find out. Null means nothing older — never "unknown".
+ */
+export interface AttachmentPage {
+  attachments: ChannelAttachment[];
+  nextCursor: string | null;
+}
+
+/**
+ * Lists one page of a destination's attachments, newest first.
  *
  * The destination kind selects the route, and the two routes are separate
  * resources on the server with separate authorization — a channel id can never
@@ -74,22 +86,45 @@ function mapAttachment(raw: unknown): ChannelAttachment | undefined {
  *
  * `limit` is a request, not a guarantee: the server clamps it and owns the
  * ordering, so a caller cannot ask for an unbounded scan or a different sort.
+ * `before` is a `nextCursor` this same listing returned; it is opaque here and
+ * only ever sent back, encoded, as a query value.
+ */
+export async function fetchConversationAttachmentPage(
+  target: { kind: "channel" | "dm"; id: string },
+  page: { limit: number; before?: string },
+  signal?: AbortSignal,
+): Promise<AttachmentPage> {
+  const collection = target.kind === "channel" ? "channels" : "dm";
+  const query = new URLSearchParams({ limit: String(page.limit) });
+  if (page.before) query.set("before", page.before);
+  const res = await authenticatedFetch<AttachmentsEnvelope>(
+    `${FILES_BASE}/${collection}/${encodeURIComponent(target.id)}/attachments?${query}`,
+    { method: "GET", signal },
+  );
+  const raw = res.data.attachments;
+  const cursor = res.data.next_cursor;
+  return {
+    attachments: Array.isArray(raw)
+      ? raw
+          .map(mapAttachment)
+          .filter((attachment): attachment is ChannelAttachment => attachment !== undefined)
+      : [],
+    // Anything but a non-empty string reads as "nothing older": a malformed
+    // cursor must never become a control that loads nothing.
+    nextCursor: typeof cursor === "string" && cursor !== "" ? cursor : null,
+  };
+}
+
+/**
+ * The newest `limit` attachments of one destination, for callers that only
+ * ever read the first page (the timeline's preview reconciliation).
  */
 export async function fetchConversationAttachments(
   target: { kind: "channel" | "dm"; id: string },
   limit: number,
   signal?: AbortSignal,
 ): Promise<ChannelAttachment[]> {
-  const collection = target.kind === "channel" ? "channels" : "dm";
-  const res = await authenticatedFetch<AttachmentsEnvelope>(
-    `${FILES_BASE}/${collection}/${encodeURIComponent(target.id)}/attachments?limit=${encodeURIComponent(limit)}`,
-    { method: "GET", signal },
-  );
-  const raw = res.data.attachments;
-  if (!Array.isArray(raw)) return [];
-  return raw
-    .map(mapAttachment)
-    .filter((attachment): attachment is ChannelAttachment => attachment !== undefined);
+  return (await fetchConversationAttachmentPage(target, { limit }, signal)).attachments;
 }
 
 // ── Inline preview (RF-31, issue #464) ───────────────────────────────────────

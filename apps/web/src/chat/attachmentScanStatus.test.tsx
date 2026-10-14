@@ -50,6 +50,18 @@ vi.mock("./filesApi", () => ({
     limit: number,
     signal?: AbortSignal,
   ) => mockFetchConversationAttachments(target, limit, signal),
+  // The panel reads pages (issue #897); every fixture here is a single page.
+  fetchConversationAttachmentPage: (
+    target: { kind: "channel" | "dm"; id: string },
+    page: { limit: number },
+    signal?: AbortSignal,
+  ) =>
+    mockFetchConversationAttachments(target, page.limit, signal).then(
+      (attachments: ChannelAttachment[]) => ({
+        attachments,
+        nextCursor: null,
+      }),
+    ),
   fetchAttachmentPreview: (id: string, signal?: AbortSignal) =>
     mockFetchAttachmentPreview(id, signal),
   fetchAttachmentContent: () => Promise.reject(new Error("not used")),
@@ -105,7 +117,7 @@ function renderPanel(files: ChannelAttachment[]) {
       kind="channel"
       state={panelState(files)}
       currentUserId={currentUserId}
-      latestPin={null}
+      workspaceId="workspace-1"
       onClose={vi.fn()}
     />,
   );
@@ -250,7 +262,7 @@ function LivePanel({ onReady }: { onReady: (reload: () => void) => void }) {
       kind="channel"
       state={state}
       currentUserId={currentUserId}
-      latestPin={null}
+      workspaceId="workspace-1"
       onClose={vi.fn()}
     />
   );

@@ -854,9 +854,9 @@ func TestPGXMessageStore_ResolveAuthorizedMentionLabels(t *testing.T) {
 		}
 	})
 
-	t.Run("returns only channel members and visible channels", func(t *testing.T) {
+	t.Run("returns eligible users when requester can add and visible channels", func(t *testing.T) {
 		mock := newMock(t)
-		mock.ExpectQuery(`(?s)chat\.channel_members.*chat\.workspace_members.*auth\.users.*UNION ALL.*chat\.workspaces.*channel_visible_to_user`).
+		mock.ExpectQuery(`(?s)source_channel.*chat\.workspace_members requester.*auth\.users requester_user.*channel_visible_to_user\(source_channel\.id, requester\.user_id\).*UNION ALL.*chat\.workspaces.*channel_visible_to_user`).
 			WithArgs("ws-1", pgxmock.AnyArg(), pgxmock.AnyArg(), "requester-1", []string{"user-1"}, []string{"ch-2"}).
 			WillReturnRows(pgxmock.NewRows([]string{"kind", "id", "label"}).
 				AddRow("user", "user-1", "Ana").

@@ -39,7 +39,7 @@ import type { MessagePriorityIntent } from "./messagePriority";
 import type { MentionType } from "./richTextMarkers";
 import { fetchAllowedReactionEmojis } from "./chatApi";
 import { usePendingReference } from "./usePendingReference";
-import { useConversationTarget } from "./useConversationTarget";
+import { useConversationTarget, withMessageJump } from "./useConversationTarget";
 import { useEmojiUsage } from "./emoji/useEmojiUsage";
 import { useMessages, type SendResult } from "./useMessages";
 import { useLatestRef } from "./messages/useLatestRef";
@@ -67,6 +67,8 @@ import { inertDirectMessage, useDirectMessageAccess } from "./directMessage";
 import { useMessageDialogs } from "./message-area/hooks/useMessageDialogs";
 import { useTypingIndicatorLabel } from "./message-area/hooks/useTypingIndicatorLabel";
 import { useViewportAnchors } from "./message-area/hooks/useViewportAnchors";
+import type { ReadProgress } from "./readCursor";
+import { readTargetFromKey } from "./readCursorWriter";
 
 interface ChatMessageAreaProps {
   kind: "channel" | "dm";
@@ -142,8 +144,27 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     currentUserId: ctx.currentUserId,
     channels: ctx.channels,
     dms: ctx.dms,
-    markRead: ctx.markRead,
   });
+  // #1082: progress is reported for the conversation the timeline was mounted
+  // for, named by its key — never for whatever the route says now, which can
+  // already be the next conversation while the previous one's rows are still
+  // on screen.
+  const reportReadProgress = ctx.reportReadProgress;
+  // The server's read point for this conversation, as the sidebar holds it now
+  // — not as of opening — so a read on another device reaches the timeline.
+  const serverReadThrough = useMemo(
+    () =>
+      (kind === "channel" ? ctx.channels : ctx.dms).find((item) => item.id === targetId)?.serverRead
+        ?.readThrough,
+    [kind, targetId, ctx.channels, ctx.dms],
+  );
+  const onReadProgress = useCallback(
+    (conversationKey: string, progress: ReadProgress) => {
+      const readTarget = readTargetFromKey(conversationKey);
+      if (readTarget) reportReadProgress?.(readTarget, progress);
+    },
+    [reportReadProgress],
+  );
 
   const recentReactionEmojis = useMemo(
     () => quickReactionEmojis(emojiUsage, allowedReactionEmojis),
@@ -157,11 +178,43 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   );
 
   const pinTarget = useMemo(() => (targetId ? { kind, id: targetId } : null), [kind, targetId]);
-  const { pins, pinnedIds, error: pinError, togglePin, reload: reloadPins } = usePins(pinTarget);
-  // One selector, one list, one result: the bar above the conversation and the
-  // details panel are handed the same object, so a pin/unpin updates both at
-  // once and neither can show a message the other does not.
+  const {
+    collection: pinCollection,
+    pins,
+    pinnedIds,
+    pendingIds: pendingPinIds,
+    error: pinError,
+    togglePin,
+    reload: reloadPins,
+  } = usePins(pinTarget);
+  // One list, one instance: the bar shows its latest pin, the details panel the
+  // whole collection (issue #896), so a pin/unpin updates both at once.
   const latestPin = useMemo(() => selectLatestPin(pins), [pins]);
+  // A pinned row opens its message through the RF-09 deep link — the same
+  // `?message=` the timeline already follows, loading history when needed —
+  // on this conversation's own path, keeping any other query and the state.
+  // Marked as a jump request, so opening the same pin again travels again.
+  const openPinnedMessage = useCallback(
+    (messageId: string) => {
+      const search = new URLSearchParams(location.search);
+      search.set("message", messageId);
+      navigate(`${location.pathname}?${search.toString()}`, {
+        state: withMessageJump(location.state),
+      });
+    },
+    [location.pathname, location.search, location.state, navigate],
+  );
+  const pinnedMessages = useMemo(
+    () => ({
+      conversationKey: `${kind}:${targetId}`,
+      collection: pinCollection,
+      pendingIds: pendingPinIds,
+      onNavigate: openPinnedMessage,
+      onUnpin: (messageId: string) => togglePin(messageId, false),
+      onRetry: reloadPins,
+    }),
+    [kind, targetId, pinCollection, pendingPinIds, openPinnedMessage, togglePin, reloadPins],
+  );
 
   const detailsToggleRef = useRef<HTMLButtonElement>(null);
   const details = useConversationDetailsPanel({
@@ -226,6 +279,11 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     focusMessageId,
     onOwnReactionConfirmed: rememberReaction,
     onPinUpdated: reloadPins,
+    // A pin.updated missed while disconnected is recovered here (issue #896).
+    onSubscriptionReady: () => {
+      reloadPins();
+      reloadOpenDetails();
+    },
     onTypingUpdated: handleTypingUpdatedFromMessages,
     // Someone added participants to the open conversation (issue #398). The
     // event names nobody, so the only correct response is to refetch — which is
@@ -504,7 +562,12 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     onOpenAcknowledgementDetails: loadAcknowledgementDetail,
   };
 
-  const directCallBarProps = directCallBar(kind, ctx.directCallSession, activeDM?.counterpart);
+  const directCallBarProps = directCallBar(
+    kind,
+    ctx.directCallSession,
+    activeDM?.counterpart,
+    ctx.workspaceId,
+  );
 
   // Issue #475: a conversation this reader is not a member of renders nothing
   // of the conversation column — no header (name/avatar/participants), no
@@ -534,8 +597,11 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       <div className="chat-msg-area__conversation">
         <ConversationHeader
           kind={kind}
+          workspaceId={ctx.workspaceId}
           name={resolvedName}
+          isPrivate={target.isPrivateChannel}
           counterpart={activeDM?.counterpart}
+          conversation={activeDM}
           presenceTarget={target.presenceTarget}
           // #673: once the direct call bar takes over presentation for this DM,
           // the header suppresses its own call actions — the same pattern #657
@@ -561,6 +627,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           mentionTarget={target.mentionTarget}
           state={state}
           currentUserId={ctx.currentUserId}
+          workspaceId={ctx.workspaceId}
           actions={messageActions}
           onLoadMore={loadMore}
           onRetry={retry}
@@ -573,11 +640,14 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           emojiUsage={emojiUsage}
           onEmojiToneChange={changeEmojiTone}
           focusMessageId={focusMessageId}
+          focusRequest={target.focusRequest}
           conversationKey={anchors.conversationKey}
           unreadCountAtOpen={anchors.unreadCountAtOpen}
+          sidebarLoading={ctx.sidebarLoading}
           initialAnchor={anchors.initialAnchor}
           onCaptureAnchor={anchors.onCaptureAnchor}
-          onReachedBottom={anchors.onReachedBottom}
+          serverReadThrough={serverReadThrough}
+          onReadProgress={onReadProgress}
         />
 
         <ConversationNotices
@@ -646,9 +716,10 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       {details.showDetails && (
         <ConversationDetailsPanel
           kind={details.detailsKind ?? "channel"}
+          workspaceId={ctx.workspaceId}
           state={details.detailsState}
           currentUserId={ctx.currentUserId}
-          latestPin={latestPin}
+          pins={pinnedMessages}
           onRename={renameConversation}
           // The very flow a mention and a message author already use, and the
           // very same instance, so the roster cannot acquire a second way — or a

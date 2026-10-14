@@ -135,33 +135,37 @@ describe("systemMessagePresentation", () => {
     expect(text).not.toContain("user-1");
   });
 
-  // Fail-safe: an event from a newer server, a user message, or a rename with
-  // nothing to rename to, all render nothing rather than a guess.
-  it("returns nothing for anything it cannot describe honestly", () => {
+  // Issue #1082: every event that can count as unread has something on screen.
+  // One this build cannot phrase — from a newer server, or a rename with
+  // nothing to rename to — uses a neutral event label.
+  it("gives an event it cannot phrase the generic line, and a user message nothing", () => {
+    const generic = { text: "Evento da conversa", icon: "info", tone: "neutral" };
     expect(
       systemMessagePresentation(
         systemMessage({ eventType: "something_from_the_future" as Message["eventType"] }),
         "channel",
       ),
-    ).toBeNull();
-    expect(systemMessagePresentation(systemMessage({ kind: "user" }), "channel")).toBeNull();
+    ).toEqual(generic);
     expect(
       systemMessagePresentation(
         systemMessage({ eventPayload: { oldName: "Projetos" } }),
         "channel",
       ),
-    ).toBeNull();
+    ).toEqual(generic);
+    expect(systemMessagePresentation(systemMessage({ eventType: undefined }), "channel")).toEqual(
+      generic,
+    );
+    expect(systemMessagePresentation(systemMessage({ kind: "user" }), "channel")).toBeNull();
   });
 
-  // A member change with no targets is the same "nothing honest to say" case:
-  // there is no one to name.
-  it("returns nothing for a member change with no targets", () => {
+  // A member change with no targets is the same case: there is no one to name.
+  it("gives a member change with no targets the generic line", () => {
     expect(
       systemMessagePresentation(
         systemMessage({ eventType: "conversation_member_added", eventPayload: {} }),
         "group",
-      ),
-    ).toBeNull();
+      )?.text,
+    ).toBe("Evento da conversa");
   });
 
   describe("conversation created and archived", () => {
@@ -419,16 +423,17 @@ describe("ConversationSystemMessage", () => {
     expect(icon).toHaveTextContent("call");
   });
 
-  it("renders nothing for an event it cannot describe", () => {
-    const { container } = render(
+  it("renders a measurable line for an event it cannot describe (#1082)", () => {
+    render(
       <ConversationSystemMessage
         message={systemMessage({
-          eventType: "something_from_the_future" as Message["eventType"],
+          // API normalization drops event types unknown to this build.
+          eventType: undefined,
         })}
         scope="group"
       />,
     );
-    expect(container).toBeEmptyDOMElement();
+    expect(screen.getByTestId("chat-system-message")).toHaveTextContent("Evento da conversa");
   });
 
   it("passes viewerId through to say 'Você'", () => {

@@ -51,6 +51,7 @@ type fakeChannelStore struct {
 	getCategoryErr         error
 	createdChannel         domain.Channel
 	createChanErr          error
+	createReplayed         bool
 	channel                domain.Channel
 	visibleChannel         domain.Channel
 	updatedChannel         domain.Channel
@@ -95,13 +96,13 @@ func (f *fakeChannelStore) CreateChannel(_ context.Context, input storage.Create
 // tell a public creation from a private one and see the actor it recorded. The
 // atomicity this method carries in the real store cannot be faked here; it is
 // proved against PostgreSQL in storage.
-func (f *fakeChannelStore) CreateChannelForActiveMember(_ context.Context, input storage.CreateChannelInput) (domain.Channel, error) {
+func (f *fakeChannelStore) CreateChannelForActiveMember(_ context.Context, input storage.CreateChannelInput) (storage.CreateChannelResult, error) {
 	f.lastCreateInput = input
 	if input.EnsureCreatorMemberRole != "" {
 		f.creatorMembershipSeeds++
 		f.lastSeededMemberUserID = input.CreatedBy
 	}
-	return f.createdChannel, f.createChanErr
+	return storage.CreateChannelResult{Channel: f.createdChannel, Replayed: f.createReplayed}, f.createChanErr
 }
 func (f *fakeChannelStore) GetCategoryByIDInWorkspace(_ context.Context, workspaceID, id string) (domain.ChannelCategory, error) {
 	if f.getCategoryErr != nil {
@@ -547,14 +548,8 @@ func (f *fakeMemberStore) AddChannelMembers(
 	if f.addCMsErr != nil {
 		return storage.AddMembersResult{}, f.addCMsErr
 	}
-	// Models the transactional re-check the real store performs: the actor must
-	// still hold the capability at write time, so a test that revokes the role
-	// between the service check and here sees the write refused. It asks the
-	// same add-specific domain predicate the store's SQL role list restates.
-	actor, ok := f.workspaceMembers[wmKey(workspaceID, callerID)]
-	if !ok || !domain.CanAddChannelMembers(&actor) {
-		return storage.AddMembersResult{}, domain.ErrForbidden
-	}
+	// addCMsErr models the real store's transactional actor re-check. Channel
+	// visibility depends on channel data this membership-only fake does not own.
 	for _, userID := range userIDs {
 		member, ok := f.workspaceMembers[wmKey(workspaceID, userID)]
 		if !ok || member.Status != domain.MemberStatusActive {
@@ -680,12 +675,7 @@ func (f *fakeMemberStore) SyncGeneralMemberships(_ context.Context, workspaceID 
 		if m.WorkspaceID != workspaceID {
 			continue
 		}
-		// Same gate as the real backfill's `status = 'active' AND role IN (...)`:
-		// CanReachPublicChannels covers both, so a guest is skipped here exactly
-		// as it is skipped there. Note this only declines to *insert* — the loop
-		// never deletes, so a guest that was explicitly added to #geral keeps
-		// that membership across a sync.
-		if !domain.CanReachPublicChannels(&m) {
+		if m.Status != domain.MemberStatusActive {
 			continue
 		}
 		key := cmKey(channelID, m.UserID)
@@ -707,23 +697,8 @@ func (f *fakeMemberStore) requireActiveWorkspace(workspaceID string) error {
 	return nil
 }
 
-// addGeneralMembership models PGXMemberStore's automatic #geral join.
-//
-// It takes the whole membership rather than a user ID because the real
-// statement selects the role from the membership row and inserts only for the
-// roles in generalMembershipRoles. A guest is excluded there (RF-74), so it is
-// excluded here: a fake that joined a guest to #geral would let a regression in
-// the guest boundary pass every service test.
-//
-// The exclusion is domain.CanReachPublicChannels, not a `role != guest`
-// comparison, so the fake and the store stay tied to the same rule and an
-// unrecognised role is denied by both.
-//
-// Silently doing nothing, rather than erroring, is what the real INSERT ...
-// SELECT does when the role does not match: zero rows, no error. Only the
-// *automatic* join is gated — an explicit AddChannelMember into #geral is a
-// different path and stays available to a guest, which is how RF-74 says a
-// guest reaches any channel.
+// addGeneralMembership mirrors RF-18 for active, schema-valid workspace roles,
+// independently of implicit public-channel access.
 func (f *fakeMemberStore) addGeneralMembership(m domain.WorkspaceMember) error {
 	channelID, ok := f.generalChannels[m.WorkspaceID]
 	if !ok {
@@ -732,8 +707,8 @@ func (f *fakeMemberStore) addGeneralMembership(m domain.WorkspaceMember) error {
 	if f.addCMErr != nil {
 		return f.addCMErr
 	}
-	if !domain.CanReachPublicChannels(&m) {
-		return nil
+	if m.Status != domain.MemberStatusActive {
+		return domain.ErrForbidden
 	}
 	key := cmKey(channelID, m.UserID)
 	if _, ok := f.channelMembers[key]; ok {

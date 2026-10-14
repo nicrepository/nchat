@@ -17,7 +17,7 @@ import {
  * threshold for the go-to-bottom button, a real IntersectionObserver
  * confirming the true tail, and a real reflow ("layout shift") that must not
  * strand the scroll-to-bottom animation partway through. Everything else
- * (state-machine transitions, mark-read gating, anchor priority) is covered
+ * (state-machine transitions, read-cursor gating, anchor priority) is covered
  * by ChatMessageArea.test.tsx in jsdom, where these three cannot be
  * faithfully simulated.
  *
@@ -106,7 +106,7 @@ async function disableNativeScrollAnchoring(page: Page) {
 }
 
 test.describe("chat scroll navigation (#492)", () => {
-  test("opens a long channel at the first unread message, shows the divider, and marks it read only once the real bottom is reached", async ({
+  test("opens a long channel at the first unread message, shows the divider, and reads only what reaches the screen (#1082)", async ({
     page,
   }, testInfo) => {
     const targetId = uniqueId(testInfo, "scroll-unread");
@@ -160,20 +160,26 @@ test.describe("chat scroll navigation (#492)", () => {
       expect(atRealBottom).toBe(false);
     }).toPass({ timeout: 2000 });
 
-    // Opening alone must not have sent the receipt.
-    let receiptSent = false;
-    void readReceipt.then(() => {
-      receiptSent = true;
-    });
-    await page.waitForTimeout(300);
-    expect(receiptSent).toBe(false);
+    // #1082: landing on the boundary reads the rows it put on screen — and only
+    // those. The receipt names one of them, never the end of the conversation.
+    const firstReceipt = await readReceipt;
+    const readThrough = (firstReceipt.postDataJSON() as { last_read_message_id: string })
+      .last_read_message_id;
+    expect(readThrough).toMatch(new RegExp(`^${targetId}-unread-`));
+    expect(readThrough).not.toBe(`${targetId}-unread-29`);
+    await expect(page.locator(`[role="log"] [data-message-id="${readThrough}"]`)).toBeInViewport();
 
-    // Scroll the real container to its real bottom.
+    // Scrolling to the end reads the rest.
+    const lastReceipt = page.waitForRequest(
+      (request) =>
+        request.url().endsWith(`/api/chat/channels/${targetId}/read`) &&
+        (request.postDataJSON() as { last_read_message_id?: string })?.last_read_message_id ===
+          `${targetId}-unread-29`,
+    );
     await page.locator('[role="log"]').evaluate((el) => {
       el.scrollTop = el.scrollHeight;
     });
-
-    await readReceipt;
+    await lastReceipt;
   });
 
   test("go-to-bottom reaches the true tail even when content grows during the animation", async ({
@@ -788,8 +794,15 @@ test.describe("the contextual scroll control (#880)", () => {
         el.scrollTop = 0;
       });
       await settledTimeline(page);
-      const toBoundary = page.getByRole("button", { name: "Começar pelas 30 novas mensagens" });
+      // #1082: the count is what is still unread — the rows the boundary put on
+      // screen have been read — not a number frozen at opening.
+      const toBoundary = page.getByRole("button", { name: /^Começar pelas \d+ novas mensagens$/ });
       await expect(toBoundary).toBeVisible();
+      const remaining = Number(
+        /\d+/.exec((await toBoundary.getAttribute("aria-label")) ?? "")?.[0],
+      );
+      expect(remaining).toBeGreaterThan(0);
+      expect(remaining).toBeLessThan(30);
 
       // A message arrives while they read: the viewport must not move, and the
       // count is unread — not "messages below the fold".
@@ -804,13 +817,14 @@ test.describe("the contextual scroll control (#880)", () => {
           created_at: "2026-07-15T12:00:00.000Z",
         }),
       });
-      await expect(
-        page.getByRole("button", { name: "Começar pelas 31 novas mensagens" }),
-      ).toBeVisible();
+      const withArrival = page.getByRole("button", {
+        name: `Começar pelas ${remaining + 1} novas mensagens`,
+      });
+      await expect(withArrival).toBeVisible();
       expect(await list.evaluate((el) => Math.round(el.scrollTop))).toBe(0);
 
       // The first press lands on the boundary, not on the end.
-      await page.getByRole("button", { name: "Começar pelas 31 novas mensagens" }).click();
+      await withArrival.click();
       await expect(separator).toBeInViewport();
       await expect
         .poll(() => list.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight))
@@ -897,7 +911,8 @@ test.describe("the contextual scroll control on a small viewport (#880)", () => 
       el.scrollTop = 0;
     });
     await settledTimeline(page);
-    const control = page.getByRole("button", { name: "Começar pelas 20 novas mensagens" });
+    // #1082: counting what is still unread after the boundary's rows were read.
+    const control = page.getByRole("button", { name: /^Começar pelas \d+ novas mensagens$/ });
     await expect(control).toBeVisible();
 
     // Above the composer, and a target a thumb can hit.

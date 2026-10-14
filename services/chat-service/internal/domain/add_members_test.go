@@ -7,32 +7,8 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
-func TestCanAddChannelMembers(t *testing.T) {
-	tests := map[string]struct {
-		member *domain.WorkspaceMember
-		want   bool
-	}{
-		"active owner":     {&domain.WorkspaceMember{Role: domain.WorkspaceRoleOwner, Status: domain.MemberStatusActive}, true},
-		"active admin":     {&domain.WorkspaceMember{Role: domain.WorkspaceRoleAdmin, Status: domain.MemberStatusActive}, true},
-		"active moderator": {&domain.WorkspaceMember{Role: domain.WorkspaceRoleModerator, Status: domain.MemberStatusActive}, true},
-		"active member":    {&domain.WorkspaceMember{Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusActive}, true},
-		"active guest":     {&domain.WorkspaceMember{Role: domain.WorkspaceRoleGuest, Status: domain.MemberStatusActive}, false},
-		"suspended member": {&domain.WorkspaceMember{Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusSuspended}, false},
-		"left owner":       {&domain.WorkspaceMember{Role: domain.WorkspaceRoleOwner, Status: domain.MemberStatusLeft}, false},
-		"unknown role":     {&domain.WorkspaceMember{Role: domain.WorkspaceRole("wizard"), Status: domain.MemberStatusActive}, false},
-		"no membership":    {nil, false},
-	}
-	for name, test := range tests {
-		t.Run(name, func(t *testing.T) {
-			if got := domain.CanAddChannelMembers(test.member); got != test.want {
-				t.Fatalf("CanAddChannelMembers = %v, want %v", got, test.want)
-			}
-		})
-	}
-}
-
-// Issue #705 deliberately leaves this administrative/removal capability
-// unchanged while addition moves to CanAddChannelMembers.
+// CanManageChannelMembers is the administrative removal/roster seam. It must
+// remain narrow even though adding now follows channel access.
 func TestCanManageChannelMembers(t *testing.T) {
 	tests := map[string]struct {
 		member *domain.WorkspaceMember
@@ -73,6 +49,8 @@ func TestCanManageChannelMembers(t *testing.T) {
 	}
 }
 
+// The predicate delegates to the workspace moderation capability rather than
+// restating its role list.
 func TestCanManageChannelMembersMatchesWorkspaceModeration(t *testing.T) {
 	roles := []domain.WorkspaceRole{
 		domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin, domain.WorkspaceRoleModerator,
@@ -88,6 +66,56 @@ func TestCanManageChannelMembersMatchesWorkspaceModeration(t *testing.T) {
 				t.Fatalf("divergence for role=%s status=%s", role, status)
 			}
 		}
+	}
+}
+
+func TestCanAddChannelMembersFollowsChannelAccessWithoutGrantingManagement(t *testing.T) {
+	public := domain.Channel{
+		ID: "ch-public", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive,
+	}
+	private := domain.Channel{
+		ID: "ch-private", WorkspaceID: "ws-1", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive,
+	}
+	member := &domain.WorkspaceMember{
+		WorkspaceID: "ws-1", UserID: "user-1", Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusActive,
+	}
+	guest := &domain.WorkspaceMember{
+		WorkspaceID: "ws-1", UserID: "guest-1", Role: domain.WorkspaceRoleGuest, Status: domain.MemberStatusActive,
+	}
+
+	tests := []struct {
+		name string
+		wm   *domain.WorkspaceMember
+		cm   *domain.ChannelMember
+		ch   domain.Channel
+		want bool
+	}{
+		{name: "member reaches public channel", wm: member, ch: public, want: true},
+		{name: "member needs private membership", wm: member, ch: private, want: false},
+		{
+			name: "member with private access", wm: member,
+			cm: &domain.ChannelMember{ChannelID: private.ID, UserID: member.UserID}, ch: private, want: true,
+		},
+		{name: "guest needs explicit public membership", wm: guest, ch: public, want: false},
+		{
+			name: "guest with explicit public access", wm: guest,
+			cm: &domain.ChannelMember{ChannelID: public.ID, UserID: guest.UserID}, ch: public, want: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := domain.CanAddChannelMembers(test.wm, test.cm, test.ch); got != test.want {
+				t.Fatalf("CanAddChannelMembers = %v, want %v", got, test.want)
+			}
+		})
+	}
+
+	if domain.CanManageChannelMembers(member) {
+		t.Fatal("add access granted channel-management authority to an ordinary member")
+	}
+	if domain.CanManageWorkspace(member) || domain.CanRenameChannel(member, public) {
+		t.Fatal("add access granted workspace or rename authority to an ordinary member")
 	}
 }
 

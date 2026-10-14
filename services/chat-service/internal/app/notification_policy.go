@@ -120,6 +120,7 @@ func realtimeContext(
 			Status:            recipient.status,
 			Muted:             recipient.muted,
 			ConversationLevel: recipient.level,
+			DoNotDisturb:      recipient.dnd,
 		},
 	}
 }
@@ -140,6 +141,8 @@ type recipientFacts struct {
 	// status is the engine's own answer to "were these readable at all". The
 	// zero value is resolved, so only a caller whose read failed says otherwise.
 	status notificationpolicy.PreferenceStatus
+	// dnd is this recipient's Do Not Disturb (issue #798).
+	dnd bool
 }
 
 // conversationKindFor reports where the event happened. A group reads as
@@ -226,6 +229,15 @@ func deniedReasons(decision notificationpolicy.Decision) []string {
 // calls.
 type recipientPolicy struct {
 	prefs storage.NotificationPrefStore
+	// dnd resolves who is in Do Not Disturb (issue #798). Optional: without
+	// it nobody is.
+	dnd doNotDisturbLookup
+}
+
+// doNotDisturbLookup is the one presence fact the notification pipeline
+// consumes. One statement for a whole subscriber list.
+type doNotDisturbLookup interface {
+	DoNotDisturbUsers(ctx context.Context, workspaceID string, userIDs []string) (map[string]bool, error)
 }
 
 // RecipientPreferences reports what each of the given recipients asked for
@@ -251,7 +263,11 @@ func (p recipientPolicy) RecipientPreferences(
 	if err != nil {
 		return nil, err
 	}
-	preferences := make(map[string]ws.RecipientPreference, len(stored))
+	dnd, err := p.doNotDisturb(ctx, workspaceID, userIDs)
+	if err != nil {
+		return nil, err
+	}
+	preferences := make(map[string]ws.RecipientPreference, len(stored)+len(dnd))
 	for _, pref := range stored {
 		switch {
 		case pref.Muted:
@@ -265,7 +281,24 @@ func (p recipientPolicy) RecipientPreferences(
 			continue
 		}
 	}
+	// Do Not Disturb silences every alert, so it replaces whatever the
+	// conversation preference would have said.
+	for userID := range dnd {
+		preferences[userID] = ws.RecipientPreferenceDoNotDisturb
+	}
 	return preferences, nil
+}
+
+// doNotDisturb is the subset of recipients in Do Not Disturb. Its failure is
+// the broadcast's failure: the fan-out then decides fail-closed for everybody,
+// which is the same answer an unreadable mute gets.
+func (p recipientPolicy) doNotDisturb(
+	ctx context.Context, workspaceID string, userIDs []string,
+) (map[string]bool, error) {
+	if p.dnd == nil {
+		return nil, nil
+	}
+	return p.dnd.DoNotDisturbUsers(ctx, workspaceID, userIDs)
 }
 
 // PolicyFor is the central decision for one recipient, from the same engine and
@@ -295,6 +328,8 @@ func recipientFactsFrom(recipientID string, preference ws.RecipientPreference) r
 		facts.level = notificationpolicy.ConversationLevelMentionsReplies
 	case ws.RecipientPreferenceUnavailable:
 		facts.status = notificationpolicy.PreferenceStatusUnavailable
+	case ws.RecipientPreferenceDoNotDisturb:
+		facts.dnd = true
 	case ws.RecipientPreferenceNone:
 	}
 	return facts
@@ -349,10 +384,16 @@ func wsPayloadToDomainMessage(payload ws.MessagePayload) domain.Message {
 // decision to everyone — the behaviour of a deployment with no database, whose
 // message routes answer 503 long before this matters.
 func withRecipientPolicyOption(
-	options []ws.HubOption, prefs storage.NotificationPrefStore,
+	options []ws.HubOption, prefs storage.NotificationPrefStore, dnd *storage.PGXPresenceStore,
 ) []ws.HubOption {
 	if prefs == nil {
 		return options
 	}
-	return append(options, ws.WithRecipientPolicy(recipientPolicy{prefs: prefs}))
+	policy := recipientPolicy{prefs: prefs}
+	// Checked on the concrete pointer: a nil store in the interface would be a
+	// non-nil lookup that panics on first use.
+	if dnd != nil {
+		policy.dnd = dnd
+	}
+	return append(options, ws.WithRecipientPolicy(policy))
 }

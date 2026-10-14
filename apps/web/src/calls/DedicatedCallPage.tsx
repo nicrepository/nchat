@@ -389,6 +389,7 @@ export default function DedicatedCallPage() {
         />
       )}
       <DedicatedCallStage
+        workspaceId={directory.workspaceId}
         title={title}
         resourceCall={resolved.target_type !== "user"}
         status={

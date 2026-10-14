@@ -1152,7 +1152,7 @@ func TestPGXChannelStore_ArchiveChannel_RollsBackWhenEventInsertFails(t *testing
 // authorizedContextArgs matches the eight placeholders of the authorized-context
 // INSERT; the individual values are asserted where they matter.
 func authorizedContextArgs() []any {
-	args := make([]any, 8)
+	args := make([]any, 9)
 	for i := range args {
 		args[i] = pgxmock.AnyArg()
 	}
@@ -1177,7 +1177,7 @@ func TestPGXChannelStore_CreateChannelForActiveMember_PublicSeedsWorkspaceMember
 	now := time.Now()
 	mock.ExpectBegin()
 	mock.ExpectQuery(`WITH authorized_context`).
-		WithArgs("ws-1", pgxmock.AnyArg(), "infra", "Infra", "public", false, 0, "user-1").
+		WithArgs("ws-1", pgxmock.AnyArg(), "infra", "Infra", "public", false, 0, "user-1", pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows(channelCols()).
 			AddRow("ch-1", "ws-1", "", "infra", "Infra", "public", "active", false, 0, "user-1", now, now))
 	expectConversationCreatedEvent(mock, "ch-1", "")
@@ -1193,7 +1193,7 @@ func TestPGXChannelStore_CreateChannelForActiveMember_PublicSeedsWorkspaceMember
 	if err != nil {
 		t.Fatalf("CreateChannelForActiveMember: %v", err)
 	}
-	if ch.ID != "ch-1" || ch.CreatedBy != "user-1" {
+	if ch.Channel.ID != "ch-1" || ch.Channel.CreatedBy != "user-1" {
 		t.Fatalf("unexpected channel: %+v", ch)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -1357,7 +1357,7 @@ func TestPGXChannelStore_CreateChannelForActiveMember_PublicPopulationFailureRol
 	now := time.Now()
 	mock.ExpectBegin()
 	mock.ExpectQuery(`WITH authorized_context`).
-		WithArgs("ws-1", pgxmock.AnyArg(), "infra", "Infra", "public", false, 0, "user-1").
+		WithArgs("ws-1", pgxmock.AnyArg(), "infra", "Infra", "public", false, 0, "user-1", pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows(channelCols()).
 			AddRow("ch-1", "ws-1", "", "infra", "Infra", "public", "active", false, 0, "user-1", now, now))
 	expectConversationCreatedEvent(mock, "ch-1", "")

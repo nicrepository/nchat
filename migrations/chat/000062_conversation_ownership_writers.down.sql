@@ -1,0 +1,12 @@
+BEGIN;
+DROP TRIGGER IF EXISTS workspace_ownership_resource ON chat.workspaces;
+DROP TRIGGER IF EXISTS channel_ownership_resource ON chat.channels;
+DROP TRIGGER IF EXISTS dm_ownership_resource ON chat.dm_conversations;
+DROP TRIGGER IF EXISTS channel_ownership_bootstrap ON chat.channel_members;
+DROP TRIGGER IF EXISTS dm_ownership_bootstrap ON chat.dm_members;
+DROP TRIGGER IF EXISTS channel_ownership_sync ON chat.channel_members;
+DROP TRIGGER IF EXISTS dm_ownership_sync ON chat.dm_members;
+DROP FUNCTION IF EXISTS chat.check_ownership_resource();
+DROP FUNCTION IF EXISTS chat.bootstrap_ownership_membership();
+DROP FUNCTION IF EXISTS chat.sync_ownership_membership();
+COMMIT;

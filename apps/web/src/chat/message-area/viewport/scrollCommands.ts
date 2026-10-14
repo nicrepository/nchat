@@ -107,7 +107,7 @@ export interface ViewportAnchorPoint {
  */
 export function computeTopmostVisible(
   container: HTMLDivElement,
-  refs: Map<string, HTMLDivElement>,
+  refs: Map<string, HTMLElement>,
 ): ViewportAnchorPoint | null {
   const containerTop = container.getBoundingClientRect().top;
   const viewportPx = container.clientHeight;

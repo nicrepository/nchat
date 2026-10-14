@@ -16,6 +16,7 @@
     "typecheck": "tsc -b"
   },
   "dependencies": {
+    "@blobatar/react": "^2.7.0",
     "@tanstack/react-virtual": "^3.14.11",
     "@tiptap/core": "^2.14.0",
     "@tiptap/extension-bold": "^2.14.0",
@@ -32,6 +33,7 @@
     "@tiptap/extension-paragraph": "^2.14.0",
     "@tiptap/extension-text": "^2.14.0",
     "@tiptap/react": "^2.14.0",
+    "blobatar": "^2.7.0",
     "livekit-client": "2.20.1",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",

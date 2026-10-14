@@ -18,6 +18,12 @@ func dmConversationCols() []string {
 	return []string{"id", "workspace_id", "type", "title", "status", "created_by", "created_at", "updated_at"}
 }
 
+// groupConversationCols is a group insert's RETURNING: the shared columns plus
+// the identity emoji (issue #1026), empty for Automático.
+func groupConversationCols() []string {
+	return append(dmConversationCols(), "avatar_emoji")
+}
+
 // dmMemberUpsertRows is what the participant upsert returns: how many of the
 // requested users were eligible, and which of them the statement actually made
 // active. The two are separate because they answer different questions — an
@@ -179,9 +185,9 @@ func TestPGXDMStore_CreateGroupConversation_CommitsConversationAndMembers(t *tes
 	now := time.Now()
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO chat\.dm_conversations`).
-		WithArgs("ws-1", pgxmock.AnyArg(), "user-1").
-		WillReturnRows(pgxmock.NewRows(dmConversationCols()).
-			AddRow("dm-group", "ws-1", "group", "Project", "active", "user-1", now, now))
+		WithArgs("ws-1", pgxmock.AnyArg(), "user-1", "").
+		WillReturnRows(pgxmock.NewRows(groupConversationCols()).
+			AddRow("dm-group", "ws-1", "group", "Project", "active", "user-1", now, now, ""))
 	expectConversationCreatedEvent(mock, "", "dm-group")
 	mock.ExpectQuery(`(?s)unnest\(\$3::uuid\[\]\).*auth\.users u.*u\.status = 'active' AND u\.deleted_at IS NULL.*INSERT INTO chat\.dm_members`).
 		WithArgs("dm-group", "ws-1", []string{"user-1", "user-2", "user-3"}).
@@ -216,9 +222,9 @@ func TestPGXDMStore_CreateGroupConversation_RollsBackWhenMemberInsertFails(t *te
 	now := time.Now()
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO chat\.dm_conversations`).
-		WithArgs("ws-1", pgxmock.AnyArg(), "user-1").
-		WillReturnRows(pgxmock.NewRows(dmConversationCols()).
-			AddRow("dm-group", "ws-1", "group", "", "active", "user-1", now, now))
+		WithArgs("ws-1", pgxmock.AnyArg(), "user-1", "").
+		WillReturnRows(pgxmock.NewRows(groupConversationCols()).
+			AddRow("dm-group", "ws-1", "group", "", "active", "user-1", now, now, ""))
 	expectConversationCreatedEvent(mock, "", "dm-group")
 	mock.ExpectQuery(`INSERT INTO chat\.dm_members`).
 		WithArgs("dm-group", "ws-1", []string{"user-1", "user-2", "user-3"}).
@@ -249,9 +255,9 @@ func TestPGXDMStore_CreateGroupConversation_RollsBackWhenAParticipantIsNotEligib
 	now := time.Now()
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO chat\.dm_conversations`).
-		WithArgs("ws-1", pgxmock.AnyArg(), "user-1").
-		WillReturnRows(pgxmock.NewRows(dmConversationCols()).
-			AddRow("dm-group", "ws-1", "group", "", "active", "user-1", now, now))
+		WithArgs("ws-1", pgxmock.AnyArg(), "user-1", "").
+		WillReturnRows(pgxmock.NewRows(groupConversationCols()).
+			AddRow("dm-group", "ws-1", "group", "", "active", "user-1", now, now, ""))
 	expectConversationCreatedEvent(mock, "", "dm-group")
 	// Two of the three requested participants were eligible at write time: the
 	// count mismatch alone must abort the whole group, without the store having to
@@ -286,13 +292,13 @@ func TestPGXDMStore_CreateGroupConversation_PropagatesTransactionFailures(t *tes
 		}},
 		{name: "insert", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
-			mock.ExpectQuery(`INSERT INTO chat\.dm_conversations`).WithArgs("ws-1", pgxmock.AnyArg(), "user-1").WillReturnError(errors.New("insert failed"))
+			mock.ExpectQuery(`INSERT INTO chat\.dm_conversations`).WithArgs("ws-1", pgxmock.AnyArg(), "user-1", "").WillReturnError(errors.New("insert failed"))
 			mock.ExpectRollback()
 		}},
 		{name: "commit", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
-			mock.ExpectQuery(`INSERT INTO chat\.dm_conversations`).WithArgs("ws-1", pgxmock.AnyArg(), "user-1").
-				WillReturnRows(pgxmock.NewRows(dmConversationCols()).AddRow("dm-1", "ws-1", "group", "", "active", "user-1", now, now))
+			mock.ExpectQuery(`INSERT INTO chat\.dm_conversations`).WithArgs("ws-1", pgxmock.AnyArg(), "user-1", "").
+				WillReturnRows(pgxmock.NewRows(groupConversationCols()).AddRow("dm-1", "ws-1", "group", "", "active", "user-1", now, now, ""))
 			expectConversationCreatedEvent(mock, "", "dm-1")
 			mock.ExpectQuery(`INSERT INTO chat\.dm_members`).WithArgs("dm-1", "ws-1", []string{"user-1"}).WillReturnRows(dmMemberUpsertRows(1))
 			mock.ExpectCommit().WillReturnError(errors.New("commit failed"))
@@ -430,7 +436,7 @@ func TestPGXDMStore_GetVisibleConversationByID_SuccessAndDatabaseError(t *testin
 // ── ListVisibleConversationsWithParticipantIDs tests ──────────────────────────
 
 func dmWithParticipantCols() []string {
-	return []string{"id", "workspace_id", "type", "title", "status", "created_by", "created_at", "updated_at", "participant_ids", "counterpart_user_id", "counterpart_display_name", "counterpart_avatar_url", "last_message_at"}
+	return []string{"id", "workspace_id", "type", "title", "status", "created_by", "created_at", "updated_at", "avatar_emoji", "participant_ids", "counterpart_user_id", "counterpart_display_name", "counterpart_avatar_url", "last_message_at"}
 }
 
 func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_ReturnsMemberOnly(t *testing.T) {
@@ -446,7 +452,7 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_ReturnsMemberOnly
 	mock.ExpectQuery(`(?s)counterpart_display_name.*counterpart_avatar_url.*FROM chat\.dm_conversations dc.*JOIN chat\.workspaces w.*JOIN chat\.workspace_members wm.*wm\.user_id = \$2.*JOIN chat\.dm_members dm.*dm\.user_id = \$2`).
 		WithArgs("ws-1", "user-1").
 		WillReturnRows(pgxmock.NewRows(dmWithParticipantCols()).
-			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", now, now, []string{"user-1", "user-2"}, "user-2", "Juliane Lino", "/media/avatars/juliane.png", &now))
+			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", now, now, "", []string{"user-1", "user-2"}, "user-2", "Juliane Lino", "/media/avatars/juliane.png", &now))
 
 	store := storage.NewPGXDMStore(mock)
 	convs, err := store.ListVisibleConversationsWithParticipantIDs(context.Background(), "ws-1", "user-1")
@@ -496,7 +502,7 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_SingleQueryForMan
 	for i, name := range want {
 		id := fmt.Sprintf("dm-%d", i)
 		peer := fmt.Sprintf("user-%d", i+2)
-		rows.AddRow(id, "ws-1", "direct", "", "active", "user-1", now, now, []string{"user-1", peer}, peer, name, "", nil)
+		rows.AddRow(id, "ws-1", "direct", "", "active", "user-1", now, now, "", []string{"user-1", peer}, peer, name, "", nil)
 	}
 	// The ORDER BY is asserted here so that adding counterpart columns can never
 	// silently reorder the sidebar.
@@ -535,7 +541,7 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_GroupHasNoCounter
 	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*LEFT JOIN LATERAL.*dc\.type = 'direct'`).
 		WithArgs("ws-1", "user-1").
 		WillReturnRows(pgxmock.NewRows(dmWithParticipantCols()).
-			AddRow("dm-grp", "ws-1", "group", "Equipe Infra", "active", "user-1", now, now, []string{"user-1", "user-2", "user-3"}, "", "", "", nil))
+			AddRow("dm-grp", "ws-1", "group", "Equipe Infra", "active", "user-1", now, now, "", []string{"user-1", "user-2", "user-3"}, "", "", "", nil))
 
 	convs, err := storage.NewPGXDMStore(mock).ListVisibleConversationsWithParticipantIDs(context.Background(), "ws-1", "user-1")
 	if err != nil {
@@ -613,8 +619,8 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_PropagatesRowFail
 	}{
 		{name: "scan", rows: pgxmock.NewRows([]string{"id"}).AddRow("dm-1")},
 		{name: "rows", rows: pgxmock.NewRows(dmWithParticipantCols()).
-			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), []string{"user-1", "user-2"}, "user-2", "Ana", "", nil).
-			AddRow("dm-2", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), []string{"user-1", "user-3"}, "user-3", "Bruno", "", nil).
+			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), "", []string{"user-1", "user-2"}, "user-2", "Ana", "", nil).
+			AddRow("dm-2", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), "", []string{"user-1", "user-3"}, "user-3", "Bruno", "", nil).
 			RowError(1, errors.New("rows failed"))},
 	} {
 		t.Run(test.name, func(t *testing.T) {

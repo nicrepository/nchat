@@ -281,12 +281,13 @@ Ordem declarada das regras:
 | 3   | evento/contexto       | tipo de evento silencioso (reacao)      | `silent_event_type`                  |
 | 4   | evento/contexto       | conversa aberta e visivel em foreground | `conversation_open`                  |
 | 5   | preferencia pessoal   | preferencias do destinatario ilegiveis  | `preferences_unavailable`            |
-| 6   | preferencia pessoal   | conversa silenciada                     | `muted`                              |
-| 7   | preferencia pessoal   | nivel da conversa (mensagem comum)      | `conversation_level`                 |
-| 8   | preferencia pessoal   | preferencia global (off / modo de som)  | `user_preference`                    |
-| 9   | disponibilidade       | sem subscription de push utilizavel     | `unsupported_or_unavailable_channel` |
-| 10  | estado do coordenador | evento ja entregue                      | `duplicate`                          |
-| 11  | estado do coordenador | cooldown de burst                       | `burst_cooldown`                     |
+| 6   | preferencia pessoal   | destinatario em Nao perturbe (#798)     | `do_not_disturb`                     |
+| 7   | preferencia pessoal   | conversa silenciada                     | `muted`                              |
+| 8   | preferencia pessoal   | nivel da conversa (mensagem comum)      | `conversation_level`                 |
+| 9   | preferencia pessoal   | preferencia global (off / modo de som)  | `user_preference`                    |
+| 10  | disponibilidade       | sem subscription de push utilizavel     | `unsupported_or_unavailable_channel` |
+| 11  | estado do coordenador | evento ja entregue                      | `duplicate`                          |
+| 12  | estado do coordenador | cooldown de burst                       | `burst_cooldown`                     |
 
 Um `urgent_reminder` (#825) atravessa exatamente essa tabela, em cada ocorrencia.
 Persistir nao e bypass: mute, origem, expediente e disponibilidade de canal
@@ -303,7 +304,7 @@ do expediente **e** em conversa silenciada e registrado como
 
 ### Versao da policy
 
-`notificationpolicy.Version` e **2** desde a #136.
+`notificationpolicy.Version` e **3** desde a #798.
 
 Ela mudou porque o proprio contrato manda mudar quando um mesmo `Context` pode
 produzir resultado diferente: um `Context` com `ConversationLevelMentionsReplies`
@@ -315,6 +316,7 @@ regras o tivessem decidido.
 | ------ | ----- | --------------------------------------- |
 | 1      | #744  | conjunto de regras original             |
 | 2      | #136  | `denyConversationLevel` entrou na lista |
+| 3      | #798  | `denyDoNotDisturb` entrou na lista      |
 
 `preferences_unavailable` (#5) vem antes de `muted` e `user_preference` porque
 substitui as duas: nenhuma delas pode responder por um destinatario cujas
@@ -325,7 +327,22 @@ Falha ao resolver preferencias **nao** bloqueia a mensagem: ela e entregue
 normalmente, apenas as superficies de alerta ficam fail-closed. Ver
 "Preferencia que nao pode ser lida".
 
-`muted` (#6) vem antes de `conversation_level` (#7) porque **mute tem
+`do_not_disturb` (#6) e o estado de presenca que a pessoa escolheu (issue
+#798): `Preferences.DoNotDisturb`, resolvido de `chat.user_presence` com a
+expiracao aplicada pelo relogio do banco, pelos **dois** consumidores — a
+projecao do outbox (uma subquery correlacionada no mesmo statement do lote, sem
+N+1) e o fan-out realtime (uma leitura em lote por broadcast, junto com as
+preferencias de conversa). Ele tira **todos** os canais de alerta, o toast
+incluido, e nada mais: a mensagem e persistida, entregue em tempo real,
+contada como nao lida, e a linha do outbox (Central de Notificacoes) continua
+sendo escrita. Prioridade nao fura Nao perturbe nesta versao: a lista de
+excecoes (pessoas, grupos, urgencia) e uma policy futura, e inventa-la aqui
+seria decidir por ela. Vem antes de `muted` porque e uma escolha sobre todas as
+conversas; um evento silenciado **e** em Nao perturbe e registrado como
+`do_not_disturb`. Uma leitura de Nao perturbe que falha e falha do broadcast —
+o fan-out decide fail-closed para todos, como ja faz para um mute ilegivel.
+
+`muted` (#7) vem antes de `conversation_level` (#8) porque **mute tem
 precedencia sobre nivel**: um evento silenciado **e** fora do nivel e registrado
 como `muted`, que e a decisao que a pessoa tomou sobre a conversa inteira. O
 nivel tem reason proprio e nao reusa `user_preference`, que e a preferencia
@@ -732,7 +749,7 @@ viaja como dado que o servidor derivou, nao como regra que o cliente reexecuta:
 
 ```json
 "notification_policy": {
-  "policy_version": 2,
+  "policy_version": 3,
   "in_app": "allow",
   "sound": "allow",
   "web_push": "deny",

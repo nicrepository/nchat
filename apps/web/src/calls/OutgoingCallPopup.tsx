@@ -1,9 +1,10 @@
-import { initialsFrom } from "../chat/messageDisplay";
-import { PersonAvatarImage } from "../chat/PersonAvatarImage";
+import { UserAvatar } from "../chat/UserAvatar";
 import "./CallPresentation.css";
 
 interface OutgoingCallPopupProps {
   name: string;
+  userId?: string;
+  workspaceId?: string;
   avatarUrl?: string;
   callType: "audio" | "video";
   /** True while this popup's own cancel() is in flight — never a second lifecycle. */
@@ -20,6 +21,8 @@ interface OutgoingCallPopupProps {
  */
 export default function OutgoingCallPopup({
   name,
+  userId = "",
+  workspaceId = "",
   avatarUrl,
   callType,
   cancelling = false,
@@ -29,10 +32,12 @@ export default function OutgoingCallPopup({
     <aside className="outgoing-call" role="region" aria-label={`Ligando para ${name}`}>
       <div className="outgoing-call__identity">
         <div className="outgoing-call__avatar" aria-hidden="true">
-          <PersonAvatarImage
-            src={avatarUrl}
-            initials={initialsFrom(name)}
-            imgClassName="outgoing-call__avatar-img"
+          <UserAvatar
+            userId={userId}
+            workspaceId={workspaceId}
+            displayName={name}
+            avatarUrl={avatarUrl}
+            imageClassName="outgoing-call__avatar-img"
           />
         </div>
         <div>

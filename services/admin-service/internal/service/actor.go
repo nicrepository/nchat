@@ -92,6 +92,7 @@ func isDenial(err error) bool {
 	return errors.Is(err, domain.ErrUnauthorized) ||
 		errors.Is(err, domain.ErrForbidden) ||
 		errors.Is(err, domain.ErrConflict) ||
+		errors.Is(err, domain.ErrConversationOwnershipConflict) ||
 		errors.Is(err, domain.ErrInvalidInput) ||
 		errors.Is(err, domain.ErrNotFound)
 }

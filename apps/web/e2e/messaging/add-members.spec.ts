@@ -29,7 +29,7 @@ test.describe("adicionar membros pelo painel de detalhes", () => {
   function scenarioWith(
     testInfo: Parameters<Parameters<typeof test>[1]>[1],
     label: string,
-    options: { canManage: boolean; type?: "public" | "private" },
+    options: { canAdd: boolean; type?: "public" | "private" },
   ) {
     const targetId = uniqueId(testInfo, label);
     const scenario = createScenario({
@@ -56,7 +56,9 @@ test.describe("adicionar membros pelo painel de detalhes", () => {
             },
           ],
           8,
-          options.canManage,
+          false,
+          false,
+          options.canAdd,
         ),
       );
     }
@@ -67,7 +69,7 @@ test.describe("adicionar membros pelo painel de detalhes", () => {
     page,
   }, testInfo) => {
     const { scenario, targetId } = scenarioWith(testInfo, "add-members-public", {
-      canManage: true,
+      canAdd: true,
       type: "public",
     });
     await installMessagingMocks(page, scenario);
@@ -121,7 +123,7 @@ test.describe("adicionar membros pelo painel de detalhes", () => {
     page,
   }, testInfo) => {
     const { scenario, targetId } = scenarioWith(testInfo, "add-members-realtime", {
-      canManage: true,
+      canAdd: true,
       type: "public",
     });
     await installMessagingMocks(page, scenario);
@@ -169,7 +171,7 @@ test.describe("adicionar membros pelo painel de detalhes", () => {
 
   test("adiciona um membro a um canal privado", async ({ page }, testInfo) => {
     const { scenario, targetId } = scenarioWith(testInfo, "add-members-private", {
-      canManage: true,
+      canAdd: true,
       type: "private",
     });
     await installMessagingMocks(page, scenario);
@@ -191,7 +193,7 @@ test.describe("adicionar membros pelo painel de detalhes", () => {
 
   test("adiciona várias pessoas de uma vez", async ({ page }, testInfo) => {
     const { scenario, targetId } = scenarioWith(testInfo, "add-members-many", {
-      canManage: true,
+      canAdd: true,
     });
     await installMessagingMocks(page, scenario);
     await page.goto(`/chat/channel/${targetId}`);
@@ -213,7 +215,7 @@ test.describe("adicionar membros pelo painel de detalhes", () => {
   // the server's answer, and a caller without permission must not see it.
   test("não oferece a ação quando o servidor nega a permissão", async ({ page }, testInfo) => {
     const { scenario, targetId } = scenarioWith(testInfo, "add-members-denied", {
-      canManage: false,
+      canAdd: false,
     });
     await installMessagingMocks(page, scenario);
     await page.goto(`/chat/channel/${targetId}`);
@@ -226,7 +228,7 @@ test.describe("adicionar membros pelo painel de detalhes", () => {
 
   test("cancelar fecha o seletor sem chamar a API", async ({ page }, testInfo) => {
     const { scenario, targetId } = scenarioWith(testInfo, "add-members-cancel", {
-      canManage: true,
+      canAdd: true,
     });
     await installMessagingMocks(page, scenario);
     await page.goto(`/chat/channel/${targetId}`);
@@ -246,7 +248,7 @@ test.describe("adicionar membros pelo painel de detalhes", () => {
   test("uma recusa do servidor mantém o seletor aberto e a seleção intacta", async ({
     page,
   }, testInfo) => {
-    const { scenario, targetId } = scenarioWith(testInfo, "add-members-403", { canManage: true });
+    const { scenario, targetId } = scenarioWith(testInfo, "add-members-403", { canAdd: true });
     scenario.addMembersStatus = 403;
     await installMessagingMocks(page, scenario);
     await page.goto(`/chat/channel/${targetId}`);
@@ -271,7 +273,7 @@ test.describe("adicionar membros pelo painel de detalhes", () => {
     page,
   }, testInfo) => {
     const { scenario, targetId } = scenarioWith(testInfo, "add-members-keyboard", {
-      canManage: true,
+      canAdd: true,
     });
     await installMessagingMocks(page, scenario);
     await page.goto(`/chat/channel/${targetId}`);
@@ -299,7 +301,7 @@ test.describe("adicionar membros pelo painel de detalhes", () => {
 
   test("Escape fecha o seletor e devolve o foco sem mutação", async ({ page }, testInfo) => {
     const { scenario, targetId } = scenarioWith(testInfo, "add-members-escape", {
-      canManage: true,
+      canAdd: true,
     });
     await installMessagingMocks(page, scenario);
     await page.goto(`/chat/channel/${targetId}`);
@@ -466,6 +468,8 @@ test.describe("troca de conversa com o seletor aberto", () => {
             },
           ],
           8,
+          false,
+          false,
           true,
         ),
       );
@@ -522,6 +526,8 @@ test.describe("troca de conversa com o seletor aberto", () => {
             },
           ],
           8,
+          false,
+          false,
           true,
         ),
       );
@@ -593,6 +599,8 @@ test.describe("candidatos excluem membros fora da prévia", () => {
             },
           ],
           9,
+          false,
+          false,
           true,
         ),
       );

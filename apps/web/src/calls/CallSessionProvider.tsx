@@ -76,6 +76,7 @@ function decodeRouteSegment(value: string): string | null {
 
 export interface CallDirectory {
   currentUserId: string;
+  workspaceId: string;
   channels: Channel[];
   dms: DMConversation[];
 }
@@ -1735,15 +1736,12 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   // peerId itself (not peer?.userId) so a direct call still gets a stable,
   // real user id even before `directory` has resolved (peer is a directory
   // lookup and can be briefly undefined while directActive already exists).
-  // resourceTarget.id covers the group/channel case. `title` is only ever
-  // the last resort when neither identity is known yet — never the primary
-  // seed, since two different peers can share the same display name.
-  const remoteSeed = peerId || resourceTarget?.id || title;
+  // resourceTarget.id only colors the preserved group/channel emblem.
+  // Missing canonical identity stays neutral; a name is never an avatar seed.
+  const remoteSeed = peerId || resourceTarget?.id || "";
   // Stable seed for the local fallback avatar — the current user's own id.
-  // Falls back to a fixed literal only for the brief window before
-  // `directory` (fetched by the host page) has resolved; never a new
-  // profile fetch just for this.
-  const localSeed = directory?.currentUserId ?? "local";
+  // Remains neutral until the directory has resolved.
+  const localSeed = directory?.currentUserId ?? "";
   const participants = media.participants ?? [];
   const participantCount = Math.max(1, participants.length + 1);
   const activeSpeakerParticipant = participants.find(
@@ -1809,6 +1807,8 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       {!dedicated && directIncoming && (
         <IncomingCallPopup
           name={peer?.displayName ?? "Participante"}
+          userId={peerId}
+          workspaceId={directory?.workspaceId ?? ""}
           avatarUrl={peer?.avatarUrl}
           callType={directIncoming.call_type}
           onAccept={() => {
@@ -1826,6 +1826,8 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       {!dedicated && directOutgoing && (
         <OutgoingCallPopup
           name={peer?.displayName ?? "Participante"}
+          userId={peerId}
+          workspaceId={directory?.workspaceId ?? ""}
           avatarUrl={peer?.avatarUrl}
           callType={directOutgoing.call_type}
           // calls.cancelling (never calls.pending — issue #615 blocker
@@ -1860,12 +1862,14 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
         // nova aba" remain available through FloatingCallWindow at all times.
         <FloatingCallWindow
           title={title}
+          workspaceId={directory?.workspaceId ?? ""}
           status={floatingStatus}
           participantCount={participantCount}
           activeSpeaker={activeSpeaker}
           screenShareLabel={screenShareLabel}
           hasRemoteVideo={media.hasRemoteVideo}
           remoteSeed={remoteSeed}
+          isResourceCall={Boolean(resourceTarget)}
           avatarUrl={peer?.avatarUrl}
           hasLocalVideo={media.hasLocalVideo}
           localSeed={localSeed}

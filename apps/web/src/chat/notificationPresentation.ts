@@ -265,6 +265,7 @@ function toAlert(event: MessageNotificationEvent): InAppAlert {
     messageId: event.eventId,
     targetKind: event.targetKind,
     targetId: event.targetId,
+    senderId: event.senderId,
     senderDisplayName: event.senderDisplayName,
     senderAvatarUrl: event.senderAvatarUrl,
     // Plain text: mention tokens become their label, and the toast renders the

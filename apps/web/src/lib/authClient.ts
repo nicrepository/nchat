@@ -184,7 +184,7 @@ export async function authenticatedFetch<T>(
       const currentAT = getAccessToken();
       if (currentAT === originalAccessToken) {
         // First settler: commit the new access token and record the rotation.
-        setTokens(newTokens.accessToken);
+        setTokens(newTokens.accessToken, "refresh");
         lastAppliedRefreshRotation = {
           fromAccessToken: originalAccessToken ?? "",
           toAccessToken: newTokens.accessToken,

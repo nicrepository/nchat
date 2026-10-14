@@ -520,10 +520,10 @@ func TestMutedUsersReportsNobodyForATargetThatCannotBeMuted(t *testing.T) {
 // left delivering the published decision rather than handed a policy that
 // cannot answer.
 func TestRecipientPolicyOptionIsOmittedWithoutAStore(t *testing.T) {
-	if got := withRecipientPolicyOption(nil, nil); got != nil {
+	if got := withRecipientPolicyOption(nil, nil, nil); got != nil {
 		t.Fatalf("added %d options with no preference store", len(got))
 	}
-	if got := withRecipientPolicyOption(nil, &fakeMutedPrefs{}); len(got) != 1 {
+	if got := withRecipientPolicyOption(nil, &fakeMutedPrefs{}, nil); len(got) != 1 {
 		t.Fatalf("added %d options, want exactly 1", len(got))
 	}
 }

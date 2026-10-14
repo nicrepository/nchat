@@ -195,3 +195,24 @@ func TestChannelService_GetChannelDetails_ReportsTheRemovalCapability(t *testing
 		})
 	}
 }
+
+func TestChannelService_GetChannelDetails_ReportsAddSeparatelyFromAdministration(t *testing.T) {
+	ms := newFakeMemberStore()
+	ms.workspaceMembers[wmKey("ws-1", "user-1")] = domain.WorkspaceMember{
+		WorkspaceID: "ws-1", UserID: "user-1", Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusActive,
+	}
+	svc := service.NewChannelService(activeWorkspaceStore("ws-1"), rosterChannelStore(false), ms)
+
+	details, err := svc.GetChannelDetails(context.Background(), service.ChannelDetailsInput{
+		WorkspaceID: "ws-1", CallerID: "user-1", ChannelID: "ch-1",
+	})
+	if err != nil {
+		t.Fatalf("GetChannelDetails: %v", err)
+	}
+	if !details.CanAddMembers {
+		t.Fatal("CanAddMembers = false for a caller who can read the channel")
+	}
+	if details.CanManageMembers || details.CanRemoveMembers {
+		t.Fatalf("administrative capabilities widened: %+v", details)
+	}
+}

@@ -25,8 +25,8 @@ func (s *integChannelStore) CreateCategory(_ context.Context, _ storage.CreateCa
 func (s *integChannelStore) CreateChannel(_ context.Context, _ storage.CreateChannelInput) (domain.Channel, error) {
 	return domain.Channel{}, nil
 }
-func (s *integChannelStore) CreateChannelForActiveMember(_ context.Context, _ storage.CreateChannelInput) (domain.Channel, error) {
-	return domain.Channel{}, nil
+func (s *integChannelStore) CreateChannelForActiveMember(_ context.Context, _ storage.CreateChannelInput) (storage.CreateChannelResult, error) {
+	return storage.CreateChannelResult{}, nil
 }
 func (s *integChannelStore) GetCategoryByIDInWorkspace(_ context.Context, _, _ string) (domain.ChannelCategory, error) {
 	return domain.ChannelCategory{}, nil
@@ -58,6 +58,10 @@ func (s *integChannelStore) ListVisibleChannelsByUser(_ context.Context, _, _ st
 // exists so integChannelStore still satisfies storage.ChannelStore (issue #527).
 // The two group mutations are unused here for the same reason, and stubbed for
 // the same reason: interface satisfaction, not behaviour (issue #527).
+func (s *integDMStore) SetGroupAvatarEmoji(context.Context, storage.SetGroupAvatarInput) error {
+	return nil
+}
+
 func (s *integDMStore) RenameGroupConversation(context.Context, storage.RenameGroupInput) (storage.RenameGroupResult, error) {
 	return storage.RenameGroupResult{}, nil
 }

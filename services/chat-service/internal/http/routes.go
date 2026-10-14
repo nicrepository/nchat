@@ -38,6 +38,9 @@ const (
 	// caller, while this one names the target in the path and requires
 	// creatorship.
 	RouteDMParticipant = "/api/chat/dm/{conversationID}/participants/{userID}"
+	// Issue #1026 group identity: PUT sets the emoji, DELETE returns the group
+	// to Automático. Groups only, with the rename's authority.
+	RouteDMAvatar = "/api/chat/dm/{conversationID}/avatar"
 	// Issue #527 group rename. Under the DM prefix because a group is a
 	// chat.dm_conversations row; served only for PATCH, and only for a group —
 	// a 1:1 conversation matches nothing in the statement behind it.

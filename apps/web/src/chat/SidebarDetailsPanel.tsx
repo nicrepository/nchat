@@ -9,16 +9,16 @@
  *
  * Deliberately a thin host: it owns no data of its own, calls the same
  * useConversationDetails every other caller does, and renders the same panel
- * component. The one thing it does not carry is the pinned-message selection,
- * which belongs to the conversation you are reading rather than to one you are
- * inspecting from the sidebar.
+ * component. The one thing it does not carry is the pin collection, which is
+ * held for the conversation you are reading rather than for one you are
+ * inspecting from the sidebar — so this panel draws no pin section at all.
  */
 
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
 import type { ConversationRenameAction } from "./conversationRename";
 import { useDirectMessageAccess, type DirectMessageCoordinator } from "./directMessage";
 import { useConversationDetails } from "./useConversationDetails";
-import { useReloadOnRename } from "./useReloadOnRename";
+import { useReloadOnRename, projectedConversationName } from "./useReloadOnRename";
 
 export interface SidebarDetailsTarget {
   /** The panel's own vocabulary: a group and a 1:1 are both DM rows. */
@@ -29,6 +29,7 @@ export interface SidebarDetailsTarget {
 interface SidebarDetailsPanelProps {
   target: SidebarDetailsTarget | null;
   currentUserId: string;
+  workspaceId: string;
   /**
    * Resolved by the shell for *this* target, which may not be the conversation
    * that is open (issue #893). Absent whenever the target is not renameable by
@@ -65,6 +66,7 @@ interface SidebarDetailsPanelProps {
 export default function SidebarDetailsPanel({
   target,
   currentUserId,
+  workspaceId,
   onRename,
   canonicalName,
   coordinator,
@@ -82,6 +84,7 @@ export default function SidebarDetailsPanel({
     canonicalName,
     target !== null,
     state.reload,
+    projectedConversationName(state.details),
   );
   /*
     This panel's own lifetime, as the coordinator sees it (issue #895).
@@ -104,7 +107,7 @@ export default function SidebarDetailsPanel({
       kind={target.kind}
       state={state}
       currentUserId={currentUserId}
-      latestPin={null}
+      workspaceId={workspaceId}
       onRename={onRename}
       openDM={access}
       onClose={onClose}

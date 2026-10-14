@@ -9,6 +9,7 @@
 
 import { authenticatedFetch } from "../lib/authClient";
 import { ApiRequestError } from "../lib/api";
+import { safeAvatarUrl } from "../chat/avatarUrl";
 
 const AUTH_BASE = import.meta.env.VITE_AUTH_API_BASE_URL ?? "/api/auth";
 
@@ -95,27 +96,6 @@ function normalizeDisplayName(raw: unknown): string {
 }
 
 /**
- * Accepts an avatar URL only when it resolves same-origin, mirroring the sidebar
- * normaliser. Belt-and-suspenders: the server already persists only same-origin
- * URLs, but the client must never render a cross-origin image.
- */
-function sameOriginAvatarUrl(raw: unknown): string | undefined {
-  if (typeof raw !== "string" || raw.trim() === "") return undefined;
-  if (typeof window === "undefined") return undefined;
-  const origin = window.location?.origin;
-  if (typeof origin !== "string" || origin === "" || origin === "null") return undefined;
-  try {
-    const parsed = new URL(raw, origin);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
-    if (parsed.origin !== origin) return undefined;
-    if (parsed.username !== "" || parsed.password !== "") return undefined;
-    return raw;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
  * Uploads an avatar image and returns the persisted same-origin URL. Throws an
  * AvatarUploadError with a typed reason on rejection so the UI can show a
  * specific message.
@@ -162,7 +142,7 @@ function selfProfileFromResponse(res: SelfProfileResponse): SelfProfile {
   return {
     id: res.data.id,
     displayName: normalizeDisplayName(res.data.display_name),
-    avatarUrl: sameOriginAvatarUrl(res.data.avatar_url),
+    avatarUrl: safeAvatarUrl(res.data.avatar_url),
     jobTitle: normalizeDisplayName(res.data.job_title),
     bio: normalizeDisplayName(res.data.bio),
     timezone: normalizeDisplayName(res.data.timezone),

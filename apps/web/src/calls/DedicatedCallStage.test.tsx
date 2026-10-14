@@ -16,6 +16,7 @@ const baseControls = {
 
 const baseProps = {
   title: "Equipe Infra",
+  workspaceId: "workspace-1",
   status: "connected" as const,
   participantCount: 3,
   participants: [
@@ -24,7 +25,7 @@ const baseProps = {
       displayName: "Ana Souza",
       hasVideo: false,
       hasAudio: true,
-      avatarUrl: "https://x/a.png",
+      avatarUrl: "/a.png",
     },
     { identity: "user-b", displayName: "Bruno Lima", hasVideo: false, hasAudio: false },
   ],
@@ -42,7 +43,7 @@ const directPeer = {
   identity: "peer-1",
   seed: "peer-1",
   displayName: "Davi Rocha",
-  avatarUrl: "https://x/peer.png",
+  avatarUrl: "/peer.png",
   hasVideo: false,
 };
 
@@ -61,39 +62,35 @@ describe("DedicatedCallStage", () => {
   it("renders a participant's own avatar image when avatarUrl is set", () => {
     const { container } = render(<DedicatedCallStage {...baseProps} />);
     const tiles = container.querySelectorAll(".dedicated-call__tile");
-    expect(tiles[1]!.querySelector("img")).toHaveAttribute("src", "https://x/a.png");
+    expect(tiles[1]!.querySelector("img")).toHaveAttribute("src", "/a.png");
   });
 
-  it("falls back to that participant's own deterministic initials when they have no avatar", () => {
+  it("falls back to that participant's own deterministic Blobatar when they have no avatar", () => {
     const { container } = render(<DedicatedCallStage {...baseProps} />);
     const tiles = container.querySelectorAll(".dedicated-call__tile");
-    expect(tiles[2]!.querySelector("img")).not.toBeInTheDocument();
-    expect(tiles[2]).toHaveTextContent("BL");
+    expect(tiles[2]!.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
   });
 
-  it("uses the passed-in localInitials verbatim, never derived from the (você)-suffixed localDisplayName (issue #612 blocker)", () => {
+  it("does not derive the local generated avatar from the display label", () => {
     const { container } = render(
       <DedicatedCallStage {...baseProps} localDisplayName="Ana (você)" localInitials="A" />,
     );
     const tiles = container.querySelectorAll(".dedicated-call__tile");
     const localAvatar = tiles[0]!.querySelector(".dedicated-call__avatar")!;
-    expect(localAvatar.textContent).toBe("A");
+    expect(localAvatar.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
   });
 
   it("renders the local avatar image when localAvatarUrl is set", () => {
-    const { container } = render(
-      <DedicatedCallStage {...baseProps} localAvatarUrl="https://x/local.png" />,
-    );
+    const { container } = render(<DedicatedCallStage {...baseProps} localAvatarUrl="/local.png" />);
     const tiles = container.querySelectorAll(".dedicated-call__tile");
-    expect(tiles[0]!.querySelector("img")).toHaveAttribute("src", "https://x/local.png");
+    expect(tiles[0]!.querySelector("img")).toHaveAttribute("src", "/local.png");
   });
 
-  it("falls back to deterministic initials, no broken image, when a participant avatar fails to load", () => {
+  it("falls back to deterministic Blobatar when a participant avatar fails to load", () => {
     const { container } = render(<DedicatedCallStage {...baseProps} />);
     const tiles = container.querySelectorAll(".dedicated-call__tile");
     fireEvent.error(tiles[1]!.querySelector("img")!);
-    expect(tiles[1]!.querySelector("img")).not.toBeInTheDocument();
-    expect(tiles[1]).toHaveTextContent("AS");
+    expect(tiles[1]!.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
   });
 
   it("camera-on: renders no avatar fallback for that tile", () => {
@@ -107,7 +104,7 @@ describe("DedicatedCallStage", () => {
             displayName: "Ana Souza",
             hasVideo: true,
             hasAudio: true,
-            avatarUrl: "https://x/a.png",
+            avatarUrl: "/a.png",
           },
         ]}
       />,
@@ -123,14 +120,14 @@ describe("DedicatedCallStage", () => {
         <DedicatedCallStage
           {...baseProps}
           title="Ana Souza"
-          headerAvatar={{ seed: "peer-1", avatarUrl: "https://x/peer.png" }}
+          headerAvatar={{ seed: "peer-1", avatarUrl: "/peer.png" }}
         />,
       );
       expect(container.querySelector(".dedicated-call__header strong")).toHaveTextContent(
         "Ana Souza",
       );
       const headerAvatar = container.querySelector(".dedicated-call__header-avatar")!;
-      expect(headerAvatar.querySelector("img")).toHaveAttribute("src", "https://x/peer.png");
+      expect(headerAvatar.querySelector("img")).toHaveAttribute("src", "/peer.png");
     });
 
     it("falls back to deterministic initials in the header when the peer avatar is missing or broken", () => {
@@ -138,20 +135,22 @@ describe("DedicatedCallStage", () => {
         <DedicatedCallStage {...baseProps} title="Ana Souza" headerAvatar={{ seed: "peer-1" }} />,
       );
       let headerAvatar = container.querySelector(".dedicated-call__header-avatar")!;
-      expect(headerAvatar.querySelector("img")).not.toBeInTheDocument();
-      expect(headerAvatar).toHaveTextContent("AS");
+      expect(headerAvatar.querySelector("img")?.getAttribute("src")).toMatch(
+        /^data:image\/svg\+xml/,
+      );
 
       rerender(
         <DedicatedCallStage
           {...baseProps}
           title="Ana Souza"
-          headerAvatar={{ seed: "peer-1", avatarUrl: "https://x/broken.png" }}
+          headerAvatar={{ seed: "peer-1", avatarUrl: "/broken.png" }}
         />,
       );
       headerAvatar = container.querySelector(".dedicated-call__header-avatar")!;
       fireEvent.error(headerAvatar.querySelector("img")!);
-      expect(headerAvatar.querySelector("img")).not.toBeInTheDocument();
-      expect(headerAvatar).toHaveTextContent("AS");
+      expect(headerAvatar.querySelector("img")?.getAttribute("src")).toMatch(
+        /^data:image\/svg\+xml/,
+      );
     });
 
     it("is decorative (aria-hidden) since the visible title already names the peer", () => {
@@ -159,7 +158,7 @@ describe("DedicatedCallStage", () => {
         <DedicatedCallStage
           {...baseProps}
           title="Ana Souza"
-          headerAvatar={{ seed: "peer-1", avatarUrl: "https://x/peer.png" }}
+          headerAvatar={{ seed: "peer-1", avatarUrl: "/peer.png" }}
         />,
       );
       expect(container.querySelector(".dedicated-call__header-avatar")).toHaveAttribute(
@@ -185,7 +184,7 @@ describe("DedicatedCallStage", () => {
             identity: "peer-1",
             seed: "peer-1",
             displayName: "Ana Souza",
-            avatarUrl: "https://x/peer.png",
+            avatarUrl: "/peer.png",
             hasVideo: false,
           }}
         />,
@@ -193,7 +192,7 @@ describe("DedicatedCallStage", () => {
       const tiles = container.querySelectorAll(".dedicated-call__tile");
       // Local tile is first, remote-direct tile is second.
       expect(tiles[1]).toHaveTextContent("Ana Souza");
-      expect(tiles[1]!.querySelector("img")).toHaveAttribute("src", "https://x/peer.png");
+      expect(tiles[1]!.querySelector("img")).toHaveAttribute("src", "/peer.png");
     });
 
     it("falls back to deterministic initials in the remote tile when the peer avatar is missing or broken", () => {
@@ -209,8 +208,7 @@ describe("DedicatedCallStage", () => {
         />,
       );
       let tile = container.querySelectorAll(".dedicated-call__tile")[1]!;
-      expect(tile.querySelector("img")).not.toBeInTheDocument();
-      expect(tile).toHaveTextContent("AS");
+      expect(tile.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
 
       rerender(
         <DedicatedCallStage
@@ -219,15 +217,14 @@ describe("DedicatedCallStage", () => {
             identity: "peer-1",
             seed: "peer-1",
             displayName: "Ana Souza",
-            avatarUrl: "https://x/broken.png",
+            avatarUrl: "/broken.png",
             hasVideo: false,
           }}
         />,
       );
       tile = container.querySelectorAll(".dedicated-call__tile")[1]!;
       fireEvent.error(tile.querySelector("img")!);
-      expect(tile.querySelector("img")).not.toBeInTheDocument();
-      expect(tile).toHaveTextContent("AS");
+      expect(tile.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
     });
 
     it("is decorative (aria-hidden) since the visible name is adjacent in the same tile", () => {
@@ -238,7 +235,7 @@ describe("DedicatedCallStage", () => {
             identity: "peer-1",
             seed: "peer-1",
             displayName: "Ana Souza",
-            avatarUrl: "https://x/peer.png",
+            avatarUrl: "/peer.png",
             hasVideo: false,
           }}
         />,
@@ -256,7 +253,7 @@ describe("DedicatedCallStage", () => {
             identity: "peer-1",
             seed: "peer-1",
             displayName: "Ana Souza",
-            avatarUrl: "https://x/peer.png",
+            avatarUrl: "/peer.png",
             hasVideo: true,
             bindVideo,
           }}
@@ -299,12 +296,14 @@ describe("DedicatedCallStage", () => {
       const view = render(<DedicatedCallStage {...baseProps} activeSpeakerId="user-b" />);
       let tile = screen.getByText("Bruno Lima").closest("article")!;
       expect(tile).toHaveClass("call-speaker-surface--active");
-      expect(tile).toHaveTextContent("BL");
+      expect(tile.querySelector(".dedicated-call__avatar img")?.getAttribute("src")).toMatch(
+        /^data:image\/svg\+xml/,
+      );
 
       view.rerender(<DedicatedCallStage {...baseProps} activeSpeakerId="user-a" />);
       tile = screen.getByText("Ana Souza").closest("article")!;
       expect(tile).toHaveClass("call-speaker-surface--active");
-      expect(tile.querySelector("img")).toHaveAttribute("src", "https://x/a.png");
+      expect(tile.querySelector("img")).toHaveAttribute("src", "/a.png");
     });
 
     it("highlights the local participant by current-user identity", () => {
@@ -707,7 +706,9 @@ describe("DedicatedCallStage", () => {
 
       const sidebar = screen.getByRole("complementary", { name: "Participantes" });
       const peerTile = within(sidebar).getByText("Davi Rocha").closest("article")!;
-      expect(peerTile).toHaveTextContent("DR");
+      expect(peerTile.querySelector(".dedicated-call__avatar img")?.getAttribute("src")).toMatch(
+        /^data:image\/svg\+xml/,
+      );
       expect(peerTile.querySelector(".dedicated-call__avatar")).toHaveAttribute(
         "aria-hidden",
         "true",

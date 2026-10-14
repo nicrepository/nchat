@@ -1,18 +1,25 @@
-import { type FormEvent, useEffect, useRef, useState } from "react";
+import { type FormEvent, useState } from "react";
 
-import { ApiRequestError } from "../lib/api";
-import { createChannel, createChannelCategory } from "./chatApi";
+import { maxAddMembersPerRequest } from "./addMembersLimits";
+import { searchDMCandidates } from "./chatApi";
 import type { ChannelCategory } from "./chatTypes";
 import {
   MAX_CHANNEL_SLUG_LENGTH,
+  NEW_CATEGORY_OPTION,
   slugifyChannelName,
   validateChannelDisplayName,
   validateChannelForm,
   type ChannelFormType,
 } from "./channelForm";
+import { PrivateChannelMembersField } from "./PrivateChannelMembersField";
+import { useChannelCreation } from "./useChannelCreation";
+import { useMemberPicker } from "./useMemberPicker";
 
 interface ChannelCreationFormProps {
   categories: ChannelCategory[];
+  /** The signed-in creator: shown as a fixed member and kept out of the search. */
+  currentUserId: string;
+  workspaceId: string;
   /** Called with the new channel's ID once the server has created it. */
   onCreated: (channelId: string) => void;
   /**
@@ -23,28 +30,190 @@ interface ChannelCreationFormProps {
   onPendingChange: (pending: boolean) => void;
 }
 
+interface ChannelCategoryFieldProps {
+  categories: ChannelCategory[];
+  selectedCategoryId: string;
+  newCategoryName: string;
+  disabled: boolean;
+  onSelect: (categoryId: string) => void;
+  onNewCategoryNameChange: (name: string) => void;
+}
+
+/** Category picker, plus the name of a new one when that option is chosen. */
+function ChannelCategoryField({
+  categories,
+  selectedCategoryId,
+  newCategoryName,
+  disabled,
+  onSelect,
+  onNewCategoryNameChange,
+}: ChannelCategoryFieldProps) {
+  return (
+    <>
+      <label className="new-dm-dialog__group-name" htmlFor="new-channel-category-select">
+        Categoria
+      </label>
+      <div className="new-dm-dialog__search-field">
+        <select
+          id="new-channel-category-select"
+          value={selectedCategoryId}
+          disabled={disabled}
+          onChange={(event) => onSelect(event.target.value)}
+          style={{
+            width: "100%",
+            background: "transparent",
+            border: "none",
+            outline: "none",
+            color: "inherit",
+            font: "inherit",
+            fontSize: "14px",
+            height: "42px",
+            cursor: "pointer",
+          }}
+        >
+          <option value="">Nenhuma (Geral)</option>
+          {categories
+            .filter((cat) => cat.kind === "category" && cat.id)
+            .map((cat) => (
+              <option key={cat.id} value={cat.id}>
+                {cat.name}
+              </option>
+            ))}
+          <option value={NEW_CATEGORY_OPTION}>+ Criar nova categoria...</option>
+        </select>
+      </div>
+
+      {selectedCategoryId === NEW_CATEGORY_OPTION && (
+        <>
+          <label className="new-dm-dialog__group-name" htmlFor="new-channel-new-category">
+            Nome da nova categoria
+          </label>
+          <div className="new-dm-dialog__search-field">
+            <input
+              id="new-channel-new-category"
+              type="text"
+              autoComplete="off"
+              placeholder="Ex.: Projetos Especiais"
+              value={newCategoryName}
+              disabled={disabled}
+              onChange={(event) => onNewCategoryNameChange(event.target.value)}
+            />
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
+interface ChannelNameFieldsProps {
+  displayName: string;
+  slug: string;
+  nameError: string | null;
+  disabled: boolean;
+  onNameChange: (value: string) => void;
+  onSlugChange: (value: string) => void;
+}
+
+/** The channel's name and its identifier, with the name's inline error. */
+function ChannelNameFields({
+  displayName,
+  slug,
+  nameError,
+  disabled,
+  onNameChange,
+  onSlugChange,
+}: ChannelNameFieldsProps) {
+  return (
+    <>
+      <label htmlFor="new-channel-name">Nome do canal</label>
+      <div className="new-dm-dialog__search-field">
+        {/* No maxLength: the browser counts UTF-16 units, so it would cut a
+          pasted name of emoji at half its real allowance and silently discard
+          what the user meant to keep. The count that decides is the server's,
+          mirrored here in code points. */}
+        <input
+          id="new-channel-name"
+          type="text"
+          autoComplete="off"
+          placeholder="Ex.: Infraestrutura"
+          value={displayName}
+          disabled={disabled}
+          aria-invalid={nameError !== null}
+          aria-describedby={nameError ? "new-channel-name-error" : undefined}
+          onChange={(event) => onNameChange(event.target.value)}
+        />
+      </div>
+      {nameError && (
+        <p
+          id="new-channel-name-error"
+          className="new-dm-dialog__error new-dm-dialog__error--open"
+          role="alert"
+        >
+          {nameError}
+        </p>
+      )}
+
+      <label className="new-dm-dialog__group-name" htmlFor="new-channel-slug">
+        Identificador
+      </label>
+      <div className="new-dm-dialog__search-field">
+        <input
+          id="new-channel-slug"
+          type="text"
+          autoComplete="off"
+          maxLength={MAX_CHANNEL_SLUG_LENGTH}
+          placeholder="infraestrutura"
+          aria-describedby="new-channel-slug-hint"
+          value={slug}
+          disabled={disabled}
+          onChange={(event) => onSlugChange(event.target.value)}
+        />
+      </div>
+      <p id="new-channel-slug-hint" className="new-dm-dialog__footer-hint">
+        Letras minúsculas, números e hifens internos. Aparece como #{slug || "canal"}.
+      </p>
+    </>
+  );
+}
+
+interface ChannelSubmitFooterProps {
+  type: ChannelFormType;
+  inviteeCount: number;
+  pending: boolean;
+  disabled: boolean;
+}
+
 /**
- * Turns a failed creation into something the user can act on.
- *
- * 401 and 403 keep their own wording: being signed out and being refused by the
- * workspace are different problems with different fixes, and collapsing either
- * into "tente novamente" would send the user in circles. Server detail is never
- * echoed — the status alone selects the message.
+ * The summary the user confirms with the submit (issue #1025): who will be able
+ * to see the channel, in the same words the server's decision will bear out.
  */
-function createErrorMessage(error: unknown): string {
-  if (error instanceof ApiRequestError) {
-    if (error.status === 401) return "Sua sessão expirou. Entre novamente para criar canais.";
-    if (error.status === 403) {
-      return "Você não tem permissão para criar canais neste workspace.";
-    }
-    if (error.status === 409) return "Já existe um canal com esse identificador.";
-    if (error.status === 400) return "Revise o nome e o identificador do canal.";
-    if (error.status === 429) {
-      return "Muitas solicitações em sequência. Aguarde um momento e tente novamente.";
-    }
-    if (error.status === 0) return "Sem conexão. Verifique sua rede e tente novamente.";
-  }
-  return "Não foi possível criar o canal. Tente novamente.";
+function channelAccessSummary(type: ChannelFormType, inviteeCount: number): string {
+  if (type === "public") return "Canal público: todo o workspace poderá entrar.";
+  if (inviteeCount === 0) return "Canal privado: somente você terá acesso.";
+  const invitees = inviteeCount === 1 ? "1 convidado" : `${inviteeCount} convidados`;
+  return `Canal privado: somente você e ${invitees} terão acesso.`;
+}
+
+function ChannelSubmitFooter({ type, inviteeCount, pending, disabled }: ChannelSubmitFooterProps) {
+  return (
+    <footer className="new-dm-dialog__footer">
+      <p className="new-dm-dialog__footer-hint" aria-live="polite">
+        {channelAccessSummary(type, inviteeCount)}
+      </p>
+      <button
+        type="submit"
+        className="new-dm-dialog__submit"
+        // The accessible name stays fixed while the visible label switches to
+        // "Criando…", so assistive tech announces the busy state instead of a
+        // control that appears to have been replaced mid-action.
+        aria-label="Criar canal"
+        disabled={disabled}
+        aria-busy={pending}
+      >
+        {pending ? "Criando…" : "Criar canal"}
+      </button>
+    </footer>
+  );
 }
 
 /**
@@ -52,12 +221,29 @@ function createErrorMessage(error: unknown): string {
  * "Nova conversa" dialog (BUG #393). It owns the fields and the one write it
  * can make; the dialog shell around it owns focus, Escape and the backdrop.
  *
+ * The shell keeps it mounted (hidden) while another mode is visited, so the
+ * draft survives a detour (issue #1023). For the same reason it does not grab
+ * focus on mount: focus stays on the mode the user just chose.
+ *
  * Nothing here decides whether the user may create a channel: the endpoint
  * derives the actor, the workspace and the membership from the session on every
  * call, and a denial arrives as a status this form translates.
+ *
+ * A private channel adds a members step (issue #1025). Its selection belongs to
+ * this draft, so Privado → Público → Privado keeps it; Público just does not
+ * send it. The write — with its idempotency and retry rules — is
+ * useChannelCreation's.
+ *
+ * The people search is the workspace one (searchDMCandidates). Its target rule
+ * — active workspace, active membership, active undeleted account, guests
+ * included — is exactly channelmembership.EligibleTargetsCTE's for a channel
+ * that has no members yet, and the channel-scoped search needs a channel that
+ * does not exist. The server re-checks every invitee in the creation itself.
  */
 export default function ChannelCreationForm({
   categories = [],
+  currentUserId,
+  workspaceId,
   onCreated,
   onPendingChange,
 }: ChannelCreationFormProps) {
@@ -70,14 +256,14 @@ export default function ChannelCreationForm({
   // than asking the user to keep it in sync themselves.
   const [slugEdited, setSlugEdited] = useState(false);
   const [type, setType] = useState<ChannelFormType>("public");
-  const [error, setError] = useState("");
-  const [pending, setPending] = useState(false);
-  const nameInputRef = useRef<HTMLInputElement>(null);
-  // State updates are asynchronous, so `pending` cannot stop a second click
-  // fired in the same tick; this ref is what actually makes submission single.
-  const submittingRef = useRef(false);
-  const abortRef = useRef<AbortController>(null);
-  const mountedRef = useRef(true);
+  const creation = useChannelCreation(onCreated, onPendingChange);
+  const { pending, error, setError } = creation;
+  const picker = useMemberPicker({
+    search: searchDMCandidates,
+    excludedUserIds: [currentUserId],
+    maxSelection: maxAddMembersPerRequest,
+  });
+  const inviteeCount = type === "private" ? picker.selected.length : 0;
 
   const effectiveSlug = slugEdited ? slug : slugifyChannelName(displayName);
   const trimmedName = displayName.trim();
@@ -87,20 +273,6 @@ export default function ChannelCreationForm({
   // telling someone their name is empty before they have typed is noise. The
   // field is never truncated, so a pasted name stays intact and editable.
   const nameError = trimmedName === "" ? null : validateChannelDisplayName(trimmedName);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    nameInputRef.current?.focus();
-    return () => {
-      mountedRef.current = false;
-      abortRef.current?.abort();
-    };
-  }, []);
-
-  function markPending(next: boolean) {
-    setPending(next);
-    onPendingChange(next);
-  }
 
   /**
    * The form's only entry point, for both Enter and the submit button.
@@ -112,57 +284,39 @@ export default function ChannelCreationForm({
    */
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    void submit();
+    submit();
+  }
+
+  function validationError(): string | null {
+    const message = validateChannelForm({ displayName, slug: effectiveSlug });
+    if (message) return message;
+    if (selectedCategoryId === NEW_CATEGORY_OPTION && !newCategoryName.trim()) {
+      return "Digite o nome da nova categoria.";
+    }
+    return null;
   }
 
   /**
-   * Creates the channel, at most once per submission.
+   * Creates the channel, at most once per submission (useSingleSubmission).
    *
    * The local validation only spares a round trip; chat-service applies the same
    * rules and the authorization check no matter what is sent. On failure the form
-   * stays put with the fields intact so a retry costs one click, and the mounted
-   * guard keeps a late response from touching state after the dialog unmounts.
+   * stays put with the fields intact so a retry costs one click.
    */
-  async function submit() {
-    if (submittingRef.current) return;
-    const message = validateChannelForm({ displayName, slug: effectiveSlug });
+  function submit() {
+    const message = validationError();
     if (message) {
       setError(message);
       return;
     }
-    if (selectedCategoryId === "__new__" && !newCategoryName.trim()) {
-      setError("Digite o nome da nova categoria.");
-      return;
-    }
-    submittingRef.current = true;
-    markPending(true);
-    setError("");
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    try {
-      let finalCategoryId = selectedCategoryId;
-      if (selectedCategoryId === "__new__") {
-        const newCat = await createChannelCategory(newCategoryName, controller.signal);
-        finalCategoryId = newCat.id || "";
-      }
-
-      const channel = await createChannel(
-        {
-          slug: effectiveSlug,
-          displayName,
-          type,
-          categoryId: finalCategoryId || undefined,
-        },
-        controller.signal,
-      );
-      if (mountedRef.current) onCreated(channel.id);
-    } catch (err) {
-      if (mountedRef.current) setError(createErrorMessage(err));
-    } finally {
-      submittingRef.current = false;
-      if (mountedRef.current) markPending(false);
-    }
+    creation.submit({
+      displayName,
+      slug: effectiveSlug,
+      type,
+      categoryId: selectedCategoryId,
+      newCategoryName,
+      memberIds: picker.selected.map((member) => member.userId),
+    });
   }
 
   return (
@@ -188,7 +342,10 @@ export default function ChannelCreationForm({
               value={value}
               checked={type === value}
               disabled={pending}
-              onChange={() => setType(value)}
+              onChange={() => {
+                setType(value);
+                setError("");
+              }}
             />
             {label}
           </label>
@@ -196,146 +353,59 @@ export default function ChannelCreationForm({
       </fieldset>
 
       <div className="new-dm-dialog__search">
-        <label htmlFor="new-channel-name">Nome do canal</label>
-        <div className="new-dm-dialog__search-field">
-          {/* No maxLength: the browser counts UTF-16 units, so it would cut a
-          pasted name of emoji at half its real allowance and silently discard
-          what the user meant to keep. The count that decides is the server's,
-          mirrored here in code points. */}
-          <input
-            ref={nameInputRef}
-            id="new-channel-name"
-            type="text"
-            autoComplete="off"
-            placeholder="Ex.: Infraestrutura"
-            value={displayName}
-            disabled={pending}
-            aria-invalid={nameError !== null}
-            aria-describedby={nameError ? "new-channel-name-error" : undefined}
-            onChange={(event) => {
-              setDisplayName(event.target.value);
-              setError("");
-            }}
-          />
-        </div>
-        {nameError && (
-          <p
-            id="new-channel-name-error"
-            className="new-dm-dialog__error new-dm-dialog__error--open"
-            role="alert"
-          >
-            {nameError}
-          </p>
-        )}
+        <ChannelNameFields
+          displayName={displayName}
+          slug={effectiveSlug}
+          nameError={nameError}
+          disabled={pending}
+          onNameChange={(value) => {
+            setDisplayName(value);
+            setError("");
+          }}
+          onSlugChange={(value) => {
+            setSlugEdited(true);
+            setSlug(value);
+            setError("");
+          }}
+        />
 
-        <label className="new-dm-dialog__group-name" htmlFor="new-channel-slug">
-          Identificador
-        </label>
-        <div className="new-dm-dialog__search-field">
-          <input
-            id="new-channel-slug"
-            type="text"
-            autoComplete="off"
-            maxLength={MAX_CHANNEL_SLUG_LENGTH}
-            placeholder="infraestrutura"
-            aria-describedby="new-channel-slug-hint"
-            value={effectiveSlug}
-            disabled={pending}
-            onChange={(event) => {
-              setSlugEdited(true);
-              setSlug(event.target.value);
-              setError("");
-            }}
-          />
-        </div>
-        <p id="new-channel-slug-hint" className="new-dm-dialog__footer-hint">
-          Letras minúsculas, números e hifens internos. Aparece como #{effectiveSlug || "canal"}.
-        </p>
-
-        <label className="new-dm-dialog__group-name" htmlFor="new-channel-category-select">
-          Categoria
-        </label>
-        <div className="new-dm-dialog__search-field">
-          <select
-            id="new-channel-category-select"
-            value={selectedCategoryId}
-            disabled={pending}
-            onChange={(event) => {
-              setSelectedCategoryId(event.target.value);
-              setError("");
-            }}
-            style={{
-              width: "100%",
-              background: "transparent",
-              border: "none",
-              outline: "none",
-              color: "inherit",
-              font: "inherit",
-              fontSize: "14px",
-              height: "42px",
-              cursor: "pointer",
-            }}
-          >
-            <option value="">Nenhuma (Geral)</option>
-            {categories
-              .filter((cat) => cat.kind === "category" && cat.id)
-              .map((cat) => (
-                <option key={cat.id} value={cat.id}>
-                  {cat.name}
-                </option>
-              ))}
-            <option value="__new__">+ Criar nova categoria...</option>
-          </select>
-        </div>
-
-        {selectedCategoryId === "__new__" && (
-          <>
-            <label className="new-dm-dialog__group-name" htmlFor="new-channel-new-category">
-              Nome da nova categoria
-            </label>
-            <div className="new-dm-dialog__search-field">
-              <input
-                id="new-channel-new-category"
-                type="text"
-                autoComplete="off"
-                placeholder="Ex.: Projetos Especiais"
-                value={newCategoryName}
-                disabled={pending}
-                onChange={(event) => {
-                  setNewCategoryName(event.target.value);
-                  setError("");
-                }}
-              />
-            </div>
-          </>
-        )}
-
-        {error && (
-          <p className="new-dm-dialog__error new-dm-dialog__error--open" role="alert">
-            {error}
-          </p>
-        )}
+        <ChannelCategoryField
+          categories={categories}
+          selectedCategoryId={selectedCategoryId}
+          newCategoryName={newCategoryName}
+          disabled={pending}
+          onSelect={(value) => {
+            setSelectedCategoryId(value);
+            setError("");
+          }}
+          onNewCategoryNameChange={(value) => {
+            setNewCategoryName(value);
+            setError("");
+          }}
+        />
       </div>
 
-      <footer className="new-dm-dialog__footer">
-        <p className="new-dm-dialog__footer-hint">
-          {type === "public"
-            ? "Todo o workspace poderá entrar."
-            : "Somente convidados verão este canal."}
+      {type === "private" && (
+        <PrivateChannelMembersField
+          picker={picker}
+          workspaceId={workspaceId}
+          disabled={pending}
+          onEdit={() => setError("")}
+        />
+      )}
+
+      {error && (
+        <p className="new-dm-dialog__error new-dm-dialog__error--open" role="alert">
+          {error}
         </p>
-        <button
-          type="submit"
-          className="new-dm-dialog__submit"
-          // The accessible name stays fixed while the visible label switches to
-          // "Criando…", so assistive tech announces the busy state instead of a
-          // control that appears to have been replaced mid-action.
-          aria-label="Criar canal"
-          disabled={pending || trimmedName === "" || nameError !== null}
-          aria-busy={pending}
-        >
-          {pending ? "Criando…" : "Criar canal"}
-        </button>
-      </footer>
+      )}
+
+      <ChannelSubmitFooter
+        type={type}
+        inviteeCount={inviteeCount}
+        pending={pending}
+        disabled={pending || trimmedName === "" || nameError !== null}
+      />
     </form>
   );
 }

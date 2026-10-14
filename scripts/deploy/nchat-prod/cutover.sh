@@ -133,6 +133,9 @@ main() {
     return 0
   fi
   require_smoke_evidence "$target" "$target:$release"
+  # A release from before manual presence is not promoted once it has been
+  # enabled (issue #798); see require_presence_capable_target.
+  require_presence_capable_target "$target"
   confirm "Move production traffic to slot $target"
   # Backends take the new slot before the browser is served the new bundle:
   # a client is compatible with its own release or newer, never with an

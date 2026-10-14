@@ -129,6 +129,7 @@ inventario e do NChat, nao do console.
 | Variavel                                                                                           | Servico dono         | Impacto                                      |
 | -------------------------------------------------------------------------------------------------- | -------------------- | -------------------------------------------- |
 | `CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED`                                                    | chat-service         | #136; gate de rollout do writer granular     |
+| `CHAT_MANUAL_PRESENCE_ENABLED`                                                                     | chat-service         | #798; gate de rollout do status manual       |
 | `CHAT_LINK_SAFETY_ENABLED`                                                                         | chat-service         | RF-21; sem credencial o servico nao sobe     |
 | `CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY`                                                          | chat-service         | Segredo. Provider primario (Google Web Risk) |
 | `CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID`                                                           | chat-service         | Segredo. Provider secundario (fallback)      |

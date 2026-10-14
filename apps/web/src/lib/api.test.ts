@@ -71,6 +71,13 @@ describe("apiFetch", () => {
     });
   });
 
+  it("preserves AbortError when the caller cancels fetch", async () => {
+    const aborted = new DOMException("The operation was aborted", "AbortError");
+    mockFetch.mockRejectedValue(aborted);
+
+    await expect(apiFetch("/test", { method: "GET" })).rejects.toBe(aborted);
+  });
+
   describe("request headers", () => {
     beforeEach(() => {
       mockFetch.mockResolvedValue(new Response(null, { status: 204 }));

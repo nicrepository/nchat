@@ -7,10 +7,12 @@ import {
   GROUP_DM_NAME,
   OTHER_USER_ID,
   OTHER_USER_NAME,
+  attachmentFixtures,
   createScenario,
   groupDetailsFixture,
   installMessagingMocks,
   makeMessage,
+  messageBubble,
   uniqueId,
 } from "../helpers/messagingApi";
 
@@ -522,6 +524,67 @@ test.describe("painel de detalhes do grupo", () => {
     await expect(panel.getByTestId("chat-details-add-members")).toHaveCount(0);
   });
 
+  // ── ISSUE #896: mensagens fixadas do grupo ─────────────────────────────
+  //
+  // O grupo usa os mesmos endpoints de pin de uma DM e a mesma seção do canal;
+  // o que se prova aqui é que a coleção, o deep link e o desafixar operam sobre
+  // a conversa de grupo (rota /chat/dm/...), não sobre um canal.
+  test("lista as mensagens fixadas do grupo, navega pelo deep link e desafixa", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "grupo-fixadas");
+    const messages = Array.from({ length: 6 }, (_, index) =>
+      makeMessage({
+        id: `${targetId}-m${index + 1}`,
+        sender_id: OTHER_USER_ID,
+        sender_display_name: OTHER_USER_NAME,
+        body_text: `Fixada do grupo ${index + 1}`,
+        created_at: new Date(Date.UTC(2026, 6, 15, 9, index)).toISOString(),
+      }),
+    );
+    const scenario = createScenario({
+      kind: "dm",
+      conversationType: "group",
+      targetId,
+      targetName: "Grupo com Fixadas",
+      messages,
+    });
+    scenario.groupDetails.set(
+      targetId,
+      groupDetailsFixture({ id: targetId, name: "Grupo com Fixadas" }, [
+        { user_id: CURRENT_USER_ID, display_name: CURRENT_USER_NAME, presence: "online" },
+      ]),
+    );
+    scenario.pinnedIds.set(`dm:${targetId}`, new Set(messages.map((message) => message.id)));
+
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/dm/${targetId}`);
+    await page.getByRole("button", { name: "Detalhes do grupo", exact: true }).click();
+    const panel = page.getByRole("complementary", { name: "Detalhes do grupo" });
+    const list = panel.getByRole("list", { name: "Mensagens fixadas" });
+
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    await panel.getByRole("button", { name: /Ver todos Mensagens fixadas/ }).click();
+    await expect(list.getByRole("listitem")).toHaveCount(6);
+
+    const third = list.getByRole("listitem").filter({ hasText: "Fixada do grupo 3" });
+    await third.getByRole("button", { name: /^Ir para a mensagem de / }).click();
+    await expect(page).toHaveURL(
+      `/chat/dm/${targetId}?message=${encodeURIComponent(messages[2].id)}`,
+    );
+    await expect(messageBubble(page, messages[2].id)).toBeInViewport();
+
+    await third.getByRole("button", { name: /^Desafixar mensagem de / }).click();
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    await expect(list.getByText("Fixada do grupo 3")).toHaveCount(0);
+    expect(scenario.requests.pins).toEqual([
+      { messageId: messages[2].id, targetId, action: "remove" },
+    ]);
+    await expect(page).toHaveURL(
+      `/chat/dm/${targetId}?message=${encodeURIComponent(messages[2].id)}`,
+    );
+  });
+
   // ── ISSUE #893: renomeação inline do grupo no painel ────────────────────
   //
   // A issue cobre canais E grupos, e um grupo não é um canal: endpoint
@@ -605,5 +668,67 @@ test.describe("painel de detalhes do grupo", () => {
     const panel = page.getByRole("complementary", { name: "Perfil" });
     await expect(panel).toBeVisible();
     await expect(panel.getByRole("button", { name: /Renomear/ })).toHaveCount(0);
+  });
+});
+
+/**
+ * Arquivos recentes do grupo (issue #897): o mesmo comportamento do canal,
+ * sobre o destino de conversa — nunca o de canal —, com a mesma ação para um
+ * arquivo aprovado e nenhuma para um em análise.
+ */
+test.describe("arquivos recentes no painel do grupo", () => {
+  test("pagina pelo destino da conversa, baixa o aprovado e não oferece nada ao em análise", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "grupo-arquivos");
+    const scenario = createScenario({
+      kind: "dm",
+      conversationType: "group",
+      targetId,
+      targetName: "Grupo com Arquivos",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no grupo" })],
+    });
+    scenario.groupDetails.set(
+      targetId,
+      groupDetailsFixture({ id: targetId, name: "Grupo com Arquivos" }, [
+        { user_id: CURRENT_USER_ID, display_name: CURRENT_USER_NAME, presence: "online" },
+        { user_id: OTHER_USER_ID, display_name: OTHER_USER_NAME, presence: "offline" },
+      ]),
+    );
+    const files = attachmentFixtures("gr", 8);
+    files[1] = { ...files[1], filename: "em-analise.png", status: "pending_scan" };
+    scenario.conversationAttachments.set(targetId, files);
+    const listingsOf = () =>
+      scenario.requests.attachmentListings.filter((request) => request.targetId === targetId);
+
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/dm/${targetId}`);
+    await page.getByRole("button", { name: "Detalhes do grupo", exact: true }).click();
+    const panel = page.getByRole("complementary", { name: "Detalhes do grupo" });
+    const list = panel.getByRole("list", { name: "Arquivos recentes" });
+
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    expect(listingsOf()).toEqual([{ targetId, limit: 5, before: null }]);
+
+    // O arquivo em análise aparece com o status em texto e sem controle.
+    await expect(list.getByRole("listitem").nth(1)).toContainText("Em análise");
+    await expect(list.getByRole("listitem").nth(1).getByRole("button")).toHaveCount(0);
+
+    const toggle = panel.getByRole("button", {
+      name: /(Ver todos|Mostrar menos) Arquivos recentes/,
+    });
+    await toggle.click();
+    await expect(list.getByRole("listitem")).toHaveCount(8);
+    expect(listingsOf()[1]).toEqual({ targetId, limit: 20, before: files[4].id });
+    await expect(panel.getByRole("button", { name: "Carregar mais arquivos" })).toHaveCount(0);
+
+    const download = page.waitForEvent("download");
+    await list.getByRole("button", { name: `Baixar ${files[7].filename}` }).click();
+    expect((await download).suggestedFilename()).toBe(files[7].filename);
+    expect(scenario.requests.attachmentContentFetches).toEqual([files[7].id]);
+
+    await toggle.click();
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    expect(listingsOf()).toHaveLength(2);
   });
 });

@@ -29,6 +29,17 @@ interface SidebarActivityFixture {
   pinned_at?: string | null;
 }
 
+type ReadPositionFixture = { created_at: string; message_id: string | null } | null;
+
+/**
+ * Issue #1082: what POST …/read answers with, and what a sidebar row with a
+ * server-side cursor carries — the count, and the point it is counted from.
+ */
+interface ReadStateFixture {
+  unread_count: number;
+  read_through: ReadPositionFixture;
+}
+
 interface SidebarChannelFixture extends SidebarActivityFixture {
   id: string;
   slug: string;
@@ -65,6 +76,8 @@ interface SidebarDMFixture extends SidebarActivityFixture {
   counterpart?: { user_id: string; display_name: string; avatar_url?: string };
   /** Issue #527: this viewer's own notification preference. */
   muted?: boolean;
+  /** Issue #1026: a group's emoji identity; absent is Automático. */
+  avatar_emoji?: string;
 }
 
 export interface DMCandidateFixture {
@@ -119,6 +132,7 @@ interface RawMessage {
   id: string;
   sender_id: string;
   sender_display_name: string;
+  sender_avatar_url?: string;
   sender_email: string;
   kind: "user" | "system";
   body_text?: string;
@@ -248,7 +262,15 @@ export interface MessagingScenario {
     leaves: Array<{ targetType: "channel" | "dm"; targetId: string }>;
     reactions: Array<{ messageId: string; emoji: string; added: boolean }>;
     dmCreates: Array<{ otherUserId: string }>;
-    groupCreates: Array<{ participantUserIds: string[]; title: string }>;
+    groupCreates: Array<{ participantUserIds: string[]; title: string; avatarEmoji?: string }>;
+    /** Issue #1026: identity changes; `null` is the explicit return to Automático. */
+    groupAvatars: Array<{ conversationId: string; emoji: string | null }>;
+    /**
+     * Issue #1025: every POST /api/chat/channels that reached the mock, in
+     * order, with its Idempotency-Key — so a spec can prove a retry reused it
+     * and a double click sent one request.
+     */
+    channelCreates: Array<{ idempotencyKey: string | null; body: Record<string, unknown> }>;
     /** Issue #516: what the composer actually uploaded, in order. */
     attachmentUploads: Array<{ targetId: string; filename: string; purpose: string }>;
     /**
@@ -258,7 +280,26 @@ export interface MessagingScenario {
      * proves that merely rendering a timeline requested nothing.
      */
     attachmentContentFetches: string[];
+    /**
+     * Issue #897: every attachment listing the browser made, in order — which
+     * destination, what page size, and which cursor. It is how a spec proves
+     * the panel opened with the compact page only and fetched more on demand.
+     */
+    attachmentListings: Array<{ targetId: string; limit: number; before: string | null }>;
+    /**
+     * Issue #1082: every POST …/read, in order, with the message it read
+     * through (null for "mark the whole conversation read").
+     */
+    reads: Array<{ targetId: string; lastReadMessageId: string | null }>;
   };
+  /**
+   * Issue #1082: the server-side read cursor per "kind:targetId" — the index of
+   * the last message read, which only ever moves forward (-1: nothing read). A
+   * conversation with a cursor here reports its read state, computed when the
+   * sidebar is served, exactly as the backend does; one without keeps its
+   * fixture's static unread_count.
+   */
+  readCursors: Map<string, number>;
   forwardedByIdempotencyKey: Map<
     string,
     { destinationChannelId: string; sourceMessageId: string; message: RawMessage }
@@ -296,6 +337,9 @@ export interface MessagingScenario {
   // click sent exactly one request.
   removeMemberRequests: Array<{ kind: TargetKind; targetId: string; userId: string }>;
   removeMemberStatus: number;
+  // Issue #1025: how many upcoming channel creations die as a network failure
+  // after the server committed them — the case an Idempotency-Key exists for.
+  channelCreateLostResponses: number;
   // Channel attachments per channel id, newest first, as the server returns them.
   channelAttachments: Map<string, AttachmentFixture[]>;
   // Group-details payload per conversation id (issue #441).
@@ -401,10 +445,12 @@ export interface ChannelDetailsFixture {
   /** Presence-filtered, capped preview — never a general roster. */
   online_members: ChannelMemberFixture[];
   /**
-   * Whether the server would let this caller add participants (issue #398).
-   * Always sent, so a spec that omits it exercises the safe default: absent
-   * reads as false and the action stays hidden.
+   * Whether the server would let this caller add members (issue #884).
+   * Kept separate from administrative management so fixtures can prove that
+   * adding a member does not grant rename, delete or removal capabilities.
    */
+  can_add_members: boolean;
+  /** Whether this caller may administer the channel (issue #398). */
   can_manage_members: boolean;
   /** Whether this caller may remove a member (issue #469). */
   can_remove_members?: boolean;
@@ -437,6 +483,25 @@ export interface AttachmentFixture {
   size: number;
   status: "pending_scan" | "clean" | "rejected";
   createdAt: string;
+  /** Wire value, as file-service sends it; absent means no preview. */
+  previewStatus?: "pending" | "ready" | "failed" | "unsupported";
+}
+
+/**
+ * `count` clean attachments, newest first as the listing serves them (issue
+ * #897), one minute apart. Ids and names are numbered from 1 so a spec can name
+ * the exact row that must, or must not, be on screen.
+ */
+export function attachmentFixtures(prefix: string, count: number): AttachmentFixture[] {
+  const newest = Date.parse("2026-07-15T12:00:00Z");
+  return Array.from({ length: count }, (_, index) => ({
+    id: `${prefix}-file-${index + 1}`,
+    filename: `${prefix}-arquivo-${String(index + 1).padStart(2, "0")}.bin`,
+    contentType: "application/octet-stream",
+    size: 20 * 1024,
+    status: "clean" as const,
+    createdAt: new Date(newest - index * 60_000).toISOString(),
+  }));
 }
 
 export function uniqueId(testInfo: TestInfo, suffix: string): string {
@@ -455,6 +520,7 @@ export function makeMessage(overrides: Partial<RawMessage> = {}): RawMessage {
     id: overrides.id ?? "msg-e2e",
     sender_id: overrides.sender_id ?? CURRENT_USER_ID,
     sender_display_name: overrides.sender_display_name ?? CURRENT_USER_NAME,
+    sender_avatar_url: overrides.sender_avatar_url,
     sender_email: overrides.sender_email ?? "author@example.test",
     kind: overrides.kind ?? "user",
     body_text: isRemoved ? undefined : (overrides.body_text ?? "Mensagem E2E"),
@@ -591,9 +657,14 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
       reactions: [],
       dmCreates: [],
       groupCreates: [],
+      groupAvatars: [],
+      channelCreates: [],
       attachmentUploads: [],
       attachmentContentFetches: [],
+      attachmentListings: [],
+      reads: [],
     },
+    readCursors: new Map(),
     forwardedByIdempotencyKey: new Map(),
     sidebarChannels,
     sidebarDMs,
@@ -608,6 +679,7 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
     addMembersStatus: 200,
     channelRosters: new Map(),
     removeMemberRequests: [],
+    channelCreateLostResponses: 0,
     removeMemberStatus: 204,
     directProfiles: new Map(),
     conversationAttachments: new Map(),
@@ -682,6 +754,9 @@ export function directProfileFixture(
  * memberCount defaults to the number of online members but is overridable,
  * because the two are independent: a channel keeps its size when nobody is
  * connected, and specs need to assert exactly that.
+ *
+ * canAddMembers defaults to false independently of management and removal,
+ * matching the client's fail-closed handling of an absent or malformed field.
  */
 export function channelDetailsFixture(
   channel: { id: string; slug: string; display_name: string; type: "public" | "private" },
@@ -689,6 +764,7 @@ export function channelDetailsFixture(
   memberCount = onlineMembers.length,
   canManageMembers = false,
   canRemoveMembers = false,
+  canAddMembers = false,
 ): ChannelDetailsFixture {
   return {
     id: channel.id,
@@ -699,6 +775,7 @@ export function channelDetailsFixture(
     member_count: memberCount,
     online_member_count: onlineMembers.length,
     online_members: onlineMembers,
+    can_add_members: canAddMembers,
     can_manage_members: canManageMembers,
     can_remove_members: canRemoveMembers,
   };
@@ -763,21 +840,18 @@ export function messagesFor(
   return emptyMessages;
 }
 
-export async function emitMessageCreated(
-  page: Page,
-  scenario: MessagingScenario,
-  options: {
-    kind: TargetKind;
-    targetId: string;
-    message: RawMessage;
-    eventId?: string;
-  },
-) {
-  const messages = messagesFor(scenario, options.kind, options.targetId);
-  if (!messages.some((message) => message.id === options.message.id)) {
-    messages.push(options.message);
-  }
-  const event = {
+/**
+ * The message.created frame the server fans out for one persisted message —
+ * exposed so a spec acting as the shared server can deliver it to sockets that
+ * may not be subscribed yet (issue #1103), which emitMessageCreated never does.
+ */
+export function messageCreatedEvent(options: {
+  kind: TargetKind;
+  targetId: string;
+  message: RawMessage;
+  eventId?: string;
+}) {
+  return {
     schema_version: 1,
     type: "message.created",
     workspace_id: "e2e-workspace",
@@ -794,6 +868,7 @@ export async function emitMessageCreated(
         : { dm_conversation_id: options.targetId }),
       sender_id: options.message.sender_id,
       sender_display_name: options.message.sender_display_name,
+      sender_avatar_url: options.message.sender_avatar_url,
       kind: options.message.kind,
       body_text: options.message.body_text ?? "",
       body_format: options.message.body_format,
@@ -809,6 +884,23 @@ export async function emitMessageCreated(
       links: options.message.links,
     },
   };
+}
+
+export async function emitMessageCreated(
+  page: Page,
+  scenario: MessagingScenario,
+  options: {
+    kind: TargetKind;
+    targetId: string;
+    message: RawMessage;
+    eventId?: string;
+  },
+) {
+  const messages = messagesFor(scenario, options.kind, options.targetId);
+  if (!messages.some((message) => message.id === options.message.id)) {
+    messages.push(options.message);
+  }
+  const event = messageCreatedEvent(options);
   await page.waitForFunction(
     ({ kind, targetId }) =>
       (
@@ -881,6 +973,9 @@ export async function emitLinkUpdated(
 export interface PresenceFixture {
   user_id: string;
   state: "online" | "away" | "offline";
+  /** Issue #798 effective presence; absent reads as the legacy state. */
+  availability?: "available" | "busy" | "dnd" | "brb" | "away" | "offline";
+  activity?: "in_call" | "in_meeting" | "presenting";
   updated_at: string;
 }
 
@@ -1068,6 +1163,52 @@ export async function emitConversationEvent(
 }
 
 /**
+ * Simulates the server's pin.updated broadcast (RF-05, issue #896): somebody
+ * else pinned or unpinned a message. The scenario's pin store is changed
+ * first, so the client's authoritative refetch of GET .../pins finds exactly
+ * what the real backend would have persisted before publishing.
+ */
+export async function emitPinUpdated(
+  page: Page,
+  scenario: MessagingScenario,
+  options: { kind: TargetKind; targetId: string; messageId: string; pinned: boolean },
+) {
+  const key = targetKey(options.kind, options.targetId);
+  const pinned = scenario.pinnedIds.get(key) ?? new Set<string>();
+  scenario.pinnedIds.set(key, pinned);
+  if (options.pinned) pinned.add(options.messageId);
+  else pinned.delete(options.messageId);
+  await page.waitForFunction(
+    ({ kind, targetId }) =>
+      (
+        window as unknown as {
+          __e2eHasSubscription?: (kind: string, targetId: string) => boolean;
+        }
+      ).__e2eHasSubscription?.(kind, targetId) === true,
+    { kind: options.kind, targetId: options.targetId },
+  );
+  await page.evaluate(
+    ({ kind, targetId, messageId, pinned }) => {
+      (
+        window as unknown as {
+          __e2eEmitWebSocketEvent: (event: Record<string, unknown>) => void;
+        }
+      ).__e2eEmitWebSocketEvent({
+        schema_version: 1,
+        type: "pin.updated",
+        workspace_id: "e2e-workspace",
+        target_type: kind,
+        target_id: targetId,
+        message_id: messageId,
+        pin: { message_id: messageId, actor_user_id: "e2e-other-actor", pinned },
+        event_id: `${messageId}-pin-${pinned}`,
+      });
+    },
+    { ...options },
+  );
+}
+
+/**
  * Makes a conversation subscribable for this session, as the server does once
  * the membership row is committed. Pair it with any fixture change that adds a
  * conversation after the mocks were installed.
@@ -1232,6 +1373,7 @@ export async function installMessagingMocks(
   await installSidebarMocks(page, scenario);
   await installInteractionMocks(page, scenario, assertConversationAccess);
   await installConversationMocks(page, scenario);
+  await installChannelCreateMock(page, scenario);
   await installMessageMocks(page, scenario, expired, assertConversationAccess);
   await installChannelDetailsMocks(page, scenario, assertConversationAccess);
 }
@@ -1574,13 +1716,12 @@ async function installChannelDetailsMocks(
       await route.fulfill({ status: 404 });
       return;
     }
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        data: { attachments: scenario.conversationAttachments.get(conversationID) ?? [] },
-      }),
-    });
+    await fulfillAttachmentListing(
+      route,
+      scenario,
+      conversationID,
+      scenario.conversationAttachments.get(conversationID) ?? [],
+    );
   });
 
   await page.route("**/api/files/channels/*/attachments**", async (route) => {
@@ -1597,12 +1738,57 @@ async function installChannelDetailsMocks(
       await route.fulfill({ status: 404 });
       return;
     }
-    const attachments = scenario.channelAttachments.get(channelId) ?? [];
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({ data: { attachments } }),
-    });
+    await fulfillAttachmentListing(
+      route,
+      scenario,
+      channelId,
+      scenario.channelAttachments.get(channelId) ?? [],
+    );
+  });
+}
+
+/**
+ * GET /api/files/{collection}/{id}/attachments — one page, the way file-service
+ * serves it (issue #897).
+ *
+ * The fixture list is already newest first. `limit` is clamped like the server's
+ * (default 20, ceiling 50), `before` continues strictly after the row it names,
+ * and `next_cursor` is present only when at least one more row exists. Ignoring
+ * the query here would hand the panel everything on the first request and hide
+ * exactly the regression a spec is meant to catch.
+ *
+ * The cursor is the last served id rather than the server's base64 token: it is
+ * opaque to the client either way, and a readable one makes a failing spec
+ * easier to read. An unknown cursor answers 400, as the server does.
+ */
+async function fulfillAttachmentListing(
+  route: Route,
+  scenario: MessagingScenario,
+  targetId: string,
+  attachments: AttachmentFixture[],
+) {
+  const query = new URL(route.request().url()).searchParams;
+  const requested = Number.parseInt(query.get("limit") ?? "", 10);
+  const limit = Number.isNaN(requested) || requested <= 0 ? 20 : Math.min(requested, 50);
+  const before = query.get("before");
+  scenario.requests.attachmentListings.push({ targetId, limit, before });
+
+  const start = before === null ? 0 : attachments.findIndex((item) => item.id === before) + 1;
+  if (start === 0 && before !== null) {
+    await route.fulfill({ status: 400 });
+    return;
+  }
+  const page = attachments.slice(start, start + limit);
+  const hasMore = start + limit < attachments.length;
+  await route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({
+      data: {
+        attachments: page,
+        ...(hasMore ? { next_cursor: page[page.length - 1].id } : {}),
+      },
+    }),
   });
 }
 
@@ -1753,6 +1939,8 @@ async function installWebSocketMock(
       sessionStorage.setItem("nchat_at", accessToken);
       const allowed = new Set(allowedTargets);
       const sockets = new Set<StableWebSocket>();
+      let createdSockets = 0;
+      let closedSockets = 0;
       const sentMessages: Array<Record<string, unknown>> = [];
       // Who the server would report as present, per conversation. Seeded from
       // the same fixtures the REST responses use, and mutable so a spec can
@@ -1785,6 +1973,7 @@ async function installWebSocketMock(
         readonly subscriptions = new Set<string>();
 
         constructor() {
+          createdSockets++;
           sockets.add(this);
           setTimeout(() => this.onopen?.(new Event("open")), 0);
         }
@@ -1964,6 +2153,7 @@ async function installWebSocketMock(
         }
 
         close() {
+          closedSockets++;
           sockets.delete(this);
           this.onclose?.(new CloseEvent("close"));
         }
@@ -2002,6 +2192,15 @@ async function installWebSocketMock(
           __e2eWebSocketMessages: () => Array<Record<string, unknown>>;
         }
       ).__e2eWebSocketMessages = () => [...sentMessages];
+      (
+        window as unknown as {
+          __e2eWebSocketLifecycle: () => { created: number; closed: number; active: number };
+        }
+      ).__e2eWebSocketLifecycle = () => ({
+        created: createdSockets,
+        closed: closedSockets,
+        active: sockets.size,
+      });
       (
         window as unknown as { __e2eReceivedSnapshots: () => Array<Record<string, unknown>> }
       ).__e2eReceivedSnapshots = () => [...deliveredSnapshots];
@@ -2069,22 +2268,22 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
     }),
   );
 
+  // The sidebar footer's status control reads the viewer's own manual presence
+  // (issue #798). Automatic unless a spec installs its own presence server
+  // (presenceSettingsMock.ts), whose route then takes precedence.
+  await page.route("**/api/chat/presence/me", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: { state: null, expires_at: null, writable: true } }),
+    }),
+  );
+
   await page.route("**/api/chat/sidebar", (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({
-        data: {
-          current_user_id: CURRENT_USER_ID,
-          // Same id the simulated realtime events already carry as
-          // workspace_id — the real contract always includes this object
-          // (chatApi.ts reads sidebar.workspace?.id), so a mock that omits it
-          // is not exercising the real shape.
-          workspace: { id: "e2e-workspace", name: "E2E Workspace", slug: "e2e-workspace" },
-          channels: scenario.sidebarChannels,
-          dm_conversations: scenario.sidebarDMs,
-        },
-      }),
+      body: sidebarResponseBody(scenario),
     }),
   );
 
@@ -2125,20 +2324,32 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
   await page.route("**/api/chat/channels/*/sidebar-pin", mutateSidebarPin);
   await page.route("**/api/chat/dm/*/sidebar-pin", mutateSidebarPin);
 
+  // Issue #1082: POST …/read, faithful to the backend's contract — the message
+  // is resolved inside the conversation (anything else is the same 404 a
+  // missing conversation gets), the cursor only moves forward, and the answer
+  // is the read state after the write, which the sidebar then reports too. A
+  // read_cursor other than "message" is refused, as the strict decoder does.
   const markConversationRead = async (route: Route) => {
     const request = route.request();
-    const parts = new URL(request.url()).pathname.split("/");
-    const marker = parts.indexOf("channels") >= 0 ? "channels" : "dm";
-    const id = parts[parts.indexOf(marker) + 1];
-    const item =
-      marker === "channels"
-        ? scenario.sidebarChannels.find((channel) => channel.id === id)
-        : scenario.sidebarDMs.find((dm) => dm.id === id);
-    if (request.method() !== "POST" || !item) {
+    const { targetType, id } = sidebarTargetFromURL(request.url());
+    const body = readRequestBody(request.postData());
+    if (!body) {
+      await route.fulfill({ status: 400 });
+      return;
+    }
+    const row = request.method() === "POST" ? sidebarRowFor(scenario, targetType, id) : undefined;
+    const lastReadMessageId = body.last_read_message_id;
+    const state = row && advanceReadCursor(scenario, targetType, id, lastReadMessageId);
+    if (!state) {
       await route.fulfill({ status: 404 });
       return;
     }
-    await route.fulfill({ status: 204 });
+    scenario.requests.reads.push({ targetId: id, lastReadMessageId: lastReadMessageId ?? null });
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: state }),
+    });
   };
   await page.route("**/api/chat/channels/*/read", markConversationRead);
   await page.route("**/api/chat/dm/*/read", markConversationRead);
@@ -2212,6 +2423,45 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
   };
   await page.route("**/api/chat/channels/*/membership", leaveConversation);
   await page.route("**/api/chat/dm/*/membership", leaveConversation);
+
+  // Group identity (issue #1026): PUT sets the emoji, DELETE returns the group
+  // to Automático. Groups only, like the real statement; the server's catalog
+  // check is modelled as "one non-markup value", which is all a spec needs.
+  await page.route("**/api/chat/dm/*/avatar", async (route) => {
+    const request = route.request();
+    const id = decodeURIComponent(new URL(request.url()).pathname.split("/").at(-2) ?? "");
+    const group = scenario.sidebarDMs.find((dm) => dm.id === id && dm.type === "group");
+    if (!group || (request.method() !== "PUT" && request.method() !== "DELETE")) {
+      await route.fulfill({
+        status: 404,
+        contentType: "application/json",
+        body: errorBody("not_found"),
+      });
+      return;
+    }
+    if (request.method() === "DELETE") {
+      scenario.requests.groupAvatars.push({ conversationId: id, emoji: null });
+      delete group.avatar_emoji;
+      await route.fulfill({ status: 204 });
+      return;
+    }
+    const raw = (request.postDataJSON() ?? {}) as { emoji?: unknown };
+    if (typeof raw.emoji !== "string" || raw.emoji === "" || raw.emoji.includes("<")) {
+      await route.fulfill({
+        status: 400,
+        contentType: "application/json",
+        body: errorBody("bad_request"),
+      });
+      return;
+    }
+    scenario.requests.groupAvatars.push({ conversationId: id, emoji: raw.emoji });
+    group.avatar_emoji = raw.emoji;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: { id, avatar_emoji: raw.emoji } }),
+    });
+  });
 
   // Group rename (issue #527). Groups only: a 1:1 conversation is refused, the
   // way the real statement refuses it by requiring type = 'group'.
@@ -2338,6 +2588,104 @@ function sidebarTargetFromURL(url: string): { targetType: "channel" | "dm"; id: 
     targetType: marker === "channels" ? "channel" : "dm",
     id: parts[parts.indexOf(marker) + 1] ?? "",
   };
+}
+
+function sidebarRowFor(
+  scenario: MessagingScenario,
+  targetType: "channel" | "dm",
+  id: string,
+): SidebarChannelFixture | SidebarDMFixture | undefined {
+  return targetType === "channel"
+    ? scenario.sidebarChannels.find((channel) => channel.id === id)
+    : scenario.sidebarDMs.find((dm) => dm.id === id);
+}
+
+/**
+ * A read request's body, or undefined when the server would refuse it: the
+ * only read_cursor it knows is "message". No last_read_message_id means "the
+ * whole conversation".
+ */
+function readRequestBody(
+  raw: string | null,
+): { last_read_message_id?: string; read_cursor?: string } | undefined {
+  const body = raw
+    ? (JSON.parse(raw) as { last_read_message_id?: string; read_cursor?: string })
+    : {};
+  return body.read_cursor === undefined || body.read_cursor === "message" ? body : undefined;
+}
+
+function positionOf(message: RawMessage | undefined): ReadPositionFixture {
+  return message ? { created_at: message.created_at, message_id: message.id } : null;
+}
+
+/** The read state a cursor at `cursor` (an index into `messages`) leaves. */
+function readStateAt(messages: RawMessage[], cursor: number): ReadStateFixture {
+  return {
+    unread_count: messages
+      .slice(cursor + 1)
+      .filter((message) => message.status === "active" && message.sender_id !== CURRENT_USER_ID)
+      .length,
+    read_through: positionOf(messages[cursor]),
+  };
+}
+
+/**
+ * GET /api/chat/sidebar as the server would answer it right now, for the given
+ * viewer. A function rather than inline so a spec that holds a response (issue
+ * #1103) can take it at the moment the request arrived and deliver it later.
+ */
+export function sidebarResponseBody(
+  scenario: MessagingScenario,
+  currentUserId: string = CURRENT_USER_ID,
+): string {
+  return JSON.stringify({
+    data: {
+      current_user_id: currentUserId,
+      // Same id the simulated realtime events already carry as
+      // workspace_id — the real contract always includes this object
+      // (chatApi.ts reads sidebar.workspace?.id), so a mock that omits it
+      // is not exercising the real shape.
+      workspace: { id: "e2e-workspace", name: "E2E Workspace", slug: "e2e-workspace" },
+      channels: scenario.sidebarChannels.map((row) => withReadState(scenario, "channel", row)),
+      dm_conversations: scenario.sidebarDMs.map((row) => withReadState(scenario, "dm", row)),
+      precise_read_cursor: true,
+    },
+  });
+}
+
+/** A sidebar row as served: with its read state when it has a server cursor. */
+function withReadState<T extends SidebarChannelFixture | SidebarDMFixture>(
+  scenario: MessagingScenario,
+  targetType: "channel" | "dm",
+  row: T,
+): T | (T & ReadStateFixture) {
+  const key = targetKey(targetType, row.id);
+  const cursor = scenario.readCursors.get(key);
+  if (cursor === undefined) return row;
+  return { ...row, ...readStateAt(scenario.messagesByTarget.get(key) ?? [], cursor) };
+}
+
+/**
+ * The server's read cursor (issue #1082): the named message, or the newest
+ * when none is named, never moving backwards. Undefined when the message is not
+ * in the conversation. The mock's arrays are in timeline order, so the index is
+ * the position.
+ */
+function advanceReadCursor(
+  scenario: MessagingScenario,
+  targetType: "channel" | "dm",
+  id: string,
+  lastReadMessageId: string | undefined,
+): ReadStateFixture | undefined {
+  const key = targetKey(targetType, id);
+  const messages = scenario.messagesByTarget.get(key) ?? [];
+  const index = lastReadMessageId
+    ? messages.findIndex((message) => message.id === lastReadMessageId)
+    : messages.length - 1;
+  if (lastReadMessageId && index < 0) return undefined;
+  const cursor = Math.max(scenario.readCursors.get(key) ?? -1, index);
+  scenario.readCursors.set(key, cursor);
+  return readStateAt(messages, cursor);
 }
 
 /** The general channel is structural; the mocks refuse it exactly as SQL does. */
@@ -2502,9 +2850,14 @@ async function installConversationMocks(page: Page, scenario: MessagingScenario)
     const raw = (await request.postDataJSON()) as {
       participant_user_ids?: string[];
       title?: string;
+      avatar_emoji?: string;
     };
     const participantUserIds = raw.participant_user_ids ?? [];
-    scenario.requests.groupCreates.push({ participantUserIds, title: raw.title ?? "" });
+    scenario.requests.groupCreates.push({
+      participantUserIds,
+      title: raw.title ?? "",
+      ...(raw.avatar_emoji !== undefined ? { avatarEmoji: raw.avatar_emoji } : {}),
+    });
     const unknown = participantUserIds.some(
       (userId) => !scenario.dmCandidates.some((c) => c.userId === userId),
     );
@@ -2514,13 +2867,122 @@ async function installConversationMocks(page: Page, scenario: MessagingScenario)
     }
     const conversationId = `e2e-group-${scenario.requests.groupCreates.length}`;
     const name = raw.title?.trim() || "Grupo sem nome";
-    scenario.sidebarDMs.push({ id: conversationId, type: "group", name, unread_count: 0 });
+    scenario.sidebarDMs.push({
+      id: conversationId,
+      type: "group",
+      name,
+      unread_count: 0,
+      ...(raw.avatar_emoji ? { avatar_emoji: raw.avatar_emoji } : {}),
+    });
     scenario.messagesByTarget.set(targetKey("dm", conversationId), []);
     await route.fulfill({
       status: 201,
       contentType: "application/json",
       body: JSON.stringify({ data: { conversation_id: conversationId } }),
     });
+  });
+}
+
+/**
+ * POST /api/chat/channels (issue #1025), modelling the server's contract: the
+ * same Idempotency-Key with the same body replays the channel it created (200)
+ * instead of creating another; a new key creates (201). A private channel
+ * appears in the creator's sidebar with them as its only reader here — the
+ * invitees' side is a separate page in the specs.
+ */
+interface ChannelCreateRequest {
+  idempotencyKey: string | null;
+  body: Record<string, unknown>;
+  serialized: string;
+}
+
+interface CreatedChannelRecord {
+  body: string;
+  id: string;
+}
+
+/** Reads one creation and records it exactly as the browser sent it. */
+function recordChannelCreate(scenario: MessagingScenario, route: Route): ChannelCreateRequest {
+  const request = route.request();
+  const idempotencyKey = request.headers()["idempotency-key"] ?? null;
+  const body = (request.postDataJSON() ?? {}) as Record<string, unknown>;
+  scenario.requests.channelCreates.push({ idempotencyKey, body });
+  return { idempotencyKey, body, serialized: JSON.stringify(body) };
+}
+
+/** The server's state change: the channel row and an empty timeline. */
+function createMockChannel(scenario: MessagingScenario, id: string, body: Record<string, unknown>) {
+  scenario.sidebarChannels.push({
+    id,
+    slug: String(body.slug),
+    display_name: String(body.display_name),
+    type: body.type === "private" ? "private" : "public",
+    can_write: true,
+    unread_count: 0,
+  });
+  scenario.messagesByTarget.set(targetKey("channel", id), []);
+}
+
+/**
+ * Answers a committed creation — or loses the answer, when the scenario asks
+ * for it, which is the case an Idempotency-Key exists for.
+ */
+async function respondToChannelCreate(
+  scenario: MessagingScenario,
+  route: Route,
+  created: { id: string; replayed: boolean; body: Record<string, unknown> },
+) {
+  if (scenario.channelCreateLostResponses > 0) {
+    scenario.channelCreateLostResponses -= 1;
+    await route.abort("failed");
+    return;
+  }
+  const { id, body } = created;
+  await route.fulfill({
+    status: created.replayed ? 200 : 201,
+    contentType: "application/json",
+    body: JSON.stringify({
+      data: { id, slug: body.slug, display_name: body.display_name, type: body.type },
+    }),
+  });
+}
+
+/**
+ * POST /api/chat/channels (issue #1025), modelling the server's contract: the
+ * same Idempotency-Key with the same body replays the channel it created (200);
+ * the same key with another body is 409 idempotency_key_reused; a new key
+ * creates (201). A private channel appears in the creator's sidebar with them
+ * as its only reader here — the invitees' side is a separate page in the specs.
+ */
+async function installChannelCreateMock(page: Page, scenario: MessagingScenario) {
+  const byKey = new Map<string, CreatedChannelRecord>();
+  await page.route("**/api/chat/channels", async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.fallback();
+      return;
+    }
+    const request = recordChannelCreate(scenario, route);
+    const previous = request.idempotencyKey ? byKey.get(request.idempotencyKey) : undefined;
+    if (previous && previous.body !== request.serialized) {
+      await route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: errorBody("idempotency_key_reused"),
+      });
+      return;
+    }
+    if (previous) {
+      await respondToChannelCreate(scenario, route, {
+        ...previous,
+        replayed: true,
+        body: request.body,
+      });
+      return;
+    }
+    const id = `e2e-channel-created-${byKey.size + 1}`;
+    if (request.idempotencyKey) byKey.set(request.idempotencyKey, { body: request.serialized, id });
+    createMockChannel(scenario, id, request.body);
+    await respondToChannelCreate(scenario, route, { id, replayed: false, body: request.body });
   });
 }
 

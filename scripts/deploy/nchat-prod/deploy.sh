@@ -125,6 +125,11 @@ main() {
   echo "candidate slot: $candidate"
   confirm "Deploy the release into slot '$candidate' with no traffic"
   render_candidate "$candidate"
+  # Issue #798. The control plane already refused an incompatible release
+  # before this script was reached (require-release-capability.sh, run from the
+  # default branch); this is the same rule on the exact manifest about to be
+  # applied, before migrations and before anything starts.
+  require_candidate_presence_capability "$TEMPORARY_ROOT/candidate.yaml"
   render_migrations
   check_capacity "$TEMPORARY_ROOT/candidate.yaml" "$TEMPORARY_ROOT" "$candidate"
   run_migrations

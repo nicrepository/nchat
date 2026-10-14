@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -21,6 +22,9 @@ type fakeChannelProvider struct {
 	err       error
 	lastInput service.CreateChannelInput
 	calls     int
+	// createdMemberIDs and createReplayed shape the CreateChannel result (#1025).
+	createdMemberIDs []string
+	createReplayed   bool
 
 	details          service.ChannelDetails
 	detailsErr       error
@@ -76,10 +80,12 @@ func (f *fakeChannelProvider) UpdateChannel(
 	return f.updated, f.updateErr
 }
 
-func (f *fakeChannelProvider) CreateChannel(_ context.Context, input service.CreateChannelInput) (domain.Channel, error) {
+func (f *fakeChannelProvider) CreateChannel(_ context.Context, input service.CreateChannelInput) (service.CreateChannelResult, error) {
 	f.calls++
 	f.lastInput = input
-	return f.channel, f.err
+	return service.CreateChannelResult{
+		Channel: f.channel, InitialMemberIDs: f.createdMemberIDs, Replayed: f.createReplayed,
+	}, f.err
 }
 
 func (f *fakeChannelProvider) GetChannelDetails(
@@ -147,7 +153,7 @@ func TestChannelHandler_Create_DerivesCallerAndWorkspaceServerSide(t *testing.T)
 		DisplayName: "Infraestrutura",
 		Type:        domain.ChannelTypePublic,
 	}
-	if provider.lastInput != want {
+	if !reflect.DeepEqual(provider.lastInput, want) {
 		t.Fatalf("input = %+v, want %+v", provider.lastInput, want)
 	}
 	body := decodeBody(t, recorder)

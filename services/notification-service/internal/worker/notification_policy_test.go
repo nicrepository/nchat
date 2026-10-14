@@ -67,6 +67,8 @@ func TestPolicyEvaluatorDecidesFromTheEventItWasGiven(t *testing.T) {
 			false, string(notificationpolicy.ReasonSilentEventType)},
 		{"a direct message is delivered", eventType(notificationevent.EventTypeDirectMessage), true, ""},
 		{"a call is delivered", eventType(notificationevent.EventTypeCall), true, ""},
+		{"a recipient in do not disturb is not", func(n *Notification) { n.DoNotDisturb = true },
+			false, string(notificationpolicy.ReasonDoNotDisturb)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

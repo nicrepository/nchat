@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"testing"
 	"time"
@@ -38,9 +39,13 @@ func TestListDestinationAttachments_ProjectsTheStoredRows(t *testing.T) {
 		{ID: "a-2", Status: domain.StatusPendingScan, Filename: "topologia", Size: 10, CreatedAt: createdAt},
 	}
 
-	views, err := f.service.ListDestinationAttachments(context.Background(), listInput(0))
+	page, err := f.service.ListDestinationAttachments(context.Background(), listInput(0))
 	if err != nil {
 		t.Fatalf("ListChannelAttachments: %v", err)
+	}
+	views := page.Attachments
+	if page.NextCursor != "" {
+		t.Fatalf("a last page must carry no cursor, got %q", page.NextCursor)
 	}
 	if len(views) != 2 {
 		t.Fatalf("expected two views, got %d", len(views))
@@ -155,6 +160,18 @@ func TestListDestinationAttachments_RequiresAWiredService(t *testing.T) {
 	}
 }
 
+func TestListDestinationAttachments_PropagatesAStoreFailure(t *testing.T) {
+	f := newFixture(t)
+	f.store.listErr = errors.New("database unavailable")
+	page, err := f.service.ListDestinationAttachments(context.Background(), listInput(5))
+	if !errors.Is(err, f.store.listErr) {
+		t.Fatalf("expected store failure, got %v", err)
+	}
+	if len(page.Attachments) != 0 || page.NextCursor != "" {
+		t.Fatalf("a failed read must not produce a page: %+v", page)
+	}
+}
+
 func TestStatusListable_ExcludesIncompleteAndAbandonedUploads(t *testing.T) {
 	for status, want := range map[domain.Status]bool{
 		domain.StatusPendingUpload: false,
@@ -216,13 +233,148 @@ func TestListDestinationAttachments_ReportsTheDestinationKindItListed(t *testing
 		{ID: "a-1", Status: domain.StatusClean, Filename: "ata.pdf", CreatedAt: time.Now()},
 	}
 
-	views, err := f.service.ListDestinationAttachments(
+	page, err := f.service.ListDestinationAttachments(
 		context.Background(), destinationListInput(domain.DestinationKindDM, testConversation, 0),
 	)
 	if err != nil {
 		t.Fatalf("ListDestinationAttachments: %v", err)
 	}
+	views := page.Attachments
 	if len(views) != 1 || views[0].DestinationKind != string(domain.DestinationKindDM) {
 		t.Fatalf("expected the dm destination kind, got %+v", views)
+	}
+}
+
+// Issue #897: the store's next position leaves the service as an opaque token,
+// and a token sent back reaches the store as the same position.
+func TestListDestinationAttachments_RoundTripsTheCursor(t *testing.T) {
+	f := newFixture(t)
+	last := domain.AttachmentListCursor{
+		CreatedAt: time.Date(2026, 7, 15, 12, 0, 0, 123456000, time.UTC),
+		ID:        "0f9c4a61-5d1e-4c1b-9d7e-2a4b6c8d0e1f",
+	}
+	f.store.listed = []service.ListedAttachment{{ID: last.ID, Status: domain.StatusClean, CreatedAt: last.CreatedAt}}
+	f.store.listNext = &last
+
+	page, err := f.service.ListDestinationAttachments(context.Background(), listInput(1))
+	if err != nil {
+		t.Fatalf("ListDestinationAttachments: %v", err)
+	}
+	if page.NextCursor == "" {
+		t.Fatal("a page with more behind it must carry a cursor")
+	}
+	if f.store.listQuery.Before != nil {
+		t.Fatalf("the first page must not be bounded, got %+v", f.store.listQuery.Before)
+	}
+
+	input := listInput(1)
+	input.Before = page.NextCursor
+	if _, err := f.service.ListDestinationAttachments(context.Background(), input); err != nil {
+		t.Fatalf("ListDestinationAttachments with cursor: %v", err)
+	}
+	got := f.store.listQuery.Before
+	if got == nil || !got.CreatedAt.Equal(last.CreatedAt) || got.ID != last.ID {
+		t.Fatalf("the cursor must reach the store as the same position, got %+v", got)
+	}
+	// The cursor narrows; it never replaces the authorized destination.
+	if f.store.listQuery.DestinationID != testChannelID || f.store.listQuery.WorkspaceID != testWorkspaceID {
+		t.Fatalf("a cursor must not move the query outside its destination: %+v", f.store.listQuery)
+	}
+}
+
+func TestListDestinationAttachments_RefusesAMalformedCursorBeforeAnyLookup(t *testing.T) {
+	for name, token := range map[string]string{
+		"not base64":       "%%%",
+		"no separator":     "bm8tc2VwYXJhdG9y",
+		"bad timestamp":    domainCursorToken("yesterday|0f9c4a61-5d1e-4c1b-9d7e-2a4b6c8d0e1f"),
+		"bad id":           domainCursorToken("2026-07-15T12:00:00Z|' OR 1=1 --"),
+		"sql in timestamp": domainCursorToken("2026-07-15T12:00:00Z'; DROP TABLE x;--|0f9c4a61-5d1e-4c1b-9d7e-2a4b6c8d0e1f"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			input := listInput(5)
+			input.Before = token
+
+			_, err := f.service.ListDestinationAttachments(context.Background(), input)
+			if !errors.Is(err, domain.ErrInvalidInput) {
+				t.Fatalf("expected ErrInvalidInput, got %v", err)
+			}
+			if len(f.authorizer.calls) != 0 || f.store.listCalled != 0 {
+				t.Fatal("a malformed cursor must be refused before any lookup")
+			}
+		})
+	}
+}
+
+func domainCursorToken(raw string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+// Proves CURSOR != AUTHORIZATION (issue #897 security review):
+// 1. User is authorized and lists page 1, getting a valid cursor.
+// 2. User's authorization is revoked (e.g. membership removed).
+// 3. User attempts to fetch next page using the valid cursor.
+// 4. Request fails closed with ErrNotFound without touching the store.
+func TestListDestinationAttachments_CursorIsNotCapability_RefusesRevokedAccess(t *testing.T) {
+	f := newFixture(t)
+	last := domain.AttachmentListCursor{
+		CreatedAt: time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC),
+		ID:        "0f9c4a61-5d1e-4c1b-9d7e-2a4b6c8d0e1f",
+	}
+	f.store.listed = []service.ListedAttachment{{ID: last.ID, Status: domain.StatusClean, CreatedAt: last.CreatedAt}}
+	f.store.listNext = &last
+
+	page, err := f.service.ListDestinationAttachments(context.Background(), listInput(1))
+	if err != nil {
+		t.Fatalf("ListDestinationAttachments: %v", err)
+	}
+	if page.NextCursor == "" {
+		t.Fatal("expected cursor from page 1")
+	}
+
+	// Membership is revoked
+	f.authorizer.err = domain.ErrNotFound
+	f.store.listCalled = 0
+
+	input := listInput(1)
+	input.Before = page.NextCursor
+	_, err = f.service.ListDestinationAttachments(context.Background(), input)
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for revoked user with previous cursor, got %v", err)
+	}
+	if f.store.listCalled != 0 {
+		t.Fatal("store must never be called when user authorization is revoked")
+	}
+}
+
+// Proves cursor from Channel A used in Channel B cannot cross boundaries:
+// The query executed in the store remains bound strictly to Channel B and Channel B's workspace.
+func TestListDestinationAttachments_CursorFromChannelACannotCrossToChannelB(t *testing.T) {
+	f := newFixture(t)
+	cursorA := domain.AttachmentListCursor{
+		CreatedAt: time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC),
+		ID:        "0f9c4a61-5d1e-4c1b-9d7e-2a4b6c8d0e1f",
+	}
+	tokenA := domain.EncodeAttachmentListCursor(cursorA)
+
+	channelB := "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	workspaceB := "wwwwwwww-wwww-4www-8www-wwwwwwwwwwww"
+	f.authorizer.result = service.AuthorizedDestination{
+		ID:               channelB,
+		WorkspaceID:      workspaceB,
+		SessionExpiresAt: time.Now().Add(time.Hour),
+	}
+
+	input := destinationListInput(domain.DestinationKindChannel, channelB, 5)
+	input.Before = tokenA
+
+	if _, err := f.service.ListDestinationAttachments(context.Background(), input); err != nil {
+		t.Fatalf("ListDestinationAttachments: %v", err)
+	}
+	if f.store.listQuery.DestinationID != channelB || f.store.listQuery.WorkspaceID != workspaceB {
+		t.Fatalf("query must remain strictly bound to Channel B and Workspace B: %+v", f.store.listQuery)
+	}
+	if f.store.listQuery.Before == nil || f.store.listQuery.Before.ID != cursorA.ID {
+		t.Fatalf("cursor position must be passed as filter only: %+v", f.store.listQuery.Before)
 	}
 }

@@ -39,6 +39,8 @@ type fakeValkeyServer struct {
 	// failing makes one command name return an error, so the error path of each
 	// operation is a tested path and not an assumption.
 	failing string
+	// clock is the fake authority's clock (TIME); nil is the real one.
+	clock func() time.Time
 }
 
 func newFakeValkeyServer() *fakeValkeyServer {
@@ -155,6 +157,18 @@ func (s *fakeValkeyServer) applyLocked(command []string) string {
 			delete(s.expires, key)
 		}
 		return fmt.Sprintf(":%d\r\n", deleted)
+	case "EVALSHA", "EVAL":
+		return s.scriptLocked(command)
+	case "HINCRBY":
+		hash := s.hashes[command[1]]
+		if hash == nil {
+			hash = make(map[string]string)
+			s.hashes[command[1]] = hash
+		}
+		current, _ := strconv.ParseInt(hash[command[2]], 10, 64)
+		increment, _ := strconv.ParseInt(command[3], 10, 64)
+		hash[command[2]] = strconv.FormatInt(current+increment, 10)
+		return fmt.Sprintf(":%d\r\n", current+increment)
 	case "MGET":
 		var reply strings.Builder
 		fmt.Fprintf(&reply, "*%d\r\n", len(command)-1)
@@ -206,6 +220,14 @@ func (s *fakeValkeyServer) ttlOf(key string) int64 {
 // putLiveness marks an instance alive without going through the directory, so a
 // test can set up processes that are not the one under test.
 func (s *fakeValkeyServer) putLiveness(instanceID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.strings[directoryLivePrefix+instanceID] = instanceCapability
+}
+
+// putLegacyLiveness marks an instance alive the way one from before issue #798
+// does.
+func (s *fakeValkeyServer) putLegacyLiveness(instanceID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.strings[directoryLivePrefix+instanceID] = "1"

@@ -34,6 +34,20 @@ NCHAT_PROD_RELEASE_SETTLE_ATTEMPTS="${NCHAT_PROD_RELEASE_SETTLE_ATTEMPTS:-19}"
 NCHAT_PROD_RELEASE_SETTLE_INTERVAL="${NCHAT_PROD_RELEASE_SETTLE_INTERVAL:-5}"
 NCHAT_PROD_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 NCHAT_PROD_SLOTS=(blue green)
+# The application settings every service reads through envFrom.
+NCHAT_PROD_CONFIGMAP=nchat-config
+# Manual presence (issue #798). A release that honours a stored manual state
+# stamps this annotation on the pod template of every workload that reads one,
+# from its own manifests; a release from before #798 cannot carry it, whatever
+# the ConfigMap says. See require_presence_capable_cluster and
+# require_presence_capable_target.
+NCHAT_PROD_PRESENCE_CAPABILITY_ANNOTATION='nchat.io/capability-manual-presence'
+NCHAT_PROD_PRESENCE_CAPABILITY_VALUE=v1
+NCHAT_PROD_PRESENCE_READERS=(chat-service notification-service)
+# Written on nchat-config the first time manual presence is enabled, and never
+# removed by a script: from then on stored states may exist that a build
+# without the capability would ignore, gate open or not.
+NCHAT_PROD_PRESENCE_ACTIVATED_ANNOTATION='nchat.io/manual-presence-activated'
 # The slot the first production release is established in. Blue is the baseline
 # by definition; bootstrap.sh and the baseline smoke both read it from here so
 # the two cannot disagree about which slot that is.
@@ -682,6 +696,192 @@ read_release_id() {
   release_id="$(<"$file")"
   [[ "$release_id" =~ ^[a-f0-9]{64}$ ]] || return 1
   printf '%s' "$release_id"
+}
+
+# ── manual presence capability (issue #798) ─────────────────────────────────
+
+# A jsonpath to one annotation, its dots escaped as kubectl requires.
+annotation_jsonpath() {
+  local prefix="$1" annotation="$2"
+  printf '{%s.annotations[%s]}' "$prefix" "'${annotation//./\\.}'"
+}
+
+# What a Deployment's pod template claims, and how many replicas it asks for:
+# empty when the Deployment does not exist, a failure when it cannot be read.
+deployment_presence_capability() {
+  kubectl get deployment "$1" -n "$NCHAT_PROD_NAMESPACE" --ignore-not-found \
+    -o "jsonpath=$(annotation_jsonpath .spec.template.metadata "$NCHAT_PROD_PRESENCE_CAPABILITY_ANNOTATION")"
+}
+
+deployment_replicas() {
+  kubectl get deployment "$1" -n "$NCHAT_PROD_NAMESPACE" --ignore-not-found -o 'jsonpath={.spec.replicas}'
+}
+
+# Every pod of a workload in a slot that can still serve — Ready or not: one
+# starting or draining can hold a WebSocket or claim an outbox row — and does
+# not carry the capability. A listing that fails is a failure, never "none".
+pods_lacking_presence_capability() {
+  local component="$1" slot="$2" pods
+  command -v jq >/dev/null || prod_fail "jq is required"
+  pods="$(kubectl get pods -n "$NCHAT_PROD_NAMESPACE" \
+    -l "app.kubernetes.io/component=$component,$NCHAT_PROD_SLOT_LABEL=$slot" -o json)" || return 1
+  jq -r --arg key "$NCHAT_PROD_PRESENCE_CAPABILITY_ANNOTATION" --arg value "$NCHAT_PROD_PRESENCE_CAPABILITY_VALUE" '
+    .items[]
+    | select((.status.phase // "") != "Succeeded" and (.status.phase // "") != "Failed")
+    | select((.metadata.annotations[$key] // "") != $value)
+    | .metadata.name' <<<"$pods"
+}
+
+# One line per way a slot could serve a manual presence reader without the
+# capability; nothing when there is none; a failure when it cannot be read.
+#
+# serving: what runs or is about to — the pods, and the template of a
+# Deployment that asks for replicas. A slot drained to zero is not serving.
+# promotable: everything a promotion would put in front of users — the
+# template counts whatever its replica count.
+slot_presence_gaps() {
+  local slot="$1" mode="$2" service deployment component capability replicas pods
+  for service in "${NCHAT_PROD_PRESENCE_READERS[@]}"; do
+    deployment="$service-$slot"
+    component="$(deployment_component "$deployment")" || return 1
+    [[ -n "$component" ]] || continue
+    capability="$(deployment_presence_capability "$deployment")" || return 1
+    replicas="$(deployment_replicas "$deployment")" || return 1
+    if [[ "$capability" != "$NCHAT_PROD_PRESENCE_CAPABILITY_VALUE" && ("$mode" == promotable || "${replicas:-0}" != 0) ]]; then
+      echo "deployment $deployment: its pod template does not carry $NCHAT_PROD_PRESENCE_CAPABILITY_ANNOTATION=$NCHAT_PROD_PRESENCE_CAPABILITY_VALUE"
+    fi
+    pods="$(pods_lacking_presence_capability "$component" "$slot")" || return 1
+    sed -n 's/^\(..*\)$/pod \1 ('"$deployment"'): no manual presence capability/p' <<<"$pods"
+  done
+}
+
+report_presence_gaps() {
+  local slot="$1" gaps="$2" line
+  echo "slot $slot cannot honour manual presence:" >&2
+  while IFS= read -r line; do
+    printf '  %s\n' "$line" >&2
+  done <<<"$gaps"
+}
+
+# The precondition for enabling manual presence, proved rather than printed:
+# in neither slot does a reader without the capability run or ask to run.
+# Anything that cannot be read fails closed.
+require_presence_capable_cluster() {
+  local slot gaps found=0
+  for slot in "${NCHAT_PROD_SLOTS[@]}"; do
+    gaps="$(slot_presence_gaps "$slot" serving)" ||
+      prod_fail "could not read the manual presence readers of slot $slot; nothing was changed"
+    [[ -n "$gaps" ]] || continue
+    found=1
+    report_presence_gaps "$slot" "$gaps"
+  done
+  [[ "$found" -eq 0 ]] ||
+    prod_fail "a chat-service or notification-service from before issue #798 is still running; drain the previous slot (make prod-blue-green-drain-old) and let every rollout finish before enabling manual presence. Nothing was changed."
+}
+
+# When manual presence was first enabled, or nothing if it never was.
+manual_presence_activated() {
+  kubectl get configmap "$NCHAT_PROD_CONFIGMAP" -n "$NCHAT_PROD_NAMESPACE" \
+    -o "jsonpath=$(annotation_jsonpath .metadata "$NCHAT_PROD_PRESENCE_ACTIVATED_ANNOTATION")"
+}
+
+# Records the first activation. Before the gate is opened, so a run that stops
+# half-way still leaves the promotions guarded.
+mark_manual_presence_activated() {
+  local existing
+  existing="$(manual_presence_activated)" ||
+    prod_fail "could not read $NCHAT_PROD_CONFIGMAP; nothing was changed"
+  [[ -z "$existing" ]] || return 0
+  kubectl annotate configmap "$NCHAT_PROD_CONFIGMAP" -n "$NCHAT_PROD_NAMESPACE" \
+    "$NCHAT_PROD_PRESENCE_ACTIVATED_ANNOTATION=$(date -u +%Y-%m-%dT%H:%M:%SZ)" ||
+    prod_fail "could not record the activation on $NCHAT_PROD_CONFIGMAP; nothing was changed"
+}
+
+# The promotion guard, for cutover and rollback: once manual presence has been
+# enabled, no slot whose readers cannot honour it is put in front of users.
+require_presence_capable_target() {
+  local target="$1" activated gaps
+  activated="$(manual_presence_activated)" ||
+    prod_fail "could not read whether manual presence was ever enabled ($NCHAT_PROD_CONFIGMAP); slot $target is not promoted without knowing"
+  [[ -n "$activated" ]] || return 0
+  gaps="$(slot_presence_gaps "$target" promotable)" ||
+    prod_fail "could not read the manual presence readers of slot $target; it is not promoted without knowing"
+  [[ -n "$gaps" ]] || return 0
+  report_presence_gaps "$target" "$gaps"
+  prod_fail "manual presence has been enabled in production (since $activated) and slot $target runs a build from before issue #798: people who chose Appear offline would be shown online and Do Not Disturb would stop silencing notifications. Promote a release from #798 on. Closing the gate (make prod-manual-presence ARGS=\"--set false\") does not make this safe: states already chosen stay stored until they expire. Runbook, section 16c."
+}
+
+# The manual presence readers a rendered release would start without the
+# capability, one per line: those missing from it entirely and those whose pod
+# template does not carry the annotation. Nothing when every reader carries
+# it; a failure when the manifest cannot be read.
+#
+# kustomize's output is regular enough to read without a YAML library on the
+# runner: one document per resource, two-space indentation, the pod template's
+# annotations at a fixed depth.
+rendered_presence_gaps() {
+  local rendered="$1"
+  [[ -s "$rendered" ]] || return 1
+  python3 - "$rendered" "$NCHAT_PROD_PRESENCE_CAPABILITY_ANNOTATION" "$NCHAT_PROD_PRESENCE_CAPABILITY_VALUE" \
+    "${NCHAT_PROD_PRESENCE_READERS[@]}" <<'PY'
+import re, sys
+path, annotation, value, readers = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+found = {}
+for doc in re.split(r"(?m)^---$", open(path, encoding="utf-8").read()):
+    if not re.search(r"(?m)^kind: Deployment$", doc):
+        continue
+    name = re.search(r"(?m)^  name: (\S+)$", doc)
+    template = doc.split("\n  template:\n", 1)
+    if not name or len(template) != 2:
+        continue
+    pod_annotations = re.search(r"(?ms)^    metadata:\n(?:^      .*\n)*?^      annotations:\n((?:^        .*\n)*)", template[1])
+    carried = pod_annotations and re.search(
+        r"(?m)^        " + re.escape(annotation) + r': "?' + re.escape(value) + r'"?$', pod_annotations.group(1))
+    for reader in readers:
+        if re.fullmatch(re.escape(reader) + r"(-(blue|green))?", name.group(1)):
+            found[reader] = bool(carried)
+for reader in readers:
+    if reader not in found:
+        print(f"{reader}: not in the release")
+    elif not found[reader]:
+        print(f"{reader}: its pod template does not carry {annotation}={value}")
+PY
+}
+
+# A release checkout the cluster may start, once manual presence was enabled:
+# every reader in its production manifests carries the capability. Renders the
+# release's own manifests — never the scripts' — and fails closed on anything
+# it cannot render or read.
+require_release_presence_capability() {
+  local release_root="$1" rendered status=0
+  command -v kustomize >/dev/null || prod_fail "kustomize is required"
+  rendered="$(mktemp "${TMPDIR:-/tmp}/nchat-release-capability.XXXXXX")"
+  if ! kustomize build "$release_root/infra/k8s/overlays/k3s-prod/slots/blue" >"$rendered" 2>/dev/null; then
+    rm -f "$rendered"
+    prod_fail "the release's production manifests do not render; nothing proves what it would start"
+  fi
+  (require_rendered_presence_capability "$rendered") || status=$?
+  rm -f "$rendered"
+  return "$status"
+}
+
+# The same, for a manifest already rendered (deploy.sh's candidate), and only
+# once manual presence was enabled.
+require_candidate_presence_capability() {
+  local rendered="$1" activated
+  activated="$(manual_presence_activated)" ||
+    prod_fail "could not read whether manual presence was ever enabled ($NCHAT_PROD_CONFIGMAP); nothing was deployed"
+  [[ -n "$activated" ]] || return 0
+  require_rendered_presence_capability "$rendered"
+}
+
+require_rendered_presence_capability() {
+  local rendered="$1" gaps
+  gaps="$(rendered_presence_gaps "$rendered")" ||
+    prod_fail "the release's production manifests could not be read; nothing proves what it would start"
+  [[ -n "$gaps" ]] || return 0
+  report_presence_gaps release "$gaps"
+  prod_fail "manual presence has been enabled in production and this release cannot honour it: its notification-service would ignore Do Not Disturb on the shared outbox and its chat-service would show people who chose Appear offline, the moment either starts — in any slot, promoted or not. Nothing was deployed. Runbook, section 16c."
 }
 
 confirm() {

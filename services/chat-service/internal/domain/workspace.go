@@ -282,6 +282,9 @@ type DMConversation struct {
 	WorkspaceID string
 	Type        DMConversationType
 	Title       string
+	// AvatarEmoji is a group's chosen identity emoji (issue #1026). Empty means
+	// Automático: initials derived from the current name, never stored.
+	AvatarEmoji string
 	Status      DMConversationStatus
 	CreatedBy   string
 	CreatedAt   time.Time
@@ -411,6 +414,9 @@ type DMConversationWithParticipantIDs struct {
 	LastMessageAt          *time.Time
 	PinnedAt               *time.Time
 	UnreadCount            int
+	// ReadThrough is the viewer's server-side read point (issue #1082), the one
+	// UnreadCount is counted from; nil when they have never read here.
+	ReadThrough *ReadThrough
 	// Muted is the viewer's own notification preference for this conversation
 	// (issue #527), viewer-scoped like the counterpart fields above and never a
 	// property of the conversation itself.
@@ -595,23 +601,29 @@ var ErrGeneralChannelImmutable = errors.New("general channel is immutable")
 // panel's selector produces in one human confirmation.
 const MaxAddMembersPerRequest = 25
 
-// CanAddChannelMembers reports whether a workspace membership may add channel
-// participants (issue #705). Operation-specific channel scope is checked by
-// the service and storage.
-func CanAddChannelMembers(wm *WorkspaceMember) bool { return CanReachPublicChannels(wm) }
+// CanAddChannelMembers reports whether wm may add participants to ch.
+//
+// Adding follows access: an active workspace member who may read the channel
+// may invite another eligible workspace member. Keeping this as a separate
+// predicate prevents that narrow ability from widening removal, rename or
+// workspace administration.
+func CanAddChannelMembers(wm *WorkspaceMember, cm *ChannelMember, ch Channel) bool {
+	return CanReadChannel(wm, cm, ch)
+}
 
 // CanManageChannelMembers reports whether a user may administratively remove
 // participants from a channel (issue #398).
 //
 // It is the workspace moderation gate — active owner, admin or moderator —
 // reusing CanModerateWorkspace rather than restating it, exactly as channel
-// categories do. MemberService.RemoveMemberFromChannel uses this predicate.
-// Issue #705 split addition into CanAddChannelMembers so a plain member can add
-// without gaining this removal authority.
+// categories do. It governs administrative removal and roster management;
+// adding is intentionally a distinct access-based capability.
 //
-// RF-74 widened this removal authority from owner/admin to include the workspace
-// moderator. Deliberately not the per-channel 'moderator' role: that role is a
-// different scope and is never read as workspace authority.
+// RF-74 is what widened this from owner/admin to include the moderator: this
+// predicate was written as the named seam for exactly that.
+//
+// Deliberately not the per-channel 'moderator' role — that role is per channel
+// and is never read as workspace authority.
 //
 // Group DM participation is a different question with a different answer and is
 // deliberately not routed through here: chat.dm_members.role is closed by CHECK

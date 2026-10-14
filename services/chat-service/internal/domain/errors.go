@@ -18,6 +18,10 @@ var (
 	ErrGeneralChannelMissing     = errors.New("workspace general channel not found")
 	ErrCannotLeaveGeneralChannel = errors.New("cannot leave general channel")
 	ErrInvalidMessageTarget      = errors.New("invalid message target")
+	// ErrPresenceFactsUnavailable is a change to a fact presence is composed
+	// from that could not first be announced to presence (issue #798). Nothing
+	// was changed; the caller may retry.
+	ErrPresenceFactsUnavailable = errors.New("presence facts unavailable")
 	// ErrMentionNotEligible is deliberately non-enumerating: it covers an
 	// unknown, cross-workspace, inactive, or unauthorized mention target without
 	// revealing which condition failed.
@@ -126,6 +130,10 @@ var (
 	ErrDuplicateChannelCategoryName = fmt.Errorf("%w: category name already in use", ErrConflict)
 	// ErrChannelCategoryLimitReached reports the per-workspace category ceiling.
 	ErrChannelCategoryLimitReached = fmt.Errorf("%w: workspace category limit reached", ErrConflict)
+	// ErrIdempotencyKeyReused reports an Idempotency-Key already bound to a
+	// different request by the same actor (issue #1025). Replaying it as the
+	// earlier result, or executing it as a new one, would both be wrong.
+	ErrIdempotencyKeyReused = fmt.Errorf("%w: idempotency key already used for a different request", ErrConflict)
 	// ErrTooManyMembersRequested reports a batch above MaxAddMembersPerRequest.
 	//
 	// This is a bound on the *request*, decided before any database work, and it

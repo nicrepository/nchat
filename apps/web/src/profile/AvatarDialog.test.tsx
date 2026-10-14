@@ -191,7 +191,7 @@ describe("AvatarDialog", () => {
 
     await user.click(removeBtn());
     expect(await screen.findByText(/erro ao remover/i)).toBeInTheDocument();
-    // The persisted avatar renders via PersonAvatarImage with alt="" (no
+    // The persisted avatar renders via UserAvatar with alt="" (no
     // adjacent caption names the person elsewhere in this dialog), so it is
     // not reachable by accessible name — query the preview image directly.
     expect(document.querySelector(".avatar-dialog__preview-img")).toHaveAttribute(

@@ -61,6 +61,16 @@
 #   scale-log            every `scale` target, and the rollout record of the
 #                        scaled Deployment is rewritten to the new replica
 #                        count
+#   capability/<deployment>  the manual presence capability its pod template
+#                        carries (issue #798); absent is a build without it
+#   pod-capability/<component>-<slot>  the capability every rendered pod of
+#                        that workload carries; absent is pods without it
+#   configmap-annotation/<annotation>  an annotation of nchat-config, its "/"
+#                        written as "%", read by jsonpath and written by
+#                        `annotate configmap`
+#   configmap-read-fails "1" refuses every `get configmap` of nchat-config
+#   configmap-annotate-fails "1" refuses `annotate configmap`
+#   annotate-log         every `annotate configmap` attempted
 set -Eeuo pipefail
 
 STATE="${FAKE_STATE_DIR:?FAKE_STATE_DIR is required}"
@@ -258,6 +268,21 @@ if [[ "${1:-}" == "patch" && "${2:-}" == "configmap" ]]; then
   exit 0
 fi
 
+# kubectl annotate configmap <name> -n <ns> <key>=<value>
+if [[ "${1:-}" == "annotate" && "${2:-}" == "configmap" ]]; then
+  printf '%s\n' "$*" >>"$STATE/annotate-log"
+  if [[ "$(read_state configmap-annotate-fails)" == "1" ]]; then
+    echo "fake: configmap annotate refused" >&2
+    exit 1
+  fi
+  pair="${*: -1}"
+  mkdir -p "$STATE/configmap-annotation"
+  annotation="${pair%%=*}"
+  printf '%s' "${pair#*=}" >"$STATE/configmap-annotation/${annotation//\//%}"
+  echo "configmap/$3 annotated"
+  exit 0
+fi
+
 # kubectl exec -n <ns> <pod> -- printenv <KEY>
 #
 # The only check that distinguishes "the ConfigMap says X" from "the process
@@ -347,6 +372,7 @@ if [[ "${1:-}" == "get" && "${2:-}" == "deployment" ]]; then
       printf '%s|%s|%s|%s|%s|%s|%s' "$generation" "$observed" "$desired" \
         "$updated" "$ready" "$available" "$unavailable"
       ;;
+    *"capability-manual-presence"*) read_state "capability/$deployment" ;;
     *"matchLabels"*) read_state "component/$deployment" ;;
     *".spec.replicas"*) printf '%s' "$desired" ;;
     *"readyReplicas"*) printf '%s' "$ready" ;;
@@ -395,7 +421,8 @@ if [[ "${1:-}" == "get" && "${2:-}" == "pods" && "$*" == *"-o json"* && "$*" != 
     cat "$STATE/pods/$component-$slot.json"
     exit 0
   fi
-  read_state "observed/$component-$slot" | jq -R -s --arg component "$component" --arg slot "$slot" '
+  read_state "observed/$component-$slot" | jq -R -s --arg component "$component" --arg slot "$slot" \
+    --arg capability "$(read_state "pod-capability/$component-$slot")" '
     def present($key; $value): if $value == "" then {} else {($key): $value} end;
     split("\n") | map(select(length > 0)) | to_entries
     | { apiVersion: "v1", kind: "List", items: map(
@@ -404,7 +431,8 @@ if [[ "${1:-}" == "get" && "${2:-}" == "pods" && "$*" == *"-o json"* && "$*" != 
               name: "\($component)-\($slot)-\(.key)",
               labels: { "app.kubernetes.io/component": $component, "nchat.io/release-slot": $slot },
               annotations: (present("nchat.io/release-sha"; .value[:$colon])
-                + present("nchat.io/release-id"; .value[$colon + 1:])) },
+                + present("nchat.io/release-id"; .value[$colon + 1:])
+                + present("nchat.io/capability-manual-presence"; $capability)) },
             status: { conditions: [{ type: "Ready", status: "True" }] } }) }'
   # The cluster moves on after this read, not before it: the listing above is
   # what the caller saw, and only a later one can see the change.
@@ -731,6 +759,19 @@ if [[ "${1:-}" == "create" && "${2:-}" == "configmap" ]]; then
 fi
 
 if [[ "${1:-}" == "get" && "${2:-}" == "configmap" ]]; then
+  if [[ "$(read_state configmap-read-fails)" == "1" ]]; then
+    echo 'Error from server (Forbidden): cannot get configmaps' >&2
+    exit 1
+  fi
+  if [[ "$*" == *".metadata.annotations"* ]]; then
+    for annotation in "$STATE"/configmap-annotation/*; do
+      [[ -e "$annotation" ]] || break
+      name="$(basename "$annotation")"
+      name="${name//%//}"
+      [[ "$*" == *"${name//./\\.}"* ]] && { cat "$annotation"; exit 0; }
+    done
+    exit 0
+  fi
   # A value a fixture (or a patch) wrote wins over the static answers below, so
   # a read-after-patch sees the patch.
   for key in "$STATE"/configmap/*; do

@@ -83,9 +83,9 @@ func TestPGXCreateMessageAutoAddsMentionedChannelMemberAtomicallyPostgreSQL(t *t
 	}
 
 	_, err = store.CreateMessage(ctx, storage.CreateMessageInput{
-		WorkspaceID: amWS, ChannelID: amPrivate, SenderID: amActive1,
+		WorkspaceID: amWS, ChannelID: amPrivate, SenderID: amActive2,
 		BodyText: "forged add", BodyFormat: domain.MessageBodyFormatV3,
-		MentionedUserIDs: []string{amActive2},
+		MentionedUserIDs: []string{amActive3},
 	})
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("ordinary member auto-add err = %v, want non-enumerating ErrNotFound", err)
@@ -95,6 +95,57 @@ func TestPGXCreateMessageAutoAddsMentionedChannelMemberAtomicallyPostgreSQL(t *t
 	}
 	if got := countAutoAddEvents(t, pool, ctx, amPrivate, ""); got != 1 {
 		t.Fatalf("unauthorized mention changed event count to %d", got)
+	}
+}
+
+func TestPGXCreateMessagePublicMentionUsesAddMemberCapabilityPostgreSQL(t *testing.T) {
+	pool, ctx := addMembersPostgres(t)
+	if _, err := pool.Exec(ctx, `UPDATE chat.channels SET type = 'public' WHERE id = $1`, amPrivate); err != nil {
+		t.Fatalf("make ordinary channel public: %v", err)
+	}
+	store := storage.NewPGXMessageStore(pool)
+
+	labels, err := store.ResolveAuthorizedMentionLabels(
+		ctx, amWS, amPrivate, "", amActive1, []string{amActive2}, nil,
+	)
+	if err != nil {
+		t.Fatalf("ResolveAuthorizedMentionLabels: %v", err)
+	}
+	if labels["user:"+amActive2] != "Active Two" {
+		t.Fatalf("eligible public-channel target labels = %v, want Active Two", labels)
+	}
+
+	message, err := store.CreateMessage(ctx, storage.CreateMessageInput{
+		WorkspaceID: amWS, ChannelID: amPrivate, SenderID: amActive1,
+		BodyText: "@[Active Two](mention:user:" + amActive2 + ")", BodyFormat: domain.MessageBodyFormatV3,
+		MentionedUserIDs: []string{amActive2},
+	})
+	if err != nil {
+		t.Fatalf("CreateMessage: %v", err)
+	}
+	if message.ID == "" || !slices.Equal(message.AutoAddedMemberIDs, []string{amActive2}) || message.MemberCount != 1 {
+		t.Fatalf("message = %+v, want persisted message and one auto-added target", message)
+	}
+	if got := countChannelMembers(t, pool, ctx, amPrivate); got != 1 {
+		t.Fatalf("public mention memberships = %d, want only auto-added target", got)
+	}
+
+	labels, err = store.ResolveAuthorizedMentionLabels(
+		ctx, amWS, amPrivate, "", amActive1, []string{amForeignU}, nil,
+	)
+	if err != nil || len(labels) != 0 {
+		t.Fatalf("cross-workspace target labels = %v, %v, want no identity disclosure", labels, err)
+	}
+	_, err = store.CreateMessage(ctx, storage.CreateMessageInput{
+		WorkspaceID: amWS, ChannelID: amPrivate, SenderID: amActive1,
+		BodyText: "forged cross-workspace mention", BodyFormat: domain.MessageBodyFormatV3,
+		MentionedUserIDs: []string{amForeignU},
+	})
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("cross-workspace mention err = %v, want non-enumerating ErrNotFound", err)
+	}
+	if got := countChannelMembers(t, pool, ctx, amPrivate); got != 1 {
+		t.Fatalf("cross-workspace mention changed memberships to %d", got)
 	}
 }
 

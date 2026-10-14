@@ -11,6 +11,8 @@ import {
 import { Link, useLocation, useNavigate } from "react-router";
 
 import "./ChatSidebar.css";
+import ChannelIcon from "./ChannelIcon";
+import { channelAccessibleName } from "./channelIdentity";
 import { useSelfProfile } from "../profile/selfProfile";
 import { partitionDMs, type Channel, type ChannelCategory, type DMConversation } from "./chatTypes";
 import ConversationActionsMenu from "./ConversationActionsMenu";
@@ -21,13 +23,18 @@ import {
   type ConversationActionId,
   type ConversationTarget,
 } from "./conversationActions";
+import GroupAvatar from "./GroupAvatar";
+import GroupIdentityDialog from "./GroupIdentityDialog";
+import { useGroupIdentityDialog } from "./useGroupIdentityDialog";
 import LeaveConversationDialog from "./LeaveConversationDialog";
 import RenameChannelDialog from "./RenameChannelDialog";
-import { avatarColorFor, initialsFrom } from "./messageDisplay";
+import { avatarColorFor } from "./messageDisplay";
 import NewConversationDialog from "./NewConversationDialog";
-import { PersonAvatarImage } from "./PersonAvatarImage";
+import { presenceTargetKey, usePresenceDetail, type PresenceState } from "./presence";
+import { describePresence } from "./presenceDescription";
+import { UserAvatar } from "./UserAvatar";
 import PresenceDot from "./PresenceDot";
-import { presenceLabel, presenceTargetKey, usePresence, type PresenceState } from "./presence";
+import PresenceStatusMenu from "./PresenceStatusMenu";
 import SidebarUserMenu from "./SidebarUserMenu";
 import { sortByActivity } from "./sidebarOrder";
 import {
@@ -60,44 +67,6 @@ function PinnedIndicator() {
 }
 
 // ── Inline SVG icons ─────────────────────────────────────────────────────────
-
-function IconHash() {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className="chat-sidebar__icon"
-      aria-hidden="true"
-    >
-      <line x1="10" y1="4" x2="8" y2="20" />
-      <line x1="16" y1="4" x2="14" y2="20" />
-      <line x1="4" y1="9" x2="20" y2="9" />
-      <line x1="3" y1="15" x2="19" y2="15" />
-    </svg>
-  );
-}
-
-function IconLock() {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className="chat-sidebar__icon chat-sidebar__icon--sm"
-      aria-hidden="true"
-    >
-      <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
-      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-    </svg>
-  );
-}
 
 function IconAdd() {
   return (
@@ -172,9 +141,10 @@ function IconChevronDown() {
 // ── Avatar helpers ────────────────────────────────────────────────────────────
 
 interface AvatarProps {
-  initials: string;
-  /** Optional picture. Initials are shown when absent or when loading fails. */
-  src?: string;
+  userId: string;
+  workspaceId: string;
+  displayName: string;
+  avatarUrl?: string;
   color?: string;
   /**
    * Live presence (RF-58). Absent for an avatar that stands for a conversation
@@ -184,47 +154,37 @@ interface AvatarProps {
    * accessible label, so nothing here has to be reachable on its own.
    */
   status?: PresenceState;
+  /** The dot's hover text, when the row has more to say than the state. */
+  statusTitle?: string;
   size?: "sm" | "md";
 }
 
-function Avatar({ initials, src, color = "purple", status, size = "sm" }: AvatarProps) {
+function Avatar({
+  userId,
+  workspaceId,
+  displayName,
+  avatarUrl,
+  color = "purple",
+  status,
+  statusTitle,
+  size = "sm",
+}: AvatarProps) {
   return (
     <span
       className={`chat-sidebar__avatar chat-sidebar__avatar--${color} chat-sidebar__avatar--${size}`}
       aria-hidden="true"
     >
-      <PersonAvatarImage src={src} initials={initials} imgClassName="chat-sidebar__avatar-img" />
-      {status && <PresenceDot state={status} size={size} ringColor="var(--cs-sidebar-bg)" />}
-    </span>
-  );
-}
-
-function GroupAvatars({ dm }: { dm: DMConversation }) {
-  const first = dm.participants[0];
-  const second = dm.participants[1];
-  // The sidebar payload carries no participants (chatApi maps them to []), so
-  // without this every group reserved the avatar slot and left it empty
-  // (BUG #395). The group name is already on the row, so its initials come from
-  // the same canonical rule the 1:1 rows use — no second rule, no empty space.
-  if (!first) {
-    return <Avatar initials={initialsFrom(dm.name)} color={avatarColorFor(dm.id)} size="sm" />;
-  }
-  return (
-    <span className="chat-sidebar__group-avatars" aria-hidden="true">
-      {first && (
-        <span
-          className={`chat-sidebar__avatar chat-sidebar__avatar--${first.color} chat-sidebar__avatar--sm chat-sidebar__avatar--group-back`}
-        >
-          {first.initials}
-        </span>
-      )}
-      {second && (
-        <span
-          className={`chat-sidebar__avatar chat-sidebar__avatar--${second.color} chat-sidebar__avatar--sm chat-sidebar__avatar--group-front`}
-        >
-          {second.initials}
-        </span>
-      )}
+      <UserAvatar
+        userId={userId}
+        workspaceId={workspaceId}
+        displayName={displayName}
+        avatarUrl={avatarUrl}
+        presence={status}
+        presenceTitle={statusTitle}
+        size={size}
+        presenceRingColor="var(--cs-sidebar-bg)"
+        imageClassName="chat-sidebar__avatar-img"
+      />
     </span>
   );
 }
@@ -492,6 +452,7 @@ function ChannelList({ channels, activeChannelId, onSelect, labelId, actions }: 
     <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={labelId}>
       {channels.map((ch) => {
         const isActive = ch.id === activeChannelId;
+        const isPrivate = ch.type === "private";
         const target: ConversationTarget = {
           kind: "channel",
           id: ch.id,
@@ -509,21 +470,16 @@ function ChannelList({ channels, activeChannelId, onSelect, labelId, actions }: 
               role="option"
               aria-selected={isActive}
               aria-label={withPinnedSuffix(
-                `Canal ${ch.type === "private" ? "privado " : ""}${ch.name}`,
+                channelAccessibleName(ch.name, isPrivate),
                 target.pinned,
               )}
               className={`chat-sidebar__nav-item${isActive ? " chat-sidebar__nav-item--active" : ""}`}
               onClick={() => onSelect(ch.id)}
             >
-              {ch.type === "private" ? <IconLock /> : <IconHash />}
+              <ChannelIcon isPrivate={isPrivate} className="chat-sidebar__icon" />
               <span className="chat-sidebar__row-lines">
                 <span className="chat-sidebar__row-line">
                   <span className="chat-sidebar__nav-item-name">{ch.name}</span>
-                  {ch.type === "private" && (
-                    <span className="chat-sidebar__badge chat-sidebar__badge--private sr-only">
-                      privado
-                    </span>
-                  )}
                   {ch.unreadCount != null && ch.unreadCount > 0 && (
                     <span
                       className={`chat-sidebar__unread-badge${ch.hasMentionUnread ? " chat-sidebar__unread-badge--mention" : ""}`}
@@ -565,6 +521,7 @@ interface DMListProps {
   labelId: string;
   emptyMessage: string;
   actions: RowActionsProps;
+  workspaceId: string;
 }
 
 /**
@@ -581,27 +538,32 @@ function DMRow({
   isActive,
   onSelect,
   actions,
+  workspaceId,
 }: {
   dm: DMConversation;
   isActive: boolean;
   onSelect: (id: string) => void;
   actions: RowActionsProps;
+  workspaceId: string;
 }) {
   const isGroup = dm.type === "group";
   const draftSummaries = useContext(DraftSummariesContext);
   const counterpart = dm.counterpart;
   // Scoped to this conversation: the counterpart is one of its two participants,
   // so the server's roster for it is exactly the list that would have named them.
-  const presence = usePresence(
+  const presenceDetail = usePresenceDetail(
     isGroup ? undefined : counterpart?.userId,
     presenceTargetKey("dm", dm.id),
   );
+  const presence = presenceDetail.state;
   const baseLabel = isGroup ? `Grupo ${dm.name}` : `Mensagem direta com ${dm.name}`;
   // Presence in words, in the row's accessible name. The dot is what a sighted
   // user sees and this is what a screen reader hears, from the same value —
   // and it is why the avatar does not need to become a focusable control to
-  // make the state reachable by keyboard.
-  const label = presence === "unknown" ? baseLabel : `${baseLabel}, ${presenceLabel(presence)}`;
+  // make the state reachable by keyboard. No clock: a list row says what the
+  // state is and why ("Ocupado · Em chamada"), never a permanent last seen.
+  const presenceText = describePresence(presenceDetail);
+  const label = presence === "unknown" ? baseLabel : `${baseLabel}, ${presenceText}`;
   // A group is a group and a 1:1 is a 1:1, from the server's own discriminator —
   // the same value partitionDMs filed this row under. It is what keeps "Sair"
   // out of a direct conversation structurally rather than by a check at the end.
@@ -628,13 +590,16 @@ function DMRow({
           one, with initials otherwise — so the row height never shifts
           depending on whether a counterpart has an avatar. */}
         {isGroup ? (
-          <GroupAvatars dm={dm} />
+          <GroupAvatar name={dm.name} emoji={dm.avatarEmoji} />
         ) : (
           <Avatar
-            initials={initialsFrom(counterpart?.displayName ?? dm.name)}
-            src={counterpart?.avatarUrl}
+            userId={counterpart?.userId ?? ""}
+            workspaceId={workspaceId}
+            displayName={counterpart?.displayName ?? dm.name}
+            avatarUrl={counterpart?.avatarUrl}
             color={avatarColorFor(counterpart?.userId ?? dm.id)}
             status={presence}
+            statusTitle={presenceText}
             size="sm"
           />
         )}
@@ -669,7 +634,15 @@ function DMRow({
   );
 }
 
-function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage, actions }: DMListProps) {
+function DMList({
+  dms,
+  activeDMId,
+  onSelect,
+  labelId,
+  emptyMessage,
+  actions,
+  workspaceId,
+}: DMListProps) {
   if (dms.length === 0) {
     return (
       <p className="chat-sidebar__empty" role="status">
@@ -687,6 +660,7 @@ function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage, actions }: D
           isActive={dm.id === activeDMId}
           onSelect={onSelect}
           actions={actions}
+          workspaceId={workspaceId}
         />
       ))}
     </div>
@@ -753,6 +727,40 @@ function SidebarRenameDialog({
       currentName={conversation.name}
       onClose={onClose}
       onRename={rename}
+    />
+  );
+}
+
+/**
+ * Resolves the group an identity dialog is open for (issue #1026). Same shape
+ * as the rename host: the current identity is read from the canonical list, and
+ * a group the refetch removed closes its dialog.
+ */
+function SidebarIdentityDialog({
+  dms,
+  targetId,
+  currentUserId,
+  onClose,
+  onSave,
+}: {
+  dms: DMConversation[] | undefined;
+  targetId: string | null;
+  /** Absent until the sidebar is ready; the dialog needs the reader's history. */
+  currentUserId: string | undefined;
+  onClose: () => void;
+  onSave?: (conversationId: string, emoji: string | undefined) => Promise<void>;
+}) {
+  const group = dms?.find((candidate) => candidate.id === targetId && candidate.type === "group");
+  if (!group || !onSave || !currentUserId) return null;
+  return (
+    <GroupIdentityDialog
+      key={group.id}
+      groupId={group.id}
+      name={group.name}
+      avatarEmoji={group.avatarEmoji}
+      currentUserId={currentUserId}
+      onClose={onClose}
+      onSave={onSave}
     />
   );
 }
@@ -939,7 +947,8 @@ function ChannelsByCategory({
 // ── Footer user block ─────────────────────────────────────────────────────────
 
 /**
- * The authenticated user's own row: picture, name, and Settings beside it.
+ * The authenticated user's own row: picture, name and state as the one status
+ * control, and Settings beside it.
  *
  * Identity comes from GET /api/auth/me through the shared self-profile cache —
  * never from a client-chosen id, never from a fixture. Until that answer exists
@@ -948,47 +957,50 @@ function ChannelsByCategory({
  * not even for a frame. A load failure is its own state for the same reason: it
  * is not a user without an avatar.
  *
- * Profile and Settings are siblings, not nested links: one interactive element
- * may not contain another.
+ * The status control and Settings are siblings, not nested: one interactive
+ * element may not contain another.
  */
-function SidebarUser() {
+function SidebarUser({ workspaceId }: { workspaceId: string }) {
   const self = useSelfProfile();
   // "" covers absent / null / whitespace-only — normalised once, in profileApi.
   const displayName = self.status === "ready" ? self.profile.displayName : "";
-  // The viewer's own presence comes back from the server like everyone else's:
-  // their session announces itself into the conversations it subscribes to, and
-  // the echo is what this reads. Nothing here decides locally that "I" am
-  // online, so the footer shows what the server would tell anybody else.
-  //
-  // No conversation is passed, and none would be right: the footer is not
-  // rendering this person *inside* a conversation. It therefore never shows
-  // "offline" — which is correct, because a viewer looking at their own row is
-  // by definition connected.
-  const presence = usePresence(self.status === "ready" ? self.profile.id : undefined);
-  const baseLabel = displayName ? `Meu perfil de ${displayName}` : "Meu perfil";
 
   return (
     <div className="chat-sidebar__user-row">
-      <Link
-        to="/profile"
-        className="chat-sidebar__user"
-        aria-label={presence === "unknown" ? baseLabel : `${baseLabel}, ${presenceLabel(presence)}`}
-      >
-        {self.status === "ready" ? (
-          <>
-            <Avatar
-              // No usable name means no initials to derive: an empty swatch,
-              // never "?". Its colour is still the user's own, so the row does
-              // not change identity when a name arrives.
-              initials={displayName ? initialsFrom(displayName) : ""}
-              src={self.profile.avatarUrl}
-              color={avatarColorFor(self.profile.id)}
-              status={presence}
-              size="md"
-            />
-            <span className="chat-sidebar__user-name">{displayName || "Meu perfil"}</span>
-          </>
-        ) : (
+      {self.status === "ready" ? (
+        // The whole identity — avatar, name and state — is the one control
+        // that sets the viewer's status (issue #798). The profile is in the
+        // account menu beside it. The state comes back from the server like
+        // everyone else's: nothing here decides locally that "I" am online.
+        <PresenceStatusMenu selfId={self.profile.id} displayName={displayName}>
+          {(trigger, summary) => (
+            <button {...trigger} className="chat-sidebar__user">
+              <Avatar
+                // No usable name means no initials to derive: an empty swatch,
+                // never "?". Its colour is still the user's own, so the row
+                // does not change identity when a name arrives. No dot: the
+                // state is written right below the name, once.
+                userId={self.profile.id}
+                workspaceId={workspaceId}
+                displayName={displayName}
+                avatarUrl={self.profile.avatarUrl}
+                color={avatarColorFor(self.profile.id)}
+                size="md"
+              />
+              <span className="chat-sidebar__user-identity" aria-hidden="true">
+                <span className="chat-sidebar__user-name">{displayName || "Meu perfil"}</span>
+                <span className="chat-sidebar__user-presence">
+                  <PresenceDot state={summary.dot} inline />
+                  <span className="chat-sidebar__user-presence-label">{summary.label}</span>
+                </span>
+              </span>
+            </button>
+          )}
+        </PresenceStatusMenu>
+      ) : (
+        // Same box as the real control, so the footer does not jump when the
+        // profile arrives — and nothing to press until it has.
+        <div className="chat-sidebar__user">
           <span
             className="chat-sidebar__user-placeholder"
             data-state={self.status}
@@ -998,8 +1010,8 @@ function SidebarUser() {
             <span className="chat-sidebar__avatar chat-sidebar__avatar--md chat-sidebar__user-avatar-skeleton" />
             <span className="chat-sidebar__user-name-skeleton" />
           </span>
-        )}
-      </Link>
+        </div>
+      )}
       <SidebarUserMenu />
     </div>
   );
@@ -1020,6 +1032,8 @@ interface ChatSidebarProps {
   renameChannel?: (channelId: string, displayName: string) => Promise<void>;
   /** Persists a group's new title; rejects with the API error (issue #527). */
   renameGroup?: (conversationId: string, title: string) => Promise<void>;
+  /** Sets a group's emoji, or with none returns it to Automático (#1026). */
+  setGroupAvatar?: (conversationId: string, emoji: string | undefined) => Promise<void>;
   /** Silences or restores one conversation for this viewer (issue #527). */
   setMuted?: (
     target: { kind: "channel" | "dm"; targetId: string },
@@ -1077,6 +1091,7 @@ export default function ChatSidebar({
   markRead,
   renameChannel,
   renameGroup,
+  setGroupAvatar,
   setMuted,
   leaveConversation,
   onOpenDetails,
@@ -1104,9 +1119,10 @@ export default function ChatSidebar({
   // useSidebarSectionPreferences for how it stays correct on the first ready
   // render and drops any stale value when the user or workspace changes,
   // without ever calling setState during this render.
+  const readyUserId = state.status === "ready" ? state.currentUserId : undefined;
   const { prefs: sectionPrefs, toggleCollapsed: toggleSectionCollapsed } =
     useSidebarSectionPreferences(
-      state.status === "ready" ? state.currentUserId : undefined,
+      readyUserId,
       state.status === "ready" ? state.workspaceId : undefined,
     );
 
@@ -1131,6 +1147,7 @@ export default function ChatSidebar({
   // at render time, so a refetch that removed the conversation closes the
   // dialog instead of leaving one open over nothing.
   const [leavingId, setLeavingId] = useState<string | null>(null);
+  const identityDialog = useGroupIdentityDialog();
 
   useEffect(() => {
     if (!newConversationOpen && state.status === "ready" && restoreFocusRef.current) {
@@ -1348,6 +1365,7 @@ export default function ChatSidebar({
       mute: () => handleMute(target, true),
       unmute: () => handleMute(target, false),
       rename: () => setRenamingId(target.id),
+      identity: () => identityDialog.open(target.id, trigger),
       // The trigger travels with the request: the panel opens somewhere else
       // entirely, and closing it has to know which row to hand focus back to
       // (issue #467, code quality review).
@@ -1392,20 +1410,34 @@ export default function ChatSidebar({
         aria-label="Navegação do workspace Nchat"
         data-testid="chat-sidebar"
       >
-        {/* ── Brand ── */}
-        <Link to="/chat" className="chat-sidebar__brand" aria-label="Nchat — Workspace Nic-Labs">
-          <img
-            src="/assets/icononly_transparent.png"
-            alt=""
-            width={30}
-            height={34}
-            className="chat-sidebar__brand-img"
-          />
-          <div className="chat-sidebar__brand-copy">
-            <p className="chat-sidebar__brand-title">Nchat</p>
-            <p className="chat-sidebar__brand-sub">Workspace Nic-Labs</p>
-          </div>
-        </Link>
+        {/* ── Top: brand + global search (issue #550) ──
+          Global actions live at the top. The search button is the brand's
+          sibling, never nested inside its link, and runs the shell's single
+          "search.open" command — the same one Ctrl/Cmd+K runs. */}
+        <div className="chat-sidebar__top">
+          <Link to="/chat" className="chat-sidebar__brand" aria-label="Nchat — Workspace Nic-Labs">
+            <img
+              src="/assets/icononly_transparent.png"
+              alt=""
+              width={30}
+              height={34}
+              className="chat-sidebar__brand-img"
+            />
+            <div className="chat-sidebar__brand-copy">
+              <p className="chat-sidebar__brand-title">Nchat</p>
+              <p className="chat-sidebar__brand-sub">Workspace Nic-Labs</p>
+            </div>
+          </Link>
+          <button
+            type="button"
+            className="chat-sidebar__search"
+            aria-label="Buscar no NChat"
+            title="Buscar"
+            onClick={onOpenSearch}
+          >
+            <IconSearch />
+          </button>
+        </div>
 
         {/* ── New conversation CTA ──
           The sidebar's single creation entry point: the dialog behind it is
@@ -1476,6 +1508,7 @@ export default function ChatSidebar({
                     labelId={DIRECTS_LABEL_ID}
                     emptyMessage="Nenhuma mensagem direta."
                     actions={rowActions}
+                    workspaceId={state.status === "ready" ? state.workspaceId : ""}
                   />
                 )}
               </Section>
@@ -1496,6 +1529,7 @@ export default function ChatSidebar({
                     labelId={GROUPS_LABEL_ID}
                     emptyMessage="Nenhum grupo."
                     actions={rowActions}
+                    workspaceId={state.status === "ready" ? state.workspaceId : ""}
                   />
                 )}
               </Section>
@@ -1510,15 +1544,6 @@ export default function ChatSidebar({
 
         {/* ── Footer ── */}
         <div className="chat-sidebar__footer">
-          <button
-            type="button"
-            className="chat-sidebar__footer-item"
-            aria-label="Buscar"
-            onClick={onOpenSearch}
-          >
-            <IconSearch />
-            <span>Buscar</span>
-          </button>
           <Link
             to="/chat/favorites"
             className="chat-sidebar__footer-item"
@@ -1527,7 +1552,7 @@ export default function ChatSidebar({
             <IconStar />
             <span>Favoritos</span>
           </Link>
-          <SidebarUser />
+          <SidebarUser workspaceId={state.status === "ready" ? state.workspaceId : ""} />
         </div>
         <SidebarRenameDialog
           channels={channels}
@@ -1536,6 +1561,13 @@ export default function ChatSidebar({
           onClose={() => setRenamingId(null)}
           onRenameChannel={renameChannel}
           onRenameGroup={renameGroup}
+        />
+        <SidebarIdentityDialog
+          dms={dms}
+          targetId={identityDialog.targetId}
+          currentUserId={readyUserId}
+          onClose={identityDialog.close}
+          onSave={setGroupAvatar}
         />
         <SidebarLeaveDialog
           channels={channels}
@@ -1547,6 +1579,7 @@ export default function ChatSidebar({
         {newConversationOpen && state.status === "ready" && (
           <NewConversationDialog
             currentUserId={state.currentUserId}
+            workspaceId={state.workspaceId}
             categories={categories || []}
             onClose={closeNewConversation}
             onOpened={handleDMOpened}

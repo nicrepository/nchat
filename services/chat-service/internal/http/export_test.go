@@ -14,3 +14,6 @@ var (
 // ExportMapToMessageJSON exposes the message serializer so the per-link
 // contract (issue #807) can be asserted field for field.
 var ExportMapToMessageJSON = mapToMessageJSON
+
+// ExportPresenceUpdateResult exposes the metric result mapping (issue #798).
+var ExportPresenceUpdateResult = presenceUpdateResult

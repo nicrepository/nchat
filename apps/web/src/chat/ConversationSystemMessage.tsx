@@ -30,19 +30,28 @@ interface ConversationSystemMessageProps {
    * Optional: omitting it degrades to the third-party phrasing everywhere.
    */
   viewerId?: string;
+  /**
+   * Registers the rendered row with the timeline (issue #1082), exactly as a
+   * bubble does: a conversation event on screen is read by the same geometry as
+   * any message, and a row that renders nothing never registers at all.
+   */
+  setMessageRef?: (messageId: string, el: HTMLElement | null) => void;
 }
 
 export default function ConversationSystemMessage({
   message,
   scope,
   viewerId,
+  setMessageRef,
 }: ConversationSystemMessageProps) {
   const presentation = systemMessagePresentation(message, scope, viewerId);
-  // An event this build cannot describe renders nothing at all, rather than an
-  // empty line: a newer server's event must not leave a blank row behind.
+  // Only a message that is not a conversation event has no presentation; every
+  // event — even one this build cannot phrase — draws a line (issue #1082).
   if (!presentation) return null;
   return (
     <p
+      ref={setMessageRef ? (el) => setMessageRef(message.id, el) : undefined}
+      data-message-id={message.id}
       className={
         presentation.tone === "call"
           ? "chat-system-message chat-system-message--call"

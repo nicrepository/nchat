@@ -1,3 +1,4 @@
+import { parseOwnership } from "./ownershipApi";
 /**
  * Chat API client.
  *
@@ -11,7 +12,9 @@
  */
 
 import { authenticatedFetch } from "../lib/authClient";
+import { safeAvatarUrl } from "./avatarUrl";
 import { parseMessageLinks } from "./messageLinks";
+import type { TimelinePosition } from "./messages/messageOrder";
 import { ApiRequestError } from "../lib/api";
 import { onAuthChange } from "../lib/authSession";
 import {
@@ -41,6 +44,7 @@ import {
   type MentionCandidate,
   type MentionTarget,
   type DMConversation,
+  type DMType,
   type FavoriteItem,
   type FavoritesPage,
   type Message,
@@ -54,9 +58,14 @@ import {
   type ConversationEventPayload,
   type ConversationEventTargetUser,
   type ConversationEventType,
+  type ConversationReadState,
 } from "./chatTypes";
 
 const CHAT_BASE = import.meta.env.VITE_CHAT_API_BASE_URL ?? "/api/chat";
+
+// Temporary compatibility export for callers and tests that imported the
+// normalizer from this module before it became a shared boundary.
+export { safeAvatarUrl } from "./avatarUrl";
 
 // ── API response shapes ───────────────────────────────────────────────────────
 
@@ -83,6 +92,8 @@ interface SidebarChannelResponse {
   last_message_at?: unknown;
   pinned_at?: unknown;
   unread_count?: unknown;
+  /** Issue #1082: the point unread_count is counted from; absent on older servers. */
+  read_through?: unknown;
 }
 
 interface SidebarDMCounterpartResponse {
@@ -98,11 +109,15 @@ interface SidebarDMResponse {
   name: string;
   /** Absent on group DMs and on pre-counterpart server responses. */
   counterpart?: SidebarDMCounterpartResponse;
+  /** A group's emoji identity (issue #1026); absent when Automático. */
+  avatar_emoji?: unknown;
   /** Validated as `unknown`: absent on pre-#414 responses, null when empty. */
   created_at?: unknown;
   last_message_at?: unknown;
   pinned_at?: unknown;
   unread_count?: unknown;
+  /** Issue #1082: see SidebarChannelResponse.read_through. */
+  read_through?: unknown;
   /** This viewer's own notification preference (issue #527). */
   muted?: unknown;
   /** The level half of that preference (issue #136); absent on older servers. */
@@ -126,6 +141,8 @@ interface SidebarResponse {
    * that predates the field, which is read as "off" — the compatible answer.
    */
   conversation_notification_levels_enabled?: unknown;
+  /** Issue #1082: the server implements the precise read cursor. */
+  precise_read_cursor?: unknown;
 }
 
 interface SidebarEnvelope {
@@ -248,6 +265,7 @@ function mapSidebarChannel(ch: SidebarChannelResponse): Channel {
     lastMessageAt: sidebarTimestamp(ch.last_message_at),
     ...(pinnedAt ? { pinnedAt } : {}),
     ...(isUnreadCount(ch.unread_count) ? { unreadCount: ch.unread_count } : {}),
+    ...readStateFieldOf(ch),
   };
 }
 
@@ -268,63 +286,41 @@ function isUnreadCount(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
-/** Guards against a hostile payload turning an attribute into a memory hog. */
-const maxAvatarUrlLength = 512;
-
 /**
- * Accepts an avatar URL only when it points at this very origin.
- *
- * Same-origin is the policy, not merely a consequence of the CSP: the deployed
- * `img-src 'self'` would block a third-party image anyway, and loading one
- * would leak the viewer's IP and referer to whoever hosts it — an avatar is a
- * perfectly good tracking pixel. Rejecting cross-origin here means the UI never
- * renders an <img> that is destined to fail, so the initials fallback is a real
- * fallback rather than the normal outcome.
- *
- * `javascript:`, `data:`, `blob:`, `file:` and every other scheme are excluded
- * by the http(s) check; backslashes and control characters are excluded before
- * parsing because browsers normalise them in ways that can escape the origin.
- *
- * This is the render-time boundary. auth-service applies a stricter, separate
- * rule at persistence time (root-relative only), because it cannot know the
- * browser origin — the two checks guard different things and are not duplicates.
+ * The server's read point off the wire (issue #1082): a message position, an
+ * instant (`message_id` null), or null when the viewer never read here.
+ * Anything malformed is treated as absent, never as a position.
  */
-export function safeAvatarUrl(raw: unknown): string | undefined {
-  if (typeof raw !== "string") return undefined;
-  const value = raw.trim();
-  if (value === "" || value.length > maxAvatarUrlLength) return undefined;
-  // eslint-disable-next-line no-control-regex -- control characters are exactly what must be rejected.
-  if (/[\u0000-\u0020\u007f]/.test(value)) return undefined;
-  // Browsers treat "\" as "/", so "/\evil.test" and "\\evil.test" can leave the
-  // origin even though URL parsing may report otherwise.
-  if (value.includes("\\")) return undefined;
+function parseReadThrough(raw: unknown): TimelinePosition | null | undefined {
+  if (raw === null) return null;
+  if (typeof raw !== "object") return undefined;
+  const { created_at: createdAt, message_id: messageId } = raw as Record<string, unknown>;
+  if (typeof createdAt !== "string" || createdAt === "") return undefined;
+  if (messageId !== null && typeof messageId !== "string") return undefined;
+  return { createdAt, id: messageId };
+}
 
-  const origin = currentOrigin();
-  if (!origin) return undefined;
-  try {
-    const parsed = new URL(value, origin);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
-    if (parsed.origin !== origin) return undefined;
-    if (parsed.username !== "" || parsed.password !== "") return undefined;
-    // The original string is returned, never the resolved absolute form, so a
-    // relative path stays relative and nothing is rewritten behind the caller.
-    return value;
-  } catch {
-    return undefined;
-  }
+/** The read-state fields every server answer about a conversation shares. */
+interface ReadStateResponse {
+  unread_count?: unknown;
+  read_through?: unknown;
 }
 
 /**
- * Returns the origin to validate against, or "" when there is no document —
- * server-side rendering, a worker, or a bare unit test. With no origin there is
- * no way to prove an avatar is same-origin, so callers drop it and fall back to
- * initials rather than guessing.
+ * The read state a server answer carries (issue #1082), or undefined from a
+ * server that sends none — its count is then all there is, and a malformed
+ * point is never taken for one.
  */
-function currentOrigin(): string {
-  if (typeof window === "undefined") return "";
-  const origin = window.location?.origin;
-  // Some environments expose the literal "null" origin (sandboxed frames).
-  return typeof origin === "string" && origin !== "" && origin !== "null" ? origin : "";
+function readStateOf(raw: ReadStateResponse): ConversationReadState | undefined {
+  const readThrough = parseReadThrough(raw.read_through);
+  if (readThrough === undefined || !isUnreadCount(raw.unread_count)) return undefined;
+  return { unreadCount: raw.unread_count, readThrough };
+}
+
+/** Spread into a sidebar row: present only when this server sent a read state. */
+function readStateFieldOf(raw: ReadStateResponse): { readState?: ConversationReadState } {
+  const readState = readStateOf(raw);
+  return readState ? { readState } : {};
 }
 
 /**
@@ -370,13 +366,24 @@ function mapSidebarDM(dm: SidebarDMResponse): DMConversation | undefined {
     name: dm.name,
     participants: [],
     counterpart: type === "group" ? undefined : mapSidebarCounterpart(dm.counterpart),
+    ...groupAvatarEmoji(type, dm.avatar_emoji),
     createdAt: sidebarTimestamp(dm.created_at),
     lastMessageAt: sidebarTimestamp(dm.last_message_at),
     muted: dm.muted === true,
     notificationLevel: parseNotificationLevel(dm.notification_level),
     ...(pinnedAt ? { pinnedAt } : {}),
     ...(isUnreadCount(dm.unread_count) ? { unreadCount: dm.unread_count } : {}),
+    ...readStateFieldOf(dm),
   };
+}
+
+/**
+ * A group's emoji, when the server sent one. Only groups have an identity, and
+ * anything that is not a non-empty string reads as Automático. It is rendered
+ * as a text node, never markup; the server's catalog check is the boundary.
+ */
+function groupAvatarEmoji(type: DMType, raw: unknown): { avatarEmoji?: string } {
+  return type === "group" && typeof raw === "string" && raw !== "" ? { avatarEmoji: raw } : {};
 }
 
 function mapSidebarDMs(raw: SidebarDMResponse[] | undefined): DMConversation[] {
@@ -467,6 +474,11 @@ export async function fetchSidebarData(): Promise<{
   // Optional in the signature for the same reason the limits above are: a
   // caller with a partial fixture reads it as absent, and absent is "off".
   notificationLevelsEnabled?: boolean;
+  /**
+   * Issue #1082: whether this server implements the precise read cursor. Only
+   * then does the client persist reading progressively; absent is "no".
+   */
+  preciseReadCursor?: boolean;
   channels: Channel[];
   dms: DMConversation[];
   categories: ChannelCategory[];
@@ -530,6 +542,7 @@ export async function fetchSidebarData(): Promise<{
     // same answer on every write, so a client that got this wrong would only
     // change which error it receives (issue #136).
     notificationLevelsEnabled: sidebar.conversation_notification_levels_enabled === true,
+    preciseReadCursor: sidebar.precise_read_cursor === true,
     channels,
     dms,
     categories,
@@ -548,24 +561,41 @@ export async function setSidebarConversationPinned(
   await authenticatedFetch(target, { method: pinned ? "POST" : "DELETE" });
 }
 
+export type { ConversationReadState } from "./chatTypes";
+
+/**
+ * Advances the read cursor to `lastReadMessageId`, or marks the whole
+ * conversation read without one. Resolves to the server's read state after the
+ * write, or undefined from a server that predates that answer (204).
+ *
+ * A cursor travels with `read_cursor: "message"`, which a server without the
+ * cursor refuses (400) instead of reading the request as "everything is read".
+ *
+ * `keepalive` lets the request outlive the page (issue #1082): a cursor read
+ * just before the tab closes still reaches the server, authenticated like any
+ * other call — which is why this is a keepalive fetch and not a beacon.
+ */
 export async function markConversationRead(
   targetType: "channel" | "dm",
   targetId: string,
   lastReadMessageId?: string,
-): Promise<void> {
+  options: { keepalive?: boolean } = {},
+): Promise<ConversationReadState | undefined> {
   const target =
     targetType === "channel"
       ? `${CHAT_BASE}/channels/${encodeURIComponent(targetId)}/read`
       : `${CHAT_BASE}/dm/${encodeURIComponent(targetId)}/read`;
-  await authenticatedFetch(target, {
+  const res = await authenticatedFetch<{ data?: ReadStateResponse }>(target, {
     method: "POST",
+    ...(options.keepalive ? { keepalive: true } : {}),
     ...(lastReadMessageId
       ? {
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ last_read_message_id: lastReadMessageId }),
+          body: JSON.stringify({ last_read_message_id: lastReadMessageId, read_cursor: "message" }),
         }
       : {}),
   });
+  return res?.data ? readStateOf(res.data) : undefined;
 }
 
 /**
@@ -689,25 +719,48 @@ export async function getOrCreateDirectDM(
 export async function createGroupDM(
   participantUserIds: string[],
   title: string,
+  avatarEmoji: string | undefined,
   signal?: AbortSignal,
 ): Promise<string> {
   const trimmedTitle = title.trim();
   const response = await authenticatedFetch<GroupDMEnvelope>(`${CHAT_BASE}/dms/group`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    // Automático sends no identity at all (issue #1026): initials are derived
+    // from the name on render, so there is nothing of theirs to persist.
     body: JSON.stringify({
       participant_user_ids: participantUserIds,
       ...(trimmedTitle ? { title: trimmedTitle } : {}),
+      ...(avatarEmoji ? { avatar_emoji: avatarEmoji } : {}),
     }),
     signal,
   });
   return response.data.conversation_id;
 }
 
+export interface CreateChannelInput {
+  slug: string;
+  displayName: string;
+  type: "public" | "private";
+  categoryId?: string;
+  /**
+   * The invitees of a private channel (issue #1025): people, never roles. The
+   * creator is implicit and the server decides every role. Sent only when
+   * present, so a public creation carries no list the server would refuse.
+   */
+  initialMemberIds?: string[];
+  /**
+   * One key per creation intent, reused by every retry of that same intent so
+   * the server returns the channel it already created instead of a second one.
+   */
+  idempotencyKey?: string;
+}
+
 /**
  * Creates a channel (RF-01) and returns it as the sidebar models one.
  *
- * Only the three caller-owned fields are sent: the workspace, the creator, the
+ * Only caller-owned fields are sent — the channel fields and, for a private
+ * channel, the invitees: the workspace, the creator, the
  * general flag and the position are derived from the session server-side, and
  * the endpoint rejects a body that carries them. No role, actor or workspace is
  * ever sent from the browser. The slug is trimmed and lowercased here because
@@ -717,17 +770,21 @@ export async function createGroupDM(
  * than as a generic failure.
  */
 export async function createChannel(
-  input: { slug: string; displayName: string; type: "public" | "private"; categoryId?: string },
+  input: CreateChannelInput,
   signal?: AbortSignal,
 ): Promise<Channel> {
   const response = await authenticatedFetch<CreateChannelEnvelope>(`${CHAT_BASE}/channels`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(input.idempotencyKey ? { "Idempotency-Key": input.idempotencyKey } : {}),
+    },
     body: JSON.stringify({
       slug: input.slug.trim().toLowerCase(),
       display_name: input.displayName.trim(),
       type: input.type,
       category_id: input.categoryId || undefined,
+      initial_member_ids: input.initialMemberIds,
     }),
     signal,
   });
@@ -850,6 +907,30 @@ export async function renameGroup(
     },
   );
   return { id: response.data.id, name: response.data.title };
+}
+
+/**
+ * Sets a group's emoji identity, or — with no emoji — returns it to Automático
+ * by removing the persisted one (issue #1026). Groups only; authority is the
+ * rename's, re-derived server-side, and the emoji is re-validated there.
+ */
+export async function setGroupAvatarEmoji(
+  conversationId: string,
+  emoji: string | undefined,
+  signal?: AbortSignal,
+): Promise<void> {
+  const target = `${CHAT_BASE}/dm/${encodeURIComponent(conversationId)}/avatar`;
+  await authenticatedFetch(
+    target,
+    emoji
+      ? {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ emoji }),
+          signal,
+        }
+      : { method: "DELETE", signal },
+  );
 }
 
 /**
@@ -2098,8 +2179,10 @@ interface ChannelDetailsEnvelope {
     member_count?: unknown;
     online_member_count?: unknown;
     online_members?: unknown;
+    can_add_members?: unknown;
     can_manage_members?: unknown;
     can_remove_members?: unknown;
+    ownership?: unknown;
   };
 }
 
@@ -2203,6 +2286,9 @@ export async function fetchChannelDetails(
     memberCount: nonNegativeCount(data.member_count),
     onlineCount: nonNegativeCount(data.online_member_count),
     onlineMembers,
+    // Independent from administrative management. Strict true makes rolling
+    // deploys with an older server fail closed by hiding the action.
+    canAddMembers: data.can_add_members === true,
     // Strict `=== true`, exactly like can_write: an absent, null or truthy-ish
     // field must never read as permission. A server that predates issue #398
     // therefore leaves the action hidden, which is the safe direction, and the
@@ -2212,6 +2298,7 @@ export async function fetchChannelDetails(
     // inferred from can_manage_members: the two are different questions, and
     // the DELETE re-derives the real answer on every call.
     canRemoveMembers: data.can_remove_members === true,
+    ownership: parseOwnership(data.ownership),
   };
 }
 
@@ -2313,6 +2400,7 @@ interface GroupDetailsEnvelope {
     participants?: unknown;
     can_manage_members?: unknown;
     can_remove_members?: unknown;
+    ownership?: unknown;
   };
 }
 
@@ -2376,6 +2464,7 @@ export async function fetchGroupDetails(
     // Genuinely a different answer for a group (issue #469): every participant
     // may add, only the creator may remove.
     canRemoveMembers: data.can_remove_members === true,
+    ownership: parseOwnership(data.ownership),
   };
 }
 
@@ -2473,9 +2562,9 @@ export async function removeChannelMember(
  * Removes one participant from a group conversation (issue #469, backend
  * issue #685).
  *
- * A separate route from the channel one because a group is a DM conversation,
- * and a separate *authority*: only the group's creator may call it, which the
- * store re-derives inside the transaction. Same empty request and same 204 as
+ * A separate route because a group is a DM conversation. The server enforces
+ * conversation ownership policy when enabled, or the legacy creator policy
+ * otherwise. The client supplies no authority. Same empty request and 204 as
  * the channel removal above.
  */
 export async function removeGroupParticipant(
@@ -2584,10 +2673,18 @@ interface DirectProfileResponse {
   display_name?: unknown;
   avatar_url?: unknown;
   presence?: unknown;
+  last_seen_at?: unknown;
   email?: unknown;
   job_title?: unknown;
   department?: unknown;
   timezone?: unknown;
+}
+
+/** A server instant the panel may show as "visto às"; anything else is absent. */
+function lastSeenFrom(raw: unknown): number | undefined {
+  if (typeof raw !== "string") return undefined;
+  const at = Date.parse(raw);
+  return Number.isFinite(at) ? at : undefined;
 }
 
 /** A profile string the panel will render: text, trimmed, or absent. */
@@ -2699,6 +2796,7 @@ export async function fetchDirectProfile(
       displayName,
       avatarUrl: safeAvatarUrl(raw.avatar_url),
       presence,
+      lastSeenAt: lastSeenFrom(raw.last_seen_at),
       email: optionalText(raw.email),
       // No column stores these yet, so today they are always absent. Reading
       // them costs three lines and is what makes "when available" true rather

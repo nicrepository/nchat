@@ -9,17 +9,21 @@
  * to a header is a change to this file alone.
  */
 
-import { forwardRef, useState, type RefObject } from "react";
+import { forwardRef, type RefObject } from "react";
 
 import type { ResourceCallHeaderState } from "../../calls/resourceCallTypes";
 import type { ChatOutletContext } from "../ChatShell";
-import type { DMCounterpart } from "../chatTypes";
+import type { DMConversation, DMCounterpart } from "../chatTypes";
 import { conversationDetailsPanelId } from "../conversationDetailsDisplay";
-import { avatarColorFor, initialsFrom } from "../messageDisplay";
-import PresenceDot from "../PresenceDot";
-import { presenceLabel, usePresence, type PresenceState } from "../presence";
+import { avatarColorFor } from "../messageDisplay";
+import { usePresenceDetail, type PresenceState } from "../presence";
+import { describePresence } from "../presenceDescription";
+import { presenceNeedsClock, usePresenceClock } from "../usePresenceClock";
+import { UserAvatar } from "../UserAvatar";
 import type { ConversationDetailsPanelState } from "../useConversationDetailsPanel";
-import { IconHash } from "./icons";
+import ChannelIcon from "../ChannelIcon";
+import GroupAvatar from "../GroupAvatar";
+import { channelAccessibleName } from "../channelIdentity";
 
 interface DetailsToggleProps {
   open: boolean;
@@ -131,18 +135,31 @@ function ResourceCallAction({ state }: { state: ResourceCallHeaderState }) {
 
 interface HeaderChannelProps {
   name: string;
+  /** Issue #1024: from the sidebar payload the server already authorised. */
+  isPrivate: boolean;
   detailsToggle?: React.ReactNode;
   /** RF-24/#622: absent only when this header is not showing a resource call at all (never the case for a channel). */
   resourceCall?: ResourceCallHeaderState;
 }
 
-export function HeaderChannel({ name, detailsToggle, resourceCall }: HeaderChannelProps) {
+export function HeaderChannel({
+  name,
+  isPrivate,
+  detailsToggle,
+  resourceCall,
+}: HeaderChannelProps) {
   return (
     <header className="chat-msg-area__header" data-testid="chat-msg-header">
       <span className="chat-msg-area__header-icon" aria-hidden="true">
-        <IconHash />
+        <ChannelIcon isPrivate={isPrivate} />
       </span>
-      <h1 className="chat-msg-area__header-title">{name}</h1>
+      {/* The lock is decorative, so the heading says "privado" in words. */}
+      <h1
+        className="chat-msg-area__header-title"
+        aria-label={name ? channelAccessibleName(name, isPrivate) : undefined}
+      >
+        {name}
+      </h1>
       {resourceCall && <ResourceCallAction state={resourceCall} />}
       {detailsToggle}
     </header>
@@ -151,8 +168,15 @@ export function HeaderChannel({ name, detailsToggle, resourceCall }: HeaderChann
 
 interface HeaderDMProps {
   name: string;
+  workspaceId?: string;
   /** Same structured counterpart the sidebar uses — never a second request. */
   counterpart?: DMCounterpart;
+  /**
+   * The conversation as the sidebar holds it (issue #1026). A group is drawn
+   * with its own identity, never with a person's avatar or a colour derived
+   * from its name.
+   */
+  conversation?: Pick<DMConversation, "type" | "avatarEmoji">;
   onStartCall?: (targetUserId: string, callType: "audio" | "video") => boolean;
   /**
    * RF-24/#622: a group's shared call room state. Always absent for a 1:1
@@ -181,18 +205,13 @@ function HeaderAvatar({
   name,
   counterpart,
   presence,
+  workspaceId,
 }: {
   name: string;
   counterpart: DMCounterpart | undefined;
   presence: PresenceState;
+  workspaceId: string;
 }) {
-  const src = counterpart?.avatarUrl;
-  const [failedSrc, setFailedSrc] = useState<string | null>(null);
-  const [trackedSrc, setTrackedSrc] = useState(src);
-  if (src !== trackedSrc) {
-    setTrackedSrc(src);
-    setFailedSrc(null);
-  }
   // Same deterministic colour the sidebar uses for this person, so the initials
   // fallback matches across both surfaces. Keyed on the counterpart user id
   // (stable per person); legacy DMs without a counterpart fall back to the name.
@@ -202,35 +221,62 @@ function HeaderAvatar({
       className={`chat-msg-area__header-avatar chat-msg-area__header-avatar--${color}`}
       aria-hidden="true"
     >
-      {Boolean(src) && failedSrc !== src ? (
-        <img
-          className="chat-msg-area__header-avatar-img"
-          src={src}
-          alt=""
-          referrerPolicy="no-referrer"
-          onError={() => setFailedSrc(src ?? null)}
-        />
-      ) : (
-        initialsFrom(counterpart?.displayName ?? name)
-      )}
-      <PresenceDot state={presence} size="md" />
+      <UserAvatar
+        userId={counterpart?.userId ?? ""}
+        workspaceId={workspaceId}
+        displayName={counterpart?.displayName ?? name}
+        avatarUrl={counterpart?.avatarUrl}
+        presence={presence}
+        size="md"
+        imageClassName="chat-msg-area__header-avatar-img"
+      />
     </div>
   );
 }
 
+/**
+ * The header's identity: a group's own (GroupAvatar), or the counterpart's.
+ * The one place the header tells the two apart, by the server's discriminator.
+ */
+function DMHeaderAvatar({
+  conversation,
+  ...person
+}: {
+  conversation: Pick<DMConversation, "type" | "avatarEmoji"> | undefined;
+  name: string;
+  counterpart: DMCounterpart | undefined;
+  presence: PresenceState;
+  workspaceId: string;
+}) {
+  if (conversation?.type === "group") {
+    return <GroupAvatar name={person.name} emoji={conversation.avatarEmoji} size="md" />;
+  }
+  return <HeaderAvatar {...person} />;
+}
+
 export function HeaderDM({
   name,
+  workspaceId = "",
   counterpart,
+  conversation,
   onStartCall,
   resourceCall,
   detailsToggle,
   presenceTarget,
 }: HeaderDMProps) {
-  const presence = usePresence(counterpart?.userId, presenceTarget);
+  const detail = usePresenceDetail(counterpart?.userId, presenceTarget);
+  const presence = detail.state;
+  const now = usePresenceClock(presenceNeedsClock(presence));
 
   return (
     <header className="chat-msg-area__header" data-testid="chat-msg-header">
-      <HeaderAvatar name={name} counterpart={counterpart} presence={presence} />
+      <DMHeaderAvatar
+        conversation={conversation}
+        name={name}
+        counterpart={counterpart}
+        presence={presence}
+        workspaceId={workspaceId}
+      />
       <h1 className="chat-msg-area__header-title">{name}</h1>
       {/* The header states the status in words as well: this is the surface a
           reader is looking at while writing to this person, so "Ausente" being
@@ -240,7 +286,7 @@ export function HeaderDM({
           className={`chat-msg-area__header-presence chat-msg-area__header-presence--${presence}`}
           data-testid="chat-msg-header-presence"
         >
-          {presenceLabel(presence)}
+          {describePresence(detail, now)}
         </span>
       )}
       {counterpart && onStartCall && (
@@ -257,8 +303,12 @@ export function HeaderDM({
 
 interface ConversationHeaderProps {
   kind: "channel" | "dm";
+  workspaceId: string;
   name: string;
+  /** Only meaningful for a channel. */
+  isPrivate: boolean;
   counterpart: DMCounterpart | undefined;
+  conversation?: Pick<DMConversation, "type" | "avatarEmoji">;
   presenceTarget: string | undefined;
   onStartCall: ChatOutletContext["startCall"];
   resourceCall: ResourceCallHeaderState | undefined;
@@ -269,8 +319,11 @@ interface ConversationHeaderProps {
 /** The channel or DM header, and the details control both of them offer. */
 export default function ConversationHeader({
   kind,
+  workspaceId,
   name,
+  isPrivate,
   counterpart,
+  conversation,
   presenceTarget,
   onStartCall,
   resourceCall,
@@ -286,12 +339,21 @@ export default function ConversationHeader({
     />
   ) : undefined;
   if (kind === "channel") {
-    return <HeaderChannel name={name} resourceCall={resourceCall} detailsToggle={detailsToggle} />;
+    return (
+      <HeaderChannel
+        name={name}
+        isPrivate={isPrivate}
+        resourceCall={resourceCall}
+        detailsToggle={detailsToggle}
+      />
+    );
   }
   return (
     <HeaderDM
       name={name}
+      workspaceId={workspaceId}
       counterpart={counterpart}
+      conversation={conversation}
       presenceTarget={presenceTarget}
       onStartCall={onStartCall}
       resourceCall={resourceCall}

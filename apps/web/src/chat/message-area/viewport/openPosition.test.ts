@@ -36,6 +36,7 @@ function input(overrides: Partial<OpenPositionInput> = {}): OpenPositionInput {
     unreadCountAtOpen: 0,
     initialAnchor: null,
     searchAttempts: 0,
+    searchPending: false,
     ...overrides,
   };
 }
@@ -185,7 +186,8 @@ describe("the navigation priority, end to end", () => {
     const decision = decideOpenPositionResolution({
       ...everything,
       resolved: false,
-      searchedForLength: -1,
+      olderPagesSettled: 0,
+      searchedAt: -1,
     });
     expect(decision).toMatchObject({ kind: "settle", target: "MESSAGE_TARGET" });
   });
@@ -193,7 +195,7 @@ describe("the navigation priority, end to end", () => {
 
 describe("decideOpenPositionResolution", () => {
   function resolutionInput(overrides: Partial<ResolutionInput> = {}): ResolutionInput {
-    return { ...input(), resolved: false, searchedForLength: -1, ...overrides };
+    return { ...input(), resolved: false, olderPagesSettled: 0, searchedAt: -1, ...overrides };
   }
 
   it("does nothing once the position has already been settled", () => {
@@ -254,7 +256,7 @@ describe("decideOpenPositionResolution", () => {
     // First render: the anchored message is older than the loaded window.
     const before = resolutionInput({ initialAnchor: anchorAt("m0"), hasMore: true });
     const search = decideOpenPositionResolution(before);
-    expect(search).toEqual({ kind: "search", searchedLength: 3 });
+    expect(search).toEqual({ kind: "search", searchedAt: 0 });
 
     // The page arrives: the same anchor is now loaded, and the decision
     // settles on it rather than asking for more.
@@ -262,9 +264,10 @@ describe("decideOpenPositionResolution", () => {
       ...before,
       messages: [message("m0"), ...before.messages],
       searchAttempts: 1,
-      // The hook records the length that asked for the page; the new page made
-      // the window longer, so this must not stand in the way of settling.
-      searchedForLength: (search as { searchedLength: number }).searchedLength,
+      // The hook records how many pages had come back when it asked; this one
+      // has come back since, so it must not stand in the way of settling.
+      searchedAt: 0,
+      olderPagesSettled: 1,
     });
     expect(after).toEqual({
       kind: "settle",
@@ -277,14 +280,14 @@ describe("decideOpenPositionResolution", () => {
 
   it("does not ask for the same page twice across repeated renders", () => {
     const first = resolutionInput({ initialAnchor: anchorAt("m0"), hasMore: true });
-    expect(decideOpenPositionResolution(first)).toEqual({ kind: "search", searchedLength: 3 });
+    expect(decideOpenPositionResolution(first)).toEqual({ kind: "search", searchedAt: 0 });
 
-    // Re-rendered with the request already in flight: same messages, so the
-    // window has not advanced and nothing may be requested again.
+    // Re-rendered with the request already in flight: no page has come back
+    // since it was asked for, so nothing may be requested again.
     const again = decideOpenPositionResolution({
       ...first,
       searchAttempts: 1,
-      searchedForLength: 3,
+      searchedAt: 0,
     });
     expect(again).toEqual({ kind: "wait" });
   });
@@ -295,7 +298,6 @@ describe("decideOpenPositionResolution", () => {
         initialAnchor: anchorAt("m0"),
         hasMore: true,
         searchAttempts: MAX_BOUNDARY_SEARCH_PAGES,
-        searchedForLength: -1,
       }),
     );
     expect(decision).toEqual({
@@ -305,5 +307,129 @@ describe("decideOpenPositionResolution", () => {
       scrollTarget: { messageId: null },
       phase: "RESTORING_POSITION",
     });
+  });
+});
+
+/**
+ * #1088: a deep link to a message older than the loaded window used to settle
+ * at once, and the jump then had nothing to travel to. It now takes part in the
+ * same bounded backward search as an anchor or an unread boundary.
+ *
+ * The search's clock is olderPagesSettled: a page counts once it has come
+ * back, whatever it held — so the last page the cap allows is still awaited,
+ * and a page of duplicates or a cursor that did not move cannot stall it.
+ */
+describe("MESSAGE_TARGET outside the loaded window (#1088)", () => {
+  function resolutionInput(overrides: Partial<ResolutionInput> = {}): ResolutionInput {
+    return {
+      ...input({ focusMessageId: "m-old", hasMore: true }),
+      resolved: false,
+      olderPagesSettled: 0,
+      searchedAt: -1,
+      ...overrides,
+    };
+  }
+
+  /** The render after the page asked for as attempt `attempt` has come back. */
+  function afterPage(attempt: number, overrides: Partial<ResolutionInput> = {}) {
+    return resolutionInput({
+      searchAttempts: attempt,
+      searchedAt: attempt - 1,
+      olderPagesSettled: attempt,
+      ...overrides,
+    });
+  }
+
+  const withTarget = [message("m-old"), ...input().messages];
+
+  it("settles on a loaded target without asking for another page", () => {
+    expect(decideOpenPositionResolution(resolutionInput({ focusMessageId: "m1" }))).toMatchObject({
+      kind: "settle",
+      target: "MESSAGE_TARGET",
+    });
+  });
+
+  it("keeps searching while the target is missing, ahead of a loaded anchor and unread", () => {
+    const position = resolveOpenPosition(
+      input({
+        focusMessageId: "m-old",
+        hasMore: true,
+        initialAnchor: anchorAt("m2"),
+        unreadCountAtOpen: 1,
+      }),
+    );
+    expect(position).toEqual({ kind: "need-more-history" });
+  });
+
+  it("settles on the target found on an intermediate page", () => {
+    const decision = decideOpenPositionResolution(afterPage(3, { messages: withTarget }));
+    expect(decision).toMatchObject({ kind: "settle", target: "MESSAGE_TARGET" });
+  });
+
+  it("waits for the last page the cap allows instead of falling back while it is on its way", () => {
+    const pending = resolutionInput({
+      searchAttempts: MAX_BOUNDARY_SEARCH_PAGES,
+      searchedAt: MAX_BOUNDARY_SEARCH_PAGES - 1,
+      olderPagesSettled: MAX_BOUNDARY_SEARCH_PAGES - 1,
+    });
+    expect(decideOpenPositionResolution(pending)).toEqual({ kind: "wait" });
+  });
+
+  it("settles on the target found exactly on the last page the cap allows", () => {
+    const decision = decideOpenPositionResolution(
+      afterPage(MAX_BOUNDARY_SEARCH_PAGES, { messages: withTarget }),
+    );
+    expect(decision).toMatchObject({ kind: "settle", target: "MESSAGE_TARGET" });
+  });
+
+  it("falls back only once that last page has come back without the target", () => {
+    const decision = decideOpenPositionResolution(afterPage(MAX_BOUNDARY_SEARCH_PAGES));
+    expect(decision).toMatchObject({ kind: "settle", target: "TAIL" });
+  });
+
+  it("asks for the next page after one that only repeated loaded messages", () => {
+    // Same messages, same length — but a page came back and the cursor moved.
+    expect(decideOpenPositionResolution(afterPage(2))).toEqual({ kind: "search", searchedAt: 2 });
+  });
+
+  it("asks for the next page after an empty one too, within the same cap", () => {
+    expect(decideOpenPositionResolution(afterPage(4))).toEqual({ kind: "search", searchedAt: 4 });
+  });
+
+  it("ends at the cap when the cursor never moves, rather than asking forever", () => {
+    // A page that comes back without moving the cursor still spends one of the
+    // cap's pages, so a stuck cursor is asked for at most that many times.
+    const asked = Array.from({ length: MAX_BOUNDARY_SEARCH_PAGES }, (_, attempt) =>
+      decideOpenPositionResolution(afterPage(attempt)),
+    );
+    expect(asked.map((decision) => decision.kind)).toEqual(
+      Array(MAX_BOUNDARY_SEARCH_PAGES).fill("search"),
+    );
+    expect(decideOpenPositionResolution(afterPage(MAX_BOUNDARY_SEARCH_PAGES))).toMatchObject({
+      kind: "settle",
+      target: "TAIL",
+    });
+  });
+
+  it("never asks twice while a page is still on its way", () => {
+    const inFlight = resolutionInput({ searchAttempts: 1, searchedAt: 0 });
+    expect(decideOpenPositionResolution(inFlight)).toEqual({ kind: "wait" });
+  });
+
+  it("falls back down the priority when the whole history lacks the target", () => {
+    // Removed, inaccessible or never existed — deliberately the same answer.
+    expect(
+      resolveOpenPosition(input({ focusMessageId: "m-gone", initialAnchor: anchorAt("m2") })),
+    ).toEqual({ kind: "anchor", messageId: "m2" });
+    expect(resolveOpenPosition(input({ focusMessageId: "m-gone", unreadCountAtOpen: 1 }))).toEqual({
+      kind: "first-unread",
+      messageId: "m3",
+    });
+    expect(resolveOpenPosition(input({ focusMessageId: "m-gone" }))).toEqual({ kind: "bottom" });
+  });
+
+  it("does not wait on a page once the history has ended", () => {
+    const ended = resolutionInput({ hasMore: false, searchAttempts: 1, searchedAt: 0 });
+    expect(decideOpenPositionResolution(ended)).toMatchObject({ kind: "settle", target: "TAIL" });
   });
 });

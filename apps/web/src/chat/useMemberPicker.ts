@@ -8,12 +8,14 @@
  *
  * Deliberately narrow. It owns the search and the selection and nothing else —
  * no submit, no error copy, no dialog chrome, no knowledge of channels or
- * groups. Those differ between the two callers, and folding them in is how a
- * shared hook turns into a component with a mode flag. NewConversationDialog is
- * intentionally left alone by this change: it also drives a 1:1 open, a group
- * title and a channel form off the same query state, and rewriting that flow to
- * adopt this hook would be a refactor of conversation creation, which is not
- * what this issue is for.
+ * groups. Those differ between the callers, and folding them in is how a
+ * shared hook turns into a component with a mode flag.
+ *
+ * It is two layers (issue #1023). `useMemberSearch` is the search alone; the
+ * "Nova conversa" flows use it directly — Pessoa needs no selection at all, and
+ * Grupo keeps its own toggle selection (dmGroupForm) so a picked person stays
+ * visible in the results. `useMemberPicker` is that search plus the add/remove
+ * selection the add-members dialog uses.
  *
  * The caller supplies `search`, which is what makes this reusable without a
  * mode flag: a channel picker passes the channel-scoped endpoint, a group
@@ -39,21 +41,32 @@ export const memberSearchDebounceMs = 150;
 
 export type MemberSearchStatus = "idle" | "loading" | "ready" | "error";
 
-export interface MemberPicker {
+export interface MemberSearch {
   query: string;
   setQuery: (value: string) => void;
   status: MemberSearchStatus;
+  /** Search results with the excluded IDs removed. */
+  results: DMCandidate[];
+  /**
+   * What the last failed request threw, meaningful only while status is
+   * "error". Handed over raw so each caller maps it to its own copy; it must
+   * never be rendered as-is, because it can carry server detail.
+   */
+  error: unknown;
+  /** Re-runs the current query; used by the error state's retry control. */
+  retry: () => void;
+}
+
+export interface MemberPicker extends MemberSearch {
   /** Search results with the excluded IDs and the current selection removed. */
   results: DMCandidate[];
   selected: DMCandidate[];
   select: (candidate: DMCandidate) => void;
   remove: (userId: string) => void;
-  /** Re-runs the current query; used by the error state's retry control. */
-  retry: () => void;
   atCapacity: boolean;
 }
 
-export interface MemberPickerOptions {
+export interface MemberSearchOptions {
   /**
    * The conversation-scoped search this picker runs.
    *
@@ -65,24 +78,42 @@ export interface MemberPickerOptions {
   search: (query: string, signal: AbortSignal) => Promise<DMCandidate[]>;
   /** Locally-known people to hide from results. Never the eligibility rule. */
   excludedUserIds: readonly string[];
+  /**
+   * Whether this search may touch the network. Defaults to true. While false
+   * no debounce starts, a pending one is cancelled and an in-flight request is
+   * aborted and ignored; query, results and status are kept as they are, so a
+   * search interrupted mid-flight resumes for the current query once enabled
+   * again, and a settled one is not re-run.
+   */
+  enabled?: boolean;
+}
+
+// `enabled` stays on the search alone: no picker caller suspends its search,
+// and an option the picker accepted but did not forward would be a lie.
+export interface MemberPickerOptions extends Omit<MemberSearchOptions, "enabled"> {
   /** Server's per-request batch cap. Selection stops here rather than dropping. */
   maxSelection: number;
 }
 
-export function useMemberPicker({
+export function useMemberSearch({
   search,
   excludedUserIds,
-  maxSelection,
-}: MemberPickerOptions): MemberPicker {
+  enabled = true,
+}: MemberSearchOptions): MemberSearch {
   const [query, setQueryState] = useState("");
   const [candidates, setCandidates] = useState<DMCandidate[]>([]);
   const [status, setStatus] = useState<MemberSearchStatus>("idle");
-  const [selected, setSelected] = useState<DMCandidate[]>([]);
+  const [error, setError] = useState<unknown>(null);
   const [attempt, setAttempt] = useState(0);
 
   const normalizedQuery = query.trim();
+  // "loading" is the one state that still owes the user an answer. Keying the
+  // effect on it is what lets a disabled search resume exactly once on
+  // re-enable, while a ready or failed one stays as it was.
+  const awaitingResults = status === "loading";
 
   useEffect(() => {
+    if (!enabled || !awaitingResults) return;
     if (normalizedQuery.length < memberSearchMinLength) return;
 
     const controller = new AbortController();
@@ -98,8 +129,9 @@ export function useMemberPicker({
           setCandidates(results);
           setStatus("ready");
         },
-        () => {
+        (reason: unknown) => {
           if (!active) return;
+          setError(reason);
           setStatus("error");
         },
       );
@@ -110,7 +142,7 @@ export function useMemberPicker({
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [normalizedQuery, attempt, search]);
+  }, [normalizedQuery, attempt, search, enabled, awaitingResults]);
 
   const setQuery = useCallback((value: string) => {
     setQueryState(value);
@@ -119,6 +151,31 @@ export function useMemberPicker({
     setCandidates([]);
     setStatus(value.trim().length >= memberSearchMinLength ? "loading" : "idle");
   }, []);
+
+  const retry = useCallback(() => {
+    setStatus("loading");
+    setAttempt((value) => value + 1);
+  }, []);
+
+  // Excluded people are removed from the rendered list rather than shown
+  // disabled: the list is a search result, not the roster, so a name that
+  // cannot be picked would just be noise the user has to read past.
+  // Recomputed every render rather than memoised: a search page is tens of
+  // people, and a memo's dependency bookkeeping is how a stale exclusion list
+  // starts offering someone who already participates.
+  const excluded = new Set(excludedUserIds);
+  const results = candidates.filter((candidate) => !excluded.has(candidate.userId));
+
+  return { query, setQuery, status, results, error, retry };
+}
+
+export function useMemberPicker({
+  search,
+  excludedUserIds,
+  maxSelection,
+}: MemberPickerOptions): MemberPicker {
+  const memberSearch = useMemberSearch({ search, excludedUserIds });
+  const [selected, setSelected] = useState<DMCandidate[]>([]);
 
   /**
    * Adds one person to the selection.
@@ -149,36 +206,17 @@ export function useMemberPicker({
     setSelected((current) => current.filter((member) => member.userId !== userId));
   }, []);
 
-  const retry = useCallback(() => {
-    setStatus("loading");
-    setAttempt((value) => value + 1);
-  }, []);
-
-  // Excluded people are removed from the rendered list rather than shown
-  // disabled: the list is a search result, not the roster, so a name that
-  // cannot be picked would just be noise the user has to read past. Whoever is
-  // already selected is likewise not repeated here — they are visible as a chip,
-  // which is also where they are removed from.
-  // Recomputed every render rather than memoised. Both inputs are a search
-  // page's worth of people — tens, not thousands — so two Sets and one filter
-  // cost less than the dependency bookkeeping a memo would need to get right,
-  // and getting that wrong is how a stale exclusion list starts offering
-  // someone who already participates.
-  const excluded = new Set(excludedUserIds);
+  // Whoever is already selected is not repeated in the results — they are
+  // visible as a chip, which is also where they are removed from.
   const chosen = new Set(selected.map((member) => member.userId));
-  const results = candidates.filter(
-    (candidate) => !excluded.has(candidate.userId) && !chosen.has(candidate.userId),
-  );
+  const results = memberSearch.results.filter((candidate) => !chosen.has(candidate.userId));
 
   return {
-    query,
-    setQuery,
-    status,
+    ...memberSearch,
     results,
     selected,
     select,
     remove,
-    retry,
     atCapacity: selected.length >= maxSelection,
   };
 }

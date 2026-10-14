@@ -204,9 +204,27 @@ type Config struct {
 	// back to this same build cannot reinterpret a row that was already written.
 	ConversationNotificationLevelsEnabled bool
 
+	// ManualPresenceEnabled gates the manual presence writer of issue #798: a
+	// member choosing Busy, Do Not Disturb, Volto já, Away, Available or Appear
+	// offline through /api/chat/presence/me.
+	//
+	// Off by default for the same reason as the level above. A slot from before
+	// #798 neither reads chat.user_presence nor understands the settings hint, so
+	// a choice written while such a slot still serves a WebSocket would never
+	// reach the people that slot serves — and appearing offline would not hide
+	// anybody there. The readers ship first; the writer opens once the previous
+	// slot has no pods left (runbook section 16c).
+	//
+	// It gates writes only. Every reader in this build honours a stored manual
+	// state with the gate in either position, so closing it again stops new
+	// choices without reinterpreting ones already made; they lapse at their own
+	// expiry, at most 31 days later.
+	ManualPresenceEnabled bool
+
 	linkSafetyEnabledInvalid                     bool
 	linkPreviewEnabledInvalid                    bool
 	conversationNotificationLevelsEnabledInvalid bool
+	manualPresenceEnabledInvalid                 bool
 }
 
 func Load() Config {
@@ -215,6 +233,7 @@ func Load() Config {
 	linkPreviewEnabled, linkPreviewEnabledInvalid := configuredBool("CHAT_LINK_PREVIEW_ENABLED", false)
 	notificationLevelsEnabled, notificationLevelsInvalid := configuredBool(
 		"CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED", false)
+	manualPresenceEnabled, manualPresenceInvalid := configuredBool("CHAT_MANUAL_PRESENCE_ENABLED", false)
 	return Config{
 		ServiceName:                 serviceName,
 		Env:                         platformconfig.GetString("APP_ENV", "development"),
@@ -268,10 +287,12 @@ func Load() Config {
 		LinkSafetySubmitUncertainTimeoutSeconds: platformconfig.GetInt(
 			"CHAT_LINK_SAFETY_SUBMIT_UNCERTAIN_TIMEOUT_SECONDS", 900),
 		ConversationNotificationLevelsEnabled: notificationLevelsEnabled,
+		ManualPresenceEnabled:                 manualPresenceEnabled,
 
 		linkSafetyEnabledInvalid:                     linkSafetyEnabledInvalid,
 		linkPreviewEnabledInvalid:                    linkPreviewEnabledInvalid,
 		conversationNotificationLevelsEnabledInvalid: notificationLevelsInvalid,
+		manualPresenceEnabledInvalid:                 manualPresenceInvalid,
 	}
 }
 
@@ -324,6 +345,9 @@ func (c Config) validateLinkSafety() error {
 	// mistaken for either.
 	if c.conversationNotificationLevelsEnabledInvalid {
 		return errors.New("CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED must be a valid boolean")
+	}
+	if c.manualPresenceEnabledInvalid {
+		return errors.New("CHAT_MANUAL_PRESENCE_ENABLED must be a valid boolean")
 	}
 	if !c.LinkSafetyEnabled {
 		return nil

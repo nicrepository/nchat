@@ -856,23 +856,27 @@ func (s *PGXAttachmentStore) GetPreviewPage(
 //	idx_attachments_conversation (workspace_id, conversation_id, created_at DESC)
 //	                             WHERE destination_kind = 'dm'      AND deleted_at IS NULL
 //
-// Two things make each index actually usable. The destination column is
-// compared directly — a COALESCE over both columns is an expression neither
-// index covers, so the planner would fall back to scanning and sorting the
-// workspace's attachments before applying LIMIT. And destination_kind is a
-// literal, so the partial index predicate is satisfied at plan time; as a bind
-// parameter the planner cannot prove it matches the index's WHERE clause and
-// would skip the index for that reason alone.
+// Each statement is written so that its index *can* apply; whether the planner
+// chooses it is the planner's decision, and nothing here asserts a plan. The
+// destination column is compared directly, never through a COALESCE over both
+// columns, which is an expression neither index covers. destination_kind is a
+// literal rather than a bind parameter, which is what allows a partial index's
+// WHERE clause to be matched when the statement is planned.
 //
-// With equality on (workspace_id, destination) the index also supplies
-// created_at DESC directly, so ORDER BY … LIMIT reads at most Limit index
-// entries instead of sorting the destination's whole history. The id DESC
-// tie-break only orders rows sharing a timestamp.
+// The ORDER BY's leading key is the index's own created_at DESC column, with id
+// DESC as a deterministic tie-break for rows sharing a timestamp. LIMIT bounds
+// the rows returned (Limit+1, see ListDestinationAttachments), not the rows the
+// database may examine: the status and message filters can reject rows first.
 //
 // The two share their parameter positions, so the caller passes the same
 // arguments in the same order whichever one it picks:
 //
 //	$1 workspace_id   $2 destination id   $3 listable statuses   $4 limit
+//	$5 cursor created_at   $6 cursor id   (only with listAttachmentsAfterCursor)
+//
+// Each constant is the filter only; listAttachmentsSQL appends the optional
+// cursor predicate and the fixed order. Every fragment is a compile-time
+// constant, so no request value ever becomes SQL text.
 const (
 	listChannelAttachmentsQuery = `
 		SELECT a.id::text, a.status, a.preview_status, a.original_filename,
@@ -890,8 +894,7 @@ const (
 		      JOIN chat.messages AS m ON m.id = ma.message_id
 		      WHERE ma.attachment_id = a.id AND m.status <> 'active'
 		  )
-		ORDER BY a.created_at DESC, a.id DESC
-		LIMIT $4`
+`
 
 	listDMAttachmentsQuery = `
 		SELECT a.id::text, a.status, a.preview_status, a.original_filename,
@@ -909,9 +912,33 @@ const (
 		      JOIN chat.messages AS m ON m.id = ma.message_id
 		      WHERE ma.attachment_id = a.id AND m.status <> 'active'
 		  )
+`
+)
+
+const (
+	// listAttachmentsAfterCursor continues a listing strictly after the last
+	// row of the previous page (issue #897). The row comparison is exactly the
+	// ORDER BY below read backwards, so it holds for rows sharing a timestamp:
+	// the id tie-break decides. Every value in it is a bind parameter.
+	listAttachmentsAfterCursor = `
+		  AND (a.created_at, a.id) < ($5::timestamptz, $6::uuid)`
+
+	listAttachmentsOrder = `
 		ORDER BY a.created_at DESC, a.id DESC
 		LIMIT $4`
 )
+
+// listAttachmentsSQL assembles one listing statement from constants.
+func listAttachmentsSQL(kind domain.DestinationKind, afterCursor bool) (string, error) {
+	filter, err := listAttachmentsQueryForKind(kind)
+	if err != nil {
+		return "", err
+	}
+	if afterCursor {
+		filter += listAttachmentsAfterCursor
+	}
+	return filter + listAttachmentsOrder, nil
+}
 
 // listAttachmentsQueryForKind picks one of the two constants above.
 //
@@ -943,59 +970,87 @@ func listAttachmentsQueryForKind(kind domain.DestinationKind) (string, error) {
 // row cleanup are shared, so the two paths cannot drift.
 func (s *PGXAttachmentStore) ListDestinationAttachments(
 	ctx context.Context, query service.ListDestinationAttachmentsQuery,
-) ([]service.ListedAttachment, error) {
+) (service.ListedAttachmentPage, error) {
 	if s == nil || s.pool == nil {
-		return nil, domain.ErrDependenciesUnavailable
+		return service.ListedAttachmentPage{}, domain.ErrDependenciesUnavailable
 	}
 	// Resolved before any database work, so an unknown kind never reaches the
 	// pool and never becomes an unfiltered read.
-	sql, err := listAttachmentsQueryForKind(query.Kind)
+	sql, err := listAttachmentsSQL(query.Kind, query.Before != nil)
 	if err != nil {
-		return nil, err
+		return service.ListedAttachmentPage{}, err
 	}
 	limit := domain.NormalizeAttachmentListLimit(query.Limit)
-	rows, err := s.pool.Query(ctx, sql,
-		query.WorkspaceID, query.DestinationID, listableStatuses(), limit,
-	)
+	// One row beyond the page is read and never served: its existence is the
+	// whole answer to "is there a next page", so the cursor is never offered
+	// for a page that would come back empty.
+	args := []any{query.WorkspaceID, query.DestinationID, listableStatuses(), limit + 1}
+	if query.Before != nil {
+		args = append(args, query.Before.CreatedAt, query.Before.ID)
+	}
+	rows, err := s.pool.Query(ctx, sql, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list destination attachments: %w", err)
+		return service.ListedAttachmentPage{}, fmt.Errorf("list destination attachments: %w", err)
 	}
 	defer rows.Close()
 
-	listed := make([]service.ListedAttachment, 0, limit)
+	listed := make([]service.ListedAttachment, 0, limit+1)
 	for rows.Next() {
-		var (
-			record        service.ListedAttachment
-			status        string
-			previewStatus pgtype.Text
-			createdAt     pgtype.Timestamptz
-			audioKind     string
-			durationMs    int32
-		)
-		if err := rows.Scan(
-			&record.ID, &status, &previewStatus, &record.Filename,
-			&record.DetectedMIME, &record.Size, &createdAt,
-			&audioKind, &durationMs,
-		); err != nil {
-			return nil, fmt.Errorf("scan destination attachment: %w", err)
+		record, err := scanListedAttachment(rows)
+		if err != nil {
+			return service.ListedAttachmentPage{}, err
 		}
-		record.AudioKind = domain.AudioKind(audioKind)
-		record.DeclaredDurationMs = durationMs
-		attachmentStatus := domain.Status(status)
-		if !attachmentStatus.Valid() {
-			// A row outside the CHECK's closed set is a data-integrity problem,
-			// not something to serve.
-			return nil, errors.New("attachment has an unknown status")
-		}
-		record.Status = attachmentStatus
-		record.PreviewStatus = previewStatusOf(previewStatus)
-		record.CreatedAt = createdAt.Time.UTC()
 		listed = append(listed, record)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate destination attachments: %w", err)
+		return service.ListedAttachmentPage{}, fmt.Errorf("iterate destination attachments: %w", err)
 	}
-	return listed, nil
+	return listedPage(listed, limit), nil
+}
+
+// listedPage trims the probe row and, when it existed, points the cursor at the
+// last row actually served.
+func listedPage(listed []service.ListedAttachment, limit int) service.ListedAttachmentPage {
+	if len(listed) <= limit {
+		return service.ListedAttachmentPage{Attachments: listed}
+	}
+	listed = listed[:limit]
+	last := listed[limit-1]
+	return service.ListedAttachmentPage{
+		Attachments: listed,
+		Next:        &domain.AttachmentListCursor{CreatedAt: last.CreatedAt, ID: last.ID},
+	}
+}
+
+// scanListedAttachment reads one listing row.
+func scanListedAttachment(rows pgx.Rows) (service.ListedAttachment, error) {
+	var (
+		record        service.ListedAttachment
+		status        string
+		previewStatus pgtype.Text
+		createdAt     pgtype.Timestamptz
+		audioKind     string
+		durationMs    int32
+	)
+	if err := rows.Scan(
+		&record.ID, &status, &previewStatus, &record.Filename,
+		&record.DetectedMIME, &record.Size, &createdAt,
+		&audioKind, &durationMs,
+	); err != nil {
+		return service.ListedAttachment{}, fmt.Errorf("scan destination attachment: %w", err)
+	}
+	record.AudioKind = domain.AudioKind(audioKind)
+	record.DeclaredDurationMs = durationMs
+	attachmentStatus := domain.Status(status)
+	if !attachmentStatus.Valid() {
+		// A row outside the CHECK's closed set is a data-integrity problem,
+		// not something to serve.
+		return service.ListedAttachment{}, errors.New("attachment has an unknown status")
+	}
+	record.Status = attachmentStatus
+	record.PreviewStatus = previewStatusOf(previewStatus)
+	record.CreatedAt = createdAt.Time.UTC()
+	return record, nil
 }
 
 // previewStatusOf maps a stored preview state onto the domain enum, failing

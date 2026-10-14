@@ -1,5 +1,7 @@
 import { useState } from "react";
+import { useOutletContext } from "react-router";
 
+import type { AppShellOutletContext } from "../chat/AppShell";
 import "./ProfileOverviewPage.css";
 import { refreshSelfProfile, useSelfProfile } from "./selfProfile";
 import ProfileIdentityCard from "./ProfileIdentityCard";
@@ -10,6 +12,8 @@ import AvatarDialog from "./AvatarDialog";
 type OpenDialog = "edit" | "avatar" | null;
 
 export default function ProfileOverviewPage() {
+  const outlet = useOutletContext<AppShellOutletContext | null>();
+  const workspaceId = outlet?.state.status === "ready" ? outlet.state.workspaceId : "";
   const self = useSelfProfile();
   const [openDialog, setOpenDialog] = useState<OpenDialog>(null);
 
@@ -44,6 +48,7 @@ export default function ProfileOverviewPage() {
       </header>
       <ProfileIdentityCard
         profile={profile}
+        workspaceId={workspaceId}
         onEdit={() => setOpenDialog("edit")}
         onChangePhoto={() => setOpenDialog("avatar")}
       />
@@ -61,7 +66,13 @@ export default function ProfileOverviewPage() {
         />
       )}
       {openDialog === "avatar" && (
-        <AvatarDialog currentAvatarUrl={profile.avatarUrl} onClose={() => setOpenDialog(null)} />
+        <AvatarDialog
+          currentAvatarUrl={profile.avatarUrl}
+          userId={profile.id}
+          workspaceId={workspaceId}
+          displayName={profile.displayName}
+          onClose={() => setOpenDialog(null)}
+        />
       )}
     </div>
   );

@@ -36,6 +36,7 @@ vi.mock("./chatApi", () => ({
   addGroupParticipants,
 }));
 
+import { parseOwnership } from "./ownershipApi";
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
 import type {
   ChannelAttachment,
@@ -52,6 +53,18 @@ import { conversationNameMaxCodePoints } from "./conversationRename";
 import { ApiRequestError } from "../lib/api";
 import type { ConversationDetailsState } from "./useConversationDetails";
 import type { DirectMessageAccess } from "./directMessage";
+import type { PinnedMessages } from "./PinnedMessagesSection";
+import type { PinMutationOutcome } from "./usePins";
+
+/** A loaded, empty pin collection with inert actions (issue #896). */
+const noPins: PinnedMessages = {
+  conversationKey: "channel:c-1",
+  collection: { status: "ready", pins: [] },
+  pendingIds: new Set(),
+  onNavigate: () => {},
+  onUnpin: () => Promise.resolve("persisted"),
+  onRetry: () => {},
+};
 
 const currentUserId = "user-me";
 
@@ -75,6 +88,7 @@ function channelDetails(
     memberCount: 12,
     onlineCount: 0,
     onlineMembers: [],
+    canAddMembers: false,
     // Off unless a case turns it on: the add action is absent by default, which
     // is what the server's own strict `=== true` normalization produces.
     canManageMembers: false,
@@ -162,7 +176,8 @@ function renderPanel(overrides: Partial<Parameters<typeof ConversationDetailsPan
       kind="channel"
       state={state()}
       currentUserId={currentUserId}
-      latestPin={null}
+      workspaceId="workspace-1"
+      pins={noPins}
       onClose={onClose}
       {...overrides}
     />,
@@ -226,7 +241,10 @@ describe("ConversationDetailsPanel — canal: estrutura e acessibilidade", () =>
   it("stays open when Escape dismisses a dialog it opened", async () => {
     const { onClose } = renderPanel({
       state: state({
-        details: { status: "ready", data: channelDetails({ canManageMembers: true }) },
+        details: {
+          status: "ready",
+          data: channelDetails({ canAddMembers: true, canManageMembers: true }),
+        },
       }),
     });
 
@@ -319,7 +337,8 @@ describe("ConversationDetailsPanel — canal: seção Sobre", () => {
         kind="channel"
         state={state({ details: { status: "loading" } })}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -331,7 +350,8 @@ describe("ConversationDetailsPanel — canal: seção Sobre", () => {
         kind="channel"
         state={state({ details: { status: "error" } })}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -356,6 +376,47 @@ describe("ConversationDetailsPanel — canal: membros", () => {
       presence: "online" as const,
     },
   ];
+
+  it.each([
+    { type: "private" as const, enabled: true },
+    { type: "private" as const, enabled: false },
+    { type: "public" as const, enabled: false },
+  ])(
+    "renders the authoritative source for $type channels with ownership=$enabled",
+    ({ type, enabled }) => {
+      const ownership = parseOwnership({
+        enabled,
+        members: [
+          {
+            user_id: currentUserId,
+            display_name: "Ownership participant",
+            role: "owner",
+            actions: { assign_role: true, transfer: false, remove: false },
+          },
+        ],
+      });
+      renderPanel({
+        state: state({
+          details: { status: "ready", data: channelDetails({ type, ownership }) },
+          roster: {
+            status: "ready",
+            data: {
+              memberCount: 1,
+              members: [{ userId: "legacy", displayName: "Legacy participant", role: "member" }],
+            },
+          },
+        }),
+      });
+      expect(
+        screen.getByText(enabled ? "Ownership participant" : "Legacy participant", { exact: true }),
+      ).toBeVisible();
+      expect(
+        screen.queryByText(enabled ? "Legacy participant" : "Ownership participant", {
+          exact: true,
+        }),
+      ).not.toBeInTheDocument();
+    },
+  );
 
   it("marks the authenticated user by id, not by name", () => {
     renderPanel({
@@ -418,7 +479,7 @@ describe("ConversationDetailsPanel — canal: membros", () => {
     // No indicator and no word, because the store has said nothing. Both rows
     // are still there: the roster does not depend on presence.
     expect(screen.queryAllByTestId("presence-dot")).toHaveLength(0);
-    expect(screen.queryByText(/· Online/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/· Disponível/)).not.toBeInTheDocument();
     expect(screen.getByText("Membro")).toBeInTheDocument();
     expect(screen.getByText("Moderador")).toBeInTheDocument();
   });
@@ -450,7 +511,8 @@ describe("ConversationDetailsPanel — canal: membros", () => {
         kind="channel"
         state={state({ details: { status: "error" } })}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -629,7 +691,8 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
         kind="channel"
         state={expanded}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -655,7 +718,8 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
           },
         })}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -696,7 +760,11 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
   });
 });
 
-describe("ConversationDetailsPanel — canal: mensagem fixada", () => {
+describe("ConversationDetailsPanel — canal: mensagens fixadas", () => {
+  function withPins(...items: PinnedItem[]): PinnedMessages {
+    return { ...noPins, collection: { status: "ready", pins: items } };
+  }
+
   it("shows an empty state when nothing is pinned", () => {
     renderPanel();
 
@@ -705,27 +773,123 @@ describe("ConversationDetailsPanel — canal: mensagem fixada", () => {
     );
   });
 
-  it("shows the selected pin's body and author", () => {
-    renderPanel({ latestPin: pin() });
+  it("lists the conversation's pins, not just the latest one", () => {
+    renderPanel({
+      pins: withPins(
+        pin({ id: "m-1", bodyText: "primeiro" }),
+        pin({ id: "m-2", bodyText: "segundo" }),
+      ),
+    });
 
-    const card = screen.getByTestId("chat-details-pin");
-    expect(card).toHaveTextContent("Procedimento de deploy atualizado.");
-    expect(card).toHaveTextContent("Juliane Lino");
-  });
-
-  it("renders a removed pin without pretending it still has a body", () => {
-    renderPanel({ latestPin: pin({ isRemoved: true, bodyText: "", status: "deleted" }) });
-
-    expect(screen.getByTestId("chat-details-pin")).toHaveTextContent("Mensagem removida.");
+    const list = screen.getByRole("list", { name: "Mensagens fixadas" });
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveTextContent("primeiro");
+    expect(rows[1]).toHaveTextContent("segundo");
+    expect(rows[0]).toHaveTextContent("Juliane Lino");
   });
 
   it("renders pin content as text, never as markup", () => {
-    renderPanel({ latestPin: pin({ bodyText: "<img src=x onerror=alert(1)>" }) });
+    renderPanel({ pins: withPins(pin({ bodyText: "<img src=x onerror=alert(1)>" })) });
 
-    expect(screen.getByTestId("chat-details-pin")).toHaveTextContent(
+    expect(screen.getByRole("list", { name: "Mensagens fixadas" })).toHaveTextContent(
       "<img src=x onerror=alert(1)>",
     );
     expect(document.querySelector("img[src='x']")).toBeNull();
+  });
+
+  it("keeps the pins' expansion apart from other sections and ends it with the conversation", async () => {
+    const six = Array.from({ length: 6 }, (_, index) =>
+      pin({ id: `m-${index}`, bodyText: `fixada ${index}` }),
+    );
+    const { rerender } = render(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={state({
+          files: {
+            status: "ready",
+            data: [1, 2, 3, 4, 5, 6].map((n) => attachment({ id: `a-${n}` })),
+          },
+        })}
+        currentUserId={currentUserId}
+        workspaceId="workspace-1"
+        pins={withPins(...six)}
+        onClose={vi.fn()}
+      />,
+    );
+    const pinsList = () => screen.getByRole("list", { name: "Mensagens fixadas" });
+
+    await userEvent.click(screen.getByRole("button", { name: /Ver todos Mensagens fixadas/ }));
+    expect(within(pinsList()).getAllByRole("listitem")).toHaveLength(6);
+    expect(screen.getByRole("button", { name: /Ver todos Arquivos recentes/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+
+    rerender(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={state()}
+        currentUserId={currentUserId}
+        workspaceId="workspace-1"
+        pins={{ ...withPins(...six), conversationKey: "channel:c-2" }}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(within(pinsList()).getAllByRole("listitem")).toHaveLength(5);
+    expect(screen.getByRole("button", { name: /Ver todos Mensagens fixadas/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  it("never moves focus into another conversation's pins after a switch mid-unpin", async () => {
+    const onUnpin = vi.fn(() => Promise.resolve<PinMutationOutcome>("persisted"));
+    const first = { ...withPins(pin({ id: "m-1" }), pin({ id: "m-2" })), onUnpin };
+    const { rerender } = render(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={state()}
+        currentUserId={currentUserId}
+        workspaceId="workspace-1"
+        pins={first}
+        onClose={vi.fn()}
+      />,
+    );
+    const list = () => screen.getByRole("list", { name: "Mensagens fixadas" });
+
+    await userEvent.click(
+      within(list()).getAllByRole("button", { name: /^Desafixar mensagem de / })[0],
+    );
+    expect(onUnpin).toHaveBeenCalledWith("m-1");
+
+    // The reader switches conversations; the new one has a row where the
+    // successor would have been.
+    rerender(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={state()}
+        currentUserId={currentUserId}
+        workspaceId="workspace-1"
+        pins={{
+          ...withPins(pin({ id: "m-2" }), pin({ id: "m-9" })),
+          conversationKey: "channel:c-2",
+        }}
+        onClose={vi.fn()}
+      />,
+    );
+
+    for (const button of within(list()).getAllByRole("button")) {
+      expect(button).not.toHaveFocus();
+    }
+  });
+
+  it("draws no pin section for a host that does not hold the conversation's pins", () => {
+    renderPanel({ pins: undefined });
+
+    expect(screen.queryByRole("heading", { name: "Mensagens fixadas" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-pin-empty")).not.toBeInTheDocument();
   });
 });
 
@@ -833,7 +997,8 @@ describe("ConversationDetailsPanel — canal: arquivos recentes", () => {
         kind="channel"
         state={state({ files: { status: "loading" } })}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -845,7 +1010,8 @@ describe("ConversationDetailsPanel — canal: arquivos recentes", () => {
         kind="channel"
         state={state({ files: { status: "error" } })}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -891,7 +1057,8 @@ function renderGroupPanel(
         reload,
       }}
       currentUserId={viewerId}
-      latestPin={null}
+      workspaceId="workspace-1"
+      pins={noPins}
       openDM={openDM}
       onClose={onClose}
     />,
@@ -1128,7 +1295,8 @@ describe("ConversationDetailsPanel — grupo", () => {
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -1146,7 +1314,8 @@ describe("ConversationDetailsPanel — grupo", () => {
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -1183,7 +1352,8 @@ function renderProfilePanel(details: { kind: "direct" } & DirectDetails = direct
         reload: vi.fn(),
       }}
       currentUserId={currentUserId}
-      latestPin={null}
+      workspaceId="workspace-1"
+      pins={noPins}
       onClose={onClose}
     />,
   );
@@ -1627,8 +1797,7 @@ describe("ConversationDetailsPanel — roster: identidade e ordem", () => {
     expect(image).toHaveAttribute("referrerpolicy", "no-referrer");
 
     // No URL, so initials — never the user id, and never a broken image.
-    expect(withInitials).toHaveTextContent("B");
-    expect(within(withInitials).queryByRole("presentation", { hidden: true })).toBeNull();
+    expect(withInitials.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
     expect(withInitials).not.toHaveTextContent("u-2");
   });
 
@@ -1675,7 +1844,7 @@ describe("ConversationDetailsPanel — DM 1:1: estrutura e acessibilidade", () =
     // instead of the person.
     expect(screen.queryByRole("heading", { name: /Membros online/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: /Participantes/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Mensagem fixada" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Mensagens fixadas" })).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Arquivos recentes" })).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Sobre" })).not.toBeInTheDocument();
     expect(screen.queryByTestId("chat-details-description")).not.toBeInTheDocument();
@@ -1685,6 +1854,10 @@ describe("ConversationDetailsPanel — DM 1:1: estrutura e acessibilidade", () =
 });
 
 describe("ConversationDetailsPanel — DM 1:1: dados do perfil", () => {
+  afterEach(() => {
+    Reflect.deleteProperty(navigator, "clipboard");
+  });
+
   it("shows the other participant's name and role", () => {
     renderProfilePanel(
       directDetails({
@@ -1706,8 +1879,7 @@ describe("ConversationDetailsPanel — DM 1:1: dados do perfil", () => {
     renderProfilePanel(directDetails({ displayName: "Juliane Lino" }));
 
     const avatar = screen.getByTestId("chat-details-profile-avatar");
-    expect(avatar.querySelector("img")).toBeNull();
-    expect(avatar).toHaveTextContent("JL");
+    expect(avatar.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
   });
 
   it("renders an accepted avatar as a decorative image", () => {
@@ -1739,16 +1911,22 @@ describe("ConversationDetailsPanel — DM 1:1: dados do perfil", () => {
     expect(metaRow("E-mail")).toBe("juliane.lino@nic-labs.test");
   });
 
-  it("says Não informado for every field the domain does not record", () => {
-    // Today's real payload: an identity and nothing else. The card keeps its
-    // shape and states the absence rather than dropping rows.
+  it("says Não informado for every professional field the domain does not record", () => {
+    // Today's real payload: an identity and nothing else. The card states the
+    // absence of role, department and address rather than dropping those rows.
     renderProfilePanel(directDetails());
 
-    for (const label of ["Cargo", "Departamento", "Fuso horário", "Horário local", "E-mail"]) {
-      expect(metaRow(label)).toBe("Não informado");
+    const labels = Array.from(screen.getByTestId("chat-details-profile-meta").children).map(
+      (row) => row.firstElementChild?.textContent,
+    );
+    expect(labels).toEqual(["Cargo", "Departamento", "E-mail"]);
+    for (const label of labels) {
+      expect(metaRow(label ?? "")).toBe("Não informado");
     }
-    // An absent job title leaves no empty subtitle behind.
+    // An absent job title leaves no empty subtitle behind, and nothing falls
+    // back to the user id.
     expect(document.querySelector(".chat-details__profile-role")).toBeNull();
+    expect(screen.getByTestId("chat-details-profile-meta")).not.toHaveTextContent("user-other");
   });
 
   it("omits the presence badge when the server tracks nothing", () => {
@@ -1759,11 +1937,62 @@ describe("ConversationDetailsPanel — DM 1:1: dados do perfil", () => {
     expect(screen.queryByTestId("chat-details-profile-status")).not.toBeInTheDocument();
   });
 
-  it("shows the e-mail as text, never as a mailto link", () => {
+  it("offers the e-mail as a copy button, never as a mailto link", () => {
     renderProfilePanel(directDetails({ email: "juliane.lino@nic-labs.test" }));
 
+    const copy = screen.getByRole("button", { name: "juliane.lino@nic-labs.test" });
+    expect(copy).toHaveAttribute("type", "button");
+    expect(copy).toHaveAccessibleDescription("Copiar e-mail");
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
     expect(document.querySelector("a[href^='mailto:']")).toBeNull();
+  });
+
+  it("renders no copy button when there is no address to copy", () => {
+    renderProfilePanel(directDetails());
+
+    expect(metaRow("E-mail")).toBe("Não informado");
+    expect(document.querySelector(".chat-details__profile-copy")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Não informado/ })).not.toBeInTheDocument();
+  });
+
+  it("does not carry copy feedback from one person over to the next", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const { rerender } = renderProfilePanel(directDetails({ email: "juliane.lino@nic-labs.test" }));
+
+    await userEvent.click(screen.getByRole("button", { name: "juliane.lino@nic-labs.test" }));
+    expect(await screen.findByText("E-mail copiado")).toBeInTheDocument();
+
+    // The panel is not remounted on a DM switch; only the payload changes.
+    rerender(
+      <ConversationDetailsPanel
+        kind="direct"
+        state={{
+          details: {
+            status: "ready",
+            data: {
+              kind: "direct",
+              conversationId: "conv-dm-2",
+              profile: {
+                userId: "user-marcos",
+                displayName: "Marcos Prado",
+                email: "marcos.prado@nic-labs.test",
+              },
+            },
+          },
+          files: { status: "loading" },
+          roster: { status: "loading" },
+          reload: vi.fn(),
+        }}
+        currentUserId={currentUserId}
+        workspaceId="workspace-1"
+        pins={noPins}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "marcos.prado@nic-labs.test" })).toBeInTheDocument();
+    expect(screen.queryByText("E-mail copiado")).not.toBeInTheDocument();
   });
 
   it("renders name, job title and department as text, never as markup", () => {
@@ -1838,12 +2067,29 @@ describe("ConversationDetailsPanel — DM 1:1: fuso e horário local", () => {
     expect(metaRow("Horário local")).toBe("10:13");
   });
 
-  it("treats an invalid or hostile zone as absent, without breaking the panel", () => {
-    for (const timezone of ["Nao/Existe", "-03:00", "<script>alert(1)</script>", " "]) {
+  it("shows the zone itself beside the local time", () => {
+    renderProfilePanel(directDetails({ timezone: "America/Sao_Paulo" }));
+
+    expect(metaRow("Fuso horário")).toBe("America/Sao_Paulo");
+  });
+
+  it("renders neither row for a missing, invalid or hostile zone, without breaking the panel", () => {
+    // #898: the zone and the local time are shown only for a trustworthy zone —
+    // no "Não informado" row, and never the viewer's own zone in its place.
+    for (const timezone of [
+      undefined,
+      "",
+      "Nao/Existe",
+      "-03:00",
+      "<script>alert(1)</script>",
+      " ",
+    ]) {
       const { unmount } = renderProfilePanel(directDetails({ timezone }));
 
-      expect(metaRow("Fuso horário")).toBe("Não informado");
-      expect(metaRow("Horário local")).toBe("Não informado");
+      const meta = screen.getByTestId("chat-details-profile-meta");
+      expect(meta).not.toHaveTextContent("Fuso horário");
+      expect(meta).not.toHaveTextContent("Horário local");
+      expect(meta).not.toHaveTextContent(/\d{2}:\d{2}/);
       // The rest of the profile is unaffected.
       expect(screen.getByTestId("chat-details-profile-name")).toHaveTextContent("Juliane Lino");
       unmount();
@@ -1970,7 +2216,8 @@ describe("ConversationDetailsPanel — DM 1:1: ação e estados", () => {
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -1992,7 +2239,8 @@ describe("ConversationDetailsPanel — DM 1:1: ação e estados", () => {
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2014,7 +2262,8 @@ describe("ConversationDetailsPanel — DM 1:1: ação e estados", () => {
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2041,7 +2290,8 @@ describe("ConversationDetailsPanel — DM 1:1: variante divergente", () => {
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2063,7 +2313,7 @@ function readyChannel(overrides: Partial<ChannelDetails> = {}, reload = vi.fn())
   return {
     details: {
       status: "ready" as const,
-      data: channelDetails({ canManageMembers: true, ...overrides }),
+      data: channelDetails({ canAddMembers: true, canManageMembers: true, ...overrides }),
     },
     files: { status: "ready" as const, data: [] },
     roster: { status: "loading" as const },
@@ -2089,7 +2339,8 @@ function renderChannelFor(state: ConversationDetailsState) {
       kind="channel"
       state={state}
       currentUserId={currentUserId}
-      latestPin={null}
+      workspaceId="workspace-1"
+      pins={noPins}
       onClose={vi.fn()}
     />,
   );
@@ -2099,8 +2350,8 @@ describe("ConversationDetailsPanel — adicionar membros: permissão", () => {
   // The action is server-gated. `canManageMembers` is normalized to false unless
   // the server explicitly said true, so every state that is not "ready and
   // permitted" must leave the control absent.
-  it("offers the action when the server says the caller may manage members", () => {
-    renderPanel({ state: state({ details: readyChannel().details }) });
+  it("offers the action when the server says the caller may add members", () => {
+    renderPanel({ state: state({ details: readyChannel({ canAddMembers: true }).details }) });
 
     expect(screen.getByTestId("chat-details-add-members")).toBeEnabled();
     expect(screen.getByTestId("chat-details-add-members")).toHaveTextContent("Adicionar membros");
@@ -2110,7 +2361,7 @@ describe("ConversationDetailsPanel — adicionar membros: permissão", () => {
     ["public", "public" as const],
     ["private", "private" as const],
   ])("offers the action on a %s channel", (_label, type) => {
-    renderPanel({ state: state({ details: readyChannel({ type }).details }) });
+    renderPanel({ state: state({ details: readyChannel({ type, canAddMembers: true }).details }) });
 
     expect(screen.getByTestId("chat-details-add-members")).toBeInTheDocument();
   });
@@ -2123,10 +2374,28 @@ describe("ConversationDetailsPanel — adicionar membros: permissão", () => {
     );
   });
 
-  it("hides the action when the caller may not manage members", () => {
+  it("offers add without widening administrative management", () => {
     renderPanel({
       state: state({
-        details: { status: "ready", data: channelDetails({ canManageMembers: false }) },
+        details: {
+          status: "ready",
+          data: channelDetails({
+            canAddMembers: true,
+            canManageMembers: false,
+            canRemoveMembers: false,
+          }),
+        },
+      }),
+    });
+
+    expect(screen.getByTestId("chat-details-add-members")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-remove-member")).not.toBeInTheDocument();
+  });
+
+  it("hides the action when the server withholds the add capability", () => {
+    renderPanel({
+      state: state({
+        details: { status: "ready", data: channelDetails({ canAddMembers: false }) },
       }),
     });
     expect(screen.queryByTestId("chat-details-add-members")).not.toBeInTheDocument();
@@ -2169,7 +2438,8 @@ describe("ConversationDetailsPanel — adicionar membros: permissão", () => {
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2226,7 +2496,8 @@ describe("ConversationDetailsPanel — adicionar membros: fluxo", () => {
         kind="group"
         state={readyGroup({ id: "dm-42" })}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2266,7 +2537,8 @@ describe("ConversationDetailsPanel — adicionar membros: fluxo", () => {
         kind="group"
         state={readyGroup({}, reload)}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2330,7 +2602,8 @@ describe("ConversationDetailsPanel — busca contextual de candidatos", () => {
         kind="group"
         state={readyGroup({ id: "dm-77" })}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2384,7 +2657,8 @@ describe("ConversationDetailsPanel — busca contextual de candidatos", () => {
           participants: [{ userId: "p-1", displayName: "Ana Lima", presence: "online" }],
         })}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2421,7 +2695,8 @@ describe("ConversationDetailsPanel — troca de conversa", () => {
         kind="channel"
         state={readyChannel({ id: "ch-B" })}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2444,7 +2719,8 @@ describe("ConversationDetailsPanel — troca de conversa", () => {
         kind="channel"
         state={readyChannel({ id: "ch-B" })}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2473,7 +2749,8 @@ describe("ConversationDetailsPanel — troca de conversa", () => {
         kind="channel"
         state={readyChannel({ id: "ch-B" })}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2498,7 +2775,8 @@ describe("ConversationDetailsPanel — troca de conversa", () => {
         kind="channel"
         state={readyChannel({ id: "ch-B" })}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2526,7 +2804,8 @@ describe("ConversationDetailsPanel — troca de conversa", () => {
         kind="channel"
         state={readyChannel({ id: "ch-2" })}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onClose={vi.fn()}
       />,
     );
@@ -2582,7 +2861,8 @@ function renderRenamePanel(
       kind="channel"
       state={state({ reload })}
       currentUserId={currentUserId}
-      latestPin={null}
+      workspaceId="workspace-1"
+      pins={noPins}
       onRename={onRename}
       onClose={vi.fn()}
       {...overrides}
@@ -3088,7 +3368,8 @@ describe("ConversationDetailsPanel — renomear inline: pendente, erro e submit 
         kind="channel"
         state={state({ reload })}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onRename={onRename}
         onClose={vi.fn()}
       />,
@@ -3112,7 +3393,8 @@ describe("ConversationDetailsPanel — renomear inline: pendente, erro e submit 
           reload,
         })}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onRename={onRename}
         onClose={vi.fn()}
       />,
@@ -3140,7 +3422,8 @@ describe("ConversationDetailsPanel — renomear inline: pendente, erro e submit 
         kind="channel"
         state={state()}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onRename={onRename}
         onClose={vi.fn()}
       />,
@@ -3161,7 +3444,8 @@ describe("ConversationDetailsPanel — renomear inline: pendente, erro e submit 
           },
         })}
         currentUserId={currentUserId}
-        latestPin={null}
+        workspaceId="workspace-1"
+        pins={noPins}
         onRename={onRename}
         onClose={vi.fn()}
       />,

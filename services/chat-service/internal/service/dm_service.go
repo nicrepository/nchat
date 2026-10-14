@@ -64,6 +64,21 @@ type CreateGroupConversationInput struct {
 	CallerID           string
 	ParticipantUserIDs []string
 	Title              string
+	// AvatarEmoji is the optional group identity (issue #1026). Empty is
+	// Automático; anything else must be one catalogued emoji sequence.
+	AvatarEmoji string
+}
+
+// CreateGroupConversationOutput is a committed group and who it was created for.
+//
+// InvitedUserIDs are every participant except the caller, as the eligibility
+// lookup resolved them — never the spelling the request carried (issue #1103).
+// They are what the post-commit conversation.available signal is addressed to,
+// and they are exactly the set the store wrote: the participant insert is
+// all-or-nothing, so a create that returns at all persisted every one of them.
+type CreateGroupConversationOutput struct {
+	Conversation   domain.DMConversation
+	InvitedUserIDs []string
 }
 
 // GetDMConversationInput identifies a visible DM conversation read.
@@ -182,50 +197,68 @@ func (s *DMService) requireEligibleDMMember(ctx context.Context, workspaceID, us
 }
 
 // CreateGroupConversation creates an ad-hoc group DM and automatically includes the caller.
-func (s *DMService) CreateGroupConversation(ctx context.Context, input CreateGroupConversationInput) (domain.DMConversation, error) {
+func (s *DMService) CreateGroupConversation(ctx context.Context, input CreateGroupConversationInput) (CreateGroupConversationOutput, error) {
 	workspaceID := strings.TrimSpace(input.WorkspaceID)
 	rawCallerID := strings.TrimSpace(input.CallerID)
 	if workspaceID == "" || rawCallerID == "" {
-		return domain.DMConversation{}, fmt.Errorf("%w: workspace_id and caller_id are required", domain.ErrInvalidInput)
+		return CreateGroupConversationOutput{}, fmt.Errorf("%w: workspace_id and caller_id are required", domain.ErrInvalidInput)
 	}
 	callerID, err := canonicalizeUserID(rawCallerID)
 	if err != nil {
-		return domain.DMConversation{}, err
+		return CreateGroupConversationOutput{}, err
 	}
-	title, err := normalizeDMTitle(input.Title)
+	title, err := normalizeNewGroupIdentity(input.Title, input.AvatarEmoji)
 	if err != nil {
-		return domain.DMConversation{}, err
+		return CreateGroupConversationOutput{}, err
 	}
 	participantUserIDs, err := normalizeGroupDMParticipants(callerID, input.ParticipantUserIDs)
 	if err != nil {
-		return domain.DMConversation{}, err
+		return CreateGroupConversationOutput{}, err
 	}
 
-	// Every participant, the caller included, goes through the same eligibility
-	// rule as a 1:1 DM: active workspace, active membership, and an active,
-	// non-deleted account. A workspace membership alone is not enough — it
-	// outlives a suspended or deleted account. The failure is the undifferentiated
-	// ErrForbidden, so an ineligible, unknown and foreign-workspace participant
-	// are indistinguishable to the caller.
-	canonicalParticipants := make([]string, 0, len(participantUserIDs))
-	for _, uid := range participantUserIDs {
-		m, err := s.requireEligibleDMMember(ctx, workspaceID, uid)
-		if err != nil {
-			return domain.DMConversation{}, err
-		}
-		canonicalParticipants = append(canonicalParticipants, m.UserID)
+	canonicalParticipants, invitedUserIDs, err := s.resolveGroupParticipants(ctx, workspaceID, callerID, participantUserIDs)
+	if err != nil {
+		return CreateGroupConversationOutput{}, err
 	}
 
 	conversation, err := s.dms.CreateGroupConversation(ctx, storage.CreateGroupConversationInput{
 		WorkspaceID:        workspaceID,
 		CreatedBy:          callerID,
 		Title:              title,
+		AvatarEmoji:        input.AvatarEmoji,
 		ParticipantUserIDs: canonicalParticipants,
 	})
 	if err != nil {
-		return domain.DMConversation{}, fmt.Errorf("create group conversation: %w", err)
+		return CreateGroupConversationOutput{}, fmt.Errorf("create group conversation: %w", err)
 	}
-	return conversation, nil
+	return CreateGroupConversationOutput{Conversation: conversation, InvitedUserIDs: invitedUserIDs}, nil
+}
+
+// resolveGroupParticipants resolves every participant of a new group, the
+// caller included, to its canonical ID, and reports separately the ones that
+// are not the caller — the people the group is announced to (issue #1103).
+//
+// Each goes through the same eligibility rule as a 1:1 DM: active workspace,
+// active membership, and an active, non-deleted account. A workspace membership
+// alone is not enough — it outlives a suspended or deleted account. The failure
+// is the undifferentiated ErrForbidden, so an ineligible, unknown and
+// foreign-workspace participant are indistinguishable to the caller.
+func (s *DMService) resolveGroupParticipants(
+	ctx context.Context, workspaceID, callerID string, participantUserIDs []string,
+) (all, invited []string, err error) {
+	all = make([]string, 0, len(participantUserIDs))
+	invited = make([]string, 0, len(participantUserIDs))
+	for _, uid := range participantUserIDs {
+		m, err := s.requireEligibleDMMember(ctx, workspaceID, uid)
+		if err != nil {
+			return nil, nil, err
+		}
+		all = append(all, m.UserID)
+		if uid != callerID {
+			invited = append(invited, m.UserID)
+		}
+	}
+	return all, invited, nil
 }
 
 // AddGroupParticipantsInput asks to add participants to an existing group DM
@@ -736,6 +769,71 @@ func (s *DMService) RenameGroup(ctx context.Context, input RenameGroupInput) (st
 		CallerID:       callerID,
 		Title:          title,
 	})
+}
+
+// GroupAvatarInput carries an actor, a target and, for a set, the emoji. The
+// workspace is the server's; authority is re-derived by the store (#1026).
+type GroupAvatarInput struct {
+	WorkspaceID    string
+	CallerID       string
+	ConversationID string
+	AvatarEmoji    string
+}
+
+// SetGroupAvatar gives a group an emoji identity. The value must be exactly
+// one sequence of the catalog this service already validates reactions with
+// (#496): no trimming, no normalisation, so a ZWJ or skin-tone sequence is
+// stored as the code points the picker produced.
+func (s *DMService) SetGroupAvatar(ctx context.Context, input GroupAvatarInput) error {
+	if err := validateGroupAvatarEmoji(input.AvatarEmoji); err != nil {
+		return err
+	}
+	return s.writeGroupAvatar(ctx, input)
+}
+
+// ClearGroupAvatar returns a group to Automático by removing its emoji.
+func (s *DMService) ClearGroupAvatar(ctx context.Context, input GroupAvatarInput) error {
+	input.AvatarEmoji = ""
+	return s.writeGroupAvatar(ctx, input)
+}
+
+func (s *DMService) writeGroupAvatar(ctx context.Context, input GroupAvatarInput) error {
+	if strings.TrimSpace(input.WorkspaceID) == "" || strings.TrimSpace(input.ConversationID) == "" {
+		return fmt.Errorf("%w: workspace_id and conversation_id are required", domain.ErrInvalidInput)
+	}
+	callerID, err := canonicalizeUserID(input.CallerID)
+	if err != nil {
+		return err
+	}
+	return s.dms.SetGroupAvatarEmoji(ctx, storage.SetGroupAvatarInput{
+		WorkspaceID:    input.WorkspaceID,
+		ConversationID: input.ConversationID,
+		CallerID:       callerID,
+		AvatarEmoji:    input.AvatarEmoji,
+	})
+}
+
+// normalizeNewGroupIdentity validates what a new group is called and drawn
+// with (issue #1026): the optional title, and the optional emoji — absent is
+// Automático, anything else must be one catalogued sequence. It returns the
+// normalised title; the emoji is stored exactly as sent.
+func normalizeNewGroupIdentity(title, avatarEmoji string) (string, error) {
+	if avatarEmoji != "" {
+		if err := validateGroupAvatarEmoji(avatarEmoji); err != nil {
+			return "", err
+		}
+	}
+	return normalizeDMTitle(title)
+}
+
+// validateGroupAvatarEmoji admits exactly one catalogued Unicode sequence.
+// The catalog is the generated authority shared with the web picker; HTML, a
+// shortcode, plain text or two emoji are simply not keys in it.
+func validateGroupAvatarEmoji(emoji string) error {
+	if !IsAllowedReactionEmoji(emoji) {
+		return fmt.Errorf("%w: avatar_emoji must be one supported emoji", domain.ErrInvalidInput)
+	}
+	return nil
 }
 
 // LeaveGroup removes the caller's own participation in a group.

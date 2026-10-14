@@ -836,12 +836,22 @@ slot. A failed migration blocks the release rather than being discovered later.
 
 ## 7. Deploying the candidate
 
+Run it from an up-to-date checkout of the default branch — the control plane —
+naming a separate checkout of the release (for example
+`git worktree add ../nchat-release <40-hex commit sha>`):
+
 ```bash
 NCHAT_PROD_RELEASE_SHA=<40-hex commit sha> \
 NCHAT_PROD_TOPOLOGY_FILE=/secure/path/topology.env \
 ARTIFACTS_DIR=./artifacts \
-make prod-blue-green-deploy
+make prod-blue-green-deploy-release RELEASE_CHECKOUT=../nchat-release
 ```
+
+The control plane first checks that the release may start at all (section 16c:
+once manual presence was enabled, a release whose readers ignore it is refused
+before anything runs), then runs the release's own `deploy.sh` from the release
+checkout. `ARTIFACTS_DIR` is resolved where you typed it. The former
+`make prod-blue-green-deploy` is retired.
 
 In order: validate context and namespace → read the active slot from the cluster
 → pick the opposite as candidate → render and pin digests → capacity preflight →
@@ -956,7 +966,7 @@ NCHAT_PROD_CAPACITY_EVIDENCE_DIR=/secure/path/capacity-evidence \
 NCHAT_PROD_RELEASE_SHA=<40-hex> \
 NCHAT_PROD_TOPOLOGY_FILE=/secure/path/topology.env \
 ARTIFACTS_DIR=./artifacts \
-make prod-blue-green-deploy
+make prod-blue-green-deploy-release RELEASE_CHECKOUT=../nchat-release
 ```
 
 The directory holds `node-allocatable.txt`, `cluster-requests.txt`,
@@ -2381,8 +2391,8 @@ the web app learns the capability from chat-service's own sidebar payload.
 
 ### Phase 1 — reader-first (this is the shipped state)
 
-1. `make prod-blue-green-deploy` — applies migrations `000050`/`000051` as part
-   of the release, then brings the candidate up with the committed
+1. `make prod-blue-green-deploy-release RELEASE_CHECKOUT=<release>` (section 7)
+   — applies migrations `000050`/`000051` as part of the release, then brings the candidate up with the committed
    `false`.
 2. `make prod-notification-levels ARGS="--status"` — expect
    `nchat-config.CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED=false` and
@@ -2463,6 +2473,207 @@ Recovering from that would need the data converting first — deleting the rows
 whose `muted_at` is NULL, which is what migration `000050`'s down migration
 does — and that is a data operation, not a slot switch. Roll back to the
 reader-compatible build instead.
+
+## 16c. Manual presence (issue #798)
+
+Manual presence (Disponível, Ocupado, Não perturbe, Volto já, Ausente, Aparecer
+offline) ships behind the same kind of **runtime capability, off in
+production**, for the same reason as 16b: two slots share one database and one
+Valkey, and a slot from before #798 does not know `chat.user_presence`'s manual
+columns at all. It would show a person who chose **Aparecer offline** as online
+and would not treat **Não perturbe** as a notification signal.
+
+```text
+CHAT_MANUAL_PRESENCE_ENABLED=false   # committed default
+```
+
+With the gate shut, `GET /api/chat/presence/me` answers with `"writable": false`
+and the web app hides the state list; `PUT`/`DELETE` answer
+`503 manual_presence_unavailable` before reaching the database. Readers do not
+depend on the gate: every reader in this build honours a stored manual state
+whichever way the gate stands.
+
+```bash
+make prod-manual-presence ARGS="--status"
+make prod-manual-presence ARGS="--set true"
+make prod-manual-presence ARGS="--set false"
+```
+
+The command is the same machinery as `prod-notification-levels` (both are thin
+wrappers over `scripts/deploy/nchat-prod/chat-capability.sh`), on its own key:
+it validates context and namespace, refuses anything but `true`/`false`, patches
+`nchat-config`, restarts `chat-service` in **both** slots, waits for each
+rollout and reads `CHAT_MANUAL_PRESENCE_ENABLED` out of a Ready pod of each slot.
+It never touches the other gate's key, and an ordinary deploy or cutover never
+touches this one.
+
+### The capability the scripts check
+
+`printenv` proves which value a pod loaded, not that its code understands it: a
+build from before #798 started against the same ConfigMap loads `true` and
+still ignores every manual state. So every release from #798 on stamps its
+manual presence readers — `chat-service` and `notification-service` (the latter
+reads Do Not Disturb through the outbox projection) — with a pod-template
+annotation from its **own manifests**:
+
+```text
+nchat.io/capability-manual-presence: "v1"
+```
+
+Configuration cannot add it; an older release cannot carry it. The scripts read
+it from the Deployments and from the pods themselves, and treat any read they
+cannot complete as a refusal (fail closed).
+
+### Phase 1 — reader-first (the shipped state)
+
+1. `make prod-blue-green-deploy-release RELEASE_CHECKOUT=<release>` — applies
+   migration `000065` (additive: one
+   table, no change to existing ones) and brings the candidate up with `false`.
+2. `make prod-manual-presence ARGS="--status"` — expect `false` on every slot
+   with pods.
+3. Smoke and cutover as usual, observation window (section 13), then
+   `make prod-blue-green-drain-old ARGS="--target <old>"`.
+
+**What the mixed window looks like.** While both slots serve WebSockets:
+
+- nobody can hold a manual state (the gate is shut), so the old slot's ignorance
+  of manual states shows nobody wrongly;
+- the new slot keeps each person's reach under a per-user key
+  (`nchat:chat:ws:presence-user:{ws}:{user}`) and **also** counts any assertion
+  an old-slot replica wrote into a conversation roster, add-only. A person
+  served by both slots is therefore not published `away`/`offline` by the new
+  slot while the old one still serves an active session of theirs (limit: the
+  new slot looks for old-slot assertions in one roster of the person, so an
+  old-slot session that shares no conversation with it is not seen);
+- the old slot publishes from its own per-conversation view, as it always did.
+  Its events carry its own instant rather than the shared projection version,
+  so an observer can see the two slots disagree for a person served by both.
+
+The convergence bound of that disagreement is the drain, not a timer: scaling
+the old slot to zero closes its sockets through the application's shutdown
+path (which withdraws its assertions), the clients reconnect to the active slot
+— the browser retries within its reconnect backoff — and each reconnection
+starts from a `presence.snapshot` composed by the new code. Valkey keys written
+by the new slot carry a 24 h TTL and need no cleanup if the release is abandoned.
+
+### Phase 2 — opening the writer
+
+```bash
+make prod-manual-presence ARGS="--set true"
+```
+
+The command proves its precondition before it changes anything, in this order:
+
+1. **Capability check, both slots.** For `chat-service` and
+   `notification-service` in blue and green: every pod that can still serve —
+   Ready or not, starting or draining; only `Succeeded`/`Failed` pods are
+   ignored — must carry the annotation, and every Deployment that asks for
+   replicas must carry it in its pod template. A slot drained to zero by
+   `drain-old` passes on its pods (it has none); a slot still running the
+   previous release, a reader without the annotation, or a rollout caught half
+   way (old and new pods together) fails the command **before** the ConfigMap
+   is touched, naming each workload or pod. A listing or a Deployment that
+   cannot be read fails it too.
+2. Confirmation.
+3. **Activation record.** The first opening writes
+   `nchat.io/manual-presence-activated=<UTC instant>` on `nchat-config`
+   (an annotation, so no pod reads it). No script ever removes it. If it
+   cannot be written, nothing else happens.
+4. Patch, restart both slots, wait, verify the loaded value (as before), and
+   run the capability check once more on the restarted pods.
+
+The checks in 16b — current release everywhere, zero pods in the old slot — are
+what the capability check now enforces; run `make prod-blue-green-status` for
+the release identities as usual.
+
+**From activation on, no incompatible release starts — in any slot.** An idle
+slot is not inert: its `notification-service` claims rows from the outbox both
+slots share (worker enabled by the shared ConfigMap, claims by lease, no slot
+ownership), so a build that ignores Do Not Disturb would deliver to people who
+asked for silence without ever being promoted. The check therefore runs before
+a release's workloads exist, and it is not left to the release's own scripts —
+a release from before #798 brings deploy scripts that never heard of it:
+
+- `cd-prepare-production.yml` runs its YAML from the default branch, then checks
+  that branch out a second time beside the release (`control-plane/`) and runs
+  `control-plane/scripts/deploy/nchat-prod/require-release-capability.sh` on the
+  release checkout **before** reserving the slot and before `deploy.sh`. It reads
+  the activation record and renders the release's own production manifests
+  (`kustomize build …/slots/blue`); once activated, a release whose
+  `chat-service` or `notification-service` pod template lacks
+  `nchat.io/capability-manual-presence: "v1"` — or whose manifests do not
+  render, or name no such workload — stops the job. Nothing has been reserved,
+  migrated, applied or scaled. The workflow contract
+  (`scripts/ci/check_cd_workflows.py`) pins the two steps, their ref (the
+  default branch, never the release) and their position.
+- **By hand, the same split.** The supported manual deploy is
+  `make prod-blue-green-deploy-release RELEASE_CHECKOUT=<checkout of the
+release>`, typed in an up-to-date checkout of the default branch (the
+  control plane). It runs that checkout's `require-release-capability.sh` on
+  the release checkout and only then hands over to the **release's**
+  `deploy.sh`, from the release checkout (section 7). The former
+  `make prod-blue-green-deploy` — which ran the deploy script of whatever
+  checkout it was typed in, so a release from before #798 deployed itself
+  unchecked — is retired and refuses with a pointer to the new target. A
+  checkout from before #798 mistaken for the control plane has no
+  `prod-blue-green-deploy-release` target at all and fails before doing
+  anything.
+- `deploy.sh` (from this release on) repeats the rule on the exact candidate it
+  rendered, before migrations and before `kubectl apply`.
+- An unreadable activation record is a refusal (fail closed).
+
+`make prod-blue-green-test` proves the manual path against the real tree of
+the last commit before #798 (`b2ad1a6`, read from history — the release-safety
+CI job checks out with `fetch-depth: 0` for it): after activation the
+entrypoint refuses it with nothing migrated, applied, scaled, restarted or
+moved, and before activation it hands the same tree to its own `deploy.sh`.
+
+Before activation every release may be prepared (Phase 1), compatible or not.
+
+**From activation on, cutover and rollback refuse an incompatible slot.**
+`cutover.sh` and `rollback.sh` (both run from `main` by their workflows) read
+the activation record; when it is present, the target slot's
+`chat-service`/`notification-service` must carry the capability in their pod
+templates — whatever their replica count — and in every pod. Otherwise the
+command fails before any Service moves, explaining that manual presence was
+enabled and the slot runs a build from before #798. If the record cannot be
+read, the promotion is refused rather than guessed.
+A browser that was already open learns `writable` from its next read of
+`/api/chat/presence/me`: on reload, on reconnect of its WebSocket, or when the
+menu is opened. Smoke: choose **Não perturbe · 1 hora**, confirm the dot in a
+second browser, then **Redefinir status**.
+
+Convergence of a write, nominal: the `PUT` publishes `presence.settings_changed`
+on the bus before it answers, every replica serving the person refreshes them
+and tells its rooms — sub-second. Expiry has no write: each replica's context
+sweep (`presenceContextSweepInterval`, 30 s) notices it, so a manual state is
+replaced by the automatic one at most ~30 s after `expires_at` (plus one sweep
+per Valkey/database failure, which defers rather than guesses).
+
+### Rollback
+
+- **Closing the feature:** `make prod-manual-presence ARGS="--set false"`, then
+  `--status` to prove no slot still runs with `true`. New writes stop; states
+  already chosen remain in force until their `expires_at` (at most 31 days) —
+  closing the writer never reinterprets a row, so nobody who chose to appear
+  offline is suddenly shown.
+- **Rolling back the release before Phase 2:** supported. The old build ignores
+  the new table, the per-user Valkey keys expire on their own, and the migration
+  is additive.
+- **Rolling back the release after Phase 2 to a build from before #798 is
+  refused by the scripts**, not only discouraged: such a build would show every
+  person who chose **Aparecer offline** as online and ignore **Não perturbe**
+  for notifications. Closing the gate does not lift the refusal — states
+  already chosen stay stored until they expire. Roll back to (or forward to) a
+  release from #798 on. If a pre-#798 build is truly unavoidable, it is a data
+  decision taken outside these scripts: confirm no unexpired manual state is
+  left (`SELECT count(*) FROM chat.user_presence WHERE manual_expires_at >
+now()` returns 0) with the gate closed, then remove the activation annotation
+  by hand (`kubectl annotate configmap nchat-config -n nchat-prod
+nchat.io/manual-presence-activated-`) and record why in the release log.
+- **Preparing a release is guarded too.** See "From activation on, no
+  incompatible release starts" above: a release from before #798 is refused
+  before its workloads exist, whichever slot it targets.
 
 ---
 

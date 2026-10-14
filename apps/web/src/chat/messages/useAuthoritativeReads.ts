@@ -74,7 +74,10 @@ export function useAuthoritativeReads({
           },
           (error: unknown) => {
             fallbacks.finish(key, controller);
-            if (isAbortError(error)) return;
+            // The controller is authoritative for cancellations initiated by
+            // this registry. Keep the signal check even if a transport wrapper
+            // normalized the rejection before it reached this hook.
+            if (controller.signal.aborted || isAbortError(error)) return;
             if (!scope.isCurrent(loadKey)) return;
             if (remaining > 0) {
               readOnce(remaining - 1);

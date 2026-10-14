@@ -6,15 +6,16 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 )
 
-// RF-15 (issue #123, TASK-94). All assertions run against a real PostgreSQL:
-// static string checks on the migration file cannot prove the Portuguese
-// dictionary actually stems, that the GIN index is actually usable, or that
-// the resync trigger actually fires when a channel's type changes.
+// RF-15 (issue #123, TASK-94), revised by issue #900 (chat migration 000059).
+// All assertions run against a real PostgreSQL: static string checks on the
+// migration file cannot prove the Portuguese dictionary actually stems or that
+// the trigger follows edits and deletions. Since 000059 every active message is
+// indexed and search-service authorizes at query time; who may read a match is
+// proven in search-service's postgres suite, not here.
 func TestChatMigration_MessageSearchVector_PostgreSQLBehavior(t *testing.T) {
 	dsn := os.Getenv("CHAT_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -109,8 +110,8 @@ func TestChatMigration_MessageSearchVector_PostgreSQLBehavior(t *testing.T) {
 			RETURNING id`, workspaceID, privateChannel, sender).Scan(&privateMsgID); err != nil {
 			t.Fatalf("insert private channel message: %v", err)
 		}
-		if messageIsIndexed(t, ctx, conn, privateMsgID) {
-			t.Fatal("private channel message must not be indexed")
+		if !messageIsIndexed(t, ctx, conn, privateMsgID) {
+			t.Fatal("private channel message must be indexed for its members")
 		}
 
 		var archivedMsgID string
@@ -120,8 +121,8 @@ func TestChatMigration_MessageSearchVector_PostgreSQLBehavior(t *testing.T) {
 			RETURNING id`, workspaceID, archivedChannel, sender).Scan(&archivedMsgID); err != nil {
 			t.Fatalf("insert archived channel message: %v", err)
 		}
-		if messageIsIndexed(t, ctx, conn, archivedMsgID) {
-			t.Fatal("message in an already-archived public channel must not be indexed")
+		if !messageIsIndexed(t, ctx, conn, archivedMsgID) {
+			t.Fatal("archived channel message stays indexed; the query excludes archived channels")
 		}
 
 		var directDMID string
@@ -138,8 +139,8 @@ func TestChatMigration_MessageSearchVector_PostgreSQLBehavior(t *testing.T) {
 			RETURNING id`, workspaceID, directDMID, sender).Scan(&directMsgID); err != nil {
 			t.Fatalf("insert direct dm message: %v", err)
 		}
-		if messageIsIndexed(t, ctx, conn, directMsgID) {
-			t.Fatal("1:1 DM message must not be indexed")
+		if !messageIsIndexed(t, ctx, conn, directMsgID) {
+			t.Fatal("1:1 DM message must be indexed for its participants")
 		}
 
 		var groupDMID string
@@ -156,8 +157,8 @@ func TestChatMigration_MessageSearchVector_PostgreSQLBehavior(t *testing.T) {
 			RETURNING id`, workspaceID, groupDMID, sender).Scan(&groupMsgID); err != nil {
 			t.Fatalf("insert group dm message: %v", err)
 		}
-		if messageIsIndexed(t, ctx, conn, groupMsgID) {
-			t.Fatal("group DM message must not be indexed")
+		if !messageIsIndexed(t, ctx, conn, groupMsgID) {
+			t.Fatal("group DM message must be indexed for its participants")
 		}
 
 		if _, err := conn.Exec(ctx, `UPDATE chat.messages SET body_text = 'mensagem publica sobre orcamentos' WHERE id = $1`, publicMsgID); err != nil {
@@ -178,7 +179,7 @@ func TestChatMigration_MessageSearchVector_PostgreSQLBehavior(t *testing.T) {
 		}
 	})
 
-	t.Run("channel privacy or archive flip resyncs existing messages", func(t *testing.T) {
+	t.Run("channel privacy or archive flip leaves the index alone", func(t *testing.T) {
 		for i, tc := range []struct {
 			name     string
 			column   string
@@ -215,14 +216,15 @@ func TestChatMigration_MessageSearchVector_PostgreSQLBehavior(t *testing.T) {
 					}
 				}
 
+				// Who may read the message changed; what it says did not.
 				flip(tc.offValue)
-				if messageIsIndexed(t, ctx, conn, msgID) {
-					t.Fatalf("%s = %s must clear search_vector for existing messages", tc.column, tc.offValue)
+				if !messageIsIndexed(t, ctx, conn, msgID) {
+					t.Fatalf("%s = %s must not clear search_vector: access is decided at query time", tc.column, tc.offValue)
 				}
 
 				flip(tc.onValue)
 				if !messageIsIndexed(t, ctx, conn, msgID) {
-					t.Fatalf("%s = %s must re-populate search_vector for existing messages, once public and active again", tc.column, tc.onValue)
+					t.Fatalf("%s = %s must keep search_vector", tc.column, tc.onValue)
 				}
 			})
 		}
@@ -315,176 +317,6 @@ func TestChatMigration_MessageSearchVector_PostgreSQLBehavior(t *testing.T) {
 			t.Fatalf("non-matching query must rank 0, got %v", noMatchRank)
 		}
 	})
-}
-
-// RF-15 post-Code Quality Review fix: the message trigger's SELECT ... FOR
-// SHARE (see 000027) must serialize the "is this channel public and active"
-// decision against a concurrent channel type/status change, so that after
-// both transactions commit — regardless of which one the database happened
-// to run first — a message can never end up indexed against a channel that
-// is not public and active.
-//
-// The scenario under test is the one identified in review: a channel UPDATE
-// (flipping it private or archived) and a message INSERT into that same
-// channel are issued concurrently. Ordering is made deterministic by holding
-// the channel row's write lock open in one transaction until PostgreSQL
-// itself reports (via pg_locks) that the other session is blocked waiting on
-// it — not by sleeping and hoping the interleaving landed a particular way.
-func TestChatMigration_MessageSearchVector_ConcurrentChannelChangeVsMessageInsert_PostgreSQLBehavior(t *testing.T) {
-	dsn := os.Getenv("CHAT_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("CHAT_TEST_DATABASE_URL is not set")
-	}
-	ctx := t.Context()
-
-	setup, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect test database: %v", err)
-	}
-	defer func() { _ = setup.Close(context.Background()) }()
-
-	var databaseName string
-	if err := setup.QueryRow(ctx, `SELECT current_database()`).Scan(&databaseName); err != nil {
-		t.Fatalf("read current database: %v", err)
-	}
-	if !strings.HasSuffix(databaseName, "_test") {
-		t.Fatalf("refusing destructive concurrency test against non-test database %q", databaseName)
-	}
-	if _, err := setup.Exec(ctx, `DROP SCHEMA IF EXISTS chat CASCADE`); err != nil {
-		t.Fatalf("reset chat schema: %v", err)
-	}
-	t.Cleanup(func() { _, _ = setup.Exec(context.Background(), `DROP SCHEMA IF EXISTS chat CASCADE`) })
-	if _, err := setup.Exec(ctx, `
-		CREATE SCHEMA IF NOT EXISTS auth;
-		CREATE TABLE IF NOT EXISTS auth.users (
-			id UUID PRIMARY KEY,
-			email TEXT NOT NULL DEFAULT '',
-			display_name TEXT NOT NULL DEFAULT '',
-			status TEXT NOT NULL DEFAULT 'active',
-			deleted_at TIMESTAMPTZ
-		)`); err != nil {
-		t.Fatalf("prepare auth schema required by chat foreign keys: %v", err)
-	}
-	if _, err := setup.Exec(ctx, readAllChatUpMigrations(t)); err != nil {
-		t.Fatalf("apply chat migrations: %v", err)
-	}
-
-	const workspaceID = "c9000000-0000-0000-0000-000000000001"
-	seedWorkspace := &pgx.Batch{}
-	seedWorkspace.Queue(`INSERT INTO chat.workspaces (id, slug, name) VALUES ($1, 'race-ws', 'Race WS')`, workspaceID)
-	seedWorkspace.Queue(`INSERT INTO chat.channels (workspace_id, slug, display_name, type, is_general)
-		VALUES ($1, 'geral', 'Geral', 'public', true)`, workspaceID)
-	if err := setup.SendBatch(ctx, seedWorkspace).Close(); err != nil {
-		t.Fatalf("seed workspace: %v", err)
-	}
-
-	// Both type -> private and status -> archived take the same row-level
-	// lock on chat.channels (a plain UPDATE, regardless of which column it
-	// sets), so the same FOR SHARE mechanism closes the race for both. This
-	// exercises both explicitly rather than only asserting it once and
-	// trusting the argument.
-	for i, tc := range []struct {
-		name     string
-		column   string
-		offValue string
-	}{
-		{name: "public channel concurrently flips to private", column: "type", offValue: "private"},
-		{name: "active channel concurrently flips to archived", column: "status", offValue: "archived"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var channelID string
-			if err := setup.QueryRow(ctx, `
-				INSERT INTO chat.channels (workspace_id, slug, display_name, type)
-				VALUES ($1, $2, 'Race Channel', 'public') RETURNING id`,
-				workspaceID, fmt.Sprintf("race-channel-%d", i)).Scan(&channelID); err != nil {
-				t.Fatalf("seed race channel: %v", err)
-			}
-
-			connA, err := pgx.Connect(ctx, dsn)
-			if err != nil {
-				t.Fatalf("connect connA: %v", err)
-			}
-			defer func() { _ = connA.Close(context.Background()) }()
-			connB, err := pgx.Connect(ctx, dsn)
-			if err != nil {
-				t.Fatalf("connect connB: %v", err)
-			}
-			defer func() { _ = connB.Close(context.Background()) }()
-
-			txA, err := connA.Begin(ctx)
-			if err != nil {
-				t.Fatalf("begin txA: %v", err)
-			}
-			// txA takes the channel row's write lock and holds it open
-			// (no commit yet), which is what forces connB's message insert
-			// below to block instead of racing ahead with a stale view of
-			// the channel.
-			updateSQL := fmt.Sprintf(`UPDATE chat.channels SET %s = $1 WHERE id = $2`, tc.column) //nolint:gosec // tc.column is a fixed test literal, never user input.
-			if _, err := txA.Exec(ctx, updateSQL, tc.offValue, channelID); err != nil {
-				t.Fatalf("flip channel in txA: %v", err)
-			}
-
-			type insertOutcome struct {
-				id  string
-				err error
-			}
-			outcomeCh := make(chan insertOutcome, 1)
-			go func() {
-				var id string
-				err := connB.QueryRow(ctx, `
-					INSERT INTO chat.messages (workspace_id, channel_id, sender_id, body_text)
-					VALUES ($1, $2, $1, 'mensagem concorrente com mudanca de canal')
-					RETURNING id`, workspaceID, channelID).Scan(&id)
-				outcomeCh <- insertOutcome{id: id, err: err}
-			}()
-
-			// Deterministic ordering: proceed only once PostgreSQL itself
-			// reports connB is blocked on the channel row's lock (polling
-			// real engine state), never a fixed sleep guess.
-			waitForRowLockWaiter(t, setup, connB.PgConn().PID())
-
-			if err := txA.Commit(ctx); err != nil {
-				t.Fatalf("commit txA: %v", err)
-			}
-
-			var outcome insertOutcome
-			select {
-			case outcome = <-outcomeCh:
-			case <-time.After(5 * time.Second):
-				t.Fatal("connB insert did not unblock after txA committed")
-			}
-			if outcome.err != nil {
-				t.Fatalf("connB insert: %v", outcome.err)
-			}
-
-			var searchVectorIsNull bool
-			if err := setup.QueryRow(ctx, `SELECT search_vector IS NULL FROM chat.messages WHERE id = $1`, outcome.id).Scan(&searchVectorIsNull); err != nil {
-				t.Fatalf("read committed search_vector: %v", err)
-			}
-			if !searchVectorIsNull {
-				t.Fatalf("message inserted concurrently with the channel's %s becoming %q must not be indexed after both commits", tc.column, tc.offValue)
-			}
-		})
-	}
-}
-
-func waitForRowLockWaiter(t *testing.T, probe *pgx.Conn, pid uint32) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	for ctx.Err() == nil {
-		var waiting bool
-		if err := probe.QueryRow(ctx, `SELECT EXISTS (
-			SELECT 1 FROM pg_locks WHERE pid = $1 AND NOT granted
-		)`, pid).Scan(&waiting); err != nil {
-			t.Fatalf("inspect row locks for pid %d: %v", pid, err)
-		}
-		if waiting {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("connection with pid %d did not block on the channel row lock", pid)
 }
 
 func messageIsIndexed(t *testing.T, ctx context.Context, conn *pgx.Conn, messageID string) bool {

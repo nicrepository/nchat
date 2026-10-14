@@ -162,7 +162,7 @@ func (s *ChannelAdminService) RemoveMember(ctx context.Context, actor Actor, cha
 	if s == nil || s.store == nil {
 		return domain.ChannelMembershipChange{}, domain.ErrUnavailable
 	}
-	change, err := s.removeMember(ctx, channelID, userID)
+	change, err := s.removeMember(ctx, actor, channelID, userID)
 	record(ctx, s.audit, actor, domain.AuditActionChannelMemberKick, "admin.channel:"+channelID, resultFor(err), map[string]string{
 		"channel_id":     channelID,
 		"workspace_id":   change.WorkspaceID,
@@ -172,9 +172,14 @@ func (s *ChannelAdminService) RemoveMember(ctx context.Context, actor Actor, cha
 	return change, err
 }
 
-func (s *ChannelAdminService) removeMember(ctx context.Context, channelID, userID string) (domain.ChannelMembershipChange, error) {
+func (s *ChannelAdminService) removeMember(ctx context.Context, actor Actor, channelID, userID string) (domain.ChannelMembershipChange, error) {
 	if !domain.ValidUUID(channelID) || !domain.ValidUUID(userID) {
 		return domain.ChannelMembershipChange{}, domain.ErrInvalidInput
+	}
+	if aware, ok := s.store.(interface {
+		RemoveChannelMemberAs(context.Context, string, string, string) (domain.ChannelMembershipChange, error)
+	}); ok {
+		return aware.RemoveChannelMemberAs(ctx, channelID, userID, actor.UserID)
 	}
 	return s.store.RemoveChannelMember(ctx, channelID, userID)
 }

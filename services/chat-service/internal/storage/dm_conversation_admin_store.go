@@ -10,42 +10,10 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
-// Group rename and self-leave (issue #527).
-//
-// Both are group-DM mutations, both are authorized by *participation* — a group
-// has no owner, admin or moderator, because chat.dm_members.role is closed by
-// CHECK to the single value 'member' — and both persist a system message in the
-// same transaction as the change they describe.
-//
-// The lock protocol extends the one PGXDMStore.AddGroupParticipants documents,
-// and the order is the same everywhere so no cycle is reachable between a
-// rename, a leave and an add running at once:
-//
-//  1. the conversation row;
-//  2. the actor's own chat.dm_members row;
-//  3. the actor's own chat.workspace_members row;
-//  4. the write.
-//
-// Step 3 is what the security review found missing. Both operations *read*
-// chat.workspace_members as a precondition — a dm_members row outlives the
-// workspace membership that justified it — but neither held it, so a revocation
-// committing mid-transaction was observed too late and the write went through on
-// authority that no longer existed. It is held FOR SHARE for the same reason
-// lockActorChannelManagementSQL holds the channel path's: suspending, removing
-// or demoting a membership is an UPDATE of that row, which takes FOR NO KEY
-// UPDATE and conflicts with FOR SHARE, so the two serialise in both directions
-// while two participants acting at once still do not block each other.
-//
-// Step 2's mode depends on the operation, and that is the second thing the
-// review found: a transaction that is going to UPDATE a row must not take a
-// shared lock on it first. Two self-leaves doing that both hold FOR SHARE and
-// both then need the exclusive lock the other is holding — a textbook
-// lock-upgrade deadlock, which PostgreSQL resolves by aborting one of them with
-// 40P01 rather than by refusing it for a domain reason. Leave therefore takes
-// the actor's membership FOR UPDATE from the start; rename, which does not touch
-// that row, keeps FOR SHARE. Step 1 follows the same rule for the same reason:
-// the rename UPDATEs the conversation row, so it takes it FOR UPDATE, while the
-// leave does not and takes it FOR SHARE.
+// Legacy group rename and self-leave keep their #527 contracts while ownership
+// is disabled. Once enabled, the HTTP adapter delegates to PGXOwnershipStore.
+// All group writers lock the conversation FOR UPDATE before participant and
+// workspace memberships, serializing them with ownership and invalidation.
 
 // RenameGroupInput is the whole input of a group rename. The actor is an
 // identity and never a decision; the title has already been normalised by the
@@ -90,7 +58,7 @@ const lockGroupConversationSQL = `
 // row: archiving it is an UPDATE that conflicts with FOR SHARE, so an archival
 // in flight is still serialised against the operation, while two of them do not
 // block each other.
-const shareConversation = `FOR SHARE OF dc`
+const shareConversation = `FOR UPDATE OF dc`
 
 // updateConversation is for the rename, which UPDATEs this very row. Taking the
 // exclusive lock up front is what keeps two concurrent renames of one group from
@@ -210,6 +178,85 @@ func (s *PGXDMStore) RenameGroupConversation(ctx context.Context, input RenameGr
 	return RenameGroupResult{Conversation: conversation, Event: event}, nil
 }
 
+// SetGroupAvatarInput is the whole input of a group identity change (issue
+// #1026). AvatarEmoji has already been validated against the catalog by the
+// service; empty clears it back to Automático.
+type SetGroupAvatarInput struct {
+	WorkspaceID    string
+	ConversationID string
+	CallerID       string
+	AvatarEmoji    string
+}
+
+// SetGroupAvatarEmoji sets or clears a group's identity emoji.
+//
+// It is authorized exactly like the rename — the identity is the same kind of
+// metadata as the name: the legacy rule is participation, taken under the same
+// locks as RenameGroupConversation; when the ownership rollout is enabled the
+// actor must also hold EditMetadata, read inside this transaction rather than
+// trusted from an earlier request. A 1:1 conversation is unreachable for the
+// same structural reason (type = 'group') and is ErrNotFound.
+//
+// No system message is written: the identity is presentation, not an event in
+// the conversation's history, and the rename's message already narrates names.
+func (s *PGXDMStore) SetGroupAvatarEmoji(ctx context.Context, input SetGroupAvatarInput) error {
+	if input.CallerID == "" {
+		return domain.ErrForbidden
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin set group avatar: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := lockGroupForActor(ctx, tx, input.ConversationID, input.WorkspaceID, input.CallerID, renameLocks); err != nil {
+		return err
+	}
+	if err := requireGroupMetadataEditor(ctx, tx, input); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE chat.dm_conversations
+		SET avatar_emoji = NULLIF($3, ''), updated_at = now()
+		WHERE id = $1::uuid AND workspace_id = $2::uuid AND status = 'active' AND type = 'group'`,
+		input.ConversationID, input.WorkspaceID, input.AvatarEmoji,
+	)
+	if err != nil {
+		return fmt.Errorf("set group avatar: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit set group avatar: %w", err)
+	}
+	return nil
+}
+
+// requireGroupMetadataEditor applies the ownership half of the rename's rule:
+// with the rollout disabled participation (already locked) is the whole
+// policy; with it enabled the actor needs the same EditMetadata capability
+// the ownership rename requires.
+func requireGroupMetadataEditor(ctx context.Context, tx pgx.Tx, input SetGroupAvatarInput) error {
+	var enabled bool
+	if err := tx.QueryRow(ctx, `SELECT enabled FROM chat.ownership_rollout WHERE singleton`).Scan(&enabled); err != nil {
+		return fmt.Errorf("read ownership rollout: %w", err)
+	}
+	if !enabled {
+		return nil
+	}
+	details, err := readOwnershipDetails(ctx, tx, OwnershipScope{
+		WorkspaceID: input.WorkspaceID, Kind: "dm", ConversationID: input.ConversationID, ActorID: input.CallerID,
+	})
+	if err != nil {
+		return err
+	}
+	if !details.Capabilities.EditMetadata {
+		return domain.ErrForbidden
+	}
+	return nil
+}
+
 // LeaveGroupConversation removes the actor's own participation and records it.
 //
 // Self-leave only: the actor is the row that is updated, so there is no target
@@ -299,7 +346,7 @@ func lockGroupForCreator(ctx context.Context, tx pgx.Tx, conversationID, workspa
 		  AND dc.workspace_id = $2::uuid
 		  AND dc.status = 'active'
 		  AND dc.type = 'group'
-		FOR SHARE OF dc`,
+		FOR UPDATE OF dc`,
 		conversationID, workspaceID,
 	).Scan(&lockedID, &createdBy)
 	if err != nil {

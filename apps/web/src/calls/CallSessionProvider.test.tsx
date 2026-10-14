@@ -302,6 +302,7 @@ function Probe() {
         onClick={() =>
           session.registerDirectory({
             currentUserId: userB,
+            workspaceId: "workspace-1",
             channels: [
               { id: channelId, name: "Produto", type: "public", canWrite: true },
               { id: channelYId, name: "Suporte", type: "public", canWrite: true },
@@ -331,6 +332,7 @@ function Probe() {
         onClick={() =>
           session.registerDirectory({
             currentUserId: userB,
+            workspaceId: "workspace-1",
             channels: [{ id: channelId, name: "Produto", type: "public", canWrite: true }],
             dms: [
               {
@@ -351,6 +353,7 @@ function Probe() {
         onClick={() =>
           session.registerDirectory({
             currentUserId: userB,
+            workspaceId: "workspace-1",
             channels: [{ id: channelId, name: "Produto", type: "public", canWrite: true }],
             dms: [
               {
@@ -358,7 +361,7 @@ function Probe() {
                 name: "Ana",
                 type: "1:1",
                 participants: [],
-                counterpart: { userId: userA, displayName: "Ana", avatarUrl: "https://x/peer.png" },
+                counterpart: { userId: userA, displayName: "Ana", avatarUrl: "/peer.png" },
               },
             ],
           })
@@ -1912,7 +1915,7 @@ describe("CallSessionProvider", () => {
     // Peer is "Ana" (userA) per the registered directory — never an index or
     // a made-up identity.
     const avatar = document.querySelector(".floating-call__avatar")!;
-    expect(avatar).toHaveTextContent(initialsFrom("Ana"));
+    expect(avatar.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
     expect(avatar).toHaveClass(`call-avatar--${avatarColorFor(userA)}`);
   });
 
@@ -1956,7 +1959,7 @@ describe("CallSessionProvider", () => {
     // Empty/loading profile name falls back to "Você" for initials too
     // (issue #612 blocker) — same visual fallback as the display label,
     // never "?" and never derived from a "(você)"-suffixed string.
-    expect(avatar).toHaveTextContent(initialsFrom("Você"));
+    expect(avatar.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
     // currentUserId (userB) — the registered directory's own id, never a
     // fetched profile just for this fallback.
     expect(avatar).toHaveClass(`call-avatar--${avatarColorFor(userB)}`);
@@ -1993,7 +1996,7 @@ describe("CallSessionProvider", () => {
 
     await waitFor(() => {
       const avatar = document.querySelector(".floating-call__local-avatar")!;
-      expect(avatar).toHaveTextContent(initialsFrom("Ana"));
+      expect(avatar.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
       expect(avatar.textContent).not.toContain("(");
     });
   });
@@ -2009,7 +2012,7 @@ describe("CallSessionProvider", () => {
     await screen.findByTestId("floating-call-window");
 
     const img = document.querySelector(".floating-call__avatar img");
-    expect(img).toHaveAttribute("src", "https://x/peer.png");
+    expect(img).toHaveAttribute("src", "/peer.png");
   });
 
   it("never uses the resource-level avatar as an individual's identity in the floating window", async () => {

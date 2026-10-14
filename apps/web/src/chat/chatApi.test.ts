@@ -16,6 +16,7 @@ import {
   addGroupParticipants,
   createChannel,
   createGroupDM,
+  setGroupAvatarEmoji,
   deleteMessage,
   editMessage,
   favoriteMessage,
@@ -695,6 +696,33 @@ describe("fetchDMs", () => {
     expect(dms).toHaveLength(2);
   });
 
+  // Issue #1026: only a group carries an identity, and only a non-empty string
+  // is one; everything else reads as Automático (no avatarEmoji at all).
+  it("maps a group's avatar_emoji and treats anything else as Automático", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [
+          { id: "g-emoji", type: "group", name: "Infra", avatar_emoji: "🧑‍🚀" },
+          { id: "g-auto", type: "group", name: "Ops" },
+          { id: "g-empty", type: "group", name: "Vazio", avatar_emoji: "" },
+          { id: "g-number", type: "group", name: "Número", avatar_emoji: 7 },
+          { id: "d-emoji", type: "direct", name: "Ana", avatar_emoji: "🎉" },
+        ],
+      }),
+    );
+
+    const dms = await fetchDMs();
+
+    expect(dms.map((dm) => [dm.id, dm.avatarEmoji])).toEqual([
+      ["g-emoji", "🧑‍🚀"],
+      ["g-auto", undefined],
+      ["g-empty", undefined],
+      ["g-number", undefined],
+      ["d-emoji", undefined],
+    ]);
+    expect(dms[1]).not.toHaveProperty("avatarEmoji");
+  });
+
   it("returns empty array when dm_conversations list is empty", async () => {
     mockAuthFetch.mockResolvedValue(sidebarResponse({ dms: [] }));
     const dms = await fetchDMs();
@@ -842,6 +870,84 @@ describe("fetchSidebarData", () => {
     expect(channels[0].unreadCount).toBe(3);
     expect(channels[1].unreadCount).toBeUndefined();
     expect(dms[0].unreadCount).toBe(2);
+  });
+
+  // Issue #1082: the point each count is counted from.
+  it("reads the precise cursor capability only from an explicit true", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        current_user_id: "u-1",
+        workspace: { id: "ws-1" },
+        channels: [],
+        dm_conversations: [],
+        precise_read_cursor: true,
+      },
+    });
+    expect((await fetchSidebarData()).preciseReadCursor).toBe(true);
+  });
+
+  it("maps the server's read state, and treats anything malformed as absent", async () => {
+    const point = { created_at: "2026-07-15T10:00:00.123456Z", message_id: "m-1" };
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          {
+            id: "ch-1",
+            slug: "a",
+            display_name: "a",
+            type: "public",
+            unread_count: 2,
+            read_through: point,
+          },
+          {
+            id: "ch-2",
+            slug: "b",
+            display_name: "b",
+            type: "public",
+            unread_count: 1,
+            read_through: { created_at: "2026-07-15T09:00:00Z", message_id: null },
+          },
+          {
+            id: "ch-3",
+            slug: "c",
+            display_name: "c",
+            type: "public",
+            unread_count: 0,
+            read_through: null,
+          },
+          {
+            id: "ch-4",
+            slug: "d",
+            display_name: "d",
+            type: "public",
+            read_through: { message_id: "x" },
+          },
+          {
+            id: "ch-5",
+            slug: "e",
+            display_name: "e",
+            type: "public",
+            read_through: { created_at: "2026-07-15T09:00:00Z", message_id: 7 },
+          },
+          { id: "ch-6", slug: "f", display_name: "f", type: "public", read_through: "nope" },
+          { id: "ch-7", slug: "g", display_name: "g", type: "public" },
+        ],
+        dms: [{ id: "dm-1", type: "direct", name: "Ana", unread_count: 2, read_through: point }],
+      }),
+    );
+
+    const { channels, dms, preciseReadCursor } = await fetchSidebarData();
+    expect(preciseReadCursor).toBe(false);
+    expect(channels.map((channel) => channel.readState)).toEqual([
+      { unreadCount: 2, readThrough: { createdAt: point.created_at, id: "m-1" } },
+      { unreadCount: 1, readThrough: { createdAt: "2026-07-15T09:00:00Z", id: null } },
+      { unreadCount: 0, readThrough: null },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    ]);
+    expect(dms[0].readState?.readThrough).toEqual({ createdAt: point.created_at, id: "m-1" });
   });
 
   it("keeps the sidebar's authoritative unread count for categorized channels", async () => {
@@ -1081,7 +1187,38 @@ describe("fetchSidebarData", () => {
     expect(channels[0]).toMatchObject({ id: "ch-orfao", categoryId: "cat-1", canWrite: true });
   });
 
-  it("marks target-specific conversations read with an optional message id", async () => {
+  it("returns the read state the write answers with (issue #1082)", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        unread_count: 2,
+        read_through: { created_at: "2026-07-15T10:00:00Z", message_id: "m-1" },
+      },
+    });
+    await expect(markConversationRead("channel", "ch-1", "m-1")).resolves.toEqual({
+      unreadCount: 2,
+      readThrough: { createdAt: "2026-07-15T10:00:00Z", id: "m-1" },
+    });
+
+    // An older server answers 204: nothing to reconcile with.
+    mockAuthFetch.mockResolvedValue(undefined);
+    await expect(markConversationRead("channel", "ch-1")).resolves.toBeUndefined();
+  });
+
+  it("asks for keepalive when the write has to outlive the page", async () => {
+    mockAuthFetch.mockResolvedValue(undefined);
+    await markConversationRead("dm", "dm-1", "m-9", { keepalive: true });
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/dm-1/read", {
+      method: "POST",
+      keepalive: true,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ last_read_message_id: "m-9", read_cursor: "message" }),
+    });
+  });
+
+  // R1 (#1082 review): a cursor declares itself, so a server without the cursor
+  // refuses it (strict body, 400) instead of reading "everything is read".
+  it("marks target-specific conversations read with an optional, self-declaring cursor", async () => {
     mockAuthFetch.mockResolvedValue({});
     await markConversationRead("channel", "ch 1");
     await markConversationRead("dm", "dm 1", "message-1");
@@ -1092,7 +1229,7 @@ describe("fetchSidebarData", () => {
     expect(mockAuthFetch).toHaveBeenNthCalledWith(2, "/api/chat/dm/dm%201/read", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ last_read_message_id: "message-1" }),
+      body: JSON.stringify({ last_read_message_id: "message-1", read_cursor: "message" }),
     });
   });
 
@@ -1266,6 +1403,7 @@ describe("partial sidebar compatibility", () => {
       // The issue #136 capability: absent from the payload, so the gate reads
       // as shut and the settings page offers the binary control.
       notificationLevelsEnabled: false,
+      preciseReadCursor: false,
       channels: [],
       dms: [],
       categories: [],
@@ -1313,9 +1451,9 @@ describe("direct DM contracts", () => {
     mockAuthFetch.mockResolvedValue({ data: { conversation_id: "dm-group" } });
     const controller = new AbortController();
 
-    await expect(createGroupDM(["user-2", "user-3"], "  Infra  ", controller.signal)).resolves.toBe(
-      "dm-group",
-    );
+    await expect(
+      createGroupDM(["user-2", "user-3"], "  Infra  ", undefined, controller.signal),
+    ).resolves.toBe("dm-group");
     expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dms/group", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1333,7 +1471,7 @@ describe("direct DM contracts", () => {
 
     for (const blank of ["", "   "]) {
       mockAuthFetch.mockClear();
-      await createGroupDM(["user-2", "user-3"], blank);
+      await createGroupDM(["user-2", "user-3"], blank, undefined);
       const [, init] = mockAuthFetch.mock.calls[0] as [string, { body: string }];
       expect(init.body).toBe(JSON.stringify({ participant_user_ids: ["user-2", "user-3"] }));
     }
@@ -1343,13 +1481,76 @@ describe("direct DM contracts", () => {
     mockAuthFetch.mockResolvedValue({ data: { conversation_id: "dm-group" } });
     const emojiTitle = Array.from({ length: 120 }, () => "🙂").join("");
 
-    await createGroupDM(["user-2", "user-3"], `  ${emojiTitle}  `);
+    await createGroupDM(["user-2", "user-3"], `  ${emojiTitle}  `, undefined);
 
     const [, init] = mockAuthFetch.mock.calls[0] as [string, { body: string }];
     const sent = JSON.parse(init.body) as { title: string };
     expect(sent.title).toBe(emojiTitle);
     // The server measures runes: 120 code points must survive serialisation.
     expect(Array.from(sent.title)).toHaveLength(120);
+  });
+
+  // Issue #1026: Automático persists nothing; Emoji sends exactly the sequence.
+  it("sends no identity for an Automático group and only avatar_emoji for an Emoji one", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { conversation_id: "dm-group" } });
+
+    await createGroupDM(["user-2", "user-3"], "Infra", undefined);
+    await createGroupDM(["user-2", "user-3"], "Infra", "👩‍💻");
+
+    const bodies = mockAuthFetch.mock.calls.map(
+      ([, init]) => JSON.parse((init as { body: string }).body) as Record<string, unknown>,
+    );
+    expect(bodies[0]).toEqual({ participant_user_ids: ["user-2", "user-3"], title: "Infra" });
+    expect(bodies[1]).toEqual({
+      participant_user_ids: ["user-2", "user-3"],
+      title: "Infra",
+      avatar_emoji: "👩‍💻",
+    });
+    for (const body of bodies) {
+      for (const derived of ["initials", "avatar_color", "color", "mode"]) {
+        expect(body).not.toHaveProperty(derived);
+      }
+    }
+  });
+
+  it("propagates a refused creation", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new Error("400"));
+    await expect(createGroupDM(["user-2", "user-3"], "Infra", "<b>x</b>")).rejects.toThrow("400");
+  });
+});
+
+describe("setGroupAvatarEmoji", () => {
+  beforeEach(() => mockAuthFetch.mockReset());
+
+  it("PUTs exactly the emoji to the group's avatar route, with the signal", async () => {
+    mockAuthFetch.mockResolvedValue(undefined);
+    const controller = new AbortController();
+
+    await setGroupAvatarEmoji("dm/1", "🎉", controller.signal);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/dm%2F1/avatar", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ emoji: "🎉" }),
+      signal: controller.signal,
+    });
+  });
+
+  it("returns to Automático with an explicit DELETE and no body", async () => {
+    mockAuthFetch.mockResolvedValue(undefined);
+    const controller = new AbortController();
+
+    await setGroupAvatarEmoji("dm-1", undefined, controller.signal);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/dm-1/avatar", {
+      method: "DELETE",
+      signal: controller.signal,
+    });
+  });
+
+  it("propagates a refusal", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new Error("403"));
+    await expect(setGroupAvatarEmoji("dm-1", "🎉")).rejects.toThrow("403");
   });
 });
 
@@ -2816,6 +3017,36 @@ describe("createChannel", () => {
     }
   });
 
+  it("sends the invitees and the idempotency key of a private creation (issue #1025)", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { id: "ch-1", slug: "infra", display_name: "Infra", type: "private" },
+    });
+
+    await createChannel({
+      slug: "infra",
+      displayName: "Infra",
+      type: "private",
+      initialMemberIds: ["u-1", "u-2"],
+      idempotencyKey: "intent-1",
+    });
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": "intent-1" },
+      body: JSON.stringify({
+        slug: "infra",
+        display_name: "Infra",
+        type: "private",
+        initial_member_ids: ["u-1", "u-2"],
+      }),
+      signal: undefined,
+    });
+    const [, init] = mockAuthFetch.mock.calls[0] as [string, { body: string }];
+    for (const forbidden of ["role", "owner", "created_by", "workspace_id"]) {
+      expect(init.body).not.toContain(forbidden);
+    }
+  });
+
   it("propagates the API status so the caller can tell a denial from a failure", async () => {
     mockAuthFetch.mockRejectedValue(new ApiRequestError(403, "forbidden", "forbidden"));
     await expect(
@@ -2850,6 +3081,7 @@ describe("fetchSidebarData", () => {
         maxFiles: 1,
         maxBytes: Number.MAX_SAFE_INTEGER,
         notificationLevelsEnabled: false,
+        preciseReadCursor: false,
         channels: [],
         dms: [],
         categories: [],
@@ -2868,6 +3100,7 @@ describe("fetchSidebarData", () => {
       // The issue #136 capability: absent from the payload, so the gate reads
       // as shut and the settings page offers the binary control.
       notificationLevelsEnabled: false,
+      preciseReadCursor: false,
       channels: [],
       dms: [],
       categories: [],
@@ -2916,6 +3149,7 @@ describe("fetchChannelDetails", () => {
       createdAt: "2024-01-12T09:30:00Z",
       memberCount: 12,
       onlineCount: 3,
+      canAddMembers: false,
       onlineMembers: [
         {
           userId: "u-1",
@@ -3183,6 +3417,32 @@ describe("fetchChannelDetails — can_manage_members", () => {
 
     expect((await fetchChannelDetails("ch-1")).canManageMembers).toBe(true);
   });
+
+  it("maps can_add_members independently from administrative management", async () => {
+    mockAuthFetch.mockResolvedValue(
+      detailsPayload({
+        can_add_members: true,
+        can_manage_members: false,
+        can_remove_members: false,
+      }),
+    );
+
+    await expect(fetchChannelDetails("ch-1")).resolves.toMatchObject({
+      canAddMembers: true,
+      canManageMembers: false,
+      canRemoveMembers: false,
+    });
+  });
+
+  it.each([undefined, false, null, "true", 1])(
+    "treats malformed can_add_members=%s as no add capability",
+    async (value) => {
+      const extra = value === undefined ? {} : { can_add_members: value };
+      mockAuthFetch.mockResolvedValue(detailsPayload(extra));
+
+      expect((await fetchChannelDetails("ch-1")).canAddMembers).toBe(false);
+    },
+  );
 
   // Anything that is not literally true must read as "no permission": a truthy
   // string or a missing field must never enable a control the server refuses.
@@ -3550,11 +3810,35 @@ describe("fetchDirectProfile (issue #443)", () => {
         avatarUrl: "/media/juliane.png",
         email: "juliane@nic.test",
         presence: "online",
+        lastSeenAt: undefined,
         jobTitle: undefined,
         department: undefined,
         timezone: undefined,
       },
     });
+  });
+
+  it("reads the server's last seen for an offline person, and nothing it cannot parse (issue #798)", async () => {
+    for (const [raw, expected] of [
+      ["2026-10-01T15:42:00Z", Date.parse("2026-10-01T15:42:00Z")],
+      ["yesterday", undefined],
+      [42, undefined],
+    ] as const) {
+      mockAuthFetch.mockResolvedValueOnce({
+        data: {
+          kind: "direct",
+          conversation_id: "conv-1",
+          profile: {
+            user_id: "u-other",
+            display_name: "Juliane",
+            presence: "offline",
+            last_seen_at: raw,
+          },
+        },
+      });
+      const details = await fetchDirectProfile("conv-1");
+      expect(details.kind === "direct" && details.profile.lastSeenAt).toBe(expected ?? undefined);
+    }
   });
 
   it("reads the professional fields when the server sends them", async () => {

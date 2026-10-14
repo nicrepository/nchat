@@ -1,7 +1,7 @@
 import type { RefCallback } from "react";
 
-import { avatarColorFor, initialsFrom } from "../chat/messageDisplay";
-import { PersonAvatarImage } from "../chat/PersonAvatarImage";
+import { avatarColorFor } from "../chat/messageDisplay";
+import { UserAvatar } from "../chat/UserAvatar";
 import CallControls, { type CallControlProps } from "./CallControls";
 import "./CallPresentation.css";
 
@@ -25,6 +25,7 @@ interface RemoteDirectTileProps {
   activeSpeakerId?: string | null;
   sidebar?: boolean;
   sharing?: boolean;
+  workspaceId?: string;
 }
 
 function SpeakerIndicator({ active, name }: { active: boolean; name: string }) {
@@ -97,6 +98,7 @@ function RemoteDirectTile({
   activeSpeakerId,
   sidebar = false,
   sharing = false,
+  workspaceId = "",
 }: RemoteDirectTileProps) {
   const active = identity === activeSpeakerId;
   return (
@@ -109,10 +111,12 @@ function RemoteDirectTile({
           className={`dedicated-call__avatar call-avatar call-avatar--${avatarColorFor(seed)}`}
           aria-hidden="true"
         >
-          <PersonAvatarImage
-            src={avatarUrl}
-            initials={initialsFrom(displayName)}
-            imgClassName="call-avatar__img"
+          <UserAvatar
+            userId={identity}
+            workspaceId={workspaceId}
+            displayName={displayName}
+            avatarUrl={avatarUrl}
+            imageClassName="call-avatar__img"
           />
         </div>
       )}
@@ -127,6 +131,7 @@ function RemoteDirectTile({
 
 export default function DedicatedCallStage({
   title,
+  workspaceId = "",
   status,
   participantCount,
   participants,
@@ -142,7 +147,6 @@ export default function DedicatedCallStage({
   localSeed,
   localParticipantId,
   localDisplayName,
-  localInitials,
   localAvatarUrl,
   headerAvatar,
   remoteDirect,
@@ -151,6 +155,7 @@ export default function DedicatedCallStage({
   remoteScreenShareParticipantId,
 }: {
   title: string;
+  workspaceId?: string;
   status: "connecting" | "connected" | "reconnecting" | "failed";
   participantCount: number;
   participants: DedicatedParticipant[];
@@ -247,10 +252,12 @@ export default function DedicatedCallStage({
           className={`dedicated-call__avatar call-avatar call-avatar--${avatarColorFor(localSeed)}`}
           aria-hidden="true"
         >
-          <PersonAvatarImage
-            src={localAvatarUrl}
-            initials={localInitials}
-            imgClassName="call-avatar__img"
+          <UserAvatar
+            userId={localSeed}
+            workspaceId={workspaceId}
+            displayName={localDisplayName}
+            avatarUrl={localAvatarUrl}
+            imageClassName="call-avatar__img"
           />
         </div>
       )}
@@ -277,10 +284,12 @@ export default function DedicatedCallStage({
             className={`dedicated-call__avatar call-avatar call-avatar--${avatarColorFor(participant.identity)}`}
             aria-hidden="true"
           >
-            <PersonAvatarImage
-              src={participant.avatarUrl}
-              initials={initialsFrom(participant.displayName)}
-              imgClassName="call-avatar__img"
+            <UserAvatar
+              userId={participant.identity}
+              workspaceId={workspaceId}
+              displayName={participant.displayName}
+              avatarUrl={participant.avatarUrl}
+              imageClassName="call-avatar__img"
             />
           </div>
         )}
@@ -302,6 +311,7 @@ export default function DedicatedCallStage({
           <RemoteDirectTile
             key={remoteDirect.identity}
             {...remoteDirect}
+            workspaceId={workspaceId}
             activeSpeakerId={activeSpeakerId}
             sidebar
             sharing={remoteDirect.identity === remoteScreenShareParticipantId}
@@ -324,10 +334,12 @@ export default function DedicatedCallStage({
               className={`dedicated-call__header-avatar call-avatar call-avatar--${avatarColorFor(headerAvatar.seed)}`}
               aria-hidden="true"
             >
-              <PersonAvatarImage
-                src={headerAvatar.avatarUrl}
-                initials={initialsFrom(title)}
-                imgClassName="call-avatar__img"
+              <UserAvatar
+                userId={headerAvatar.seed}
+                workspaceId={workspaceId}
+                displayName={title}
+                avatarUrl={headerAvatar.avatarUrl}
+                imageClassName="call-avatar__img"
               />
             </div>
           )}
@@ -365,7 +377,13 @@ export default function DedicatedCallStage({
         <section className="dedicated-call__grid" aria-label="Participantes">
           {screenShareTile}
           {localParticipantTile}
-          {remoteDirect && <RemoteDirectTile {...remoteDirect} activeSpeakerId={activeSpeakerId} />}
+          {remoteDirect && (
+            <RemoteDirectTile
+              {...remoteDirect}
+              workspaceId={workspaceId}
+              activeSpeakerId={activeSpeakerId}
+            />
+          )}
           {remoteParticipantTiles}
         </section>
       )}

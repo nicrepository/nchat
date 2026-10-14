@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, Route, Routes, useParams } from "react-router";
+import { MemoryRouter, Outlet, Route, Routes, useParams } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { mockGetOrCreateDirectDM } = vi.hoisted(() => ({
@@ -28,14 +28,30 @@ beforeEach(() => {
 });
 
 describe("UserResultRow", () => {
-  it("renders the highlighted display name and initials fallback", () => {
+  it("renders the highlighted display name and deterministic fallback", () => {
     render(
-      <MemoryRouter>
-        <UserResultRow result={makeResult()} query="alice" />
+      <MemoryRouter initialEntries={["/chat/search"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <Outlet
+                context={{
+                  currentUserId: "current-user",
+                  workspaceId: "workspace-1",
+                  channels: [],
+                  dms: [],
+                }}
+              />
+            }
+          >
+            <Route path="search" element={<UserResultRow result={makeResult()} query="alice" />} />
+          </Route>
+        </Routes>
       </MemoryRouter>,
     );
     expect(screen.getByText("Alice", { selector: "mark" })).toBeInTheDocument();
-    expect(screen.getByText("AS")).toBeInTheDocument();
+    expect(document.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
   });
 
   it("opens (or creates) the DM and navigates on success", async () => {

@@ -799,7 +799,7 @@ describe("DedicatedCallPage", () => {
     ];
     session.media.activeSpeakerId = "user-a";
     vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
-      { userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" },
+      { userId: "user-a", displayName: "Ana Souza", avatarUrl: "/a.png" },
     ]);
     renderPage();
     await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1));
@@ -816,17 +816,19 @@ describe("DedicatedCallPage", () => {
       { identity: "user-b", displayName: "Bruno Lima", hasVideo: false, bindVideo: vi.fn() },
     ];
     vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
-      { userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" },
-      { userId: "user-b", displayName: "Bruno Lima", avatarUrl: "https://x/b.png" },
+      { userId: "user-a", displayName: "Ana Souza", avatarUrl: "/a.png" },
+      { userId: "user-b", displayName: "Bruno Lima", avatarUrl: "/b.png" },
     ]);
     const { container } = renderPage();
     await waitFor(() => {
       const imgs = container.querySelectorAll(".dedicated-call__tile img");
-      expect(imgs.length).toBeGreaterThanOrEqual(2);
+      expect(Array.from(imgs).map((img) => img.getAttribute("src"))).toEqual(
+        expect.arrayContaining(["/a.png", "/b.png"]),
+      );
     });
     const imgs = Array.from(container.querySelectorAll(".dedicated-call__tile img"));
     expect(imgs.map((img) => img.getAttribute("src"))).toEqual(
-      expect.arrayContaining(["https://x/a.png", "https://x/b.png"]),
+      expect.arrayContaining(["/a.png", "/b.png"]),
     );
   });
 
@@ -853,7 +855,7 @@ describe("DedicatedCallPage", () => {
         { identity: "user-a", displayName: "Participante", hasVideo: false, bindVideo: vi.fn() },
       ];
       vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
-        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" },
+        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "/a.png" },
       ]);
       renderPage();
       expect(await screen.findByText("Ana Souza")).toBeInTheDocument();
@@ -868,7 +870,7 @@ describe("DedicatedCallPage", () => {
       vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
         // user-a has a profile, but the name is blank — must still fall
         // back to LiveKit's name, never render an empty label.
-        { userId: "user-a", displayName: "   ", avatarUrl: "https://x/a.png" },
+        { userId: "user-a", displayName: "   ", avatarUrl: "/a.png" },
         // user-b has no profile entry at all (not a member, fetch miss).
       ]);
       renderPage();
@@ -882,7 +884,7 @@ describe("DedicatedCallPage", () => {
       ];
       session.media.remoteScreenShare = { identity: "user-a", bindMedia: vi.fn() };
       vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
-        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" },
+        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "/a.png" },
       ]);
       renderPage();
       expect(await screen.findByText("Tela de Ana Souza")).toBeInTheDocument();
@@ -895,7 +897,7 @@ describe("DedicatedCallPage", () => {
         { identity: "user-a", displayName: "Ana Souza", hasVideo: false, bindVideo: vi.fn() },
       ];
       vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
-        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" },
+        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "/a.png" },
       ]);
       const view = renderPage();
       await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1));
@@ -917,8 +919,8 @@ describe("DedicatedCallPage", () => {
         { identity: "user-b", displayName: "Bruno Lima", hasVideo: false, bindVideo: vi.fn() },
       ];
       vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
-        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" },
-        { userId: "user-b", displayName: "Bruno Lima", avatarUrl: "https://x/b.png" },
+        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "/a.png" },
+        { userId: "user-b", displayName: "Bruno Lima", avatarUrl: "/b.png" },
       ]);
       const view = renderPage();
       await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1));
@@ -938,7 +940,7 @@ describe("DedicatedCallPage", () => {
         { identity: "user-a", displayName: "Ana Souza", hasVideo: false, bindVideo: vi.fn() },
       ];
       vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
-        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" },
+        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "/a.png" },
       ]);
       const view = renderPage();
       await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1));
@@ -963,7 +965,7 @@ describe("DedicatedCallPage", () => {
         { identity: "user-a", displayName: "Participante", hasVideo: false, bindVideo: vi.fn() },
       ];
       vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
-        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" },
+        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "/a.png" },
       ]);
       const view = renderPage();
       await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1));
@@ -1026,7 +1028,7 @@ describe("DedicatedCallPage", () => {
       await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1));
 
       vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValueOnce([
-        { userId: "user-c", displayName: "Carla Dias", avatarUrl: "https://x/c.png" },
+        { userId: "user-c", displayName: "Carla Dias", avatarUrl: "/c.png" },
       ]);
       session.media.participants = [
         { identity: "user-c", displayName: "Carla Dias", hasVideo: false, bindVideo: vi.fn() },
@@ -1039,7 +1041,7 @@ describe("DedicatedCallPage", () => {
       await waitFor(() => {
         expect(container.querySelector(".dedicated-call__tile img")).toHaveAttribute(
           "src",
-          "https://x/c.png",
+          "/c.png",
         );
       });
 
@@ -1048,13 +1050,10 @@ describe("DedicatedCallPage", () => {
       // would call setParticipantProfiles with a map containing only
       // user-a, replacing (not merging into) the current map and wiping out
       // Carla's already-applied avatar.
-      resolveFirst([{ userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" }]);
+      resolveFirst([{ userId: "user-a", displayName: "Ana Souza", avatarUrl: "/a.png" }]);
       await new Promise((resolve) => setTimeout(resolve, 0));
 
-      expect(container.querySelector(".dedicated-call__tile img")).toHaveAttribute(
-        "src",
-        "https://x/c.png",
-      );
+      expect(container.querySelector(".dedicated-call__tile img")).toHaveAttribute("src", "/c.png");
     });
   });
 
@@ -1069,7 +1068,7 @@ describe("DedicatedCallPage", () => {
     }
 
     function profilesFor(ids: string[]) {
-      return ids.map((id) => ({ userId: id, displayName: id, avatarUrl: `https://x/${id}.png` }));
+      return ids.map((id) => ({ userId: id, displayName: id, avatarUrl: `/${id}.png` }));
     }
 
     it("50 participants -> exactly one batch request", async () => {
@@ -1124,7 +1123,7 @@ describe("DedicatedCallPage", () => {
       );
       expect(srcs.size).toBe(51); // every tile has its OWN avatar, none shared/duplicated
       for (const participant of participants) {
-        expect(srcs.has(`https://x/${participant.identity}.png`)).toBe(true);
+        expect(srcs.has(`/${participant.identity}.png`)).toBe(true);
       }
     });
 
@@ -1157,13 +1156,15 @@ describe("DedicatedCallPage", () => {
       const { container } = renderPage();
       await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(2));
       await waitFor(() => {
-        const imgs = container.querySelectorAll(".dedicated-call__tile img");
-        expect(imgs.length).toBe(50); // the failed chunk's 1 participant has no avatar...
+        const imgs = container.querySelectorAll(".dedicated-call__tile img[src^='/']");
+        expect(imgs.length).toBe(50);
       });
       const tiles = Array.from(container.querySelectorAll(".dedicated-call__tile"));
       const failedTile = tiles.find((tile) => tile.textContent?.includes("Participante 50"));
-      expect(failedTile?.querySelector("img")).toBeNull(); // ...degrades to initials, not a crash
-      expect(failedTile).toHaveTextContent(/P/); // deterministic initials still render
+      expect(failedTile?.querySelector("img")?.getAttribute("src")).toMatch(
+        /^data:image\/svg\+xml/,
+      );
+      expect(failedTile).toHaveTextContent("Participante 50");
     });
 
     it("fences a stale delayed response from an old multi-chunk roster: it cannot overwrite the current call's identities", async () => {
@@ -1199,7 +1200,7 @@ describe("DedicatedCallPage", () => {
       await waitFor(() => {
         expect(container.querySelector(".dedicated-call__tile img")).toHaveAttribute(
           "src",
-          "https://x/user-c.png",
+          "/user-c.png",
         );
       });
 
@@ -1207,7 +1208,7 @@ describe("DedicatedCallPage", () => {
       // It must not resurrect any of the old roster's tiles or otherwise
       // corrupt the new, single-participant call's state.
       resolveStaleChunk([
-        { userId: "user-050", displayName: "Participante 50", avatarUrl: "https://x/stale.png" },
+        { userId: "user-050", displayName: "Participante 50", avatarUrl: "/stale.png" },
       ]);
       await new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -1218,7 +1219,7 @@ describe("DedicatedCallPage", () => {
       ).toBe(false);
       expect(container.querySelector(".dedicated-call__tile img")).toHaveAttribute(
         "src",
-        "https://x/user-c.png",
+        "/user-c.png",
       );
     });
   });
@@ -1285,14 +1286,14 @@ describe("DedicatedCallPage", () => {
       setUpDirectCall({
         userId: "peer-1",
         displayName: "Ana Souza",
-        avatarUrl: "https://x/peer.png",
+        avatarUrl: "/peer.png",
       });
       const { container } = renderPage();
       await screen.findByRole("main", { name: "Chamada Ana Souza" });
 
       await waitFor(() => {
         const headerAvatar = container.querySelector(".dedicated-call__header-avatar");
-        expect(headerAvatar?.querySelector("img")).toHaveAttribute("src", "https://x/peer.png");
+        expect(headerAvatar?.querySelector("img")).toHaveAttribute("src", "/peer.png");
       });
     });
 
@@ -1302,8 +1303,9 @@ describe("DedicatedCallPage", () => {
       await screen.findByRole("main", { name: "Chamada Ana Souza" });
 
       const headerAvatar = container.querySelector(".dedicated-call__header-avatar")!;
-      expect(headerAvatar.querySelector("img")).not.toBeInTheDocument();
-      expect(headerAvatar).toHaveTextContent("AS");
+      expect(headerAvatar.querySelector("img")?.getAttribute("src")).toMatch(
+        /^data:image\/svg\+xml/,
+      );
     });
 
     it("never shows a header avatar for a channel resource call", async () => {
@@ -1350,7 +1352,7 @@ describe("DedicatedCallPage", () => {
       setUpDirectCall({
         userId: "peer-1",
         displayName: "Ana Souza",
-        avatarUrl: "https://x/peer.png",
+        avatarUrl: "/peer.png",
       });
       session.media.hasRemoteVideo = false;
       const { container } = renderPage();
@@ -1360,7 +1362,7 @@ describe("DedicatedCallPage", () => {
         const tiles = container.querySelectorAll(".dedicated-call__tile");
         expect(tiles).toHaveLength(2); // local + remote-direct
         expect(tiles[1]).toHaveTextContent("Ana Souza");
-        expect(tiles[1]!.querySelector("img")).toHaveAttribute("src", "https://x/peer.png");
+        expect(tiles[1]!.querySelector("img")).toHaveAttribute("src", "/peer.png");
       });
     });
 
@@ -1375,15 +1377,14 @@ describe("DedicatedCallPage", () => {
         expect(tiles).toHaveLength(2);
         return tiles[1]!;
       })) as Element;
-      expect(tile.querySelector("img")).not.toBeInTheDocument();
-      expect(tile).toHaveTextContent("AS");
+      expect(tile.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
     });
 
     it("camera-on: shows the remote peer's real video, no avatar fallback tile content", async () => {
       setUpDirectCall({
         userId: "peer-1",
         displayName: "Ana Souza",
-        avatarUrl: "https://x/peer.png",
+        avatarUrl: "/peer.png",
       });
       session.media.hasRemoteVideo = true;
       const { container } = renderPage();
@@ -1424,6 +1425,6 @@ describe("DedicatedCallPage", () => {
     renderPage();
     const label = await screen.findByText("Ana (você)");
     const avatar = label.closest("article")!.querySelector(".dedicated-call__avatar")!;
-    expect(avatar.textContent).toBe("A");
+    expect(avatar.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
   });
 });

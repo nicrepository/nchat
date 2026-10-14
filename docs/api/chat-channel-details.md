@@ -34,6 +34,9 @@ usuario), porque o painel refaz a consulta a cada troca de canal.
     "created_at": "2024-01-12T09:30:00Z",
     "member_count": 12,
     "online_member_count": 5,
+    "can_add_members": true,
+    "can_manage_members": false,
+    "can_remove_members": false,
     "online_members": [
       {
         "user_id": "22222222-2222-4222-8222-222222222222",
@@ -63,6 +66,10 @@ Campos:
   estado neutro nesse caso.
 - `created_at` e RFC3339 em UTC, e vem do agregado -- nunca da primeira mensagem,
   da membership ou do relogio do cliente.
+- `can_add_members` e `true` para todo chamador que pode ler o canal; e a unica
+  capability que controla a exibicao do picker de adicao no frontend.
+- `can_manage_members` e `can_remove_members` continuam capacidades
+  administrativas independentes. O cliente nunca deriva uma da outra.
 
 As tres grandezas de membros respondem perguntas diferentes e **nenhuma deriva
 da outra**:
@@ -245,27 +252,20 @@ aparece na rota: e resolvido no servidor a partir da sessao, como nas demais.
 
 ### Autorizacao
 
-`owner`, `admin` ou `moderator` ativo do workspace, via
-`domain.CanManageChannelMembers` -- que delega a `CanModerateWorkspace`, o mesmo
-gate das categorias de canal. RF-74 (migration 000022) foi o que criou o papel
-`moderator` de workspace e gastou essa costura; antes dela o predicado so
-admitia owner/admin. O store re-deriva a mesma lista dentro da transacao
-(`wm.role IN ('owner', 'admin', 'moderator')`).
-
-**Nao** e "qualquer membro do canal": isso permitiria a quem apenas le um canal
-privado ampliar a audiencia dele, que e exatamente a propriedade que um canal
-privado tem. O papel `moderator` de `chat.channel_members` e por canal e nunca e
-lido como autoridade de workspace -- nenhum caminho de codigo o atribui e nenhum
-o consulta para autorizar. A matriz completa esta em
+`domain.CanAddChannelMembers`, que segue o acesso canonico ao canal. Um membro
+ativo com alcance publico pode adicionar em canal publico sem row explicita;
+canal privado e guest exigem membership explicita. O store revalida a mesma
+decisao dentro da transacao com `chat.channel_visible_to_user`, alem do estado
+ativo de workspace, membership e conta. A matriz completa esta em
 [rbac-matrix.md](../security/rbac-matrix.md).
 
-A autorizacao e verificada **antes** de o canal ser lido, entao um chamador sem
-permissao nao descobre pela resposta se um UUID de canal existe.
+Acesso negado a canal privado usa o mesmo `404` de canal inexistente, arquivado
+ou de outro workspace.
 
-O campo `can_manage_members` da resposta de `GET .../details` carrega a mesma
-decisao para o painel decidir se mostra a acao. E uma dica de renderizacao, nunca
-o controle: este endpoint reavalia a decisao a cada chamada. Ausente ou invalido
-e lido como `false` pelo cliente.
+O details expõe `can_add_members` separadamente de `can_manage_members` e
+`can_remove_members`. O frontend usa somente o primeiro para mostrar o picker;
+os demais continuam administrativos. Todos sao hints: POST e busca de
+candidatos reavaliam `CanAddChannelMembers` a cada chamada.
 
 ### Corpo
 
@@ -361,9 +361,10 @@ Parametros: `query` (2 a 64 caracteres) e `limit` opcional (padrao 20, maximo
 50, sempre clampado no servidor). Nada mais e aceito — workspace e ator vem da
 sessao, e um `workspace_id` na query string e simplesmente ignorado.
 
-Autorizacao: a mesma de `POST .../members` (`owner`/`admin`/`moderator` ativo), verificada
-**antes** de o canal ser lido. Isso e deliberado: a rota revela quem **nao** esta
-num canal, o que e um fato sobre a composicao de um canal privado.
+Autorizacao: a mesma de `POST .../members`: membro ativo com acesso canonico ao
+canal. Canal privado sem membership explicita responde como inexistente. A
+consulta também revalida conta ativa e `chat.channel_visible_to_user`, evitando
+vazamento se o acesso for revogado entre o gate de servico e a leitura.
 
 A resposta traz apenas `user_id` e `display_name`:
 
@@ -553,8 +554,8 @@ chamador). A rota nomeia o alvo; workspace e ator vem da sessao. **Nao ha
 corpo** -- nao existe campo para um cliente afirmar workspace, papel ou
 permissao.
 
-- **Autorizacao:** `domain.CanManageChannelMembers`, o mesmo predicado da
-  adicao, re-derivado no servidor a cada chamada; `#geral` e recusado.
+- **Autorizacao:** `domain.CanManageChannelMembers`, separado da capability de
+  adicao e re-derivado no servidor a cada chamada; `#geral` e recusado.
 - **Auto-remocao e recusada** com `400`: sair da conversa e a operacao de
   `DELETE .../membership`, e reusar esta rota escreveria "removeu" na timeline
   sobre quem saiu.
@@ -581,9 +582,8 @@ permissao.
 ### `can_remove_members` em `GET .../details`
 
 Campo booleano, sempre enviado, com a decisao do servidor sobre **remover**.
-Convive com `can_manage_members` (adicionar) e nao deve ser deduzido dele: num
-canal os dois avaliam hoje o mesmo predicado, mas sao perguntas diferentes -- e
-num grupo elas ja divergem (ver
+Convive com `can_manage_members` e nao deve ser deduzido da capability de add:
+adicionar segue acesso, enquanto remover continua administrativo (ver
 [chat-group-details.md](./chat-group-details.md)). Como o vizinho, e dica de
 renderizacao: ausente ou invalido e lido como `false`, e o DELETE reavalia a
 decisao de qualquer forma.

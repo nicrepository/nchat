@@ -94,6 +94,10 @@ main() {
     report_no_op "$target" "$release"
     return 0
   fi
+  # Once manual presence has been enabled, a slot whose build predates it is no
+  # rollback target at all (issue #798): it would show people who chose to
+  # appear offline. Refused before anything moves, never warned about.
+  require_presence_capable_target "$target"
   confirm "Move production traffic back to slot $target"
   # The reverse of a promotion, and so is the order: the browser is served
   # the older bundle before the backends go back to it. See

@@ -69,7 +69,7 @@ func TestPGXMemberStore_AddChannelMembers_RevalidatesActorBeforeWriting(t *testi
 	// chat.channel_members obeys.
 	mock.ExpectExec(`FROM chat.channels WHERE id = \$1::uuid FOR UPDATE`).WithArgs(pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*c\.is_general = false.*wm\.role IN \('owner', 'admin', 'moderator', 'member'\).*wm\.role IN \('owner', 'admin', 'moderator'\).*wm\.role = 'member'.*channel_visible_to_user\(c\.id, wm\.user_id\).*FOR SHARE OF wm`).
+	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*JOIN auth\.users u.*chat\.channel_visible_to_user\(c\.id, wm\.user_id\).*FOR SHARE OF wm, w, u`).
 		WithArgs(msWorkspace, msChannel, msActor).
 		WillReturnRows(pgxmock.NewRows([]string{"ok"}).AddRow(true))
 	mock.ExpectQuery(`(?s)WITH eligible AS.*INSERT INTO chat\.channel_members.*ON CONFLICT \(channel_id, user_id\) DO NOTHING`).
@@ -300,7 +300,7 @@ func TestPGXDMStore_AddGroupParticipants_LocksConversationThenActor(t *testing.T
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*dc\.type = 'group'.*FOR SHARE OF dc`).
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*dc\.type = 'group'.*FOR UPDATE OF dc`).
 		WithArgs(msConversation, msWorkspace).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(msConversation))
 	mock.ExpectQuery(`(?s)FROM chat\.dm_members dm.*FOR SHARE OF dm`).
@@ -345,7 +345,7 @@ func TestPGXDMStore_AddGroupParticipants_ReportsNothingForAnExistingParticipant(
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*FOR SHARE OF dc`).
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*FOR UPDATE OF dc`).
 		WithArgs(msConversation, msWorkspace).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(msConversation))
 	mock.ExpectQuery(`(?s)FROM chat\.dm_members dm.*FOR SHARE OF dm`).
@@ -386,7 +386,7 @@ func TestPGXDMStore_AddGroupParticipants_AddedMatchesTheReturnedIDs(t *testing.T
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*FOR SHARE OF dc`).
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*FOR UPDATE OF dc`).
 		WithArgs(msConversation, msWorkspace).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(msConversation))
 	mock.ExpectQuery(`(?s)FROM chat\.dm_members dm.*FOR SHARE OF dm`).
@@ -433,7 +433,7 @@ func TestPGXDMStore_AddGroupParticipants_RollsBackWhenEventInsertFails(t *testin
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*FOR SHARE OF dc`).
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*FOR UPDATE OF dc`).
 		WithArgs(msConversation, msWorkspace).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(msConversation))
 	mock.ExpectQuery(`(?s)FROM chat\.dm_members dm.*FOR SHARE OF dm`).
@@ -474,7 +474,7 @@ func TestPGXDMStore_AddGroupParticipants_RollsBackWhenActorNoLongerParticipates(
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)FOR SHARE OF dc`).
+	mock.ExpectQuery(`(?s)FOR UPDATE OF dc`).
 		WithArgs(msConversation, msWorkspace).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(msConversation))
 	mock.ExpectQuery(`(?s)FOR SHARE OF dm`).
@@ -503,7 +503,7 @@ func TestPGXDMStore_AddGroupParticipants_RollsBackWhenConversationNotLockable(t 
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)FOR SHARE OF dc`).
+	mock.ExpectQuery(`(?s)FOR UPDATE OF dc`).
 		WithArgs(msConversation, msWorkspace).
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectRollback()
@@ -527,7 +527,7 @@ func TestPGXDMStore_AddGroupParticipants_AcceptsNewcomersRegardlessOfSize(t *tes
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)FOR SHARE OF dc`).
+	mock.ExpectQuery(`(?s)FOR UPDATE OF dc`).
 		WithArgs(msConversation, msWorkspace).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(msConversation))
 	mock.ExpectQuery(`(?s)FOR SHARE OF dm`).
@@ -676,7 +676,7 @@ func TestPGXMemberStore_SearchChannelMemberCandidates_ExcludesCurrentMembersInSQ
 	}
 	defer mock.Close()
 
-	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*EXISTS.*actor\.role IN \('owner', 'admin', 'moderator', 'member'\).*actor\.role = 'member'.*channel_visible_to_user\(actor_channel\.id, actor\.user_id\).*NOT EXISTS.*FROM chat\.channel_members cm.*cm\.channel_id = \$2::uuid`).
+	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*NOT EXISTS.*FROM chat\.channel_members cm.*cm\.channel_id = \$2::uuid`).
 		WithArgs(msWorkspace, msChannel, msActor, "an", 20).
 		WillReturnRows(pgxmock.NewRows([]string{"user_id", "display_name"}).AddRow("u-1", "Ana"))
 

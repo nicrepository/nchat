@@ -1,6 +1,12 @@
 import { expect, test, type Locator, type Page, type TestInfo } from "@playwright/test";
 
 import {
+  allowsServiceUnavailable,
+  captureBrowserErrors,
+  expectNoUnexpectedBrowserErrors,
+} from "../helpers/browserErrors";
+
+import {
   CURRENT_USER_ID,
   OTHER_USER_ID,
   createScenario,
@@ -17,32 +23,17 @@ interface CallFixture {
   createdAt: string;
 }
 
-const browserErrors = new WeakMap<Page, string[]>();
-
 test.describe.configure({ retries: 0 });
 
 test.beforeEach(async ({ page }) => {
-  const errors: string[] = [];
-  browserErrors.set(page, errors);
-  page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
-  page.on("console", (message) => {
-    if (message.type() !== "error") return;
-    const expectedTokenFailure =
-      message.text() ===
-        "Failed to load resource: the server responded with a status of 503 (Service Unavailable)" &&
-      message.location().url.includes("/api/media/media/livekit/token");
-    const expectedSidebarFailure =
-      message.text() ===
-        "Failed to load resource: the server responded with a status of 503 (Service Unavailable)" &&
-      message.location().url.includes("/api/chat/sidebar");
-    if (!expectedTokenFailure && !expectedSidebarFailure) {
-      errors.push(`console.error: ${message.text()}`);
-    }
-  });
+  captureBrowserErrors(page, [
+    allowsServiceUnavailable("/api/media/media/livekit/token"),
+    allowsServiceUnavailable("/api/chat/sidebar"),
+  ]);
 });
 
 test.afterEach(async ({ page }) => {
-  expect(browserErrors.get(page)).toEqual([]);
+  expectNoUnexpectedBrowserErrors(page);
 });
 
 test.describe("chamada 1:1", () => {
@@ -331,7 +322,9 @@ test.describe("chamada 1:1", () => {
 
     const dialog = page.getByLabel(`Chamada com ${participantName}`);
     await expect(dialog.getByRole("button", { name: "Encerrar chamada" })).toBeVisible();
-    expect(sidebarRequests).toBe(2);
+    // #1048 reconciles the sidebar after subscriptions are acknowledged,
+    // once identity loading has made the conversation targets available.
+    await expect.poll(() => sidebarRequests).toBe(3);
     // RF-23: an active call restored this way (never locally started or
     // accepted by this tab) must not request media on its own, however long
     // identity took to resolve — only the explicit activation click may.
@@ -385,7 +378,8 @@ test.describe("chamada 1:1", () => {
       y: beforeDrag!.y,
     });
 
-    await page.getByRole("link", { name: /^Meu perfil/ }).click();
+    await page.getByRole("button", { name: /menu da conta/i }).click();
+    await page.getByRole("menuitem", { name: "Meu perfil" }).click();
     await expect(page).toHaveURL(/\/profile$/);
     await expect(floating).toBeVisible();
     await page.goBack();

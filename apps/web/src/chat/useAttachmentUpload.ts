@@ -261,13 +261,11 @@ export function useAttachmentUpload(
   const commitItems = useCallback(
     (update: (current: AttachmentUploadItem[]) => AttachmentUploadItem[], mirror: boolean) => {
       if (!mountedRef.current) return;
-      setItems((current) => {
-        const next = update(current);
-        itemsRef.current = next;
-        const key = draftKeyRef.current;
-        if (mirror && draftsRef.current && key) draftsRef.current.setAttachments(key, next);
-        return next;
-      });
+      const next = update(itemsRef.current);
+      itemsRef.current = next;
+      setItems(next);
+      const key = draftKeyRef.current;
+      if (mirror && draftsRef.current && key) draftsRef.current.setAttachments(key, next);
     },
     [],
   );

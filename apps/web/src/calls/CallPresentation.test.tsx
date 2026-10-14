@@ -514,7 +514,7 @@ describe("FloatingCallWindow", () => {
     expect(document.querySelector(".floating-call__local-avatar")).toBeNull();
   });
 
-  it("uses the passed-in localInitials verbatim, never derived from the (você)-suffixed localName (issue #612 blocker)", () => {
+  it("renders a generated local avatar rather than deriving initials from the (você) suffix", () => {
     render(
       <FloatingCallWindow
         title="Ana"
@@ -525,12 +525,13 @@ describe("FloatingCallWindow", () => {
         {...videoPresent}
         hasLocalVideo={false}
         localSeed="current-user"
+        workspaceId="workspace-1"
         localName="Ana (você)"
         localInitials="A"
       />,
     );
     const avatar = document.querySelector(".floating-call__local-avatar")!;
-    expect(avatar.textContent).toBe("A");
+    expect(avatar.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
   });
 
   it("keeps the participant count in its own stable slot across active-speaker mount/unmount", () => {

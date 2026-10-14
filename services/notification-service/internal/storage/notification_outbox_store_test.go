@@ -50,7 +50,7 @@ func notificationColumnNames() []string {
 	return []string{
 		"id", "workspace_id", "recipient_user_id", "kind", "priority",
 		"source_type", "message_id", "origin", "dedupe_key", "attempts", "occurred_at",
-		"muted", "notification_level", "presentation",
+		"muted", "notification_level", "do_not_disturb", "presentation",
 	}
 }
 
@@ -60,7 +60,7 @@ func notificationColumnNames() []string {
 func preferenceNotificationRows(muted bool, level string) *pgxmock.Rows {
 	return pgxmock.NewRows(notificationColumnNames()).
 		AddRow("n1", "ws-1", "user-1", "mention", "high",
-			"message", "msg-1", "live", "message:msg-1:mention", 2, time.Now(), muted, level,
+			"message", "msg-1", "live", "message:msg-1:mention", 2, time.Now(), muted, level, false,
 			// NULL: the presentation is absent unless a test is about it, which
 			// is also what the projection returns for every notification whose
 			// message the recipient may not see (issue #870).
@@ -193,7 +193,7 @@ func TestListPendingResolvesEveryMuteInOneQuery(t *testing.T) {
 	const batch = 25
 	for i := 0; i < batch; i++ {
 		rows.AddRow("n"+strconv.Itoa(i), "ws-1", "user-1", "mention", "high",
-			"message", "msg-1", "live", "", 1, time.Now(), i%2 == 0, "all", nil)
+			"message", "msg-1", "live", "", 1, time.Now(), i%2 == 0, "all", false, nil)
 	}
 	// Exactly one ExpectQuery is registered. pgxmock fails any further query,
 	// so a per-event lookup could not pass this test.
@@ -557,7 +557,7 @@ func TestClaimDueDecodesTheApprovedPresentation(t *testing.T) {
 	mock := newNotificationMock(t)
 	rows := pgxmock.NewRows(notificationColumnNames()).
 		AddRow("n1", "ws-1", "user-1", "mention", "high",
-			"message", "msg-1", "live", "message:msg-1:mention", 2, time.Now(), false, "all",
+			"message", "msg-1", "live", "message:msg-1:mention", 2, time.Now(), false, "all", false,
 			[]byte(`{"sender":"Ana Ribeiro","context":"#geral","body":"subiu o hotfix","attachment":true}`))
 	mock.ExpectQuery(`FOR UPDATE SKIP LOCKED`).WithArgs(10, 60.0, 5, true).WillReturnRows(rows)
 
@@ -631,5 +631,26 @@ func TestPresentationProjectionIsScopedAndGuarded(t *testing.T) {
 				t.Fatalf("the projection does not carry %s: %v", name, err)
 			}
 		})
+	}
+}
+
+// Do Not Disturb (issue #798) has to survive the projection for the same reason
+// the mute does: a dropped column would scan as false and every recipient in
+// Do Not Disturb would start receiving pushes again.
+func TestListPendingProjectsTheRecipientsDoNotDisturb(t *testing.T) {
+	for _, dnd := range []bool{true, false} {
+		mock := newNotificationMock(t)
+		rows := pgxmock.NewRows(notificationColumnNames()).
+			AddRow("n1", "ws-1", "user-1", "mention", "high",
+				"message", "msg-1", "live", "", 1, time.Now(), false, "all", dnd, nil)
+		mock.ExpectQuery(`chat\.user_presence`).WithArgs(10).WillReturnRows(rows)
+
+		events, err := storage.NewPGXNotificationOutboxStore(mock, true).ListPending(context.Background(), 10)
+		if err != nil {
+			t.Fatalf("ListPending: %v", err)
+		}
+		if len(events) != 1 || events[0].DoNotDisturb != dnd {
+			t.Fatalf("DoNotDisturb = %+v, want %v", events, dnd)
+		}
 	}
 }

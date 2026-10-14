@@ -1,5 +1,6 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Locator, type Page, type TestInfo } from "@playwright/test";
 
+import { captureBrowserErrors, expectNoUnexpectedBrowserErrors } from "../helpers/browserErrors";
 import {
   CURRENT_USER_ID,
   CURRENT_USER_NAME,
@@ -7,12 +8,16 @@ import {
   OTHER_CHANNEL_NAME,
   OTHER_USER_ID,
   OTHER_USER_NAME,
+  attachmentFixtures,
   channelDetailsFixture,
   channelRosterFixture,
   createScenario,
+  emitConversationEvent,
   emitConversationUpdated,
+  emitPinUpdated,
   installMessagingMocks,
   makeMessage,
+  messageBubble,
   setServerChannelName,
   uniqueId,
 } from "../helpers/messagingApi";
@@ -132,7 +137,7 @@ test.describe("painel de detalhes do canal", () => {
     await expect(members.getByText("Você")).toBeVisible();
     await expect(members.getByText(OTHER_USER_NAME)).toBeVisible();
     await expect(members.getByText("Pessoa Offline 01")).toBeVisible();
-    await expect(panel.getByRole("heading", { name: "Mensagem fixada" })).toBeVisible();
+    await expect(panel.getByRole("heading", { name: "Mensagens fixadas" })).toBeVisible();
     await expect(
       panel.getByRole("list", { name: "Arquivos recentes" }).getByText("relatorio-backup.pdf"),
     ).toBeVisible();
@@ -847,5 +852,709 @@ test.describe("renomeação inline do canal no painel", () => {
         ),
       )
       .toBe(true);
+  });
+});
+
+/**
+ * Mensagens fixadas no painel (issue #896).
+ *
+ * The collection comes from the same GET .../pins the pinned bar uses, and the
+ * mutations are the same POST/DELETE, so every assertion below is about what
+ * the panel does with the authoritative list — never about a copy of it.
+ */
+test.describe("mensagens fixadas no painel de detalhes do canal", () => {
+  const minuteMs = 60_000;
+
+  /** A channel with `total` messages, the first `pinned` of them pinned. */
+  function pinnedChannel(
+    testInfo: TestInfo,
+    label: string,
+    options: { total?: number; pinned: number; removed?: boolean },
+  ) {
+    const targetId = uniqueId(testInfo, label);
+    const start = Date.UTC(2026, 6, 15, 9, 0);
+    const messages = Array.from({ length: options.total ?? options.pinned }, (_, index) =>
+      makeMessage({
+        id: `${targetId}-m${String(index + 1).padStart(2, "0")}`,
+        sender_id: OTHER_USER_ID,
+        sender_display_name: OTHER_USER_NAME,
+        body_text: `Mensagem número ${index + 1}`,
+        created_at: new Date(start + index * minuteMs).toISOString(),
+        is_removed: options.removed && index === 0 ? true : undefined,
+      }),
+    );
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Canal Fixadas",
+      messages,
+    });
+    for (const channel of scenario.sidebarChannels) {
+      scenario.channelDetails.set(
+        channel.id,
+        channelDetailsFixture(
+          channel,
+          [
+            {
+              user_id: CURRENT_USER_ID,
+              display_name: CURRENT_USER_NAME,
+              role: "member",
+              presence: "online",
+            },
+          ],
+          1,
+        ),
+      );
+      scenario.channelRosters.set(
+        channel.id,
+        channelRosterFixture(
+          [{ user_id: CURRENT_USER_ID, display_name: CURRENT_USER_NAME, role: "member" }],
+          1,
+        ),
+      );
+    }
+    scenario.pinnedIds.set(
+      `channel:${targetId}`,
+      new Set(messages.slice(0, options.pinned).map((message) => message.id)),
+    );
+    return { targetId, scenario, messages };
+  }
+
+  async function openPins(page: Page, targetId: string) {
+    await page.goto(`/chat/channel/${targetId}`);
+    await expect(page.getByTestId("chat-composer-input")).toBeVisible();
+    await page.getByRole("button", { name: "Detalhes do canal", exact: true }).click();
+    const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
+    await expect(panel.getByRole("heading", { name: "Mensagens fixadas" })).toBeVisible();
+    return { panel, list: panel.getByRole("list", { name: "Mensagens fixadas" }) };
+  }
+
+  test("mostra cinco no compacto, expande para todas e recolhe de volta", async ({
+    page,
+  }, testInfo) => {
+    const { targetId, scenario } = pinnedChannel(testInfo, "pins-compact", { pinned: 7 });
+    await installMessagingMocks(page, scenario);
+    const { panel, list } = await openPins(page, targetId);
+
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    const toggle = panel.getByRole("button", { name: /Ver todos Mensagens fixadas/ });
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    await toggle.click();
+    await expect(list.getByRole("listitem")).toHaveCount(7);
+    await expect(list.getByText("Mensagem número 7")).toBeAttached();
+    const collapse = panel.getByRole("button", { name: /Mostrar menos Mensagens fixadas/ });
+    await expect(collapse).toHaveAttribute("aria-expanded", "true");
+    // The primitive's bounded region: expanding scrolls inside the section.
+    await expect(list).toHaveCSS("overflow-y", "auto");
+    await expect(panel).toBeVisible();
+    await expect(page).toHaveURL(`/chat/channel/${targetId}`);
+
+    await collapse.click();
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+  });
+
+  test("navega até a mensagem fixada pelo deep link da conversa, de novo a cada ativação", async ({
+    page,
+  }, testInfo) => {
+    const { targetId, scenario, messages } = pinnedChannel(testInfo, "pins-navigate", {
+      total: 60,
+      pinned: 1,
+    });
+    await installMessagingMocks(page, scenario);
+    const { panel, list } = await openPins(page, targetId);
+    const oldest = messages[0];
+    // The conversation opens at its newest message; the pinned one is far above.
+    await expect(messageBubble(page, messages.at(-1)!.id)).toBeVisible();
+    await expect(messageBubble(page, oldest.id)).not.toBeInViewport();
+
+    const highlightOf = (id: string) =>
+      page.waitForFunction(
+        (messageId) =>
+          document
+            .querySelector(`[data-message-id="${messageId}"]`)
+            ?.classList.contains("chat-msg-area__msg--highlight") === true,
+        id,
+      );
+    const openPinned = list.getByRole("button", { name: /^Ir para a mensagem de / });
+    const deepLink = `/chat/channel/${targetId}?message=${encodeURIComponent(oldest.id)}`;
+
+    const firstJump = highlightOf(oldest.id);
+    await openPinned.click();
+    await expect(page).toHaveURL(deepLink);
+    await firstJump;
+    await expect(messageBubble(page, oldest.id)).toBeInViewport();
+    await expect(panel).toBeVisible();
+
+    // The reader goes back down with the conversation's own control; the URL
+    // still names the pinned message.
+    await page.getByTitle("Ir para o final").click();
+    await expect(messageBubble(page, messages.at(-1)!.id)).toBeInViewport();
+    await expect(messageBubble(page, oldest.id)).not.toBeInViewport();
+    await expect(page).toHaveURL(deepLink);
+
+    // Same pin, same URL: a new request all the same.
+    const secondJump = highlightOf(oldest.id);
+    await openPinned.click();
+    await secondJump;
+    await expect(messageBubble(page, oldest.id)).toBeInViewport();
+    await expect(page).toHaveURL(deepLink);
+  });
+
+  test("desafixa sem navegar, com progresso no item e convergência sem recarregar", async ({
+    page,
+  }, testInfo) => {
+    const { targetId, scenario, messages } = pinnedChannel(testInfo, "pins-unpin", { pinned: 3 });
+    await installMessagingMocks(page, scenario);
+    let releaseDelete!: () => void;
+    const deleteGate = new Promise<void>((resolve) => {
+      releaseDelete = resolve;
+    });
+    await page.route(`**/api/chat/channels/${targetId}/messages/*/pin`, async (route) => {
+      if (route.request().method() === "DELETE") await deleteGate;
+      await route.fallback();
+    });
+    const { list } = await openPins(page, targetId);
+    await page.evaluate(() => {
+      (window as unknown as { __pinsE2EMarker: boolean }).__pinsE2EMarker = true;
+    });
+    const second = list.getByRole("listitem").filter({ hasText: "Mensagem número 2" });
+
+    await second.getByRole("button", { name: /^Desafixar mensagem de / }).click();
+
+    const pending = second.getByRole("button", { name: /^Desafixando mensagem de / });
+    await expect(pending).toHaveAttribute("aria-disabled", "true");
+    await expect(list.getByRole("listitem")).toHaveCount(3);
+    await expect(page).toHaveURL(`/chat/channel/${targetId}`);
+
+    releaseDelete();
+    await expect(list.getByRole("listitem")).toHaveCount(2);
+    await expect(list.getByText("Mensagem número 2")).toHaveCount(0);
+    expect(scenario.requests.pins).toEqual([
+      { messageId: messages[1].id, targetId, action: "remove" },
+    ]);
+    await expect(page).toHaveURL(`/chat/channel/${targetId}`);
+    expect(
+      await page.evaluate(
+        () => (window as unknown as { __pinsE2EMarker?: boolean }).__pinsE2EMarker,
+      ),
+    ).toBe(true);
+  });
+
+  test("não rouba o foco de volta quando o leitor clica em texto durante o desafixar", async ({
+    page,
+  }, testInfo) => {
+    const { targetId, scenario } = pinnedChannel(testInfo, "pins-focus-away", { pinned: 3 });
+    await installMessagingMocks(page, scenario);
+    let releaseDelete!: () => void;
+    const deleteGate = new Promise<void>((resolve) => {
+      releaseDelete = resolve;
+    });
+    await page.route(`**/api/chat/channels/${targetId}/messages/*/pin`, async (route) => {
+      if (route.request().method() === "DELETE") await deleteGate;
+      await route.fallback();
+    });
+    const { panel, list } = await openPins(page, targetId);
+    const rowOf = (n: number) =>
+      list.getByRole("listitem").filter({ hasText: `Mensagem número ${n}` });
+
+    await rowOf(2)
+      .getByRole("button", { name: /^Desafixar mensagem de / })
+      .click();
+    const pending = rowOf(2).getByRole("button", { name: /^Desafixando mensagem de / });
+    await expect(pending).toBeFocused();
+
+    // Plain text: the click drops focus with no destination while the row is
+    // still on screen — the reader let go, the removal did not take it.
+    await panel.getByRole("heading", { name: "Mensagens fixadas" }).click();
+    await expect(pending).not.toBeFocused();
+    await expect(pending).toBeVisible();
+
+    releaseDelete();
+    await expect(list.getByRole("listitem")).toHaveCount(2);
+
+    for (const button of await list.getByRole("button").all()) {
+      await expect(button).not.toBeFocused();
+    }
+  });
+
+  test("funciona por teclado: navega, desafixa e mantém o foco previsível", async ({
+    page,
+  }, testInfo) => {
+    const { targetId, scenario, messages } = pinnedChannel(testInfo, "pins-keyboard", {
+      pinned: 3,
+    });
+    await installMessagingMocks(page, scenario);
+    const { list } = await openPins(page, targetId);
+    const rows = list.getByRole("listitem");
+    const firstOpen = rows.nth(0).getByRole("button", { name: /^Ir para a mensagem de / });
+
+    // Tab from the panel's first control until the first pin is reached.
+    for (let step = 0; step < 40; step += 1) {
+      if (await firstOpen.evaluate((element) => element === document.activeElement)) break;
+      await page.keyboard.press("Tab");
+    }
+    await expect(firstOpen).toBeFocused();
+    await page.keyboard.press("Enter");
+    const deepLink = `/chat/channel/${targetId}?message=${encodeURIComponent(messages[0].id)}`;
+    await expect(page).toHaveURL(deepLink);
+
+    await page.keyboard.press("Tab");
+    const firstUnpin = rows.nth(0).getByRole("button", { name: /^Desafixar mensagem de / });
+    await expect(firstUnpin).toBeFocused();
+    await page.keyboard.press("Enter");
+
+    await expect(rows).toHaveCount(2);
+    await expect(page).toHaveURL(deepLink);
+    // The row that took the removed one's place has focus, not <body>.
+    await expect(
+      rows.nth(0).getByRole("button", { name: /^Ir para a mensagem de / }),
+    ).toBeFocused();
+    await expect(rows.nth(0)).toContainText("Mensagem número 2");
+  });
+
+  test("mostra o estado vazio real para um canal sem mensagens fixadas", async ({
+    page,
+  }, testInfo) => {
+    captureBrowserErrors(page);
+    const { targetId, scenario } = pinnedChannel(testInfo, "pins-empty", { total: 1, pinned: 0 });
+    await installMessagingMocks(page, scenario);
+    const { panel } = await openPins(page, targetId);
+
+    await expect(panel.getByTestId("chat-details-pin-empty")).toHaveText(
+      "Nenhuma mensagem fixada neste canal.",
+    );
+    await expect(panel.getByRole("list", { name: "Mensagens fixadas" })).toHaveCount(0);
+    await expect(panel.getByRole("button", { name: /Ver todos Mensagens fixadas/ })).toHaveCount(0);
+    expectNoUnexpectedBrowserErrors(page);
+  });
+
+  test("mostra o marcador de mensagem removida para um pin cuja mensagem foi apagada", async ({
+    page,
+  }, testInfo) => {
+    captureBrowserErrors(page);
+    const { targetId, scenario } = pinnedChannel(testInfo, "pins-removed", {
+      pinned: 2,
+      removed: true,
+    });
+    await installMessagingMocks(page, scenario);
+    const { list } = await openPins(page, targetId);
+
+    await expect(list.getByRole("listitem")).toHaveCount(2);
+    await expect(list.getByRole("listitem").nth(0)).toContainText("Mensagem removida.");
+    await expect(list.getByRole("listitem").nth(1)).toContainText("Mensagem número 2");
+    expectNoUnexpectedBrowserErrors(page);
+  });
+
+  test("converge em tempo real quando outra pessoa fixa e desafixa", async ({ page }, testInfo) => {
+    const { targetId, scenario, messages } = pinnedChannel(testInfo, "pins-realtime", {
+      total: 3,
+      pinned: 1,
+    });
+    await installMessagingMocks(page, scenario);
+    const { list } = await openPins(page, targetId);
+    await expect(list.getByRole("listitem")).toHaveCount(1);
+
+    await emitPinUpdated(page, scenario, {
+      kind: "channel",
+      targetId,
+      messageId: messages[2].id,
+      pinned: true,
+    });
+    await expect(list.getByRole("listitem")).toHaveCount(2);
+    await expect(list.getByText("Mensagem número 3")).toBeVisible();
+
+    await emitPinUpdated(page, scenario, {
+      kind: "channel",
+      targetId,
+      messageId: messages[0].id,
+      pinned: false,
+    });
+    await expect(list.getByRole("listitem")).toHaveCount(1);
+    await expect(list.getByText("Mensagem número 1")).toHaveCount(0);
+  });
+});
+
+/**
+ * Arquivos recentes (issue #897): compacto em cinco, "Ver todos" só quando o
+ * servidor diz que há mais, páginas buscadas sob demanda pela mesma listagem, e
+ * a linha de um arquivo aprovado executando a ação que o produto já tem.
+ */
+test.describe("arquivos recentes no painel do canal", () => {
+  async function openFiles(page: Page, targetId: string) {
+    await page.goto(`/chat/channel/${targetId}`);
+    await page.getByRole("button", { name: "Detalhes do canal", exact: true }).click();
+    const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
+    return { panel, list: panel.getByRole("list", { name: "Arquivos recentes" }) };
+  }
+
+  function filesToggle(panel: Locator) {
+    return panel.getByRole("button", { name: /(Ver todos|Mostrar menos) Arquivos recentes/ });
+  }
+
+  test("mostra 5, expande paginando sob demanda e recolhe sem refazer a busca", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "files-pages");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Arquivos Paginados",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
+    });
+    const files = attachmentFixtures("pg", 27);
+    scenario.channelAttachments.set(targetId, files);
+    const listingsOf = () =>
+      scenario.requests.attachmentListings.filter((request) => request.targetId === targetId);
+
+    await installMessagingMocks(page, scenario);
+    const { panel, list } = await openFiles(page, targetId);
+
+    // ── 1. compacto: só a página compacta foi pedida ──────────────────────
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    await expect(list.getByText(files[0].filename)).toBeVisible();
+    await expect(list.getByText(files[5].filename)).toHaveCount(0);
+    const toggle = filesToggle(panel);
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(listingsOf()).toEqual([{ targetId, limit: 5, before: null }]);
+
+    // ── 2. expandir busca a próxima página e mantém as cinco primeiras ────
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await expect(list.getByRole("listitem")).toHaveCount(25);
+    expect(listingsOf()[1]).toEqual({ targetId, limit: 20, before: files[4].id });
+    // A ordem é a do servidor, sem duplicatas na emenda das páginas.
+    await expect(list.getByRole("listitem").nth(4)).toContainText(files[4].filename);
+    await expect(list.getByRole("listitem").nth(5)).toContainText(files[5].filename);
+
+    const scroll = await list.evaluate((element) => ({
+      clientHeight: element.clientHeight,
+      scrollHeight: element.scrollHeight,
+      overflowY: getComputedStyle(element).overflowY,
+      tabIndex: element.tabIndex,
+    }));
+    expect(scroll.overflowY).toBe("auto");
+    expect(scroll.scrollHeight).toBeGreaterThan(scroll.clientHeight);
+    expect(scroll.tabIndex).toBe(0);
+
+    // ── 3. a última página vem pelo rodapé, e depois dela nada é oferecido ─
+    await panel.getByRole("button", { name: "Carregar mais arquivos" }).click();
+    await expect(list.getByRole("listitem")).toHaveCount(27);
+    await expect(panel.getByRole("button", { name: "Carregar mais arquivos" })).toHaveCount(0);
+    await expect(list).toBeFocused();
+    expect(listingsOf()[2]).toEqual({ targetId, limit: 20, before: files[24].id });
+
+    // ── 4. recolher e reexpandir não busca de novo nem duplica ─────────────
+    await toggle.click();
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    await toggle.click();
+    await expect(list.getByRole("listitem")).toHaveCount(27);
+    expect(listingsOf()).toHaveLength(3);
+  });
+
+  test("baixa um arquivo verificado pela ação existente e nada oferece aos não aprovados", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "files-action");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Arquivos e Estados",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
+    });
+    scenario.channelAttachments.set(targetId, [
+      {
+        id: `${targetId}-clean`,
+        filename: "relatorio.zip",
+        contentType: "application/zip",
+        size: 113 * 1024,
+        status: "clean",
+        createdAt: "2026-07-15T12:24:00Z",
+      },
+      {
+        id: `${targetId}-pending`,
+        filename: "analise.png",
+        contentType: "image/png",
+        size: 2048,
+        status: "pending_scan",
+        createdAt: "2026-07-15T12:20:00Z",
+      },
+      {
+        id: `${targetId}-rejected`,
+        filename: "virus.exe",
+        contentType: "application/octet-stream",
+        size: 4096,
+        status: "rejected",
+        createdAt: "2026-07-15T12:10:00Z",
+      },
+    ]);
+
+    await installMessagingMocks(page, scenario);
+    const { list } = await openFiles(page, targetId);
+
+    // Em análise e reprovado: status em texto, nenhum controle.
+    await expect(list.getByRole("listitem")).toHaveCount(3);
+    await expect(list.getByRole("listitem").nth(1)).toContainText("Em análise");
+    await expect(list.getByRole("listitem").nth(2)).toContainText("Reprovado");
+    await expect(list.getByRole("listitem").nth(1).getByRole("button")).toHaveCount(0);
+    await expect(list.getByRole("listitem").nth(2).getByRole("button")).toHaveCount(0);
+    await expect(list.getByRole("link")).toHaveCount(0);
+
+    // Verificado: a linha é o Baixar do produto, pela rota autenticada.
+    const action = list.getByRole("button", { name: "Baixar relatorio.zip" });
+    await expect(action).toContainText("Verificado");
+    const download = page.waitForEvent("download");
+    await action.click();
+    expect((await download).suggestedFilename()).toBe("relatorio.zip");
+    expect(scenario.requests.attachmentContentFetches).toEqual([`${targetId}-clean`]);
+  });
+
+  test("funciona por teclado: expande, ativa um arquivo e recolhe com foco visível", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "files-keyboard");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Arquivos Teclado",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
+    });
+    const files = attachmentFixtures("kb", 7);
+    scenario.channelAttachments.set(targetId, files);
+
+    await installMessagingMocks(page, scenario);
+    const { panel, list } = await openFiles(page, targetId);
+    const toggle = filesToggle(panel);
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+
+    await toggle.focus();
+    await page.keyboard.press("Enter");
+    await expect(list.getByRole("listitem")).toHaveCount(7);
+
+    // Controle → região rolável → primeiro arquivo, na ordem natural.
+    await page.keyboard.press("Tab");
+    await expect(list).toBeFocused();
+    await page.keyboard.press("Tab");
+    const first = list.getByRole("button", { name: `Baixar ${files[0].filename}` });
+    await expect(first).toBeFocused();
+    const outline = await first.evaluate((element) => getComputedStyle(element).outlineStyle);
+    expect(outline).not.toBe("none");
+
+    const download = page.waitForEvent("download");
+    await page.keyboard.press("Enter");
+    expect((await download).suggestedFilename()).toBe(files[0].filename);
+
+    await toggle.focus();
+    await page.keyboard.press(" ");
+    await expect(list.getByRole("listitem")).toHaveCount(5);
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(toggle).toBeFocused();
+  });
+
+  test("converge sem recarregar quando um arquivo novo chega, mantendo a lista expandida", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "files-realtime");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Arquivos ao Vivo",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
+    });
+    const files = attachmentFixtures("rt", 6);
+    scenario.channelAttachments.set(targetId, files);
+
+    await installMessagingMocks(page, scenario);
+    const { panel, list } = await openFiles(page, targetId);
+    const toggle = filesToggle(panel);
+    await toggle.click();
+    await expect(list.getByRole("listitem")).toHaveCount(6);
+
+    // Outra pessoa enviou um arquivo: o servidor passa a listá-lo primeiro e
+    // publica o evento da conversa, que é o sinal que o painel já segue.
+    const fresh = { ...attachmentFixtures("rt-new", 1)[0], filename: "chegou-agora.pdf" };
+    fresh.createdAt = "2026-07-16T09:00:00Z";
+    scenario.channelAttachments.set(targetId, [fresh, ...files]);
+    await emitConversationEvent(page, scenario, {
+      kind: "channel",
+      targetId,
+      message: makeMessage({ id: `${targetId}-m2`, body_text: "Arquivo enviado" }),
+    });
+
+    // O mesmo tamanho de janela, relido de uma vez: o novo no topo, a lista
+    // ainda expandida, e o mais antigo alcançável pela próxima página.
+    await expect(list.getByRole("listitem").first()).toContainText("chegou-agora.pdf");
+    await expect(list.getByRole("listitem")).toHaveCount(6);
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await panel.getByRole("button", { name: "Carregar mais arquivos" }).click();
+    await expect(list.getByRole("listitem")).toHaveCount(7);
+    await expect(list.getByRole("listitem").last()).toContainText(files[5].filename);
+  });
+
+  test("fecha o visualizador de documento ao trocar de conversa e não o restaura ao voltar", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "files-viewer");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Documentos do Canal",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
+    });
+    scenario.channelAttachments.set(targetId, [
+      {
+        id: `${targetId}-doc`,
+        filename: "contrato-do-canal-a.pdf",
+        contentType: "application/pdf",
+        size: 113 * 1024,
+        status: "clean",
+        previewStatus: "ready",
+        createdAt: "2026-07-15T12:24:00Z",
+      },
+    ]);
+    scenario.channelAttachments.set(OTHER_CHANNEL_ID, [
+      { ...attachmentFixtures("b", 1)[0], filename: "somente-do-canal-b.pdf" },
+    ]);
+    await installMessagingMocks(page, scenario);
+    // The viewer's own manifest: one page. Its bytes are not what this test is
+    // about, so the page itself answers 404 and the viewer shows its fallback.
+    await page.route("**/api/files/attachments/*/document-preview", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          data: { attachmentId: `${targetId}-doc`, kind: "pages", pageCount: 1, labels: ["1"] },
+        }),
+      }),
+    );
+    await page.route("**/api/files/attachments/*/document-preview/pages/*", (route) =>
+      route.fulfill({ status: 404 }),
+    );
+
+    // B first, then A through the sidebar, so the browser history can take the
+    // user back and forth without a reload — and without touching the modal
+    // backdrop, whose own click would close the viewer and prove nothing.
+    await page.goto(`/chat/channel/${OTHER_CHANNEL_ID}`);
+    await page.getByRole("option", { name: /Documentos do Canal/ }).click();
+    await page.getByRole("button", { name: "Detalhes do canal", exact: true }).click();
+    const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
+    const list = panel.getByRole("list", { name: "Arquivos recentes" });
+
+    await list.getByRole("button", { name: "Visualizar contrato-do-canal-a.pdf" }).click();
+    const viewer = page.getByRole("dialog", { name: "contrato-do-canal-a.pdf" });
+    await expect(viewer).toBeVisible();
+
+    // A → B: the panel now describes B, and A's document is gone with A.
+    await page.goBack();
+    await expect(list.getByText("somente-do-canal-b.pdf")).toBeVisible();
+    await expect(viewer).toHaveCount(0);
+
+    // B → A: A's files are back, its document is not reopened on its own.
+    await page.goForward();
+    await expect(
+      list.getByRole("button", { name: "Visualizar contrato-do-canal-a.pdf" }),
+    ).toBeVisible();
+    await expect(viewer).toHaveCount(0);
+  });
+
+  test("não mostra arquivos da conversa anterior quando a troca é mais rápida que a resposta", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "files-switch");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Arquivos Lentos",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
+    });
+    scenario.channelAttachments.set(targetId, [
+      { ...attachmentFixtures("a", 1)[0], filename: "somente-do-canal-a.pdf" },
+    ]);
+    scenario.channelAttachments.set(OTHER_CHANNEL_ID, [
+      { ...attachmentFixtures("b", 1)[0], filename: "somente-do-canal-b.pdf" },
+    ]);
+    await installMessagingMocks(page, scenario);
+
+    // A listagem do canal A fica retida até o canal B estar na tela. Registrada
+    // depois dos mocks, esta rota é consultada primeiro; ao ser liberada, segue
+    // para o mock normal, que responde com o arquivo de A.
+    let releaseA: () => void = () => {};
+    const aReleased = new Promise<void>((resolve) => (releaseA = resolve));
+    let aAnswered: () => void = () => {};
+    const aDone = new Promise<void>((resolve) => (aAnswered = resolve));
+    await page.route(`**/api/files/channels/${targetId}/attachments**`, async (route) => {
+      await aReleased;
+      await route.fallback().catch(() => {});
+      aAnswered();
+    });
+
+    await page.goto(`/chat/channel/${targetId}`);
+    await page.getByRole("button", { name: "Detalhes do canal", exact: true }).click();
+    const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
+    await expect(panel.getByText("Carregando arquivos…")).toBeVisible();
+
+    await page.getByRole("option", { name: new RegExp(OTHER_CHANNEL_NAME) }).click();
+    const list = panel.getByRole("list", { name: "Arquivos recentes" });
+    await expect(list.getByText("somente-do-canal-b.pdf")).toBeVisible();
+
+    releaseA();
+    await aDone;
+    await expect(list.getByRole("listitem")).toHaveCount(1);
+    await expect(panel.getByText("somente-do-canal-a.pdf")).toHaveCount(0);
+  });
+
+  test("continua utilizável e sem overflow horizontal em viewport estreito", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    const targetId = uniqueId(testInfo, "files-phone");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Arquivos Estreitos",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
+    });
+    const files = attachmentFixtures("ph", 8);
+    files[0] = {
+      ...files[0],
+      filename: `${"relatorio-trimestral-com-um-nome-muito-longo-".repeat(4)}final.pdf`,
+    };
+    scenario.channelAttachments.set(targetId, files);
+
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/channel/${targetId}`);
+    await page.getByTestId("chat-details-toggle").click();
+    const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
+    const list = panel.getByRole("list", { name: "Arquivos recentes" });
+    const toggle = filesToggle(panel);
+
+    await toggle.click();
+    await expect(list.getByRole("listitem")).toHaveCount(8);
+    await expect(toggle).toBeVisible();
+
+    const overflow = await page.evaluate(() => {
+      const aside = document.querySelector<HTMLElement>("[data-testid=chat-conversation-details]");
+      return {
+        document: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+        panel: aside ? aside.scrollWidth - aside.clientWidth : 0,
+      };
+    });
+    expect(overflow.document).toBeLessThanOrEqual(0);
+    expect(overflow.panel).toBeLessThanOrEqual(0);
+
+    // O nome longo é truncado dentro da linha, e a ação continua alcançável.
+    const longRow = list.getByRole("button", { name: `Baixar ${files[0].filename}` });
+    await expect(longRow).toBeVisible();
+    const [rowBox, listBox] = await Promise.all([longRow.boundingBox(), list.boundingBox()]);
+    expect((rowBox?.x ?? 0) + (rowBox?.width ?? 0)).toBeLessThanOrEqual(
+      (listBox?.x ?? 0) + (listBox?.width ?? 0) + 1,
+    );
+    const download = page.waitForEvent("download");
+    await longRow.click();
+    await download;
+
+    await toggle.click();
+    await expect(list.getByRole("listitem")).toHaveCount(5);
   });
 });

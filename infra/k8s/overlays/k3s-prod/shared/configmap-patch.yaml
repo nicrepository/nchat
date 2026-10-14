@@ -142,5 +142,11 @@ data:
   # half, and only once no such reader is left. See
   # docs/architecture/notification-policy.md, "Rollout".
   CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED: "false"
+  # The same kind of gate for manual presence (issue #798): a slot from before
+  # #798 neither reads chat.user_presence nor understands its settings hint, so
+  # a status chosen while such a slot still serves a WebSocket would not reach
+  # the people it serves. Opened with `make prod-manual-presence` once the
+  # previous slot has no pods. See the runbook, section 16c.
+  CHAT_MANUAL_PRESENCE_ENABLED: "false"
 
   SMTP_WORKER_ENABLED: "true"

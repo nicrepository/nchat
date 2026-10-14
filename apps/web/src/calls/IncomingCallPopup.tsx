@@ -1,11 +1,12 @@
 import { useRef, useState } from "react";
 
-import { initialsFrom } from "../chat/messageDisplay";
-import { PersonAvatarImage } from "../chat/PersonAvatarImage";
+import { UserAvatar } from "../chat/UserAvatar";
 import "./CallPresentation.css";
 
 interface IncomingCallPopupProps {
   name: string;
+  userId?: string;
+  workspaceId?: string;
   avatarUrl?: string;
   callType: "audio" | "video";
   onAccept: () => unknown;
@@ -16,6 +17,8 @@ interface IncomingCallPopupProps {
 
 export default function IncomingCallPopup({
   name,
+  userId = "",
+  workspaceId = "",
   avatarUrl,
   callType,
   onAccept,
@@ -42,10 +45,12 @@ export default function IncomingCallPopup({
     <aside className="incoming-call" role="dialog" aria-modal="false" aria-label="Chamada recebida">
       <div className="incoming-call__identity">
         <div className="incoming-call__avatar" aria-hidden="true">
-          <PersonAvatarImage
-            src={avatarUrl}
-            initials={initialsFrom(name)}
-            imgClassName="incoming-call__avatar-img"
+          <UserAvatar
+            userId={userId}
+            workspaceId={workspaceId}
+            displayName={name}
+            avatarUrl={avatarUrl}
+            imageClassName="incoming-call__avatar-img"
           />
         </div>
         <div>

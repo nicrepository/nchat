@@ -22,6 +22,8 @@ import type { EmojiUsage } from "../../emoji/emojiUsage";
 import { presenceTargetKey } from "../../presence";
 import type { MessagesState } from "../../useMessages";
 import type { ConversationDetailsKind } from "../../useConversationDetailsPanel";
+import type { TimelinePosition } from "../../messages/messageOrder";
+import type { ReadProgress } from "../../readCursor";
 import { EmptyState, ErrorState, LoadingSkeleton } from "../ConversationStates";
 import MessageList from "./MessageList";
 import type { ConversationMessageActions } from "./MessageTimelineItem";
@@ -34,6 +36,7 @@ export interface ConversationTimelineProps {
   mentionTarget?: MentionTarget;
   state: MessagesState;
   currentUserId: string;
+  workspaceId: string;
   /** Every callback a message offers; see MessageTimelineItem. */
   actions: ConversationMessageActions;
   onLoadMore: () => void;
@@ -50,12 +53,19 @@ export interface ConversationTimelineProps {
   emojiUsage: EmojiUsage;
   onEmojiToneChange: (tone: number) => void;
   focusMessageId: string;
+  /** Issue #896: see MessageListProps. */
+  focusRequest?: string;
   /** #492: see MessageListProps. */
   conversationKey: string;
   unreadCountAtOpen: number;
+  /** #1082: the sidebar, and so this conversation's unread count, is not loaded yet. */
+  sidebarLoading?: boolean;
   initialAnchor: ViewportAnchor | null;
   onCaptureAnchor: (key: string, anchor: ViewportAnchor) => void;
-  onReachedBottom: () => void;
+  /** #1082: see MessageListProps. */
+  serverReadThrough?: TimelinePosition | null;
+  /** #1082: see MessageListProps. */
+  onReadProgress: (conversationKey: string, progress: ReadProgress) => void;
 }
 
 /**
@@ -87,15 +97,20 @@ export default function ConversationTimeline(props: ConversationTimelineProps) {
   if (state.status === "error") return <ErrorState onRetry={props.onRetry} />;
   if (state.status !== "ready") return null;
   if (state.messages.length === 0) return <EmptyState kind={kind} name={name} />;
+  // #1082: where the conversation opens depends on its unread count, which
+  // the sidebar brings — wait for it rather than settle on a guessed 0.
+  if (props.sidebarLoading) return <LoadingSkeleton />;
   return (
     <MessageList
       messages={state.messages}
       currentUserId={props.currentUserId}
+      workspaceId={props.workspaceId}
       // "canal" / "grupo" / "conversa" for this timeline's system messages
       // (issue #527).
       systemScope={systemScopeFor(props.detailsKind, kind)}
       hasMore={state.nextCursor !== ""}
       loadingMore={state.loadingMore}
+      olderPagesSettled={state.olderPagesSettled}
       lastMutation={state.lastMutation}
       onLoadMore={props.onLoadMore}
       actions={{
@@ -115,11 +130,13 @@ export default function ConversationTimeline(props: ConversationTimelineProps) {
       emojiUsage={props.emojiUsage}
       onEmojiToneChange={props.onEmojiToneChange}
       focusMessageId={props.focusMessageId}
+      focusRequest={props.focusRequest}
       conversationKey={props.conversationKey}
       unreadCountAtOpen={props.unreadCountAtOpen}
       initialAnchor={props.initialAnchor}
       onCaptureAnchor={props.onCaptureAnchor}
-      onReachedBottom={props.onReachedBottom}
+      serverReadThrough={props.serverReadThrough}
+      onReadProgress={props.onReadProgress}
     />
   );
 }

@@ -504,6 +504,66 @@ describe("useMessages — DM body format", () => {
     expect(result.current.state.realtimeError).toBeNull();
   });
 
+  it("does not report the superseded auto-add event read as a realtime failure", async () => {
+    const event = makeMessage({
+      id: "event-member-added-race",
+      kind: "system",
+      eventType: "conversation_member_added",
+      eventPayload: { targetUsers: [{ userId: "user-new", displayName: "Pessoa nova" }] },
+    });
+    let finishPost!: (message: Message) => void;
+    let firstSignal: AbortSignal | undefined;
+    const reads: { signal: AbortSignal | undefined; resolve: (message: Message) => void }[] = [];
+    const post = new Promise<Message>((resolve) => {
+      finishPost = resolve;
+    });
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockPostChannelMessage.mockReturnValue(post);
+    mockFetchChannelMessage.mockImplementation((_channelId, _messageId, signal) => {
+      firstSignal ??= signal;
+      return new Promise((resolve, reject) => {
+        reads.push({ signal, resolve });
+        signal?.addEventListener(
+          "abort",
+          () => reject(new ApiRequestError(0, "network_error", "Network error")),
+          { once: true },
+        );
+      });
+    });
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-auto-add", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let send!: Promise<unknown>;
+    act(() => {
+      send = result.current.sendMessage("@[Pessoa nova](mention:user:user-new)");
+    });
+    act(() => fireWsConversationEvent("channel", "ch-auto-add", event.id));
+    await waitFor(() => expect(mockFetchChannelMessage).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      finishPost(
+        makeMessage({ id: "message-with-auto-add", createdConversationEventId: event.id }),
+      );
+      await send;
+    });
+    await waitFor(() => expect(firstSignal?.aborted).toBe(true));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The second read superseded the first on purpose. Even if a transport
+    // wrapper normalizes the cancelled fetch to network_error, it is not a
+    // socket or server failure and must never make the realtime warning flash.
+    expect(result.current.state.realtimeError).toBeNull();
+
+    await act(async () => reads.at(-1)?.resolve(event));
+    await waitFor(() => expect(result.current.state.messages).toContainEqual(event));
+  });
+
   it("keeps direct messages on v2 by default", async () => {
     mockFetchDMMessages.mockResolvedValue(emptyPage);
     mockPostDMMessage.mockResolvedValue(makeMessage({ id: "direct-message", bodyFormat: "v2" }));
@@ -544,9 +604,10 @@ describe("useMessages — WS message.created integration", () => {
     expect(mockFetchChannelMessage).not.toHaveBeenCalled();
   });
 
-  it("loads a focused DM message outside the current page", async () => {
+  it("never fetches a focused message outside the page on its own", async () => {
+    // #1088: the viewport pages back to it through the ordinary history; a
+    // message spliced in beside a page it is not part of breaks prepending.
     mockFetchDMMessages.mockResolvedValue(emptyPage);
-    mockFetchDMMessage.mockResolvedValue(makeMessage({ id: "focused-dm" }));
 
     const { result } = renderHook(() =>
       useMessages({
@@ -558,26 +619,33 @@ describe("useMessages — WS message.created integration", () => {
     );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
-    expect(result.current.state.messages.map((message) => message.id)).toEqual(["focused-dm"]);
-    expect(mockFetchDMMessage).toHaveBeenCalledWith("dm-1", "focused-dm", expect.any(AbortSignal));
+    expect(result.current.state.messages).toEqual([]);
+    expect(mockFetchDMMessage).not.toHaveBeenCalled();
   });
 
-  it("keeps the page generic when a focused message cannot be read", async () => {
+  it("reopens the conversation from its newest page when the deep link changes", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
-    mockFetchChannelMessage.mockRejectedValue(new Error("not found"));
 
-    const { result } = renderHook(() =>
-      useMessages({
-        kind: "channel",
-        targetId: "ch-1",
-        currentUserId: "user-me",
-        focusMessageId: "protected",
-      }),
+    const { result, rerender } = renderHook(
+      ({ focusMessageId }) =>
+        useMessages({
+          kind: "channel",
+          targetId: "ch-1",
+          currentUserId: "user-me",
+          focusMessageId,
+        }),
+      { initialProps: { focusMessageId: "m-1" } },
     );
-
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
-    expect(result.current.state.messages).toEqual([]);
-    expect(result.current.state.realtimeError).toBeNull();
+
+    rerender({ focusMessageId: "m-2" });
+
+    await waitFor(() => expect(mockFetchChannelMessages).toHaveBeenCalledTimes(2));
+    expect(mockFetchChannelMessages).toHaveBeenLastCalledWith(
+      "ch-1",
+      undefined,
+      expect.any(AbortSignal),
+    );
   });
 
   it("revalidates a mounted reference on focus and removes a revoked preview", async () => {

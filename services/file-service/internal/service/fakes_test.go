@@ -91,6 +91,7 @@ type fakeStore struct {
 	authorizedErr error
 
 	listed     []service.ListedAttachment
+	listNext   *domain.AttachmentListCursor
 	listErr    error
 	listQuery  service.ListDestinationAttachmentsQuery
 	listCalled int
@@ -107,15 +108,15 @@ type fakeStore struct {
 
 func (s *fakeStore) ListDestinationAttachments(
 	_ context.Context, query service.ListDestinationAttachmentsQuery,
-) ([]service.ListedAttachment, error) {
+) (service.ListedAttachmentPage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.listCalled++
 	s.listQuery = query
 	if s.listErr != nil {
-		return nil, s.listErr
+		return service.ListedAttachmentPage{}, s.listErr
 	}
-	return s.listed, nil
+	return service.ListedAttachmentPage{Attachments: s.listed, Next: s.listNext}, nil
 }
 
 func newFakeStore() *fakeStore {

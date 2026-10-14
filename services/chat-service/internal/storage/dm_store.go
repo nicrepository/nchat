@@ -27,9 +27,11 @@ type CreateDirectConversationResult struct {
 
 // CreateGroupConversationInput holds storage-only fields for group DM creation.
 type CreateGroupConversationInput struct {
-	WorkspaceID        string
-	CreatedBy          string
-	Title              string
+	WorkspaceID string
+	CreatedBy   string
+	Title       string
+	// AvatarEmoji is already validated by the service; empty stores NULL.
+	AvatarEmoji        string
 	ParticipantUserIDs []string
 }
 
@@ -63,6 +65,10 @@ type DMStore interface {
 	// same transaction. Authorized by participation; a 1:1 conversation is
 	// unreachable because the statement requires type = 'group' (issue #527).
 	RenameGroupConversation(ctx context.Context, input RenameGroupInput) (RenameGroupResult, error)
+	// SetGroupAvatarEmoji sets a group's identity emoji, or clears it back to
+	// Automático when the emoji is empty (issue #1026). Same authority as the
+	// rename, re-derived in the same transaction as the write.
+	SetGroupAvatarEmoji(ctx context.Context, input SetGroupAvatarInput) error
 	// LeaveGroupConversation marks the actor's own participation left and
 	// records the departure. Self-leave only — there is no target user
 	// parameter (issue #527).
@@ -491,15 +497,15 @@ func createGroupConversation(ctx context.Context, q dmQuerier, input CreateGroup
 	var conversation domain.DMConversation
 	err := q.QueryRow(ctx, `
 		INSERT INTO chat.dm_conversations
-			(workspace_id, type, title, status, created_by)
-		VALUES ($1, 'group', $2, 'active', $3)
+			(workspace_id, type, title, status, created_by, avatar_emoji)
+		VALUES ($1, 'group', $2, 'active', $3, NULLIF($4, ''))
 		RETURNING id, workspace_id, type, COALESCE(title, ''), status, created_by,
-		          created_at, updated_at`,
-		input.WorkspaceID, title, input.CreatedBy,
+		          created_at, updated_at, COALESCE(avatar_emoji, '')`,
+		input.WorkspaceID, title, input.CreatedBy, input.AvatarEmoji,
 	).Scan(
 		&conversation.ID, &conversation.WorkspaceID, (*string)(&conversation.Type),
 		&conversation.Title, (*string)(&conversation.Status), &conversation.CreatedBy,
-		&conversation.CreatedAt, &conversation.UpdatedAt,
+		&conversation.CreatedAt, &conversation.UpdatedAt, &conversation.AvatarEmoji,
 	)
 	if err != nil {
 		return domain.DMConversation{}, fmt.Errorf("create group conversation: %w", err)
@@ -522,12 +528,9 @@ type dmQuerier interface {
 // the rest of this file acquires them, so two of these running concurrently
 // cannot deadlock against each other.
 //
-// Both locks are FOR SHARE. They exist to pin the *authorization context* while
-// the write happens — archiving the conversation or removing the actor are
-// UPDATEs that conflict with FOR SHARE and so are serialised against an add in
-// flight — and for nothing else. There is no participant ceiling to serialise,
-// so two people adding different users to the same large group proceed in
-// parallel rather than queueing behind each other.
+// The conversation is locked FOR UPDATE before membership rows, matching
+// ownership transfers, departures and account invalidation. Membership locks
+// retain authorization until commit.
 //
 // Two things are re-established under those locks, each here rather than in the
 // service because the service's copy would be a check the write could outrun:
@@ -579,7 +582,7 @@ func (s *PGXDMStore) AddGroupParticipants(
 		  AND dc.workspace_id = $2::uuid
 		  AND dc.status = 'active'
 		  AND dc.type = 'group'
-		FOR SHARE OF dc`,
+		FOR UPDATE OF dc`,
 		input.ConversationID, input.WorkspaceID,
 	).Scan(&conversationID)
 	if err != nil {
@@ -601,8 +604,8 @@ func (s *PGXDMStore) AddGroupParticipants(
 	// removing the actor from the group is an UPDATE of this row and conflicts
 	// with FOR SHARE, so a revocation is still serialised against this add,
 	// while two participants adding people concurrently do not block each other.
-	// Nothing here is taken FOR UPDATE: there is no ceiling to serialise, and the
-	// uniqueness of a membership is settled by the primary key at write time.
+	// The conversation lock already serializes writes to this group; the
+	// membership lock pins the actor until commit.
 	var actorParticipates bool
 	err = tx.QueryRow(ctx, `
 		SELECT true
@@ -756,6 +759,8 @@ func upsertEligibleDMMembers(
 			FROM eligible
 			ON CONFLICT (conversation_id, user_id)
 			DO UPDATE SET role = 'member',
+                          ownership_role = 'member',
+                          joined_at = now(),
 			              status = 'active',
 			              left_at = NULL
 			WHERE dm.status <> 'active'
@@ -833,7 +838,7 @@ func (s *PGXDMStore) ListVisibleConversationsByUser(ctx context.Context, workspa
 func (s *PGXDMStore) ListVisibleConversationsWithParticipantIDs(ctx context.Context, workspaceID, userID string) ([]domain.DMConversationWithParticipantIDs, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT dc.id, dc.workspace_id, dc.type, COALESCE(dc.title, ''), dc.status,
-		       dc.created_by, dc.created_at, dc.updated_at,
+		       dc.created_by, dc.created_at, dc.updated_at, COALESCE(dc.avatar_emoji, ''),
 		       ARRAY(
 		           SELECT dm2.user_id::text
 		           FROM chat.dm_members dm2
@@ -896,7 +901,7 @@ func (s *PGXDMStore) ListVisibleConversationsWithParticipantIDs(ctx context.Cont
 		if err := rows.Scan(
 			&c.ID, &c.WorkspaceID, (*string)(&c.Type),
 			&c.Title, (*string)(&c.Status), &c.CreatedBy,
-			&c.CreatedAt, &c.UpdatedAt, &c.ParticipantIDs,
+			&c.CreatedAt, &c.UpdatedAt, &c.AvatarEmoji, &c.ParticipantIDs,
 			&c.CounterpartUserID, &c.CounterpartDisplayName, &c.CounterpartAvatarURL,
 			&c.LastMessageAt,
 		); err != nil {

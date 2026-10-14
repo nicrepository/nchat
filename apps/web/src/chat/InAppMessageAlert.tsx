@@ -1,7 +1,6 @@
 import { useEffect } from "react";
 
-import { initialsFrom } from "./messageDisplay";
-import { PersonAvatarImage } from "./PersonAvatarImage";
+import { UserAvatar } from "./UserAvatar";
 import "./InAppMessageAlert.css";
 
 /**
@@ -22,6 +21,7 @@ export interface InAppAlert {
   messageId: string;
   targetKind: "channel" | "dm";
   targetId: string;
+  senderId: string;
   senderDisplayName: string;
   senderAvatarUrl?: string;
   bodyText: string;
@@ -33,11 +33,17 @@ const AUTO_DISMISS_MS = 6000;
 
 interface InAppMessageAlertProps {
   alert: InAppAlert;
+  workspaceId?: string;
   onOpen: (alert: InAppAlert) => void;
   onDismiss: () => void;
 }
 
-export default function InAppMessageAlert({ alert, onOpen, onDismiss }: InAppMessageAlertProps) {
+export default function InAppMessageAlert({
+  alert,
+  workspaceId = "",
+  onOpen,
+  onDismiss,
+}: InAppMessageAlertProps) {
   // Keyed by the message in AppShell, so a newer alert remounts this and the
   // timer starts again rather than inheriting the previous one's remaining time.
   useEffect(() => {
@@ -57,10 +63,12 @@ export default function InAppMessageAlert({ alert, onOpen, onDismiss }: InAppMes
       data-testid="in-app-message-alert"
     >
       <span className="in-app-alert__avatar" aria-hidden="true">
-        <PersonAvatarImage
-          src={alert.senderAvatarUrl}
-          initials={initialsFrom(alert.senderDisplayName)}
-          imgClassName="in-app-alert__avatar-img"
+        <UserAvatar
+          userId={alert.senderId}
+          workspaceId={workspaceId}
+          displayName={alert.senderDisplayName}
+          avatarUrl={alert.senderAvatarUrl}
+          imageClassName="in-app-alert__avatar-img"
         />
       </span>
       <span className="in-app-alert__text">

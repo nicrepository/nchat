@@ -40,3 +40,5 @@ var ErrNotFound = errors.New("not found")
 
 var ErrStatusTransitionNotAllowed = errors.New("status transition not allowed")
 var ErrForbidden = errors.New("forbidden")
+
+var ErrConversationOwnershipConflict = errors.New("conversation ownership conflict")

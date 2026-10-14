@@ -1,5 +1,5 @@
-import { avatarColorFor, initialsFrom } from "../chat/messageDisplay";
-import { PersonAvatarImage } from "../chat/PersonAvatarImage";
+import { avatarColorFor } from "../chat/messageDisplay";
+import { UserAvatar } from "../chat/UserAvatar";
 import { useElapsedLabel } from "./callBarTiming";
 import "./CallPresentation.css";
 
@@ -10,6 +10,7 @@ export interface ActiveDirectCallBarProps {
   startedAt: string;
   /** Server-resolved counterpart identity (never route/name-derived) — used only for the avatar's deterministic color, matching the sidebar/header. */
   peerUserId: string;
+  workspaceId?: string;
   peerName: string;
   peerAvatarUrl?: string;
   microphoneEnabled: boolean;
@@ -40,6 +41,7 @@ export default function ActiveDirectCallBar({
   title,
   startedAt,
   peerUserId,
+  workspaceId = "",
   peerName,
   peerAvatarUrl,
   microphoneEnabled,
@@ -78,10 +80,12 @@ export default function ActiveDirectCallBar({
         <span
           className={`voicebanner__avatar call-avatar call-avatar--${avatarColorFor(peerUserId)}`}
         >
-          <PersonAvatarImage
-            src={peerAvatarUrl}
-            initials={initialsFrom(peerName)}
-            imgClassName="call-avatar__img"
+          <UserAvatar
+            userId={peerUserId}
+            workspaceId={workspaceId}
+            displayName={peerName}
+            avatarUrl={peerAvatarUrl}
+            imageClassName="call-avatar__img"
           />
         </span>
       </div>

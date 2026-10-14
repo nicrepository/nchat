@@ -1,6 +1,11 @@
 import { expect, test, type Page } from "@playwright/test";
 
 import {
+  allowsServiceUnavailable,
+  captureBrowserErrors,
+  expectNoUnexpectedBrowserErrors,
+} from "../helpers/browserErrors";
+import {
   CURRENT_USER_NAME,
   createScenario,
   fillComposer,
@@ -25,18 +30,9 @@ import {
 const MENTIONED_USER_ID = "22222222-2222-4222-8222-222222222222";
 const MENTIONED_USER_NAME = "Marina Costa";
 
-const browserErrors = new WeakMap<Page, string[]>();
-
 test.beforeEach(async ({ page }) => {
-  const errors: string[] = [];
-  browserErrors.set(page, errors);
-  page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
-  page.on("console", (message) => {
-    if (message.type() !== "error") return;
-    const expectedSidebarFailure =
-      message.text() ===
-        "Failed to load resource: the server responded with a status of 503 (Service Unavailable)" &&
-      message.location().url.includes("/api/chat/sidebar");
+  captureBrowserErrors(page, [
+    allowsServiceUnavailable("/api/chat/sidebar"),
     // Pre-existing warning (verified via `git stash` bisection against
     // unmodified upstream/develop): the *pre-existing* "abrir conversa com o
     // autor" flow (issue #707), which shares the open-DM coordinator
@@ -44,17 +40,15 @@ test.beforeEach(async ({ page }) => {
     // this on fast refreshConversations()-then-navigate sequences. Not from
     // #795 and out of scope to fix here — allowlisted so this suite tests
     // #795's own behavior rather than re-reporting a known, unrelated issue.
-    const knownPreExistingDMOpenWarning = message
-      .text()
-      .startsWith("Can't perform a React state update on a component that hasn't mounted yet.");
-    if (!expectedSidebarFailure && !knownPreExistingDMOpenWarning) {
-      errors.push(`console.error: ${message.text()}`);
-    }
-  });
+    (message) =>
+      message
+        .text()
+        .startsWith("Can't perform a React state update on a component that hasn't mounted yet."),
+  ]);
 });
 
 test.afterEach(async ({ page }) => {
-  expect(browserErrors.get(page)).toEqual([]);
+  expectNoUnexpectedBrowserErrors(page);
 });
 
 async function gotoWithSidebarReady(page: Page, path: string) {

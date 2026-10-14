@@ -84,6 +84,11 @@ type NotificationEvent struct {
 	// recipient with no preference row has, and the engine normalises it to the
 	// product default rather than guessing here.
 	NotificationLevel string
+	// DoNotDisturb is the recipient's presence choice at the moment the batch
+	// was read (issue #798), resolved by doNotDisturbProjection in the same
+	// statement. A resolved fact, not a decision: the policy engine is what
+	// silences.
+	DoNotDisturb bool
 	// Presentation is what a push banner may say about this event (issue #870),
 	// resolved by presentationProjection in the same statement and against this
 	// recipient's access at the claim snapshot. The zero value means "nothing may be said",
@@ -219,6 +224,26 @@ const levelProjection = `
 		SELECT p.notification_level` + preferenceRowJoin + `
 		LIMIT 1
 	), 'all')`
+
+// doNotDisturbProjection asks whether the recipient is in Do Not Disturb
+// (issue #798), from chat.user_presence — the table chat-service writes when a
+// member chooses a manual state, with the expiry applied by the database
+// clock, so a state that ran out reads as false whether or not anybody cleared
+// it.
+//
+// Scoped by the persisted row's own workspace and recipient, exactly like the
+// preference join above: one member's state can never reach another member's
+// event, nor a workspace's event reach another workspace's state. One primary
+// key lookup per row of the batch, inside the batch statement — no query per
+// event.
+const doNotDisturbProjection = `
+	EXISTS (
+		SELECT 1 FROM chat.user_presence up
+		WHERE up.workspace_id = o.workspace_id
+		  AND up.user_id = o.recipient_user_id
+		  AND up.manual_state = 'dnd'
+		  AND up.manual_expires_at > clock_timestamp()
+	)`
 
 // MessagePresentation is ephemeral content authorized at the ClaimDue statement
 // snapshot, never persisted in the outbox. Changes after that snapshot cannot
@@ -367,7 +392,7 @@ const notificationColumns = `
 	o.id::text, o.workspace_id::text, o.recipient_user_id::text,
 	o.kind, o.priority, o.source_type, o.message_id::text, o.origin,
 	COALESCE(o.dedupe_key, ''), o.attempts, o.occurred_at,` +
-	mutedProjection + `,` + levelProjection
+	mutedProjection + `,` + levelProjection + `,` + doNotDisturbProjection
 
 // listPendingQuery reads events no policy has looked at yet.
 //
@@ -759,7 +784,7 @@ func scanNotificationEvents(rows pgx.Rows, operation string) ([]NotificationEven
 		if err := rows.Scan(&event.ID, &event.WorkspaceID, &event.RecipientID,
 			&event.EventType, &event.Priority, &event.SourceType, &event.SourceID,
 			&event.Origin, &event.DedupeKey, &event.Attempts, &event.OccurredAt,
-			&event.Muted, &event.NotificationLevel, &presentation); err != nil {
+			&event.Muted, &event.NotificationLevel, &event.DoNotDisturb, &presentation); err != nil {
 			return nil, fmt.Errorf("%s: %w", operation, err)
 		}
 		if err := decodePresentation(presentation, &event.Presentation); err != nil {

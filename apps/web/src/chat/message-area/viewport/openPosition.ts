@@ -5,12 +5,14 @@
  * Priority: an explicit deep link (focusMessageId, owned by the jump effect) >
  * a saved history anchor > the first unread message > the bottom.
  *
- * A saved anchor or an unread boundary outside the currently loaded window
- * asks for another page instead of guessing — the existing loadMore/
- * beforeCursor pagination, reused rather than a new endpoint. That search is
- * capped at MAX_BOUNDARY_SEARCH_PAGES: exhausting it while more history
- * remains falls back to the bottom rather than rendering a wrong boundary
- * (#492 item 9 — a safe fallback, never an infinite search or a crash).
+ * A deep link, a saved anchor or an unread boundary outside the currently
+ * loaded window asks for another page instead of guessing (#1088 for the deep
+ * link) — the existing loadMore/beforeCursor pagination, reused rather than a
+ * new endpoint. That search is capped at MAX_BOUNDARY_SEARCH_PAGES: exhausting
+ * it while more history remains falls back to the bottom rather than rendering
+ * a wrong boundary (#492 item 9 — a safe fallback, never an infinite search or
+ * a crash). The cap is spent when the last page it allowed has come back, not
+ * when it was asked for, so that page can still hold the destination (#1088).
  *
  * Pure and total on purpose: every one of these endings is reachable from a
  * plain object, so none of them needs a rendered timeline to be exercised.
@@ -49,11 +51,31 @@ export interface OpenPositionInput {
   focusMessageId?: string;
   /** How many extra pages the bounded backward search has already asked for. */
   searchAttempts: number;
+  /** Whether the last page this search asked for has yet to come back. */
+  searchPending: boolean;
 }
 
-/** Whether the bounded backward search may ask for one more page. */
+/**
+ * Whether the bounded backward search can still bring the destination in: a
+ * page it asked for is on its way, or it may ask for one more.
+ */
 function canSearchFurther(input: OpenPositionInput): boolean {
-  return input.hasMore && input.searchAttempts < MAX_BOUNDARY_SEARCH_PAGES;
+  return input.hasMore && (input.searchPending || input.searchAttempts < MAX_BOUNDARY_SEARCH_PAGES);
+}
+
+/**
+ * A `?message=` deep link (#1088). It wins only once its message is in the
+ * loaded history — until then it keeps the search going, so no other
+ * destination can win on an intermediate page. Null when it cannot be reached
+ * (removed, inaccessible, never existed, or past the cap — deliberately
+ * indistinguishable), which hands the decision to the cases below.
+ */
+function fromMessageTarget(input: OpenPositionInput): OpenPosition | null {
+  const messageId = input.focusMessageId;
+  if (!messageId) return null;
+  if (input.messages.some((message) => message.id === messageId)) return { kind: "deep-link" };
+  if (canSearchFurther(input)) return { kind: "need-more-history" };
+  return null;
 }
 
 /**
@@ -101,8 +123,11 @@ function fromFirstUnread(input: OpenPositionInput): OpenPosition | null {
  * destinations; targetFor names which.
  */
 export function resolveOpenPosition(input: OpenPositionInput): OpenPosition {
-  if (input.focusMessageId) return { kind: "deep-link" };
-  return fromSavedAnchor(input) ?? fromFirstUnread(input) ?? { kind: "bottom" };
+  return (
+    fromMessageTarget(input) ??
+    fromSavedAnchor(input) ??
+    fromFirstUnread(input) ?? { kind: "bottom" }
+  );
 }
 
 // ── What this render of the conversation has to do about it ─────────────────
@@ -119,10 +144,10 @@ export type ScrollTarget = { messageId: string | null } | undefined;
  * plain object in a test.
  */
 export type OpenPositionResolution =
-  /** Nothing to do: already settled, nothing loaded, or a page already asked for. */
+  /** Nothing to do: already settled, nothing loaded, or a page still on its way. */
   | { kind: "wait" }
-  /** Ask for one more page, and record the length that asked for it. */
-  | { kind: "search"; searchedLength: number }
+  /** Ask for one more page, and record how many had come back when it did. */
+  | { kind: "search"; searchedAt: number }
   /** The position is decided; these are the values it decides. */
   | {
       kind: "settle";
@@ -134,17 +159,21 @@ export type OpenPositionResolution =
       phase: ViewportPhase;
     };
 
-export interface ResolutionInput extends OpenPositionInput {
+export interface ResolutionInput extends Omit<OpenPositionInput, "searchPending"> {
   /** Whether the opening position has already been settled. */
   resolved: boolean;
+  /** Older pages that have come back, with a page or an error (#1088). */
+  olderPagesSettled: number;
   /**
-   * The messages.length that last asked for a page. Comparing against it is
-   * what guarantees at most one request per distinct length, so an incidental
-   * extra render can never double-fetch — and it belongs to the decision, not
+   * olderPagesSettled as it was when this search last asked for a page; -1
+   * before it ever has. While the two are equal that page is still on its way,
+   * so an incidental extra render can never double-fetch — and every page that
+   * does come back is progress, even one of duplicates, an empty one, or one
+   * that left the cursor where it was (#1088). It belongs to the decision, not
    * to the hook, because "should I ask again" is the same question as "what
    * should happen now".
    */
-  searchedForLength: number;
+  searchedAt: number;
 }
 
 /** Which logical destination this answer is, in the shared vocabulary (#880). */
@@ -177,7 +206,8 @@ type SettledPosition = Exclude<OpenPosition, { kind: "need-more-history" }>;
 
 export function decideOpenPositionResolution(input: ResolutionInput): OpenPositionResolution {
   if (input.resolved || input.messages.length === 0) return { kind: "wait" };
-  const position = resolveOpenPosition(input);
+  const searchPending = input.searchedAt === input.olderPagesSettled;
+  const position = resolveOpenPosition({ ...input, searchPending });
   if (position.kind !== "need-more-history") {
     return {
       kind: "settle",
@@ -187,6 +217,6 @@ export function decideOpenPositionResolution(input: ResolutionInput): OpenPositi
       phase: phaseFor(position),
     };
   }
-  if (input.searchedForLength === input.messages.length) return { kind: "wait" };
-  return { kind: "search", searchedLength: input.messages.length };
+  if (searchPending) return { kind: "wait" };
+  return { kind: "search", searchedAt: input.olderPagesSettled };
 }

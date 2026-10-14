@@ -58,6 +58,7 @@ export type ConversationMessageActions = Omit<TimelineMessageActions, "onQuoteJu
 /** What is true of the whole conversation, rather than of any one message. */
 export interface TimelineRowContext {
   currentUserId: string;
+  workspaceId: string;
   /**
    * Whether a system message in this timeline says "canal", "grupo" or
    * "conversa" (issue #527). The kind comes from the conversation record, never
@@ -118,7 +119,7 @@ interface Props {
    * positioning targets this instead.
    */
   unreadDividerRef: RefObject<HTMLDivElement | null>;
-  setMessageRef: (messageId: string, el: HTMLDivElement | null) => void;
+  setMessageRef: (messageId: string, el: HTMLElement | null) => void;
 }
 
 export default function MessageTimelineItem({
@@ -200,6 +201,7 @@ function TimelineMessageRow({
         message={message}
         scope={context.systemScope}
         viewerId={context.currentUserId}
+        setMessageRef={setMessageRef}
       />
     );
   }
@@ -207,6 +209,7 @@ function TimelineMessageRow({
   return (
     <MessageBubble
       message={message}
+      workspaceId={context.workspaceId}
       isMine={!!context.currentUserId && message.senderId === context.currentUserId}
       isGrouped={row.isGrouped}
       onToggleReaction={actions.onToggleReaction}

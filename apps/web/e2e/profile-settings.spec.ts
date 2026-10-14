@@ -16,7 +16,7 @@ const CURRENT_USER_ID = "e2e-user";
 const CURRENT_USER_NAME = "E2E User";
 
 // A 1x1 transparent PNG, so an <img src> pointed at a mocked avatar URL
-// actually loads instead of erroring out and falling back to initials.
+// actually loads instead of erroring out and falling back to Blobatar.
 const ONE_PIXEL_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=",
   "base64",
@@ -462,7 +462,9 @@ test.describe("Profile & account settings (#672)", () => {
     ).toHaveAttribute("src", newSrc);
   });
 
-  test("removing the avatar falls back to initials", async ({ page }) => {
+  test("removing the avatar falls back to the same Blobatar in profile and sidebar", async ({
+    page,
+  }) => {
     await mockProfileApi(page, { avatar_url: "/media/avatars/e2e-user-existing.png" });
     await page.reload();
     await expect(page.locator("img.profile-identity__avatar-img")).toBeVisible();
@@ -475,11 +477,11 @@ test.describe("Profile & account settings (#672)", () => {
     await dialog.getByRole("button", { name: "Remover avatar" }).click();
     await expect(dialog).toBeHidden();
 
-    await expect(page.locator("img.profile-identity__avatar-img")).toHaveCount(0);
-    await expect(page.locator(".profile-identity__avatar")).toContainText("EU");
-    await expect(page.locator(".chat-sidebar__user-row img.chat-sidebar__avatar-img")).toHaveCount(
-      0,
-    );
+    const profileAvatar = page.locator("img.profile-identity__avatar-img");
+    const sidebarAvatar = page.locator(".chat-sidebar__user-row img.chat-sidebar__avatar-img");
+    await expect(profileAvatar).toHaveAttribute("src", /^data:image\/svg\+xml/);
+    const source = await profileAvatar.getAttribute("src");
+    await expect(sidebarAvatar).toHaveAttribute("src", source!);
   });
 
   test("navigates all four sections via tabs, and each is a real deep link surviving reload", async ({

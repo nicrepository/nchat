@@ -19,7 +19,7 @@ import (
 type dmProvider interface {
 	SearchDMCandidates(ctx context.Context, input service.SearchDMCandidatesInput) ([]domain.DMCandidate, error)
 	GetOrCreateDirectConversation(ctx context.Context, input service.CreateDirectConversationInput) (service.CreateDirectConversationOutput, error)
-	CreateGroupConversation(ctx context.Context, input service.CreateGroupConversationInput) (domain.DMConversation, error)
+	CreateGroupConversation(ctx context.Context, input service.CreateGroupConversationInput) (service.CreateGroupConversationOutput, error)
 	// AddGroupParticipants adds people to an existing group conversation (#398).
 	AddGroupParticipants(ctx context.Context, input service.AddGroupParticipantsInput) (storage.AddMembersResult, error)
 	// GetGroupDetails is the read-only projection the group panel renders.
@@ -32,6 +32,9 @@ type dmProvider interface {
 	// set of call-participant user IDs, scoped to this group conversation
 	// (issue #612).
 	GetGroupCallParticipantProfiles(ctx context.Context, input service.GroupCallParticipantProfilesInput) ([]domain.CallParticipantProfile, error)
+	// SetGroupAvatar and ClearGroupAvatar change a group's identity (#1026).
+	SetGroupAvatar(ctx context.Context, input service.GroupAvatarInput) error
+	ClearGroupAvatar(ctx context.Context, input service.GroupAvatarInput) error
 	// RenameGroup sets a group's title (issue #527). Group conversations only.
 	RenameGroup(ctx context.Context, input service.RenameGroupInput) (storage.RenameGroupResult, error)
 	// LeaveGroup removes the caller's own participation (issue #527).
@@ -59,6 +62,7 @@ const (
 
 type DMHandler struct {
 	workspaces workspaceResolver
+	ownership  ownershipProvider
 	dms        dmProvider
 	limiter    dmRateLimiter
 	broadcast  membersBroadcaster
@@ -120,6 +124,9 @@ type createDirectDMResponse struct {
 type createGroupDMRequest struct {
 	ParticipantUserIDs []string `json:"participant_user_ids"`
 	Title              string   `json:"title"`
+	// AvatarEmoji is the optional group identity (issue #1026). Absent or
+	// empty is Automático; DMService validates anything else.
+	AvatarEmoji string `json:"avatar_emoji"`
 }
 
 type createGroupDMResponse struct {
@@ -136,8 +143,8 @@ type createGroupDMResponse struct {
 // and every other profile attribute are deliberately absent — a details panel
 // is not a directory export.
 //
-// There is no role: chat.dm_members.role is closed by CHECK to 'member', so a
-// group has no role worth showing.
+// Conversation-local roles and actions are projected separately in ownership
+// when the rollout is enabled; this legacy preview remains compatible.
 type groupParticipantJSON struct {
 	UserID      string `json:"user_id"`
 	DisplayName string `json:"display_name"`
@@ -162,14 +169,15 @@ type groupParticipantJSON struct {
 // participant_count is every active participant; participants is the capped
 // preview and its length must never be shown as the count.
 type groupDetailsResponse struct {
-	ID                 string                 `json:"id"`
-	Type               string                 `json:"type"`
-	Name               string                 `json:"name"`
-	Description        string                 `json:"description,omitempty"`
-	CreatorDisplayName string                 `json:"creator_display_name,omitempty"`
-	CreatedAt          string                 `json:"created_at"`
-	ParticipantCount   int                    `json:"participant_count"`
-	Participants       []groupParticipantJSON `json:"participants"`
+	Ownership          *storage.OwnershipDetails `json:"ownership,omitempty"`
+	ID                 string                    `json:"id"`
+	Type               string                    `json:"type"`
+	Name               string                    `json:"name"`
+	Description        string                    `json:"description,omitempty"`
+	CreatorDisplayName string                    `json:"creator_display_name,omitempty"`
+	CreatedAt          string                    `json:"created_at"`
+	ParticipantCount   int                       `json:"participant_count"`
+	Participants       []groupParticipantJSON    `json:"participants"`
 	// CanManageMembers (issue #398) is always sent, so a client that predates it
 	// reads absent-as-false and hides the add action — the safe direction. It is
 	// a rendering hint: POST .../members re-derives the decision in its own
@@ -218,7 +226,13 @@ func (h *DMHandler) GroupDetails(w http.ResponseWriter, r *http.Request) {
 		writeGroupDetailsError(w, err)
 		return
 	}
-	httputil.WriteJSON(w, http.StatusOK, h.groupDetailsBody(workspaceID, details))
+	body := h.groupDetailsBody(workspaceID, details)
+	body.Ownership, err = ownershipProjection(r.Context(), h.ownership, storage.OwnershipScope{WorkspaceID: workspaceID, Kind: "dm", ConversationID: conversationID, ActorID: callerID})
+	if err != nil {
+		writeOwnershipError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, body)
 }
 
 func (h *DMHandler) groupDetailsBody(workspaceID string, details service.GroupDetails) groupDetailsResponse {
@@ -353,6 +367,16 @@ type directProfileJSON struct {
 	// Presence is omitted when the server does not track it, so a client can
 	// tell "not tracked" from "tracked and offline".
 	Presence string `json:"presence,omitempty"`
+	// LastSeenAt is when the server last published this person as offline
+	// (issue #798), present only while they are offline. It is the server's
+	// instant, never a client's, and carries nothing about their activity.
+	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+}
+
+// lastSeenLookup is the optional half of a presence source that can say when
+// an offline person was last seen.
+type lastSeenLookup interface {
+	LastSeen(ctx context.Context, workspaceID, userID string) (time.Time, bool)
 }
 
 // directProfileResponse is the panel payload for a 1:1 conversation.
@@ -404,6 +428,7 @@ func (h *DMHandler) DirectProfile(w http.ResponseWriter, r *http.Request) {
 		writeDirectProfileError(w, r, conversationID, err)
 		return
 	}
+	presence := h.presenceOf(workspaceID, result.Profile.UserID)
 	httputil.WriteJSON(w, http.StatusOK, directProfileResponse{
 		Kind:           "direct",
 		ConversationID: result.Conversation.ID,
@@ -412,9 +437,25 @@ func (h *DMHandler) DirectProfile(w http.ResponseWriter, r *http.Request) {
 			DisplayName: result.Profile.DisplayName,
 			AvatarURL:   result.Profile.AvatarURL,
 			Email:       result.Profile.Email,
-			Presence:    h.presenceOf(workspaceID, result.Profile.UserID),
+			Presence:    presence,
+			LastSeenAt:  h.lastSeenOf(r.Context(), workspaceID, result.Profile.UserID, presence),
 		},
 	})
+}
+
+// lastSeenOf is the last-seen instant of an offline profile, when the presence
+// source can tell. Never for someone present: "last seen" about a person who is
+// here would only disclose when they last left.
+func (h *DMHandler) lastSeenOf(ctx context.Context, workspaceID, userID, presence string) *time.Time {
+	lookup, ok := h.presence.(lastSeenLookup)
+	if !ok || presence != presenceOffline {
+		return nil
+	}
+	at, found := lookup.LastSeen(ctx, workspaceID, userID)
+	if !found {
+		return nil
+	}
+	return &at
 }
 
 // presenceOf reports the live presence of one user, or "" when presence is not
@@ -594,17 +635,40 @@ func (h *DMHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	conversation, err := h.dms.CreateGroupConversation(r.Context(), service.CreateGroupConversationInput{
+	result, err := h.dms.CreateGroupConversation(r.Context(), service.CreateGroupConversationInput{
 		WorkspaceID:        workspaceID,
 		CallerID:           callerID,
 		ParticipantUserIDs: request.ParticipantUserIDs,
 		Title:              request.Title,
+		AvatarEmoji:        request.AvatarEmoji,
 	})
 	if err != nil {
 		writeDMConversationError(w, err)
 		return
 	}
-	httputil.WriteJSON(w, http.StatusCreated, createGroupDMResponse{ConversationID: conversation.ID})
+	h.announceCreatedGroup(r.Context(), workspaceID, result)
+	httputil.WriteJSON(w, http.StatusCreated, createGroupDMResponse{ConversationID: result.Conversation.ID})
+}
+
+// announceCreatedGroup tells the people a new group was created for that it now
+// exists (issue #1103) — the group counterpart of announceNewDirectConversation
+// and announceCreatedChannel, through the same signal and for the same reason:
+// nobody is subscribed to a conversation that did not exist, so no room event,
+// message.created included, can reach them.
+//
+// Called only after CreateGroupConversation returned successfully, which means
+// the store committed; a refused or rolled-back create announces nothing. The
+// recipients are the service's eligibility-resolved participants minus the
+// creator, who already holds the group they just opened — never the body's
+// list. A publish failure is not reported: the group is persisted, and the hub
+// treats the bus copy as best-effort exactly as for the other two.
+func (h *DMHandler) announceCreatedGroup(
+	ctx context.Context, workspaceID string, result service.CreateGroupConversationOutput,
+) {
+	if h.broadcast == nil || len(result.InvitedUserIDs) == 0 {
+		return
+	}
+	h.broadcast.PublishConversationAvailable(ctx, workspaceID, "dm", result.Conversation.ID, result.InvitedUserIDs)
 }
 
 // AddParticipants handles POST /api/chat/dm/{conversationID}/members.
@@ -895,6 +959,72 @@ func (h *DMHandler) RenameGroup(w http.ResponseWriter, r *http.Request) {
 		ID:    result.Conversation.ID,
 		Title: result.Conversation.Title,
 	})
+}
+
+// setGroupAvatarRequest is the whole accepted body: the emoji and nothing else.
+// The strict decoder refuses a workspace, an actor or any other field.
+type setGroupAvatarRequest struct {
+	Emoji string `json:"emoji"`
+}
+
+type setGroupAvatarResponse struct {
+	ID          string `json:"id"`
+	AvatarEmoji string `json:"avatar_emoji"`
+}
+
+// SetGroupAvatar handles PUT /api/chat/dm/{conversationID}/avatar (#1026).
+//
+// Same transport, budget and refusals as RenameGroup; the catalog check is the
+// service's and the authority the store's. Every participant's sidebar is told
+// to refetch, which is how the new identity reaches them.
+func (h *DMHandler) SetGroupAvatar(w http.ResponseWriter, r *http.Request) {
+	conversationID, callerID, workspaceID, ok := h.beginGroupAdmin(w, r, true)
+	if !ok {
+		return
+	}
+	var request setGroupAvatarRequest
+	if !decodeStrictJSON(w, r, &request) {
+		return
+	}
+	err := h.dms.SetGroupAvatar(r.Context(), service.GroupAvatarInput{
+		WorkspaceID:    workspaceID,
+		CallerID:       callerID,
+		ConversationID: conversationID,
+		AvatarEmoji:    request.Emoji,
+	})
+	if err != nil {
+		writeGroupAdminError(w, err)
+		return
+	}
+	h.publishGroupIdentity(r.Context(), workspaceID, conversationID)
+	httputil.WriteJSON(w, http.StatusOK, setGroupAvatarResponse{ID: conversationID, AvatarEmoji: request.Emoji})
+}
+
+// ClearGroupAvatar handles DELETE /api/chat/dm/{conversationID}/avatar: the
+// explicit return to Automático. Idempotent — clearing a group that has no
+// emoji is the same 204.
+func (h *DMHandler) ClearGroupAvatar(w http.ResponseWriter, r *http.Request) {
+	conversationID, callerID, workspaceID, ok := h.beginGroupAdmin(w, r, false)
+	if !ok {
+		return
+	}
+	err := h.dms.ClearGroupAvatar(r.Context(), service.GroupAvatarInput{
+		WorkspaceID:    workspaceID,
+		CallerID:       callerID,
+		ConversationID: conversationID,
+	})
+	if err != nil {
+		writeGroupAdminError(w, err)
+		return
+	}
+	h.publishGroupIdentity(r.Context(), workspaceID, conversationID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *DMHandler) publishGroupIdentity(ctx context.Context, workspaceID, conversationID string) {
+	if h.broadcast != nil {
+		h.broadcast.PublishConversationUpdated(ctx, workspaceID, "dm", conversationID)
+	}
 }
 
 // LeaveGroup handles DELETE /api/chat/dm/{conversationID}/membership (#527).

@@ -320,13 +320,17 @@ export default function EmojiPicker({ usage, onToneChange, onSelect }: EmojiPick
     });
   }, []);
 
+  // Choosing returns focus to the emoji exactly like dismissing does: the
+  // palette unmounts with focus inside it, which would otherwise drop to
+  // <body>. A host that moves focus on select still does so afterwards.
   const pickTone = useCallback(
     (emoji: string, tone: number) => {
+      tonePick?.cell.focus();
       setTonePick(null);
       onToneChange(tone);
       onSelect(emoji);
     },
-    [onSelect, onToneChange],
+    [tonePick, onSelect, onToneChange],
   );
 
   const changeTab = useCallback((next: EmojiTab) => {

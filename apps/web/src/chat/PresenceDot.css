@@ -43,10 +43,52 @@
   background: var(--presence-online);
 }
 
+.presence-dot--busy {
+  background: var(--presence-busy);
+}
+
+/* Do Not Disturb: the Busy colour with a bar across it, so the two differ in
+   shape and not only in meaning. */
+.presence-dot--dnd {
+  background: var(--presence-busy);
+}
+
+.presence-dot--dnd::after {
+  content: "";
+  position: absolute;
+  left: 20%;
+  right: 20%;
+  top: 50%;
+  height: 2px;
+  margin-top: -1px;
+  border-radius: 1px;
+  background: var(--color-surface, #fff);
+}
+
 .presence-dot--away {
   background: var(--presence-away);
 }
 
+/* Volto já: the Away colour with a hollow centre — an intentional, short
+   absence, told apart from idleness by shape. */
+.presence-dot--brb {
+  background: var(--color-surface, #fff);
+  box-shadow: inset 0 0 0 3px var(--presence-away);
+}
+
+/* Offline is an outline: nothing is lit. */
 .presence-dot--offline {
-  background: var(--presence-offline);
+  background: var(--color-surface, #fff);
+  box-shadow: inset 0 0 0 2px var(--presence-offline);
+}
+
+/* In a line of text, beside the word it repeats. Still positioned, so the
+   Do Not Disturb bar has a box to sit in. */
+.presence-dot--inline {
+  position: relative;
+  right: auto;
+  bottom: auto;
+  display: inline-block;
+  border-color: transparent;
+  vertical-align: middle;
 }

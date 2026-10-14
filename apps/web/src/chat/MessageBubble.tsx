@@ -14,26 +14,14 @@ import MessageContent from "./MessageContent";
 import MessageEditHistory from "./MessageEditHistory";
 import MessageToolbar from "./MessageToolbar";
 import { formatTime, senderLabel } from "./messageDisplay";
-import { PersonAvatarImage } from "./PersonAvatarImage";
 import { presenceLabel, usePresence, type PresenceState } from "./presence";
-import PresenceDot from "./PresenceDot";
+import { UserAvatar } from "./UserAvatar";
 import type { MentionInteraction } from "./RichTextRenderer";
 import { useMessageEditing } from "./useMessageEditing";
 
-function senderInitials(msg: Message): string {
-  const label = msg.senderDisplayName || msg.senderEmail;
-  if (label) {
-    return label
-      .split(" ")
-      .slice(0, 2)
-      .map((w) => w[0]?.toUpperCase() ?? "")
-      .join("");
-  }
-  return msg.senderId.slice(0, 2).toUpperCase();
-}
-
 export interface MessageBubbleProps {
   message: Message;
+  workspaceId?: string;
   /** True when this message is from the viewing user (we don't know real user ID here). */
   isMine?: boolean;
   /** True when consecutive messages from the same sender within the same minute. */
@@ -77,7 +65,7 @@ export interface MessageBubbleProps {
   onQuoteJump?: (messageId: string) => void;
   onReferenceJump?: (reference: NonNullable<Message["reference"]>) => void;
   isHighlighted?: boolean;
-  setMessageRef?: (messageId: string, el: HTMLDivElement | null) => void;
+  setMessageRef?: (messageId: string, el: HTMLElement | null) => void;
   /**
    * RF-21 "Verificar novamente" (issue #135). Asks the server to re-read what it
    * already knows about this message's unverified links; it never starts a new
@@ -188,15 +176,26 @@ function MessageMeta({
  * and the state are already in the meta row, where a screen reader reads them
  * once per group instead of once per message.
  */
-function MessageAvatar({ message, presence }: { message: Message; presence: PresenceState }) {
+function MessageAvatar({
+  message,
+  presence,
+  workspaceId,
+}: {
+  message: Message;
+  presence: PresenceState;
+  workspaceId: string;
+}) {
   return (
     <div className="chat-msg-area__msg-avatar" aria-hidden="true">
-      <PersonAvatarImage
-        src={message.senderAvatarUrl}
-        initials={senderInitials(message)}
-        imgClassName="chat-msg-area__msg-avatar-img"
+      <UserAvatar
+        userId={message.senderId}
+        workspaceId={workspaceId}
+        displayName={message.senderDisplayName || message.senderEmail || ""}
+        avatarUrl={message.senderAvatarUrl}
+        presence={presence}
+        size="sm"
+        imageClassName="chat-msg-area__msg-avatar-img"
       />
-      <PresenceDot state={presence} size="sm" />
     </div>
   );
 }
@@ -317,6 +316,7 @@ function MessageBubbleBody({
         {props.onAcknowledge ? (
           <MessageAcknowledgementStrip
             messageId={message.id}
+            workspaceId={props.workspaceId}
             acknowledgement={props.acknowledgement}
             senderId={message.senderId}
             currentUserId={props.currentUserId}
@@ -376,7 +376,13 @@ export default function MessageBubble(props: MessageBubbleProps) {
       tabIndex={0}
       {...reveal}
     >
-      {!isMine && <MessageAvatar message={message} presence={senderPresence} />}
+      {!isMine && (
+        <MessageAvatar
+          message={message}
+          presence={senderPresence}
+          workspaceId={props.workspaceId ?? ""}
+        />
+      )}
       <MessageBubbleBody props={props} senderPresence={senderPresence} />
     </div>
   );

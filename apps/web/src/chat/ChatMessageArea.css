@@ -134,9 +134,16 @@
   color: var(--color-success-ink, #166534);
 }
 
-.chat-msg-area__header-presence--away {
+.chat-msg-area__header-presence--busy,
+.chat-msg-area__header-presence--dnd {
   background: var(--color-danger-tint, #fee2e2);
   color: var(--color-danger-ink, #991b1b);
+}
+
+.chat-msg-area__header-presence--away,
+.chat-msg-area__header-presence--brb {
+  background: var(--presence-away-tint);
+  color: var(--presence-away-ink);
 }
 
 /* Pushes the header actions to the trailing edge without a wrapper element. */

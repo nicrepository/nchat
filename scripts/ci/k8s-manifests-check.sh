@@ -1184,20 +1184,14 @@ if [[ -z "${K8S_OVERLAY:-}" ]]; then
   # excluded on purpose: it is the template the overlays patch, and it carries
   # the application default so a new environment starts from "off" and has to
   # say otherwise.
+  # nchat-dev-server had RF-21 paused for the MVP and asserted "false" here;
+  # it is back on with rich previews (#807), which depend on its clearances.
   for overlay in \
     infra/k8s/overlays/k3s-dev \
-    infra/k8s/overlays/k3s-staging; do
+    infra/k8s/overlays/k3s-staging \
+    infra/k8s/overlays/nchat-dev-server; do
     validate_link_safety "$overlay" "${rendered_by_overlay[$overlay]}" true
   done
-  # nchat-dev-server: RF-21 is temporarily off for the MVP because the
-  # Cloudflare URL Scanner's behaviour makes it operationally unfit to gate
-  # messages there. Asserted as "false" rather than left unasserted, so the
-  # decision keeps a home in CI and going back to "true" stays a one-line,
-  # reviewed change here instead of a quiet drift in an overlay.
-  validate_link_safety \
-    infra/k8s/overlays/nchat-dev-server \
-    "${rendered_by_overlay[infra/k8s/overlays/nchat-dev-server]}" \
-    false
 fi
 
 echo "K8s manifests CI check passed."

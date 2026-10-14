@@ -157,11 +157,13 @@ func TestAdminCreateUser_InternalError_Returns500(t *testing.T) {
 // ── AdminUpdateUserStatus tests ────────────────────────────────────────────
 
 type fakeUserStatusManager struct {
-	user domain.User
-	err  error
+	user        domain.User
+	err         error
+	statusCalls [][3]string
 }
 
-func (f *fakeUserStatusManager) UpdateUserStatus(_ context.Context, _, _, _ string) (domain.User, error) {
+func (f *fakeUserStatusManager) UpdateUserStatus(_ context.Context, caller, id, status string) (domain.User, error) {
+	f.statusCalls = append(f.statusCalls, [3]string{caller, id, status})
 	return f.user, f.err
 }
 
@@ -260,4 +262,22 @@ func TestAdminUpdateUserStatus_Forbidden_Returns403(t *testing.T) {
 		t.Fatalf("expected 403, got %d", rec.Code)
 	}
 	assertErrorCode(t, rec.Body.Bytes(), "forbidden")
+}
+
+// The bootstrap endpoint tolerates unknown JSON fields, but its service contract
+// carries only caller, target and status. Ownership authority stays in storage.
+func TestAdminUpdateUserStatus_ExternalOwnershipFieldsHaveNoAuthority(t *testing.T) {
+	for _, field := range []string{"successor_user_id", "force_role", "owner_count", "conversation_role", "current_owner"} {
+		t.Run(field, func(t *testing.T) {
+			svc := &fakeUserStatusManager{user: domain.User{ID: "user-1", Status: "suspended"}}
+			body := `{"status":"suspended","` + field + `":"attacker"}`
+			rec := patchAdminUserStatus(t, httpapi.AdminUpdateUserStatus(svc), "user-1", body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status: %d (%s)", rec.Code, rec.Body.String())
+			}
+			if len(svc.statusCalls) != 1 || svc.statusCalls[0] != ([3]string{"", "user-1", "suspended"}) {
+				t.Fatalf("unexpected service authority: %v", svc.statusCalls)
+			}
+		})
+	}
 }

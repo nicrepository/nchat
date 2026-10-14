@@ -441,3 +441,29 @@ describe("ExpandableDetailsSection — semântica ARIA", () => {
     expect(collapseToggle()).toHaveAccessibleName("Mostrar menos Coleção (12)");
   });
 });
+
+describe("ExpandableDetailsSection — rodapé do estado expandido (issue #897)", () => {
+  it("draws the footer only while expanded, and keeps children in both states", async () => {
+    renderSection(ready({ items: rows(7) }), {
+      expandedFooter: <p>Rodapé expandido</p>,
+      children: <p>Sempre visível</p>,
+    });
+
+    expect(screen.queryByText("Rodapé expandido")).not.toBeInTheDocument();
+    expect(screen.getByText("Sempre visível")).toBeInTheDocument();
+
+    await userEvent.click(expandToggle());
+    expect(screen.getByText("Rodapé expandido")).toBeInTheDocument();
+    expect(screen.getByText("Sempre visível")).toBeInTheDocument();
+
+    await userEvent.click(collapseToggle());
+    expect(screen.queryByText("Rodapé expandido")).not.toBeInTheDocument();
+  });
+
+  it("never opens itself: a footer alone does not make a section expandable", () => {
+    renderSection(ready({ items: rows(3) }), { expandedFooter: <button>Carregar mais</button> });
+
+    expect(screen.queryByRole("button", { name: /Ver todos/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Carregar mais" })).not.toBeInTheDocument();
+  });
+});

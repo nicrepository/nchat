@@ -25,8 +25,8 @@ import "./MessageAcknowledgementDetails.css";
 import type { CallParticipantProfile } from "./chatApi";
 import type { MessageAcknowledgementRecipient } from "./chatTypes";
 import { useAnchoredPicker } from "./emoji/useAnchoredPicker";
-import { formatTime, initialsFrom } from "./messageDisplay";
-import { PersonAvatarImage } from "./PersonAvatarImage";
+import { formatTime } from "./messageDisplay";
+import { UserAvatar } from "./UserAvatar";
 
 const titleId = "ack-details-title";
 
@@ -80,20 +80,24 @@ function RecipientRow({
   recipient,
   profile,
   showTimestamp,
+  workspaceId,
 }: {
   recipient: MessageAcknowledgementRecipient;
   profile: CallParticipantProfile | undefined;
   showTimestamp: boolean;
+  workspaceId: string;
 }) {
   const name = profile?.displayName || "";
   const time = showTimestamp ? formatResolvedAt(recipient.resolvedAt) : null;
   return (
     <li className="chat-msg-ack-details__recipient" data-testid="ack-details-recipient">
       <span className="chat-msg-ack-details__avatar" aria-hidden="true">
-        <PersonAvatarImage
-          src={profile?.avatarUrl}
-          initials={initialsFrom(name)}
-          imgClassName="chat-msg-ack-details__avatar-img"
+        <UserAvatar
+          userId={profile?.userId ?? recipient.recipientId}
+          workspaceId={workspaceId}
+          displayName={name}
+          avatarUrl={profile?.avatarUrl}
+          imageClassName="chat-msg-ack-details__avatar-img"
         />
       </span>
       <span className="chat-msg-ack-details__name">{name || "Membro"}</span>
@@ -106,10 +110,12 @@ function RecipientSection({
   section,
   recipients,
   profiles,
+  workspaceId,
 }: {
   section: Section;
   recipients: MessageAcknowledgementRecipient[];
   profiles: Map<string, CallParticipantProfile>;
+  workspaceId: string;
 }) {
   if (recipients.length === 0) return null;
   return (
@@ -122,6 +128,7 @@ function RecipientSection({
             recipient={recipient}
             profile={profiles.get(recipient.recipientId)}
             showTimestamp={section === "acknowledged"}
+            workspaceId={workspaceId}
           />
         ))}
       </ul>
@@ -132,6 +139,7 @@ function RecipientSection({
 export interface MessageAcknowledgementDetailsProps {
   total: number;
   acknowledged: number;
+  workspaceId?: string;
   /** Undefined while the sender's detail read has not landed yet. */
   recipients?: MessageAcknowledgementRecipient[];
   anchorRef: RefObject<HTMLElement | null>;
@@ -143,6 +151,7 @@ export interface MessageAcknowledgementDetailsProps {
 export default function MessageAcknowledgementDetails({
   total,
   acknowledged,
+  workspaceId = "",
   recipients,
   anchorRef,
   containerRef,
@@ -232,9 +241,20 @@ export default function MessageAcknowledgementDetails({
             section="acknowledged"
             recipients={groups.acknowledged}
             profiles={profiles}
+            workspaceId={workspaceId}
           />
-          <RecipientSection section="responded" recipients={groups.responded} profiles={profiles} />
-          <RecipientSection section="pending" recipients={groups.pending} profiles={profiles} />
+          <RecipientSection
+            section="responded"
+            recipients={groups.responded}
+            profiles={profiles}
+            workspaceId={workspaceId}
+          />
+          <RecipientSection
+            section="pending"
+            recipients={groups.pending}
+            profiles={profiles}
+            workspaceId={workspaceId}
+          />
         </>
       )}
     </div>

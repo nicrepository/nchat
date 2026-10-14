@@ -1,3 +1,6 @@
+import OwnershipDialogs from "./OwnershipDialogs";
+import OwnershipRoster from "./OwnershipRoster";
+import { renameChannel, renameGroup } from "./chatApi";
 /**
  * ConversationDetailsPanel — the side panel for a channel ("Detalhes do canal",
  * issue #435), an ad-hoc group ("Detalhes do grupo", issue #441) and a 1:1 DM
@@ -31,7 +34,9 @@
  *   AttachmentThumbnail and AttachmentVideo fetch their bytes through the
  *   authenticated client and show them from an object URL scoped to this
  *   document, so there is still no address anyone could share or reuse, and
- *   neither is drawn for a file the scan has not cleared.
+ *   neither is drawn for a file the scan has not cleared. A clean file's row
+ *   action (issue #897) is the product's existing Baixar or document viewer,
+ *   over the same authenticated client; see RecentFileRow.
  *
  * The panel is a layout sibling of the conversation, never a modal and never a
  * route: it renders beside the messages so opening it cannot unmount the
@@ -40,6 +45,7 @@
 
 import {
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -49,25 +55,23 @@ import {
 import "./ConversationDetailsPanel.css";
 import AddMembersDialog from "./AddMembersDialog";
 import { fetchChannelMembers } from "./chatApi";
-import AttachmentThumbnail from "./AttachmentThumbnail";
-import AttachmentVideo from "./AttachmentVideo";
+import AttachmentViewerHost from "./AttachmentViewerHost";
 import ConversationNameField from "./ConversationNameField";
+import CopyableEmailRow from "./CopyableEmailRow";
 import ExpandableDetailsSection, {
   SectionMessage,
   type ExpandableSectionContent,
 } from "./ExpandableDetailsSection";
 import type { ConversationRenameAction } from "./conversationRename";
-import RichTextRenderer from "./RichTextRenderer";
 import type {
   AddMembersResult,
-  ChannelAttachment,
   ChannelDetails,
   ChannelRoster,
   DirectDetails,
   GroupDetails,
-  PinnedItem,
 } from "./chatTypes";
 import ParticipantRow, { type ParticipantRemoval } from "./ParticipantRow";
+import PinnedMessagesSection, { type PinnedMessages } from "./PinnedMessagesSection";
 import RemoveMemberDialog from "./RemoveMemberDialog";
 import { useMemberRemoval, type MemberRemovalFlow } from "./useMemberRemoval";
 import {
@@ -77,52 +81,26 @@ import {
   type RosterParticipant,
 } from "./participantRosterOrder";
 import type { DirectMessageAccess } from "./directMessage";
-import {
-  avatarColorFor,
-  formatDayLabel,
-  formatLongDate,
-  formatTime,
-  initialsFrom,
-  senderLabel,
-} from "./messageDisplay";
+import { avatarColorFor, formatLongDate } from "./messageDisplay";
+import RecentFileRow from "./RecentFileRow";
+import { presenceTargetKey, usePresenceDetail, usePresenceTarget } from "./presence";
 import PresenceDot from "./PresenceDot";
-import { presenceLabel, presenceTargetKey, usePresence, usePresenceTarget } from "./presence";
-import type { ConversationDetailsState } from "./useConversationDetails";
+import { describePresence } from "./presenceDescription";
+import { presenceNeedsClock, usePresenceClock } from "./usePresenceClock";
+import { UserAvatar } from "./UserAvatar";
+import type {
+  ConversationDetailsState,
+  FilesSection,
+  NextFilesPage,
+} from "./useConversationDetails";
 import {
   conversationDetailsPanelId,
   conversationDetailsTitleId,
-  formatFileSize,
   formatLocalTime,
   isValidTimeZone,
   localTimeRefreshMs,
   notInformedLabel,
 } from "./conversationDetailsDisplay";
-
-/** Material symbol name for a file, chosen from the *detected* type only. */
-function fileIconFor(contentType: string): string {
-  if (contentType.startsWith("image/")) return "image";
-  if (contentType.startsWith("video/")) return "movie";
-  if (contentType.startsWith("audio/")) return "graphic_eq";
-  if (contentType === "application/pdf") return "picture_as_pdf";
-  if (contentType.startsWith("text/")) return "description";
-  return "draft";
-}
-
-/**
- * The one place the three scan states get their words (RF-22).
- *
- * All three are drawn, including `clean`. The badge used to be suppressed for
- * an approved file on the theory that "no news is good news", which left the
- * only visible states meaning "wait" and "blocked" — so a user reading the list
- * could not tell an approved file from one whose badge they had simply missed,
- * and the approval this whole feature exists to establish was the one outcome
- * never shown.
- */
-const attachmentStatusLabel: Record<ChannelAttachment["status"], string> = {
-  pending_scan: "Em análise",
-  clean: "Verificado",
-  rejected: "Reprovado",
-};
 
 /**
  * Presence has exactly one authority in this client, and it is the realtime
@@ -391,6 +369,7 @@ function previewShortfall(
 function rosterItems(
   participants: readonly RosterParticipant[],
   context: RosterContext,
+  workspaceId: string,
   removal?: ParticipantRemoval,
 ): ReactNode[] {
   const access = context.openDM;
@@ -410,6 +389,7 @@ function rosterItems(
         participant={participant}
         presence={presenceOf(participant.userId)}
         isCurrentUser={isCurrentUser}
+        workspaceId={workspaceId}
         // The viewer's own row activates nothing: there is no conversation to
         // open with yourself, and the flow refuses it anyway.
         onOpenDM={isCurrentUser ? undefined : openDM}
@@ -475,6 +455,7 @@ function rosterItems(
 function channelRosterContent(
   roster: ChannelRoster,
   context: RosterContext,
+  workspaceId: string,
   removal?: ParticipantRemoval,
 ): ExpandableSectionContent {
   return {
@@ -489,6 +470,7 @@ function channelRosterContent(
         subtitle: member.role === "moderator" ? "Moderador" : "Membro",
       })),
       context,
+      workspaceId,
       removal,
     ),
     empty: <SectionMessage>Nenhum membro para administrar neste canal.</SectionMessage>,
@@ -515,6 +497,7 @@ function channelRosterContent(
 function groupParticipantsContent(
   details: GroupDetails,
   context: RosterContext,
+  workspaceId: string,
   removal?: ParticipantRemoval,
 ): ExpandableSectionContent {
   return {
@@ -528,6 +511,7 @@ function groupParticipantsContent(
         subtitle: "Participante",
       })),
       context,
+      workspaceId,
       removal,
     ),
     empty: <SectionMessage>Nenhum participante para exibir.</SectionMessage>,
@@ -558,30 +542,32 @@ function ProfileMetaRow({ label, value }: { label: string; value: string }) {
 }
 
 /**
- * The "Horário local" row.
+ * The "Fuso horário" and "Horário local" rows, for a zone already validated.
  *
- * The clock is read from the browser but interpreted in the *profile's* zone,
- * never the viewer's: the instant is universal, the wall-clock reading is not.
- * A missing or unusable zone leaves the row absent rather than quietly
- * substituting the reader's own time, which would be a statement about the
- * wrong person.
+ * Unlike the other rows these are not "Não informado" when absent (issue #898):
+ * the caller mounts them only for a usable zone, so a missing or invalid one
+ * leaves no row and starts no timer. Nothing substitutes the reader's own zone,
+ * which would be a statement about the wrong person.
  *
- * The timer is what makes this a clock instead of a snapshot of when the panel
- * happened to open, and it is cleared on unmount and whenever the zone changes,
- * so switching conversations cannot leave one running.
+ * The clock is read from the browser but interpreted in the *profile's* zone:
+ * the instant is universal, the wall-clock reading is not. The timer is what
+ * makes this a clock instead of a snapshot of when the panel opened, and it is
+ * cleared on unmount and whenever the zone changes, so switching conversations
+ * cannot leave one running.
  */
-function ProfileLocalTimeRow({ timezone }: { timezone?: string }) {
+function ProfileTimeZoneRows({ timezone }: { timezone: string }) {
   const [now, setNow] = useState(() => new Date());
-  const valid = isValidTimeZone(timezone);
 
   useEffect(() => {
-    if (!valid) return;
     const timer = setInterval(() => setNow(new Date()), localTimeRefreshMs);
     return () => clearInterval(timer);
-  }, [valid, timezone]);
+  }, [timezone]);
 
   return (
-    <ProfileMetaRow label="Horário local" value={valid ? formatLocalTime(now, timezone) : ""} />
+    <>
+      <ProfileMetaRow label="Fuso horário" value={timezone} />
+      <ProfileMetaRow label="Horário local" value={formatLocalTime(now, timezone)} />
+    </>
   );
 }
 
@@ -594,10 +580,21 @@ function ProfileLocalTimeRow({ timezone }: { timezone?: string }) {
  * presence badge disappears when the server tracks nothing rather than claiming
  * "offline", and each metadata row says "Não informado".
  */
-function DirectProfileSection({ details }: { details: DirectDetails }) {
+function DirectProfileSection({
+  details,
+  workspaceId,
+}: {
+  details: DirectDetails;
+  workspaceId: string;
+}) {
   const profile = details.profile;
   const color = avatarColorFor(profile.userId);
-  const presence = usePresence(profile.userId, presenceTargetKey("dm", details.conversationId));
+  const presenceDetail = usePresenceDetail(
+    profile.userId,
+    presenceTargetKey("dm", details.conversationId),
+  );
+  const presence = presenceDetail.state;
+  const now = usePresenceClock(presenceNeedsClock(presence));
   return (
     <div className="chat-details__profile">
       <span
@@ -605,17 +602,15 @@ function DirectProfileSection({ details }: { details: DirectDetails }) {
         aria-hidden="true"
         data-testid="chat-details-profile-avatar"
       >
-        {profile.avatarUrl ? (
-          <img
-            className="chat-details__avatar-img"
-            src={profile.avatarUrl}
-            alt=""
-            referrerPolicy="no-referrer"
-          />
-        ) : (
-          initialsFrom(profile.displayName)
-        )}
-        <PresenceDot state={presence} size="lg" />
+        <UserAvatar
+          userId={profile.userId}
+          workspaceId={workspaceId}
+          displayName={profile.displayName}
+          avatarUrl={profile.avatarUrl}
+          presence={presence}
+          size="lg"
+          imageClassName="chat-details__avatar-img"
+        />
       </span>
 
       <p className="chat-details__profile-name" data-testid="chat-details-profile-name">
@@ -632,11 +627,11 @@ function DirectProfileSection({ details }: { details: DirectDetails }) {
           className={`chat-details__profile-status chat-details__profile-status--${presence}`}
           data-testid="chat-details-profile-status"
         >
-          <span
-            className={`chat-details__status-dot chat-details__status-dot--${presence}`}
-            aria-hidden="true"
-          />
-          {presenceLabel(presence)}
+          <PresenceDot state={presence} inline />
+          {/* The context the server gave: the call behind "Ocupado", or when an
+              offline person was last seen — from the realtime store, or from the
+              profile itself when this tab never saw them leave. */}
+          {describePresence(presenceDetail, now, profile.lastSeenAt)}
         </p>
       )}
 
@@ -644,15 +639,15 @@ function DirectProfileSection({ details }: { details: DirectDetails }) {
       <div className="chat-details__profile-meta" data-testid="chat-details-profile-meta">
         <ProfileMetaRow label="Cargo" value={profile.jobTitle ?? ""} />
         <ProfileMetaRow label="Departamento" value={profile.department ?? ""} />
-        <ProfileMetaRow
-          label="Fuso horário"
-          value={isValidTimeZone(profile.timezone) ? profile.timezone : ""}
-        />
-        <ProfileLocalTimeRow timezone={profile.timezone} />
-        {/* Text, never a mailto: link. Nothing in this issue asks for a compose
-            action, and turning an address into a target is a decision of its
-            own. */}
-        <ProfileMetaRow label="E-mail" value={profile.email ?? ""} />
+        {isValidTimeZone(profile.timezone) && <ProfileTimeZoneRows timezone={profile.timezone} />}
+        {/* Activating the address copies it — never a mailto: link (#898).
+            Keyed by person so copy feedback cannot outlive a DM switch, and no
+            button exists for an address there is nothing to copy from. */}
+        {profile.email ? (
+          <CopyableEmailRow key={`${profile.userId}:${profile.email}`} email={profile.email} />
+        ) : (
+          <ProfileMetaRow label="E-mail" value="" />
+        )}
       </div>
 
       <UnavailableAction
@@ -734,48 +729,6 @@ const conversationCopy = {
 } as const;
 
 /**
- * One row of the recent-files list.
- *
- * Extracted so the files section hands the shared primitive a list of rows and
- * nothing else: the scan badge, the thumbnail and the player are this row's
- * concern and stay entirely inside it (RF-22, RF-31).
- */
-function FileRow({ file }: { file: ChannelAttachment }) {
-  return (
-    <li className="chat-details__file">
-      {/* The thumbnail owns its own fetch and object URL; the icon stays exactly
-          as it was and is what shows whenever there is no preview to show. */}
-      <AttachmentThumbnail
-        attachment={file}
-        fallback={
-          <span className="chat-details__file-icon" aria-hidden="true">
-            <span className="material-symbols-outlined">{fileIconFor(file.contentType)}</span>
-          </span>
-        }
-      />
-      <span className="chat-details__file-text">
-        {/* A filename is text. It is never a URL and never markup. */}
-        <span className="chat-details__file-name">{file.filename}</span>
-        <span className="chat-details__file-meta">
-          {file.createdAt && `${formatDayLabel(file.createdAt)}, ${formatTime(file.createdAt)} · `}
-          {formatFileSize(file.size)}
-          <span
-            className={`chat-details__file-status chat-details__file-status--${file.status}`}
-            data-testid={`chat-details-file-status-${file.id}`}
-          >
-            {attachmentStatusLabel[file.status]}
-          </span>
-        </span>
-      </span>
-      {/* The player is a sibling of the row's text rather than part of it, so it
-          wraps onto its own line and a file that is not a playable video renders
-          nothing at all — the row keeps its icon, its size and its status. */}
-      <AttachmentVideo attachment={file} />
-    </li>
-  );
-}
-
-/**
  * Everything the people section needs to decide what to draw.
  *
  * One value instead of five positional arguments, because the five are not
@@ -790,6 +743,7 @@ interface PeopleView {
   roster: ChannelRoster | null;
   rosterState: ConversationDetailsState["roster"];
   context: RosterContext;
+  workspaceId: string;
   removal?: ParticipantRemoval;
 }
 
@@ -817,32 +771,27 @@ const peopleSectionMessages = {
  * — a cast would assert the same thing without the type system checking it.
  */
 function peopleContent(view: PeopleView): ExpandableSectionContent {
-  const { kind, details, roster, rosterState, context, removal } = view;
+  const { kind, details, roster, rosterState, context, workspaceId, removal } = view;
   const words = peopleSectionMessages[kind];
   if (details.status === "error") return { status: "error", message: words.error };
   if (details.status !== "ready") return { status: "loading", message: words.loading };
   if (details.data.kind === "group") {
-    return groupParticipantsContent(details.data, context, removal);
+    return groupParticipantsContent(details.data, context, workspaceId, removal);
   }
   if (details.data.kind === "direct") return { status: "loading", message: words.loading };
   if (rosterState.status === "loading") return { status: "loading", message: words.loading };
   if (rosterState.status === "error" || !roster) return { status: "error", message: words.error };
-  return channelRosterContent(roster, context, removal);
+  return channelRosterContent(roster, context, workspaceId, removal);
 }
 
 /**
- * The recent-files section's content (issue #892).
+ * The recent-files section's content (issues #892, #897).
  *
- * No `count` and no `hasMore`: the list endpoint reports neither a total nor a
- * cursor, and the panel asks it for exactly `channelFilesPreviewLimit` rows. So
- * this section is structurally expandable and, with today's contract, never has
- * anything to expand to — which is why it shows no control at all rather than
- * one that would reveal nothing.
+ * `hasMore` is the listing's own cursor, not a guess from a full page: the
+ * server reads one row past every page to know. So "Ver todos" appears exactly
+ * when there is something older to show, and the section's loader fetches it.
  */
-function filesContent(
-  files: ConversationDetailsState["files"],
-  emptyText: string,
-): ExpandableSectionContent {
+function filesContent(files: FilesSection, emptyText: string): ExpandableSectionContent {
   if (files.status === "loading") {
     return { status: "loading", message: "Carregando arquivos…" };
   }
@@ -851,13 +800,103 @@ function filesContent(
   }
   return {
     status: "ready",
-    items: files.data.map((file) => <FileRow key={file.id} file={file} />),
+    items: files.data.map((file) => <RecentFileRow key={file.id} file={file} />),
+    hasMore: files.next !== undefined,
     empty: (
       <p className="chat-details__empty" data-testid="chat-details-files-empty">
         {emptyText}
       </p>
     ),
   };
+}
+
+/**
+ * What sits under the expanded file list: the state of the next page.
+ *
+ * Loading and failure are about the next page only, so they are lines *below*
+ * the rows already loaded, which stay exactly where they are. The retry and the
+ * "load more" are the same call — `next.load` asks for the page the list ends
+ * at, whichever of the two brought the user here.
+ */
+function NextFilesFooter({ next }: { next?: NextFilesPage }) {
+  if (!next) return null;
+  return (
+    <>
+      {next.status === "loading" && (
+        <SectionMessage role="status">Carregando mais arquivos…</SectionMessage>
+      )}
+      {next.status === "error" && (
+        <SectionMessage role="alert">Não foi possível carregar mais arquivos.</SectionMessage>
+      )}
+      <LoadMoreFilesButton next={next} />
+    </>
+  );
+}
+
+/**
+ * The one control for the next page, mounted for as long as there is one.
+ *
+ * It stays in place while its page travels — `aria-disabled`, since `load` is
+ * already a no-op then — so a keyboard user who pressed it keeps focus on it.
+ * When the last page arrives it has nothing left to offer and unmounts; if it
+ * held focus then, focus moves to the list it just grew rather than to <body>.
+ * The layout-effect cleanup runs before the button leaves the DOM, which is the
+ * only moment it can still tell it was focused.
+ */
+function LoadMoreFilesButton({ next }: { next: NextFilesPage }) {
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  useLayoutEffect(() => {
+    const button = buttonRef.current;
+    return () => {
+      if (button && button === document.activeElement) {
+        button.closest("section")?.querySelector<HTMLElement>("ul")?.focus();
+      }
+    };
+  }, []);
+  return (
+    <button
+      ref={buttonRef}
+      type="button"
+      className="chat-details__link-action"
+      aria-disabled={next.status === "loading" || undefined}
+      onClick={next.load}
+    >
+      {next.status === "error" ? "Tentar novamente" : "Carregar mais arquivos"}
+    </button>
+  );
+}
+
+/**
+ * The recent-files section (issue #897).
+ *
+ * The primitive owns expanding; this owns only what files add to it: the first
+ * expansion fetches the next page through `onExpand`, and every page after that
+ * through the footer. The viewer host is here because the panel is not inside
+ * the timeline's, and a document opened from a row needs one.
+ *
+ * A document opened from a row must end with the conversation it belongs to:
+ * nothing opened in A may survive into B, or come back on returning to A. The
+ * caller's key cannot guarantee that on its own — it is the *details'* id, and
+ * details and files are independent sections, so while details are loading or
+ * failed every conversation shares one key. The files carry their own boundary
+ * instead: useConversationDetails takes them out of "ready" on every
+ * conversation switch and never on a refresh of the same one, so the viewer host
+ * exists only while one conversation's list is loaded, and a switch unmounts it.
+ */
+function RecentFilesSection({ files, emptyText }: { files: FilesSection; emptyText: string }) {
+  const next = files.status === "ready" ? files.next : undefined;
+  const section = (
+    <ExpandableDetailsSection
+      title="Arquivos recentes"
+      listLabel="Arquivos recentes"
+      content={filesContent(files, emptyText)}
+      onExpand={next?.load}
+      expandedFooter={<NextFilesFooter next={next} />}
+    />
+  );
+  // Rows — the only thing that opens a viewer — exist only in the ready state.
+  if (files.status !== "ready") return section;
+  return <AttachmentViewerHost>{section}</AttachmentViewerHost>;
 }
 
 /**
@@ -873,14 +912,20 @@ function filesContent(
  * hook recorded about the request it actually made, so a response that survived
  * a conversation switch cannot be rendered here as a profile.
  */
-function DirectBody({ details }: { details: ConversationDetailsState["details"] }) {
+function DirectBody({
+  details,
+  workspaceId = "",
+}: {
+  details: ConversationDetailsState["details"];
+  workspaceId: string;
+}) {
   if (details.status === "loading") {
     return <SectionMessage role="status">Carregando perfil…</SectionMessage>;
   }
   if (details.status === "error" || details.data.kind !== "direct") {
     return <SectionMessage role="alert">Não foi possível carregar o perfil.</SectionMessage>;
   }
-  return <DirectProfileSection details={details.data} />;
+  return <DirectProfileSection details={details.data} workspaceId={workspaceId} />;
 }
 
 type ConversationCopy = (typeof conversationCopy)[keyof typeof conversationCopy];
@@ -972,75 +1017,33 @@ function AboutSection({
   );
 }
 
-/** The one pinned message the panel and the bar above the conversation share. */
-function PinnedMessageSection({
-  latestPin,
-  emptyText,
-}: {
-  latestPin: PinnedItem | null;
-  emptyText: string;
-}) {
-  return (
-    <section className="chat-details__section" aria-labelledby="chat-details-pin">
-      <h3 id="chat-details-pin" className="chat-details__label">
-        Mensagem fixada
-      </h3>
-      {latestPin === null ? (
-        <p className="chat-details__empty" data-testid="chat-details-pin-empty">
-          {emptyText}
-        </p>
-      ) : (
-        <div className="chat-details__pin" data-testid="chat-details-pin">
-          <span className="material-symbols-outlined chat-details__pin-icon" aria-hidden="true">
-            push_pin
-          </span>
-          <div className="chat-details__pin-text">
-            <div className="chat-details__pin-body">
-              {latestPin.message.isRemoved ? (
-                <em>Mensagem removida.</em>
-              ) : (
-                <RichTextRenderer
-                  text={latestPin.message.bodyText}
-                  bodyFormat={latestPin.message.bodyFormat}
-                />
-              )}
-            </div>
-            <div className="chat-details__pin-by">
-              {senderLabel(latestPin.message)}
-              {latestPin.pinnedAt &&
-                ` · ${formatDayLabel(latestPin.pinnedAt)}, ${formatTime(latestPin.pinnedAt)}`}
-            </div>
-          </div>
-        </div>
-      )}
-    </section>
-  );
-}
-
 /**
  * The conversation currently described and what this caller may do to it.
  *
  * "" while loading, and "" for a direct payload — which cannot reach here, but
  * the type permits it and an id borrowed from the wrong aggregate would be the
- * worst possible default. `canManage` is the server's own answer, never
- * inferred: a rendering hint only, since POST .../members re-derives it from
- * the session on every call (issue #398).
+ * worst possible default. `canAdd` is the server's own answer, never inferred
+ * from administrative management: POST .../members re-derives it from the
+ * session on every call.
  */
 function manageableTarget(details: ConversationDetailsState["details"]): {
   id: string;
   name: string;
-  canManage: boolean;
+  canAdd: boolean;
   canRemove: boolean;
 } {
   if (details.status !== "ready" || details.data.kind === "direct") {
-    return { id: "", name: "", canManage: false, canRemove: false };
+    return { id: "", name: "", canAdd: false, canRemove: false };
   }
   return {
     id: details.data.id,
     // The server's own name for the conversation, which the removal
     // confirmation states so it cannot be about the wrong one.
     name: details.data.name,
-    canManage: details.data.canManageMembers,
+    canAdd:
+      details.data.kind === "channel"
+        ? details.data.canAddMembers === true
+        : details.data.canManageMembers,
     // The server's separate answer for removal (issue #469). Read, never
     // derived: in a group the two differ, and in a channel they are two
     // questions that happen to share a predicate today.
@@ -1144,7 +1147,6 @@ function peopleSectionWords(
  */
 function administrableRoster(
   kind: "channel" | "group",
-  _canRemove: boolean,
   roster: ConversationDetailsState["roster"],
 ): ChannelRoster | null {
   if (kind !== "channel" || roster.status !== "ready") return null;
@@ -1218,6 +1220,7 @@ function PeopleSection({
   details,
   roster,
   currentUserId,
+  workspaceId,
   copy,
   reload,
   openDM,
@@ -1227,6 +1230,7 @@ function PeopleSection({
   /** The channel's administrable membership section (issue #469). */
   roster: ConversationDetailsState["roster"];
   currentUserId: string;
+  workspaceId: string;
   copy: ConversationCopy;
   reload: () => void;
   openDM?: DirectMessageAccess;
@@ -1236,7 +1240,7 @@ function PeopleSection({
   // unrepresentable: the panel is deliberately not remounted on a target
   // switch, so a boolean would survive one and let a dialog opened for A post
   // its selection to B.
-  const { id: targetId, name: conversationName, canManage, canRemove } = manageableTarget(details);
+  const { id: targetId, name: conversationName, canAdd, canRemove } = manageableTarget(details);
 
   /*
     One subscription for the whole roster, scoped to this conversation, read
@@ -1266,7 +1270,7 @@ function PeopleSection({
     reload,
     fallbackFocusRef: addMembersButtonRef,
   });
-  const requestedRoster = administrableRoster(kind, canRemove, roster);
+  const requestedRoster = administrableRoster(kind, roster);
   const [loadedRoster, setLoadedRoster] = useState<{
     base: ChannelRoster | null;
     value: ChannelRoster;
@@ -1281,7 +1285,7 @@ function PeopleSection({
   // comparison closes it during render — the dialog unmounts, its
   // AbortController cancels any in-flight search or submit, and the selection
   // goes with it. One structural mechanism, no effect.
-  const pickerOpen = pickerFor !== null && pickerFor === targetId && targetId !== "";
+  const pickerOpen = pickerFor === targetId && targetId !== "";
 
   // Plain functions rather than useCallback: AddMembersDialog only calls them
   // — it keeps neither in an effect's dependencies and is not memoized — so
@@ -1290,7 +1294,7 @@ function PeopleSection({
   // memoization anyway.
   function closePicker() {
     setPickerFor(null);
-    // The button is only rendered while the caller may manage members, so the
+    // The button is only rendered while the caller may add members, so the
     // ref can be detached by the time this runs (a refetch that revoked the
     // permission). Focusing a detached node would drop focus to <body>.
     addMembersButtonRef.current?.focus();
@@ -1318,15 +1322,8 @@ function PeopleSection({
     });
   }
 
-  return (
-    <>
-      {/*
-        Keyed by the conversation. The panel is deliberately not remounted on a
-        target switch, so without this the roster expanded for one conversation
-        would stay expanded under the next one's name — and that expansion is a
-        statement about a list that no longer exists. The remount React already
-        offers is the whole mechanism; there is no reset protocol to maintain.
-      */}
+  function renderLegacyParticipants() {
+    return (
       <ExpandableDetailsSection
         key={`people-${targetId}`}
         title={sectionWords.heading}
@@ -1344,6 +1341,7 @@ function PeopleSection({
           roster: channelRoster,
           rosterState: roster,
           context: { presence, currentUserId, openDM },
+          workspaceId,
           removal: rowRemoval,
         })}
       >
@@ -1355,11 +1353,11 @@ function PeopleSection({
         <RosterShortfallNote note={shortfall.note} />
         {/*
           Rendered only once the server has answered and said this caller may
-          manage members. Loading, error and "not permitted" all leave it absent
-          — the safe default, since canManageMembers is false unless the server
-          sent exactly true. Hiding it is not the security boundary.
+          add members. Loading, error and "not permitted" all leave it absent —
+          the safe default, since canAddMembers is false unless the server sent
+          exactly true. Hiding it is not the security boundary.
         */}
-        {canManage && (
+        {canAdd && (
           <button
             ref={addMembersButtonRef}
             type="button"
@@ -1373,57 +1371,105 @@ function PeopleSection({
             {copy.addAction}
           </button>
         )}
-        {addedNotice?.targetId === targetId && (
-          // Announced rather than shown as a transient toast: the panel above
-          // has already been refetched, and this says what changed.
-          <p className="chat-details__note" role="status">
-            {addedNotice.text}
-          </p>
-        )}
-        {removal.notice !== "" && (
-          /*
+      </ExpandableDetailsSection>
+    );
+  }
+
+  const ownership = ownershipProjection(details);
+  return (
+    <OwnershipDialogs
+      status={details.status}
+      context={
+        ownership
+          ? {
+              kind,
+              id: targetId,
+              ownership,
+              currentUserId,
+              workspaceId,
+              reload,
+              onCommitted: (text) => setAddedNotice({ targetId, text }),
+            }
+          : undefined
+      }
+    >
+      {(openOwnershipAction) => (
+        <>
+          {/*
+        Keyed by the conversation. The panel is deliberately not remounted on a
+        target switch, so without this the roster expanded for one conversation
+        would stay expanded under the next one's name — and that expansion is a
+        statement about a list that no longer exists. The remount React already
+        offers is the whole mechanism; there is no reset protocol to maintain.
+      */}
+          {ownership ? (
+            <OwnershipRoster
+              key={`ownership-${kind}-${targetId}`}
+              ownership={ownership}
+              addButtonRef={addMembersButtonRef}
+              presence={presence}
+              onOpenDM={directMessageAction(openDM)}
+              workspaceId={workspaceId}
+              currentUserId={currentUserId}
+              onAdd={() => setPickerFor(targetId)}
+              onAction={openOwnershipAction}
+              onRemove={(member, trigger) => removal.request({ ...member, subtitle: "" }, trigger)}
+            />
+          ) : (
+            renderLegacyParticipants()
+          )}
+
+          {addedNotice?.targetId === targetId && (
+            <p className="chat-details__note" role="status">
+              {addedNotice.text}
+            </p>
+          )}
+          {removal.notice !== "" && (
+            /*
             A removal is announced rather than only seen (issue #469): the row
             it happened to is gone from the list, and focus has moved to the
             control above — neither of which says anything to someone who is
             not looking at the panel.
           */
-          <p className="chat-details__note" role="status">
-            {removal.notice}
-          </p>
-        )}
-      </ExpandableDetailsSection>
+            <p className="chat-details__note" role="status">
+              {removal.notice}
+            </p>
+          )}
 
-      <MemberRemovalDialog
-        kind={kind}
-        details={details}
-        conversationName={conversationName}
-        removal={removal}
-      />
+          <MemberRemovalDialog
+            kind={kind}
+            details={details}
+            conversationName={conversationName}
+            removal={removal}
+          />
 
-      {pickerOpen && (
-        <AddMembersDialog
-          target={
-            kind === "channel"
-              ? { kind: "channel", channelId: targetId }
-              : { kind: "group", conversationId: targetId }
-          }
-          /*
+          {pickerOpen && (
+            <AddMembersDialog
+              workspaceId={workspaceId}
+              target={
+                kind === "channel"
+                  ? { kind: "channel", channelId: targetId }
+                  : { kind: "group", conversationId: targetId }
+              }
+              /*
             Only the viewer. Current members are excluded by the search endpoint
             itself, in SQL — this list deliberately does not carry the rendered
             roster, because both sections are capped previews and passing them
             made members they could not show appear as selectable.
           */
-          excludedUserIds={currentUserId ? [currentUserId] : []}
-          onClose={closePicker}
-          onAdded={handleAdded}
-        />
+              excludedUserIds={currentUserId ? [currentUserId] : []}
+              onClose={closePicker}
+              onAdded={handleAdded}
+            />
+          )}
+        </>
       )}
-    </>
+    </OwnershipDialogs>
   );
 }
 
 /**
- * The body of a channel or group panel: about, people, pin and files.
+ * The body of a channel or group panel: about, people, pins and files.
  *
  * Extracted so the direct variant can be a sibling rather than a set of
  * conditionals threaded through four sections. The conversation vocabulary and
@@ -1433,24 +1479,56 @@ function PeopleSection({
  * Each section decides its own content; this function decides only which
  * sections exist and in what order.
  */
+function ownershipProjection(details: ConversationDetailsState["details"]) {
+  const target = ownershipConversationOf(details);
+  return target ? target.ownership : undefined;
+}
+
+function directMessageAction(access?: DirectMessageAccess) {
+  return access ? (userId: string) => access.coordinator.open(userId, access.origin) : undefined;
+}
+
+function ownershipConversationOf(details: ConversationDetailsState["details"]) {
+  if (details.status !== "ready" || details.data.kind === "direct") return undefined;
+  return details.data;
+}
+
+function ownershipRenameAction(
+  kind: "channel" | "group",
+  details: ConversationDetailsState["details"],
+  reload: () => void,
+  legacy?: ConversationRenameAction,
+): ConversationRenameAction | undefined {
+  const target = ownershipConversationOf(details);
+  if (!target?.ownership) return legacy;
+  if (target.ownership.capabilities.editMetadata !== true) return undefined;
+  return async (name: string) => {
+    if (kind === "channel") await renameChannel(target.id, name);
+    else await renameGroup(target.id, name);
+    reload();
+  };
+}
+
 function ConversationBody({
   kind,
   details: rawDetails,
   files,
   roster,
   currentUserId,
-  latestPin,
+  workspaceId,
+  pins,
   reload,
   onRename,
   openDM,
 }: {
   kind: "channel" | "group";
   details: ConversationDetailsState["details"];
-  files: ConversationDetailsState["files"];
+  files: FilesSection;
   /** The channel's administrable membership (issue #469). */
   roster: ConversationDetailsState["roster"];
   currentUserId: string;
-  latestPin: PinnedItem | null;
+  workspaceId: string;
+  pins?: PinnedMessages;
   reload: () => void;
   onRename?: ConversationRenameAction;
   openDM?: DirectMessageAccess;
@@ -1469,24 +1547,33 @@ function ConversationBody({
       ? { status: "loading" }
       : rawDetails;
 
+  const ownedRename = ownershipRenameAction(kind, details, reload, onRename);
   return (
     <>
-      <AboutSection kind={kind} details={details} onRename={onRename} />
+      <AboutSection kind={kind} details={details} onRename={ownedRename} />
       <PeopleSection
         kind={kind}
         details={details}
         roster={roster}
         currentUserId={currentUserId}
+        workspaceId={workspaceId}
         copy={copy}
         reload={reload}
         openDM={openDM}
       />
-      <PinnedMessageSection latestPin={latestPin} emptyText={copy.pinEmpty} />
-      <ExpandableDetailsSection
-        key={`files-${manageableTarget(details).id}`}
-        title="Arquivos recentes"
-        listLabel="Arquivos recentes"
-        content={filesContent(files, copy.filesEmpty)}
+      {/* Keyed by the conversation, like the other sections: its expansion and
+          its focus bookkeeping are statements about one conversation's pins. */}
+      {pins && (
+        <PinnedMessagesSection
+          key={`pins-${pins.conversationKey}`}
+          pins={pins}
+          emptyText={copy.pinEmpty}
+        />
+      )}
+      <RecentFilesSection
+        key={`files-${kind}-${manageableTarget(details).id}`}
+        files={files}
+        emptyText={copy.filesEmpty}
       />
     </>
   );
@@ -1503,12 +1590,17 @@ interface ConversationDetailsPanelProps {
   state: ConversationDetailsState;
   /** Identifies the viewer by ID; a display name would be ambiguous. */
   currentUserId: string;
+  workspaceId?: string;
   /**
-   * The result of the one pin selector, shared with the bar above the
-   * conversation. Passing the selected item (rather than the list) is what makes
-   * "the bar and the panel show the same message" structural.
+   * The conversation's pins (issue #896): the collection of the one usePins
+   * instance the pinned bar and the timeline also read, plus the actions on it.
+   * The panel never fetches pins itself, so opening it costs no request.
+   *
+   * Absent means the host does not hold this conversation's pins — the
+   * sidebar's row-menu panel — and the section is not drawn at all, rather than
+   * claiming a collection nobody loaded is empty.
    */
-  latestPin: PinnedItem | null;
+  pins?: PinnedMessages;
   /**
    * Renames the conversation this panel describes (issue #893).
    *
@@ -1550,7 +1642,8 @@ export default function ConversationDetailsPanel({
   kind,
   state,
   currentUserId,
-  latestPin,
+  workspaceId = "",
+  pins,
   onRename,
   openDM,
   onClose,
@@ -1615,7 +1708,7 @@ export default function ConversationDetailsPanel({
 
       <div className="chat-details__body">
         {kind === "direct" ? (
-          <DirectBody details={details} />
+          <DirectBody details={details} workspaceId={workspaceId} />
         ) : (
           <ConversationBody
             kind={kind}
@@ -1623,7 +1716,8 @@ export default function ConversationDetailsPanel({
             files={files}
             roster={roster}
             currentUserId={currentUserId}
-            latestPin={latestPin}
+            workspaceId={workspaceId}
+            pins={pins}
             reload={state.reload}
             onRename={onRename}
             openDM={openDM}

@@ -14,21 +14,23 @@
  * entirely inside the flow the caller passes in.
  */
 
-import PresenceDot from "./PresenceDot";
 import { useDirectMessagePending, type DirectMessagePendingSource } from "./directMessage";
-import { avatarColorFor, initialsFrom } from "./messageDisplay";
+import { avatarColorFor } from "./messageDisplay";
 import { presenceLabel, type PresenceState } from "./presence";
 import type { RosterParticipant } from "./participantRosterOrder";
+import { UserAvatar } from "./UserAvatar";
 
 /** The identity block: avatar with its presence dot, name, and the status line. */
 function ParticipantIdentity({
   participant,
   presence,
   isCurrentUser,
+  workspaceId,
 }: {
   participant: RosterParticipant;
   presence: PresenceState;
   isCurrentUser: boolean;
+  workspaceId: string;
 }) {
   const color = avatarColorFor(participant.userId);
   return (
@@ -38,17 +40,15 @@ function ParticipantIdentity({
         aria-hidden="true"
         data-testid="chat-details-member-avatar"
       >
-        {participant.avatarUrl ? (
-          <img
-            className="chat-details__avatar-img"
-            src={participant.avatarUrl}
-            alt=""
-            referrerPolicy="no-referrer"
-          />
-        ) : (
-          initialsFrom(participant.displayName)
-        )}
-        <PresenceDot state={presence} size="md" />
+        <UserAvatar
+          userId={participant.userId}
+          workspaceId={workspaceId}
+          displayName={participant.displayName}
+          avatarUrl={participant.avatarUrl}
+          presence={presence}
+          size="md"
+          imageClassName="chat-details__avatar-img"
+        />
       </span>
       <span className="chat-details__member-text">
         <span className="chat-details__member-name">
@@ -174,6 +174,7 @@ export default function ParticipantRow({
   participant,
   presence,
   isCurrentUser,
+  workspaceId,
   onOpenDM,
   pendingSource,
   removal,
@@ -181,6 +182,7 @@ export default function ParticipantRow({
   participant: RosterParticipant;
   presence: PresenceState;
   isCurrentUser: boolean;
+  workspaceId: string;
   onOpenDM?: (userId: string) => void;
   pendingSource?: DirectMessagePendingSource;
   /** The removal action for *this* person, or nothing (issue #469). */
@@ -192,6 +194,7 @@ export default function ParticipantRow({
       participant={participant}
       presence={presence}
       isCurrentUser={isCurrentUser}
+      workspaceId={workspaceId}
     />
   );
   // Rendered after the identity region in both variants, so the control is

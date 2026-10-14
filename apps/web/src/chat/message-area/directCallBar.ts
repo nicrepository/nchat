@@ -26,6 +26,7 @@ export function directCallBar(
   kind: "channel" | "dm",
   session: ChatOutletContext["directCallSession"],
   counterpart: DMCounterpart | undefined,
+  workspaceId = "",
 ): ActiveDirectCallBarProps | null {
   if (kind !== "dm" || !session || !counterpart || counterpart.userId !== session.peerUserId) {
     return null;
@@ -34,6 +35,7 @@ export function directCallBar(
     title: `${session.callType === "video" ? "Chamada de vídeo" : "Chamada de voz"} — ${counterpart.displayName}`,
     startedAt: session.startedAt,
     peerUserId: session.peerUserId,
+    workspaceId,
     peerName: counterpart.displayName,
     peerAvatarUrl: counterpart.avatarUrl,
     microphoneEnabled: session.microphoneEnabled,

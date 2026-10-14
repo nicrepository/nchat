@@ -14,6 +14,7 @@ const alert: InAppAlert = {
   targetKind: "channel",
   targetId: "channel-1",
   senderDisplayName: "Ana",
+  senderId: "sender-1",
   bodyText: "Nova mensagem",
   conversationName: "geral",
 };
@@ -76,6 +77,7 @@ describe("InAppMessageAlert", () => {
   it("renders a message body as text, never as markup", () => {
     render(
       <InAppMessageAlert
+        workspaceId="workspace-1"
         alert={{ ...alert, bodyText: "<img src=x onerror=alert(1)>" }}
         onOpen={vi.fn()}
         onDismiss={vi.fn()}
@@ -83,7 +85,7 @@ describe("InAppMessageAlert", () => {
     );
 
     const surface = screen.getByTestId("in-app-message-alert");
-    expect(surface.querySelector("img")).toBeNull();
+    expect(surface.querySelector("img[src='x']")).toBeNull();
     expect(screen.getByText("<img src=x onerror=alert(1)>")).toBeInTheDocument();
   });
 

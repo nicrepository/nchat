@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { compareByActivity, laterActivity, parseInstant, sortByActivity } from "./sidebarOrder";
+import { parseInstant } from "./instant";
+import { compareByActivity, laterActivity, sortByActivity } from "./sidebarOrder";
 import type { ActivityOrdered } from "./sidebarOrder";
 
 /**

@@ -10,6 +10,8 @@ expires.
 import datetime
 import importlib.util
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -144,6 +146,56 @@ class RepositoryExceptionFileTest(unittest.TestCase):
         )
         self.assertEqual(problems, [])
         self.assertEqual(accepted, {ACCEPTED_ADVISORY})
+
+
+class ScanRetryTest(unittest.TestCase):
+    def run_scan(self, outcomes):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "attempts"
+            scanner = root / "scanner"
+            scanner.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                f"state = pathlib.Path({str(state)!r})\n"
+                "attempt = int(state.read_text()) if state.exists() else 0\n"
+                "state.write_text(str(attempt + 1))\n"
+                f"outcomes = {outcomes!r}\n"
+                "status, message = outcomes[min(attempt, len(outcomes) - 1)]\n"
+                "print(json.dumps({'attempt': attempt + 1}))\n"
+                "print(message, file=sys.stderr)\n"
+                "sys.exit(status)\n"
+            )
+            scanner.chmod(0o755)
+            sleeper = root / "sleep"
+            sleeper.write_text("#!/bin/sh\nexit 0\n")
+            sleeper.chmod(0o755)
+            report_path = root / "report.json"
+            helper = REPO_ROOT / "scripts/security/govulncheck-retry.sh"
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1"; govulncheck_retry "$2" "$3" "$4"',
+                 "retry-test", str(helper), str(report_path), str(root / "stderr"), str(scanner)],
+                env={**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]},
+                capture_output=True, text=True, check=False,
+            )
+            return result.returncode, int(state.read_text()), json.loads(report_path.read_text())
+
+    def test_transient_fetch_recovers_with_a_fresh_report(self):
+        transient = "govulncheck: fetching vulnerabilities: Get URL: connection reset by peer"
+        self.assertEqual(self.run_scan([(1, transient), (0, "")]), (0, 2, {"attempt": 2}))
+        self.assertEqual(self.run_scan([(1, transient), (3, "findings")]), (3, 2, {"attempt": 2}))
+
+    def test_errors_remain_fail_closed(self):
+        for status, message, attempts in [
+            (1, "govulncheck: fetching vulnerabilities: connection reset by peer", 3),
+            (1, "package loading failed", 1),
+            (1, "connection reset by peer while loading packages", 1),
+            (3, "vulnerabilities found", 1),
+            (2, "invalid arguments", 1),
+        ]:
+            with self.subTest(message=message):
+                self.assertEqual(self.run_scan([(status, message)]),
+                                 (status, attempts, {"attempt": attempts}))
 
 
 if __name__ == "__main__":

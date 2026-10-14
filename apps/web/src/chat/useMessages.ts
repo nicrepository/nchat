@@ -52,6 +52,7 @@ import type {
   WSAttachmentStatusEvent,
   WSConversationEventMessage,
   WSMembersAddedEvent,
+  WSConversationUpdatedEvent,
   WSPinUpdatedEvent,
   WSTypingUpdatedEvent,
 } from "./useChatWebSocket";
@@ -81,6 +82,7 @@ interface UseMessagesOptions {
    * membership would double the WebSocket count per conversation.
    */
   onMembersAdded?: (event: WSMembersAddedEvent) => void;
+  onConversationUpdated?: (event: WSConversationUpdatedEvent) => void;
   /**
    * Issue #469: called on a conversation.event for the active target.
    *
@@ -106,6 +108,8 @@ interface UseMessagesOptions {
    * caller for reactions rather than dropped here.
    */
   onTypingUpdated?: (event: WSTypingUpdatedEvent) => void;
+  /** Issue #896: called when the subscription is (re)established, to resync. */
+  onSubscriptionReady?: () => void;
   onMessageRemoved?: () => void;
 }
 
@@ -184,9 +188,11 @@ export function useMessages({
   onOwnReactionConfirmed,
   onPinUpdated,
   onMembersAdded,
+  onConversationUpdated,
   onConversationEvent,
   onAttachmentStatus,
   onTypingUpdated,
+  onSubscriptionReady,
   onMessageRemoved,
 }: UseMessagesOptions): UseMessagesResult {
   const [state, dispatch] = useReducer(reducer, initialState);
@@ -285,9 +291,11 @@ export function useMessages({
     listeners: {
       onPinUpdated,
       onMembersAdded,
+      onConversationUpdated,
       onConversationEvent,
       onAttachmentStatus,
       onTypingUpdated,
+      onSubscriptionReady,
     },
   });
 

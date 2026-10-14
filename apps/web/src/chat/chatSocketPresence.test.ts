@@ -193,6 +193,24 @@ describe("presence activity", () => {
     handle.release();
   });
 
+  // Issue #798: the window regaining focus is somebody coming back; losing it,
+  // or hiding the tab, is not leaving — those send nothing, so the only road to
+  // away is the server's idle timeout across every session.
+  it("reports the window regaining focus, and never blur or a hidden tab", () => {
+    const handle = openConnection();
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+
+    window.dispatchEvent(new Event("blur"));
+    visibility.mockReturnValue("hidden");
+    document.dispatchEvent(new Event("visibilitychange"));
+    vi.advanceTimersByTime(4 * 60 * 1_000);
+    expect(frames()).toHaveLength(0);
+
+    window.dispatchEvent(new Event("focus"));
+    expect(framesOfType("ping")).toHaveLength(1);
+    handle.release();
+  });
+
   it("installs one set of listeners however many consumers join", () => {
     const first = openConnection();
     const second = acquireChatSocket({});

@@ -21,6 +21,8 @@ import type { EmojiUsage } from "../../emoji/emojiUsage";
 import { TimelineScrollRootContext } from "../../lazyAttachment";
 import type { TimelineRow } from "../../timelineVirtualization";
 import type { LastMutation } from "../../useMessages";
+import type { TimelinePosition } from "../../messages/messageOrder";
+import type { ReadProgress } from "../../readCursor";
 import { useConversationViewport } from "../viewport/useConversationViewport";
 import MessageTimelineItem, {
   type ConversationMessageActions,
@@ -32,8 +34,11 @@ import { useReactionMenu } from "./useReactionMenu";
 export interface MessageListProps {
   messages: Message[];
   currentUserId: string;
+  workspaceId: string;
   hasMore: boolean;
   loadingMore: boolean;
+  /** #1088: older pages that have come back, so a search can tell one arrived. */
+  olderPagesSettled: number;
   lastMutation: LastMutation;
   /**
    * What a message offers. Without onQuoteJump: travelling to a quoted message
@@ -62,6 +67,8 @@ export interface MessageListProps {
   emojiUsage: EmojiUsage;
   onEmojiToneChange: (tone: number) => void;
   focusMessageId?: string;
+  /** Issue #896: which request asked for focusMessageId. */
+  focusRequest?: string;
   /** #492: `${kind}:${targetId}` — keys the per-conversation viewport anchor. */
   conversationKey: string;
   /** #492: the sidebar's unread_count for this target as of opening it. */
@@ -70,16 +77,20 @@ export interface MessageListProps {
   initialAnchor: ViewportAnchor | null;
   /** #492: called on unmount (leaving the conversation) with the current anchor. */
   onCaptureAnchor: (key: string, anchor: ViewportAnchor) => void;
-  /** #492: called once the bottom sentinel confirms the real tail was reached. */
-  onReachedBottom: () => void;
+  /** #1082: the server's current read point for this conversation, live. */
+  serverReadThrough?: TimelinePosition | null;
+  /** #1082: the read cursor advanced, or the unread it leaves changed. */
+  onReadProgress: (conversationKey: string, progress: ReadProgress) => void;
 }
 
 export default function MessageList(props: MessageListProps) {
   const {
     messages,
     currentUserId,
+    workspaceId,
     hasMore,
     loadingMore,
+    olderPagesSettled,
     lastMutation,
     actions,
     onLoadMore,
@@ -87,8 +98,9 @@ export default function MessageList(props: MessageListProps) {
     unreadCountAtOpen,
     initialAnchor,
     focusMessageId,
+    focusRequest,
     onCaptureAnchor,
-    onReachedBottom,
+    onReadProgress,
   } = props;
 
   const {
@@ -111,14 +123,17 @@ export default function MessageList(props: MessageListProps) {
     messages,
     currentUserId,
     hasMore,
+    olderPagesSettled,
     lastMutation,
     conversationKey,
     unreadCountAtOpen,
     initialAnchor,
     focusMessageId,
+    focusRequest,
     onLoadMore,
     onCaptureAnchor,
-    onReachedBottom,
+    onReadProgress,
+    serverReadThrough: props.serverReadThrough,
   });
   const reactionMenu = useReactionMenu();
   const messagesById = useMemo(
@@ -127,6 +142,7 @@ export default function MessageList(props: MessageListProps) {
   );
   const context: TimelineRowContext = {
     currentUserId,
+    workspaceId,
     systemScope: props.systemScope,
     presenceTarget: props.presenceTarget,
     mentionTarget: props.mentionTarget,

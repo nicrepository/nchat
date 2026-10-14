@@ -5,6 +5,8 @@ import OutgoingCallPopup from "./OutgoingCallPopup";
 
 const baseProps = {
   name: "Bruno Lima",
+  userId: "user-bruno",
+  workspaceId: "workspace-1",
   callType: "video" as const,
   onCancel: vi.fn(),
 };
@@ -24,23 +26,22 @@ describe("OutgoingCallPopup", () => {
     expect(screen.queryByText("Chamada de vídeo")).not.toBeInTheDocument();
   });
 
-  it("shows two-letter initials, not a single raw character, when there is no avatar", () => {
+  it("shows a deterministic Blobatar when there is no avatar", () => {
     const { container } = render(<OutgoingCallPopup {...baseProps} />);
-    expect(container.querySelector(".outgoing-call__avatar")).toHaveTextContent("BL");
+    expect(container.querySelector(".outgoing-call__avatar img")?.getAttribute("src")).toMatch(
+      /^data:image\/svg\+xml/,
+    );
   });
 
   it("renders the personalized avatar image when avatarUrl is set", () => {
-    const { container } = render(<OutgoingCallPopup {...baseProps} avatarUrl="https://x/a.png" />);
-    expect(container.querySelector("img")).toHaveAttribute("src", "https://x/a.png");
+    const { container } = render(<OutgoingCallPopup {...baseProps} avatarUrl="/a.png" />);
+    expect(container.querySelector("img")).toHaveAttribute("src", "/a.png");
   });
 
-  it("falls back to initials, not a broken-image glyph, when the avatar fails to load", () => {
-    const { container } = render(
-      <OutgoingCallPopup {...baseProps} avatarUrl="https://x/broken.png" />,
-    );
+  it("falls back to Blobatar, not a broken-image glyph, when the avatar fails to load", () => {
+    const { container } = render(<OutgoingCallPopup {...baseProps} avatarUrl="/broken.png" />);
     fireEvent.error(container.querySelector("img")!);
-    expect(container.querySelector("img")).not.toBeInTheDocument();
-    expect(container.querySelector(".outgoing-call__avatar")).toHaveTextContent("BL");
+    expect(container.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
   });
 
   it("shows the ringing status, available to screen readers via a live region", () => {

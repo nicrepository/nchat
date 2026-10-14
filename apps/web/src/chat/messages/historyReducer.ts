@@ -19,6 +19,7 @@ function applyLoaded(state: MessagesState, action: ActionOf<"loaded">): Messages
     sendError: null,
     sending: false,
     loadingMore: false,
+    olderPagesSettled: 0,
     lastMutation: "initial",
     realtimeError: null,
     actionError: null,
@@ -41,6 +42,7 @@ function applyPrepended(state: MessagesState, action: ActionOf<"prepended">): Me
     messages: fresh.length > 0 ? [...fresh, ...state.messages] : state.messages,
     nextCursor: action.page.nextCursor,
     loadingMore: false,
+    olderPagesSettled: state.olderPagesSettled + 1,
     lastMutation: fresh.length > 0 ? "prepend" : "none",
   };
 }
@@ -90,7 +92,12 @@ export function reduceHistory(state: MessagesState, action: Action): MessagesSta
     case "prepended":
       return applyPrepended(state, action);
     case "prepend_error":
-      return { ...state, loadingMore: false, lastMutation: "none" };
+      return {
+        ...state,
+        loadingMore: false,
+        olderPagesSettled: state.olderPagesSettled + 1,
+        lastMutation: "none",
+      };
     default:
       return undefined;
   }

@@ -628,7 +628,7 @@ test.describe("layout responsivo", () => {
 
     // The footer is the bottom-most focusable thing in the sidebar; focusing it
     // is the gesture most likely to ask the browser to scroll an ancestor.
-    await page.getByRole("link", { name: /Meu perfil/ }).focus();
+    await page.getByRole("button", { name: /definir status/i }).focus();
     await expectNoRootScroll(page, "rodapé focado");
 
     await fillComposer(page, "mensagem digitada sem mover o documento");
@@ -701,7 +701,8 @@ test.describe("layout responsivo", () => {
     await openChannelWithLongSidebar(page, testInfo);
     await expectNoRootScroll(page, "no chat");
 
-    await page.getByRole("link", { name: /Meu perfil/ }).click();
+    await page.getByRole("button", { name: /menu da conta/i }).click();
+    await page.getByRole("menuitem", { name: "Meu perfil" }).click();
     await expect(page).toHaveURL(/\/profile$/);
 
     await expect(page.getByTestId("chat-shell")).toBeVisible();

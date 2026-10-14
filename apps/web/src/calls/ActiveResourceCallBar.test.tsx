@@ -241,6 +241,7 @@ describe("ActiveResourceCallBar", () => {
 
   it("caps visible avatars and shows a +N overflow badge beyond the cap", () => {
     const { container } = renderBarParticipatingLocal({
+      workspaceId: "workspace-1",
       participants: [
         { identity: "p1", displayName: "P1" },
         { identity: "p2", displayName: "P2" },
@@ -293,6 +294,7 @@ describe("ActiveResourceCallBar", () => {
 
   it("keeps the local avatar visible even when a remote speaker outside the cap is swapped in", () => {
     const { container } = renderBarParticipatingLocal({
+      workspaceId: "workspace-1",
       participants: [
         { identity: "p1", displayName: "P1" },
         { identity: "p2", displayName: "P2" },
@@ -306,7 +308,9 @@ describe("ActiveResourceCallBar", () => {
     const visibleAvatars = container.querySelectorAll(
       ".voicebanner__avatar:not(.voicebanner__avatar--overflow)",
     );
-    expect(visibleAvatars[0]).toHaveTextContent("AN");
+    expect(visibleAvatars[0]?.querySelector("img")?.getAttribute("src")).toMatch(
+      /^data:image\/svg\+xml/,
+    );
   });
 
   // ── #642 review — accessible name includes elapsed time + participant count ──

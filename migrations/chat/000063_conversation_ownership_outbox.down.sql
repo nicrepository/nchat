@@ -1,0 +1,12 @@
+BEGIN;
+DROP TRIGGER ownership_account_invalidation ON auth.users;
+DROP TRIGGER ownership_workspace_invalidation ON chat.workspace_members;
+DROP FUNCTION chat.enqueue_ownership_access();
+DROP TRIGGER ownership_dm_invalidation ON chat.dm_members;
+DROP TRIGGER ownership_channel_invalidation ON chat.channel_members;
+DROP FUNCTION chat.enqueue_ownership_membership();
+DROP FUNCTION chat.enqueue_ownership_resource(TEXT,UUID,UUID);
+DROP TRIGGER IF EXISTS ownership_audit_outbox ON chat.ownership_audit;
+DROP FUNCTION IF EXISTS chat.enqueue_ownership_change();
+DROP TABLE IF EXISTS chat.ownership_outbox;
+COMMIT;

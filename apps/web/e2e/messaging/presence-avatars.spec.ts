@@ -13,6 +13,7 @@ import {
   SECOND_CANDIDATE_NAME,
   channelDetailsFixture,
   createScenario,
+  directProfileFixture,
   groupDetailsFixture,
   dropWebSocket,
   emitPresence,
@@ -92,7 +93,7 @@ test.describe("presença nos avatares (RF-58)", () => {
     });
     await expect(dot(page)).toHaveAttribute("data-presence", "online");
     await expect(dmRow(page)).toHaveAccessibleName(
-      `Mensagem direta com ${OTHER_USER_NAME}, Online`,
+      `Mensagem direta com ${OTHER_USER_NAME}, Disponível`,
     );
 
     await emitPresence(page, {
@@ -195,11 +196,164 @@ test.describe("presença nos avatares (RF-58)", () => {
       user: { user_id: CURRENT_USER_ID, state: "online", updated_at: ONLINE_AT },
     });
 
-    const profile = page.getByRole("link", {
-      name: new RegExp(`Meu perfil de ${CURRENT_USER_NAME}`),
+    // The footer's identity is the status control; its state is drawn once,
+    // under the name, and the avatar carries no dot (issue #798).
+    const identity = page.getByRole("button", { name: /definir status/i });
+    await expect(identity).toHaveAccessibleName(`${CURRENT_USER_NAME}, Disponível. Definir status`);
+    await expect(identity.getByTestId("presence-dot")).toHaveCount(1);
+    await expect(
+      identity.locator(".chat-sidebar__user-presence").getByTestId("presence-dot"),
+    ).toHaveAttribute("data-presence", "online");
+  });
+});
+
+test.describe("Blobatar determinístico (#1016)", () => {
+  test("prioriza foto persistida e mantém o fallback dos participantes consistente", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "blobatar-photo");
+    const photo = "/api/auth/avatars/e2e-photo.svg";
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: OTHER_USER_NAME,
+      messages: [
+        makeMessage({
+          id: `${targetId}-msg`,
+          sender_id: OTHER_USER_ID,
+          sender_display_name: OTHER_USER_NAME,
+          sender_avatar_url: photo,
+          body_text: "Foto persistida",
+        }),
+      ],
     });
-    await expect(profile).toHaveAccessibleName(`Meu perfil de ${CURRENT_USER_NAME}, Online`);
-    await expect(profile.getByTestId("presence-dot")).toHaveAttribute("data-presence", "online");
+    scenario.sidebarDMs.find((dm) => dm.id === targetId)!.counterpart!.avatar_url = photo;
+    scenario.directProfiles.set(
+      targetId,
+      directProfileFixture(targetId, {
+        user_id: OTHER_USER_ID,
+        display_name: OTHER_USER_NAME,
+        avatar_url: photo,
+      }),
+    );
+    scenario.groupDetails.set(
+      GROUP_DM_ID,
+      groupDetailsFixture({ id: GROUP_DM_ID, name: GROUP_DM_NAME }, [
+        { user_id: CURRENT_USER_ID, display_name: CURRENT_USER_NAME },
+      ]),
+    );
+    await installMessagingMocks(page, scenario);
+    await page.route(`**${photo}`, (route) =>
+      route.fulfill({
+        contentType: "image/svg+xml",
+        body: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="50" fill="#2864b4"/></svg>',
+      }),
+    );
+    await page.goto(`/chat/dm/${targetId}`);
+    await expect(dmRow(page).locator("img")).toHaveAttribute("src", photo);
+    await expect(page.locator(".chat-msg-area__msg-avatar img")).toHaveAttribute("src", photo);
+    await page
+      .getByRole("button", { name: `Abrir perfil de ${OTHER_USER_NAME}`, exact: true })
+      .click();
+    await expect(page.getByTestId("chat-details-profile-avatar").locator("img")).toHaveAttribute(
+      "src",
+      photo,
+    );
+    await page.screenshot({ path: testInfo.outputPath("profile-photo.png") });
+    await page.reload();
+    await expect(dmRow(page).locator("img")).toHaveAttribute("src", photo);
+    const selfImage = page.getByRole("button", { name: /definir status/i }).locator("img");
+    await expect(selfImage).toHaveAttribute("src", /^data:image\/svg\+xml/);
+    const source = await selfImage.getAttribute("src");
+    await page.goto(`/chat/dm/${GROUP_DM_ID}`);
+    await page.getByRole("button", { name: "Detalhes do grupo", exact: true }).click();
+    await expect(page.getByTestId("chat-details-member-avatar").locator("img")).toHaveAttribute(
+      "src",
+      source!,
+    );
+    await page.screenshot({ path: testInfo.outputPath("blobatar-participants.png") });
+  });
+  test("mantém o mesmo avatar na sidebar, mensagem, perfil e busca após reload", async ({
+    page,
+  }, testInfo) => {
+    const errors: string[] = [];
+    const externalRequests: string[] = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    page.on("request", (request) => {
+      if (
+        /^https?:/.test(request.url()) &&
+        new URL(request.url()).hostname !== "localhost" &&
+        new URL(request.url()).hostname !== "127.0.0.1"
+      )
+        externalRequests.push(request.url());
+    });
+    const targetId = uniqueId(testInfo, "blobatar");
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: OTHER_USER_NAME,
+      messages: [
+        makeMessage({
+          id: `${targetId}-msg`,
+          sender_id: OTHER_USER_ID,
+          sender_display_name: OTHER_USER_NAME,
+          body_text: "Avatar consistente",
+        }),
+      ],
+    });
+    scenario.directProfiles.set(
+      targetId,
+      directProfileFixture(targetId, { user_id: OTHER_USER_ID, display_name: OTHER_USER_NAME }),
+    );
+    await installMessagingMocks(page, scenario);
+    await page.route("**/api/search/users", (route) =>
+      route.fulfill({
+        json: {
+          data: {
+            data: [{ id: OTHER_USER_ID, display_name: OTHER_USER_NAME, avatar_url: null }],
+            pagination: { limit: 20, next_cursor: null, has_more: false },
+          },
+        },
+      }),
+    );
+    for (const kind of ["v2/messages", "channels", "groups", "files", "links"]) {
+      await page.route(`**/api/search/${kind}`, (route) =>
+        route.fulfill({
+          json: {
+            data: { data: [], pagination: { limit: 20, next_cursor: null, has_more: false } },
+          },
+        }),
+      );
+    }
+    await page.goto(`/chat/dm/${targetId}`);
+    const image = dmRow(page).locator("img");
+    await expect(image).toHaveAttribute("src", /^data:image\/svg\+xml/);
+    const source = await image.getAttribute("src");
+    await expect(page.getByTestId("chat-msg-header").locator("img")).toHaveAttribute(
+      "src",
+      source!,
+    );
+    await expect(page.locator(".chat-msg-area__msg-avatar img")).toHaveAttribute("src", source!);
+    await page
+      .getByRole("button", { name: `Abrir perfil de ${OTHER_USER_NAME}`, exact: true })
+      .click();
+    await expect(page.getByTestId("chat-details-profile-avatar").locator("img")).toHaveAttribute(
+      "src",
+      source!,
+    );
+    await page.screenshot({ path: testInfo.outputPath("blobatar-profile.png") });
+    await page.reload();
+    await expect(dmRow(page).locator("img")).toHaveAttribute("src", source!);
+    await page.goto("/chat/search");
+    await page.getByRole("searchbox").fill(OTHER_USER_NAME);
+    await page.getByRole("tab", { name: "Pessoas" }).click();
+    await expect(page.getByRole("tabpanel").locator(".global-search__result img")).toHaveAttribute(
+      "src",
+      source!,
+    );
+    await page.screenshot({ path: testInfo.outputPath("blobatar-search.png") });
+    expect(errors).toEqual([]);
+    expect(externalRequests).toEqual([]);
   });
 });
 
@@ -285,7 +439,7 @@ test.describe("assinatura compartilhada e acessibilidade (#444)", () => {
 
     const bubble = page.getByTestId("chat-msg-bubble");
     await expect(bubble.getByTestId("chat-msg-sender")).toHaveText(OTHER_USER_NAME);
-    await expect(bubble.getByTestId("chat-msg-sender-presence")).toHaveText("Status: Online");
+    await expect(bubble.getByTestId("chat-msg-sender-presence")).toHaveText("Status: Disponível");
     await expect(bubble.getByTestId("presence-dot")).toHaveAttribute("aria-hidden", "true");
   });
 });

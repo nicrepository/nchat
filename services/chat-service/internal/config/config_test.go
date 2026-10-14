@@ -425,3 +425,20 @@ func TestMessageAttachmentLimitsRejectUnsafeValues(t *testing.T) {
 		})
 	}
 }
+
+// The manual presence writer (issue #798) is closed unless a deployment opens
+// it, and a value that is neither true nor false refuses to start rather than
+// being read as either.
+func TestLoad_ManualPresenceGate(t *testing.T) {
+	if Load().ManualPresenceEnabled {
+		t.Fatal("the manual presence writer is open by default")
+	}
+	t.Setenv("CHAT_MANUAL_PRESENCE_ENABLED", "true")
+	if cfg := Load(); !cfg.ManualPresenceEnabled || cfg.Validate() != nil {
+		t.Fatalf("enabled = %v, validate = %v", cfg.ManualPresenceEnabled, cfg.Validate())
+	}
+	t.Setenv("CHAT_MANUAL_PRESENCE_ENABLED", "maybe")
+	if err := Load().Validate(); err == nil || err.Error() != "CHAT_MANUAL_PRESENCE_ENABLED must be a valid boolean" {
+		t.Fatalf("validate = %v", err)
+	}
+}

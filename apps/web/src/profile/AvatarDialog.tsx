@@ -31,16 +31,25 @@ import {
   uploadAvatar,
 } from "./profileApi";
 import { refreshSelfProfile } from "./selfProfile";
-import { PersonAvatarImage } from "../chat/PersonAvatarImage";
+import { UserAvatar } from "../chat/UserAvatar";
 
 interface AvatarDialogProps {
   currentAvatarUrl?: string;
+  userId?: string;
+  workspaceId?: string;
+  displayName?: string;
   onClose: () => void;
 }
 
 const titleId = "avatar-dialog-title";
 
-export default function AvatarDialog({ currentAvatarUrl, onClose }: AvatarDialogProps) {
+export default function AvatarDialog({
+  currentAvatarUrl,
+  userId = "",
+  workspaceId = "",
+  displayName = "",
+  onClose,
+}: AvatarDialogProps) {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
@@ -210,10 +219,12 @@ export default function AvatarDialog({ currentAvatarUrl, onClose }: AvatarDialog
               className="avatar-dialog__preview-img"
             />
           ) : (
-            <PersonAvatarImage
-              src={shownSrc}
-              initials=""
-              imgClassName="avatar-dialog__preview-img"
+            <UserAvatar
+              userId={userId}
+              workspaceId={workspaceId}
+              displayName={displayName}
+              avatarUrl={shownSrc}
+              imageClassName="avatar-dialog__preview-img"
             />
           )}
         </div>

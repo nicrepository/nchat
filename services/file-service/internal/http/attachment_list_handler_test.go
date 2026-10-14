@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -172,6 +173,56 @@ func TestListDestinationAttachmentsHidesUnreachableConversations(t *testing.T) {
 		t.Fatalf("expected 404, got %d", response.Code)
 	}
 	if errorCode(t, response) != httputil.ErrCodeNotFound {
+		t.Fatalf("unexpected code %q", errorCode(t, response))
+	}
+}
+
+// Issue #897: the cursor travels opaquely both ways — out as next_cursor when
+// the service has one, back in as ?before= — and is absent on a last page.
+func TestListDestinationAttachmentsCarriesTheCursorBothWays(t *testing.T) {
+	useCases := readyUseCases()
+	useCases.listNextCursor = "opaque-next"
+	router := newTestRouter(t, useCases, enabledConfig())
+
+	response := listRequest(t, router, dmUploadPath(testDMID)+"?limit=5&before=opaque-prev")
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Data struct {
+			NextCursor *string `json:"next_cursor"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode listing: %v", err)
+	}
+	if body.Data.NextCursor == nil || *body.Data.NextCursor != "opaque-next" {
+		t.Fatalf("expected next_cursor, got body %s", response.Body.String())
+	}
+	if useCases.listInput.Before != "opaque-prev" || useCases.listInput.Limit != 5 {
+		t.Fatalf("expected the cursor and limit forwarded, got %+v", useCases.listInput)
+	}
+
+	useCases.listNextCursor = ""
+	last := listRequest(t, router, channelUploadPath(testChannelID))
+	if strings.Contains(last.Body.String(), "next_cursor") {
+		t.Fatalf("a last page must not carry next_cursor: %s", last.Body.String())
+	}
+	if useCases.listInput.Before != "" {
+		t.Fatalf("an absent cursor must stay empty, got %q", useCases.listInput.Before)
+	}
+}
+
+func TestListDestinationAttachmentsRejectsAMalformedCursor(t *testing.T) {
+	useCases := readyUseCases()
+	useCases.listErr = domain.ErrInvalidInput
+	router := newTestRouter(t, useCases, enabledConfig())
+
+	response := listRequest(t, router, channelUploadPath(testChannelID)+"?before=%25%25")
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", response.Code)
+	}
+	if errorCode(t, response) != httputil.ErrCodeBadRequest {
 		t.Fatalf("unexpected code %q", errorCode(t, response))
 	}
 }

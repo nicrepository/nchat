@@ -1,5 +1,5 @@
-import { avatarColorFor, initialsFrom } from "../chat/messageDisplay";
-import { PersonAvatarImage } from "../chat/PersonAvatarImage";
+import { avatarColorFor } from "../chat/messageDisplay";
+import { UserAvatar } from "../chat/UserAvatar";
 import { useElapsedLabel } from "./callBarTiming";
 import "./CallPresentation.css";
 
@@ -12,6 +12,7 @@ export interface ActiveResourceCallBarParticipant {
 
 interface BarBase {
   title: string;
+  workspaceId?: string;
   /** Authoritative call-start instant (Call.created_at) — never Date.now() at mount. */
   startedAt: string;
 }
@@ -143,7 +144,6 @@ export default function ActiveResourceCallBar(props: ActiveResourceCallBarProps)
     participants,
     localId,
     localName,
-    localInitials,
     localAvatarUrl,
     activeSpeakerId,
     microphoneEnabled,
@@ -161,15 +161,7 @@ export default function ActiveResourceCallBar(props: ActiveResourceCallBarProps)
       name: participant.displayName,
       avatarUrl: undefined as string | undefined,
     })),
-  ].map((entry) => ({
-    ...entry,
-    // The local entry's initials are the caller-provided, pre-computed
-    // localInitials — never initialsFrom(localName), which would risk
-    // feeding "(" from the "(você)" suffix in as a second initial for a
-    // one-word name (issue #612 blocker; see CallSessionProvider's own
-    // identical localInitials derivation).
-    initials: entry.id === localId ? localInitials : initialsFrom(entry.name),
-  }));
+  ];
   // Local always stays visible (index 0). When the active speaker falls
   // outside the natural head slice, swap them into the LAST visible slot
   // instead of silently hiding them behind "+N" (issue #642 review, HIGH
@@ -223,10 +215,12 @@ export default function ActiveResourceCallBar(props: ActiveResourceCallBarProps)
               entry.id === activeSpeakerId ? " voicebanner__avatar--speaking" : ""
             }`}
           >
-            <PersonAvatarImage
-              src={entry.avatarUrl}
-              initials={entry.initials}
-              imgClassName="call-avatar__img"
+            <UserAvatar
+              userId={entry.id}
+              workspaceId={props.workspaceId ?? ""}
+              displayName={entry.name}
+              avatarUrl={entry.avatarUrl}
+              imageClassName="call-avatar__img"
             />
           </span>
         ))}

@@ -90,6 +90,7 @@ describe("conversationActions", () => {
     }
     expect([...ids].sort()).toEqual([
       "details",
+      "identity",
       "leave",
       "mark-read",
       "mute",
@@ -143,6 +144,14 @@ describe("conversationActions — the product matrix", () => {
     ]);
   });
 
+  // Issue #1026: only a group has an identity of its own to change.
+  it("offers Alterar identidade on a group only", () => {
+    expect(ids({ kind: "channel", canRename: true })).not.toContain("identity");
+    expect(ids({ kind: "dm" })).not.toContain("identity");
+    const action = conversationActions(target({ kind: "group" })).find((a) => a.id === "identity");
+    expect(action?.label).toBe("Alterar identidade");
+  });
+
   // The general channel is structural: it is where everyone is reachable by
   // construction, so it cannot be renamed, silenced or left — by anybody. The
   // backend refuses all three in SQL; this is the UI not offering them.
@@ -160,6 +169,7 @@ describe("conversationActions — the product matrix", () => {
       "mark-read",
       "mute",
       "rename",
+      "identity",
       "details",
       "leave",
     ]);

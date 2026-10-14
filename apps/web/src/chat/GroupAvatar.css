@@ -1,0 +1,49 @@
+/* GroupAvatar (issue #1026). One neutral background for every group, on every
+   surface: a tint of the surrounding text colour, so it reads as neutral on the
+   dark sidebar and on a light dialog alike without a second palette. */
+.group-avatar {
+  --group-avatar-bg: color-mix(in srgb, currentColor 16%, transparent);
+
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border-radius: 30%;
+  background: var(--group-avatar-bg);
+  color: inherit;
+  font-weight: 600;
+  line-height: 1;
+  overflow: hidden;
+  user-select: none;
+}
+
+.group-avatar--sm {
+  width: 24px;
+  height: 24px;
+  font-size: 9.5px;
+}
+
+.group-avatar--md {
+  width: 34px;
+  height: 34px;
+  font-size: 12px;
+}
+
+.group-avatar--lg {
+  width: 56px;
+  height: 56px;
+  font-size: 20px;
+}
+
+/* An emoji is a picture, not lettering: it gets the room initials do not. */
+.group-avatar--sm[data-mode="emoji"] {
+  font-size: 14px;
+}
+
+.group-avatar--md[data-mode="emoji"] {
+  font-size: 20px;
+}
+
+.group-avatar--lg[data-mode="emoji"] {
+  font-size: 32px;
+}

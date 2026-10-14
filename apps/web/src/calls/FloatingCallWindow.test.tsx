@@ -16,6 +16,7 @@ const baseControls = {
 
 const baseProps = {
   title: "Caio Almeida",
+  workspaceId: "workspace-1",
   status: "connected" as const,
   participantCount: 2,
   controls: baseControls,
@@ -45,49 +46,61 @@ describe("FloatingCallWindow", () => {
       "aria-label",
       "Você",
     );
-    expect(container.querySelector(".floating-call__local-avatar")).toHaveTextContent("V");
+    expect(
+      container.querySelector(".floating-call__local-avatar img")?.getAttribute("src"),
+    ).toMatch(/^data:image\/svg\+xml/);
   });
 
-  it("derives initials from the raw one-word name, never 'A(' from the (você) suffix (issue #612 blocker)", () => {
-    const { container } = render(
+  it("does not derive the generated avatar from the display label", () => {
+    const { container, rerender } = render(
       <FloatingCallWindow {...baseProps} localName="Ana (você)" localInitials="A" />,
     );
-    const avatar = container.querySelector(".floating-call__local-avatar")!;
-    expect(avatar.textContent).toBe("A");
+    const source = container.querySelector(".floating-call__local-avatar img")?.getAttribute("src");
+    rerender(<FloatingCallWindow {...baseProps} localName="Outro nome" localInitials="ON" />);
+    expect(container.querySelector(".floating-call__local-avatar img")?.getAttribute("src")).toBe(
+      source,
+    );
   });
 
   it("renders the local avatar image when localAvatarUrl is set", () => {
-    const { container } = render(
-      <FloatingCallWindow {...baseProps} localAvatarUrl="https://x/local.png" />,
-    );
+    const { container } = render(<FloatingCallWindow {...baseProps} localAvatarUrl="/local.png" />);
     expect(container.querySelector(".floating-call__local-avatar img")).toHaveAttribute(
       "src",
-      "https://x/local.png",
+      "/local.png",
     );
   });
 
-  it("falls back to deterministic initials when the local avatar fails to load", () => {
+  it("falls back to a deterministic Blobatar when the local avatar fails to load", () => {
     const { container } = render(
-      <FloatingCallWindow {...baseProps} localAvatarUrl="https://x/broken.png" />,
+      <FloatingCallWindow {...baseProps} localAvatarUrl="/broken.png" />,
     );
     fireEvent.error(container.querySelector(".floating-call__local-avatar img")!);
-    expect(container.querySelector(".floating-call__local-avatar img")).not.toBeInTheDocument();
-    expect(container.querySelector(".floating-call__local-avatar")).toHaveTextContent("AS");
+    expect(
+      container.querySelector(".floating-call__local-avatar img")?.getAttribute("src"),
+    ).toMatch(/^data:image\/svg\+xml/);
   });
 
   it("renders the remote avatar image for a direct call when avatarUrl is set", () => {
-    const { container } = render(
-      <FloatingCallWindow {...baseProps} avatarUrl="https://x/remote.png" />,
-    );
+    const { container } = render(<FloatingCallWindow {...baseProps} avatarUrl="/remote.png" />);
     expect(container.querySelector(".floating-call__avatar img")).toHaveAttribute(
       "src",
-      "https://x/remote.png",
+      "/remote.png",
     );
   });
 
-  it("falls back to initials from the title when there is no remote avatar", () => {
+  it("preserves the group emblem for resource calls", () => {
+    const { container } = render(
+      <FloatingCallWindow {...baseProps} isResourceCall title="Equipe Produto" />,
+    );
+    expect(container.querySelector(".floating-call__avatar")).toHaveTextContent("EP");
+    expect(container.querySelector(".floating-call__avatar img")).toBeNull();
+  });
+
+  it("falls back to Blobatar when there is no remote avatar", () => {
     const { container } = render(<FloatingCallWindow {...baseProps} />);
-    expect(container.querySelector(".floating-call__avatar")).toHaveTextContent("CA");
+    expect(container.querySelector(".floating-call__avatar img")?.getAttribute("src")).toMatch(
+      /^data:image\/svg\+xml/,
+    );
   });
 
   it("camera-on: renders no avatar fallback for either party", () => {
@@ -115,7 +128,7 @@ describe("FloatingCallWindow", () => {
         <FloatingCallWindow
           {...baseProps}
           hasLocalVideo={false}
-          localAvatarUrl="https://x/local.png"
+          localAvatarUrl="/local.png"
           activeSpeaker={{ kind: "local", name: "Ana Souza (você)" }}
         />,
       );
@@ -124,7 +137,7 @@ describe("FloatingCallWindow", () => {
       );
       expect(document.querySelector(".floating-call__local-avatar img")).toHaveAttribute(
         "src",
-        "https://x/local.png",
+        "/local.png",
       );
     });
 
@@ -144,7 +157,7 @@ describe("FloatingCallWindow", () => {
         <FloatingCallWindow
           {...baseProps}
           hasRemoteVideo={false}
-          avatarUrl="https://x/remote.png"
+          avatarUrl="/remote.png"
           activeSpeaker={{ kind: "direct-remote", name: "Caio Almeida" }}
         />,
       );
@@ -153,7 +166,7 @@ describe("FloatingCallWindow", () => {
       );
       expect(document.querySelector(".floating-call__avatar img")).toHaveAttribute(
         "src",
-        "https://x/remote.png",
+        "/remote.png",
       );
     });
 

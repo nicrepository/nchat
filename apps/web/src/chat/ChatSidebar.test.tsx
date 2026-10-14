@@ -44,7 +44,14 @@ const {
   mockGetOrCreateDirectDM:
     vi.fn<(userId: string, signal?: AbortSignal) => Promise<DirectDMResult>>(),
   mockCreateGroupDM:
-    vi.fn<(userIds: string[], title: string, signal?: AbortSignal) => Promise<string>>(),
+    vi.fn<
+      (
+        userIds: string[],
+        title: string,
+        avatarEmoji: string | undefined,
+        signal?: AbortSignal,
+      ) => Promise<string>
+    >(),
   mockCreateChannel: vi.fn<
     (
       input: {
@@ -82,8 +89,12 @@ vi.mock("./chatApi", () => ({
     mockSearchDMCandidates(query, signal),
   getOrCreateDirectDM: (userId: string, signal?: AbortSignal) =>
     mockGetOrCreateDirectDM(userId, signal),
-  createGroupDM: (userIds: string[], title: string, signal?: AbortSignal) =>
-    mockCreateGroupDM(userIds, title, signal),
+  createGroupDM: (
+    userIds: string[],
+    title: string,
+    avatarEmoji: string | undefined,
+    signal?: AbortSignal,
+  ) => mockCreateGroupDM(userIds, title, avatarEmoji, signal),
   createChannel: (
     input: { slug: string; displayName: string; type: "public" | "private"; categoryId?: string },
     signal?: AbortSignal,
@@ -529,17 +540,28 @@ describe("ChatSidebar — DMs", () => {
     expect(screen.queryByRole("option", { name: /EI/ })).toBeNull();
   });
 
-  it("still composes participant avatars when a group carries participants", async () => {
+  // Issue #1026: a group is drawn by its own identity only — the initials of its
+  // name on the neutral background, or its emoji — never by its participants.
+  it("draws a group with its own identity, never with participant avatars", async () => {
     mockFetchSidebarData.mockResolvedValue({
       currentUserId: "user-a",
       channels: [],
-      dms: SAMPLE_DMS,
+      dms: [
+        ...SAMPLE_DMS,
+        { id: "dm-emoji", type: "group", name: "Plataforma", participants: [], avatarEmoji: "🚀" },
+      ],
     });
     renderChat();
 
     const option = await screen.findByRole("option", { name: "Grupo Equipe Infra" });
-    expect(option.textContent).toContain("JL");
-    expect(option.textContent).toContain("CA");
+    const auto = option.querySelector(".group-avatar") as HTMLElement;
+    expect(auto.textContent).toBe("EI");
+    expect(auto.dataset.mode).toBe("auto");
+    expect(option.textContent).not.toContain("JL");
+    expect(option.querySelector("[class*='chat-sidebar__avatar--']")).toBeNull();
+
+    const emoji = screen.getByRole("option", { name: "Grupo Plataforma" });
+    expect(emoji.querySelector(".group-avatar")?.textContent).toBe("🚀");
   });
 
   it("shows the counterpart avatar in a 1:1 DM", async () => {
@@ -728,8 +750,9 @@ describe("ChatSidebar — DMs", () => {
     // A renders, then fails → initials.
     expect(dmOption().querySelector("img")).toHaveAttribute("src", "/a.png");
     fireEvent.error(dmOption().querySelector("img") as HTMLImageElement);
-    await waitFor(() => expect(dmOption().querySelector("img")).toBeNull());
-    expect(dmOption().textContent).toContain("JL");
+    await waitFor(() =>
+      expect(dmOption().querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/),
+    );
 
     // The same slot switches to B → B renders.
     rerender(tree("/b.png"));
@@ -986,6 +1009,7 @@ async function openGroupModeAndSelectBoth(user: ReturnType<typeof userEvent.setu
   await user.type(screen.getByRole("searchbox"), "eq");
   await user.click(await screen.findByRole("button", { name: "Juliane Lino" }));
   await user.click(screen.getByRole("button", { name: "Caio Almeida" }));
+  await user.click(screen.getByRole("button", { name: "Continuar" }));
 }
 
 describe("ChatSidebar — ad-hoc group creation", () => {
@@ -1009,6 +1033,7 @@ describe("ChatSidebar — ad-hoc group creation", () => {
     expect(mockCreateGroupDM).toHaveBeenCalledWith(
       ["juliane", "caio"],
       "  Equipe Infra  ",
+      undefined,
       expect.any(AbortSignal),
     );
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -1058,6 +1083,7 @@ describe("ChatSidebar — ad-hoc group creation", () => {
     expect(mockCreateGroupDM).toHaveBeenCalledWith(
       ["juliane", "caio"],
       "",
+      undefined,
       expect.any(AbortSignal),
     );
     expect(await screen.findByRole("option", { name: "Grupo Grupo DM" })).toBeInTheDocument();
@@ -1081,10 +1107,12 @@ describe("ChatSidebar — ad-hoc group creation", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Não foi possível criar o grupo");
     expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-dm")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Voltar" }));
     expect(screen.getByRole("list", { name: "Pessoas selecionadas" })).toHaveTextContent(
       "Juliane Lino",
     );
-    expect(screen.queryByTestId("chat-dm")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Continuar" }));
 
     await user.click(screen.getByRole("button", { name: "Criar grupo" }));
     await waitFor(() => expect(screen.getByTestId("chat-dm")).toBeInTheDocument());
@@ -2058,8 +2086,11 @@ describe("ChatSidebar — footer", () => {
     );
   }
 
-  const userLink = () => screen.getByRole("link", { name: /meu perfil/i });
-  const avatarText = () => userLink().querySelector(".chat-sidebar__avatar")?.textContent;
+  // The viewer's identity — avatar, name and state — is one button: the
+  // status control (issue #798).
+  const identity = () => screen.getByRole("button", { name: /definir status/i });
+  const avatarText = () => identity().querySelector(".chat-sidebar__avatar")?.textContent;
+  const avatarSource = () => identity().querySelector("img")?.getAttribute("src");
 
   it("shows no invented identity while the profile is loading", async () => {
     // A request that never settles: the loading state stays observable.
@@ -2090,7 +2121,7 @@ describe("ChatSidebar — footer", () => {
     renderFooter();
 
     await screen.findByText("Ana Souza");
-    const img = userLink().querySelector("img");
+    const img = identity().querySelector("img");
     expect(img).toHaveAttribute("src", "/api/auth/avatars/a.png");
     expect(img).toHaveAttribute("referrerpolicy", "no-referrer");
   });
@@ -2100,8 +2131,7 @@ describe("ChatSidebar — footer", () => {
     renderFooter();
 
     await screen.findByText("Ana Souza");
-    expect(userLink().querySelector("img")).toBeNull();
-    expect(avatarText()).toBe("AS");
+    expect(avatarSource()).toMatch(/^data:image\/svg\+xml/);
   });
 
   it("falls back to initials when the avatar image fails to load", async () => {
@@ -2113,11 +2143,10 @@ describe("ChatSidebar — footer", () => {
     renderFooter();
 
     await screen.findByText("Ana Souza");
-    const img = userLink().querySelector("img") as HTMLImageElement;
+    const img = identity().querySelector("img") as HTMLImageElement;
     fireEvent.error(img);
 
-    expect(userLink().querySelector("img")).toBeNull();
-    expect(avatarText()).toBe("AS");
+    expect(avatarSource()).toMatch(/^data:image\/svg\+xml/);
   });
 
   it("tries a new avatar URL after a previous one failed", async () => {
@@ -2129,8 +2158,8 @@ describe("ChatSidebar — footer", () => {
     renderFooter();
 
     await screen.findByText("Ana Souza");
-    fireEvent.error(userLink().querySelector("img") as HTMLImageElement);
-    expect(userLink().querySelector("img")).toBeNull();
+    fireEvent.error(identity().querySelector("img") as HTMLImageElement);
+    expect(avatarSource()).toMatch(/^data:image\/svg\+xml/);
 
     // A confirmed profile change publishes the new URL; the earlier failure is
     // scoped to the URL it happened on and must not suppress this one.
@@ -2142,7 +2171,7 @@ describe("ChatSidebar — footer", () => {
     act(() => refreshSelfProfile());
 
     await waitFor(() =>
-      expect(userLink().querySelector("img")).toHaveAttribute("src", "/api/auth/avatars/new.png"),
+      expect(identity().querySelector("img")).toHaveAttribute("src", "/api/auth/avatars/new.png"),
     );
   });
 
@@ -2154,29 +2183,27 @@ describe("ChatSidebar — footer", () => {
     });
     renderFooter();
 
-    await waitFor(() => expect(userLink().querySelector("img")).toBeInTheDocument());
+    await waitFor(() => expect(identity().querySelector("img")).toBeInTheDocument());
 
     mockFetchMyProfile.mockResolvedValue({ id: "user-a", displayName: "Ana Souza" });
     act(() => refreshSelfProfile());
 
-    await waitFor(() => expect(userLink().querySelector("img")).toBeNull());
-    expect(avatarText()).toBe("AS");
+    await waitFor(() => expect(avatarSource()).toMatch(/^data:image\/svg\+xml/));
   });
 
-  it.each([
-    ["Ana", "A"],
-    ["Ana Souza", "AS"],
-    ["Ana   Maria   Souza", "AM"],
-    ["Édson Ávila", "ÉÁ"],
-    ["ana souza", "AS"],
-  ])("derives at most two initials from %s", async (displayName, expected) => {
-    mockFetchMyProfile.mockResolvedValue({ id: "user-a", displayName });
+  it("keeps the same Blobatar after a confirmed profile rename", async () => {
+    mockFetchMyProfile.mockResolvedValue({ id: "user-a", displayName: "Ana" });
     renderFooter();
 
     await waitFor(() =>
       expect(screen.queryByTestId("chat-sidebar-user-placeholder")).not.toBeInTheDocument(),
     );
-    expect(avatarText()).toBe(expected);
+    const source = avatarSource();
+    expect(source).toMatch(/^data:image\/svg\+xml/);
+    mockFetchMyProfile.mockResolvedValue({ id: "user-a", displayName: "Édson Ávila" });
+    act(() => refreshSelfProfile());
+    await screen.findByText("Édson Ávila");
+    expect(avatarSource()).toBe(source);
   });
 
   it("keeps the footer structure with a very long name", async () => {
@@ -2185,22 +2212,23 @@ describe("ChatSidebar — footer", () => {
     renderFooter();
 
     // The name is one clipped element (CSS ellipsis), and the account menu
-    // trigger remains a sibling of the profile link rather than being pushed
-    // out of it.
+    // trigger remains a sibling of the status control rather than being
+    // pushed out of it.
     const name = await screen.findByText(longName);
     expect(name).toHaveClass("chat-sidebar__user-name");
-    expect(avatarText()).toBe("MA");
+    expect(avatarSource()).toMatch(/^data:image\/svg\+xml/);
     expect(screen.getByRole("button", { name: /menu da conta/i })).toBeInTheDocument();
   });
 
-  it("keeps the account menu trigger as a sibling of the profile link", async () => {
+  it("keeps the account menu trigger as a sibling of the status control", async () => {
     renderFooter();
 
     const trigger = await screen.findByRole("button", { name: /menu da conta/i });
+    await screen.findByText("Ana Souza");
     expect(trigger).toHaveAttribute("aria-haspopup", "menu");
     // Interactive elements must not nest: the trigger is a sibling of the
-    // profile link, never inside it.
-    expect(userLink().contains(trigger)).toBe(false);
+    // status control, never inside it.
+    expect(identity().contains(trigger)).toBe(false);
   });
 
   it("uses the supplied global-search action", async () => {
@@ -2208,29 +2236,120 @@ describe("ChatSidebar — footer", () => {
     const user = userEvent.setup();
     renderFooter(onOpenSearch);
 
-    await user.click(screen.getByRole("button", { name: "Buscar" }));
+    await user.click(screen.getByRole("button", { name: "Buscar no NChat" }));
 
     expect(onOpenSearch).toHaveBeenCalledOnce();
   });
 
-  it("keeps the profile link reachable", async () => {
+  // Issue #550: search is a global action, so it sits with the brand at the
+  // top — before "Nova conversa" — and no longer beside Favoritos/profile.
+  it("offers exactly one global-search entry, at the top of the sidebar", () => {
+    renderFooter();
+
+    const [search, ...duplicates] = screen.getAllByRole("button", { name: /buscar/i });
+    expect(duplicates).toHaveLength(0);
+    expect(search).toHaveAccessibleName("Buscar no NChat");
+    expect(search).toHaveAttribute("title", "Buscar");
+
+    const brand = screen.getByRole("link", { name: "Nchat — Workspace Nic-Labs" });
+    const newConversation = screen.getByRole("button", { name: "Nova conversa" });
+    const favorites = screen.getByRole("link", { name: "Meus favoritos" });
+    const follows = (a: Element, b: Element) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    // A sibling of the brand link, never an interactive nested inside it.
+    expect(brand.contains(search)).toBe(false);
+    expect(follows(brand, search)).toBe(true);
+    expect(follows(search, newConversation)).toBe(true);
+    expect(follows(newConversation, favorites)).toBe(true);
+  });
+
+  it("keeps the profile reachable from the account menu", async () => {
+    const user = userEvent.setup();
     renderFooter();
 
     await screen.findByText("Ana Souza");
-    expect(userLink()).toHaveAttribute("href", "/profile");
+    await user.click(screen.getByRole("button", { name: /menu da conta/i }));
+    expect(screen.getByRole("menuitem", { name: "Meu perfil" })).toHaveAttribute(
+      "href",
+      "/profile",
+    );
   });
 
-  it("reaches the profile link and account menu trigger by keyboard", async () => {
+  it("reaches the status control and the account menu by keyboard", async () => {
     const user = userEvent.setup();
     renderFooter();
 
     await screen.findByText("Ana Souza");
     const trigger = screen.getByRole("button", { name: /menu da conta/i });
-    userLink().focus();
-    expect(userLink()).toHaveFocus();
+    identity().focus();
+    expect(identity()).toHaveFocus();
     await user.tab();
     expect(trigger).toHaveFocus();
   });
+
+  // Issue #798 follow-up: the identity block is the status control, with the
+  // state written once, under the name.
+  it("is one button holding the avatar without a dot, the name and the state", async () => {
+    renderFooter();
+
+    const name = await screen.findByText("Ana Souza");
+    const control = identity();
+    expect(control.tagName).toBe("BUTTON");
+    expect(control).toHaveAttribute("type", "button");
+    expect(control).toHaveAttribute("aria-haspopup", "menu");
+    expect(control).toHaveAttribute("aria-expanded", "false");
+    expect(control).toHaveAttribute("title", "Definir status");
+    expect(control).toHaveAccessibleName("Ana Souza. Definir status");
+    expect(control.contains(name)).toBe(true);
+    expect(control.querySelector(".chat-sidebar__avatar")).toBeInTheDocument();
+    expect(control.querySelector(".chat-sidebar__user-presence")).toBeInTheDocument();
+    // Nothing is known about the state yet (no socket here), so no dot at all —
+    // and the avatar never carries one. With a known state, exactly one dot is
+    // drawn, under the name: see presenceSurfaces.test.tsx.
+    const row = control.closest(".chat-sidebar__user-row") as HTMLElement;
+    expect(within(row).queryAllByTestId("presence-dot")).toHaveLength(0);
+    expect(screen.queryByRole("link", { name: /meu perfil/i })).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["the avatar", () => identity().querySelector(".chat-sidebar__avatar") as HTMLElement],
+    ["the name", () => screen.getByText("Ana Souza")],
+    ["the state", () => identity().querySelector(".chat-sidebar__user-presence") as HTMLElement],
+  ])("opens the status menu from %s", async (_part, part) => {
+    const user = userEvent.setup();
+    renderFooter();
+
+    await screen.findByText("Ana Souza");
+    await user.click(part());
+    expect(screen.getByRole("menu", { name: "Status" })).toBeInTheDocument();
+    expect(identity()).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("leaves the status menu closed when Settings is pressed", async () => {
+    const user = userEvent.setup();
+    renderFooter();
+
+    await screen.findByText("Ana Souza");
+    await user.click(screen.getByRole("button", { name: /menu da conta/i }));
+    expect(screen.queryByRole("menu", { name: "Status" })).not.toBeInTheDocument();
+    expect(identity()).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it.each([["{Enter}"], [" "]])(
+    "opens with %s and Escape closes, back on the identity",
+    async (key) => {
+      const user = userEvent.setup();
+      renderFooter();
+
+      await screen.findByText("Ana Souza");
+      identity().focus();
+      await user.keyboard(key);
+      expect(screen.getByRole("menu", { name: "Status" })).toBeInTheDocument();
+      await user.keyboard("{Escape}");
+      expect(screen.queryByRole("menu", { name: "Status" })).not.toBeInTheDocument();
+      expect(identity()).toHaveFocus();
+    },
+  );
 
   it("does not invent an identity when the profile fails to load", async () => {
     mockFetchMyProfile.mockRejectedValue(new ApiRequestError(500, "internal_error", "boom"));
@@ -3170,6 +3289,7 @@ describe("ChatSidebar — row action menu", () => {
     markRead?: (target: { kind: "channel" | "dm"; targetId: string }) => void;
     renameChannel?: (channelId: string, displayName: string) => Promise<void>;
     renameGroup?: (conversationId: string, title: string) => Promise<void>;
+    setGroupAvatar?: (conversationId: string, emoji: string | undefined) => Promise<void>;
     setMuted?: (
       target: { kind: "channel" | "dm"; targetId: string },
       muted: boolean,
@@ -3179,31 +3299,33 @@ describe("ChatSidebar — row action menu", () => {
     draftSummaries?: ReadonlyMap<string, DraftSummary>;
   }
 
+  // Every row action, as a resolving mock. A test overrides only the ones it
+  // inspects; the rest exist so the menu offers the full set.
+  const sidebarActions = () => ({
+    setPinned: vi.fn().mockResolvedValue(undefined),
+    markRead: vi.fn(),
+    renameChannel: vi.fn().mockResolvedValue(undefined),
+    renameGroup: vi.fn().mockResolvedValue(undefined),
+    setGroupAvatar: vi.fn().mockResolvedValue(undefined),
+    setMuted: vi.fn().mockResolvedValue(undefined),
+    leaveConversation: vi.fn().mockResolvedValue(undefined),
+    onOpenDetails: vi.fn(),
+  });
+
   const renderSidebar = ({
     channels = [],
     dms = [],
     path = "/chat",
-    setPinned = vi.fn().mockResolvedValue(undefined),
-    markRead = vi.fn(),
-    renameChannel = vi.fn().mockResolvedValue(undefined),
-    renameGroup = vi.fn().mockResolvedValue(undefined),
-    setMuted = vi.fn().mockResolvedValue(undefined),
-    leaveConversation = vi.fn().mockResolvedValue(undefined),
-    onOpenDetails = vi.fn(),
     draftSummaries,
+    ...actions
   }: RenderOptions = {}) =>
     render(
       <MemoryRouter initialEntries={[path]}>
         <ChatSidebar
           state={readyState(channels, dms)}
           retry={() => {}}
-          setPinned={setPinned}
-          markRead={markRead}
-          renameChannel={renameChannel}
-          renameGroup={renameGroup}
-          setMuted={setMuted}
-          leaveConversation={leaveConversation}
-          onOpenDetails={onOpenDetails}
+          {...sidebarActions()}
+          {...actions}
           draftSummaries={draftSummaries}
         />
       </MemoryRouter>,
@@ -3407,6 +3529,31 @@ describe("ChatSidebar — row action menu", () => {
     ]);
   });
 
+  // Issue #1026: the identity is changed from the group's own menu, persisted
+  // through the hook, and the row is never patched optimistically.
+  it("changes a group's identity from its menu, back to Automático", async () => {
+    const user = userEvent.setup();
+    const setGroupAvatar = vi.fn().mockResolvedValue(undefined);
+    renderSidebar({
+      dms: [dm("Equipe", "group", { avatarEmoji: "🎉" })],
+      setGroupAvatar,
+    });
+
+    await user.click(trigger("grupo Equipe"));
+    await user.click(screen.getByRole("menuitem", { name: "Alterar identidade" }));
+    const dialog = screen.getByRole("dialog", { name: "Identidade do grupo" });
+    await user.click(within(dialog).getByRole("radio", { name: "Automático" }));
+    // Still the persisted emoji on the row until the server confirms.
+    expect(
+      screen.getByRole("option", { name: "Grupo Equipe" }).querySelector(".group-avatar")
+        ?.textContent,
+    ).toBe("🎉");
+    await user.click(within(dialog).getByRole("button", { name: "Salvar" }));
+
+    expect(setGroupAvatar).toHaveBeenCalledWith("Equipe", undefined);
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+
   it("offers the full menu on a group, including rename", async () => {
     const user = userEvent.setup();
     renderSidebar({ dms: [dm("Equipe", "group", { unreadCount: 1 })] });
@@ -3418,6 +3565,7 @@ describe("ChatSidebar — row action menu", () => {
       "Marcar como lido",
       "Silenciar notificações",
       "Renomear grupo",
+      "Alterar identidade",
       "Detalhes do grupo",
       "Sair do grupo",
     ]);
@@ -4031,5 +4179,99 @@ describe("ChatSidebar — renaming a channel", () => {
     );
 
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+});
+
+// Issue #1024: a channel row is drawn by ChannelIcon — `#`, plus a lock when
+// private — and never by an avatar, initials or a colour of its own.
+describe("ChatSidebar — channel identity (#1024)", () => {
+  const PUBLIC: Channel = { id: "geral", name: "geral", type: "public", canWrite: true };
+  const PRIVATE: Channel = { id: "fin", name: "financeiro", type: "private", canWrite: true };
+
+  const tree = (channels: Channel[], path = "/chat") => (
+    <MemoryRouter initialEntries={[path]}>
+      <ChatSidebar
+        state={{
+          status: "ready",
+          currentUserId: "user-a",
+          workspaceId: "workspace-1",
+          channels,
+          dms: [],
+          categories: [],
+        }}
+        retry={() => {}}
+      />
+    </MemoryRouter>
+  );
+
+  const row = (name: string) => screen.getByRole("option", { name });
+  const iconOf = (option: HTMLElement) => option.querySelector("svg[data-channel-icon]");
+
+  it("draws a public channel as # and a private one as # + lock", () => {
+    render(tree([PUBLIC, PRIVATE]));
+
+    expect(iconOf(row("Canal geral"))).toHaveAttribute("data-channel-icon", "public");
+    expect(iconOf(row("Canal privado financeiro"))).toHaveAttribute("data-channel-icon", "private");
+    expect(row("Canal privado financeiro").querySelector("[data-channel-lock]")).not.toBeNull();
+    expect(row("Canal geral").querySelector("[data-channel-lock]")).toBeNull();
+  });
+
+  it("never gives a channel an avatar, initials or a colour of its own", () => {
+    render(tree([PUBLIC, PRIVATE]));
+
+    for (const option of [row("Canal geral"), row("Canal privado financeiro")]) {
+      // UserAvatar always renders an <img> (a photo or the Blobatar data URI).
+      expect(option.querySelector("img")).toBeNull();
+      expect(option.querySelectorAll("svg[data-channel-icon]")).toHaveLength(1);
+      expect(option.querySelector("[style*='background']")).toBeNull();
+      expect(option.textContent).toBe(
+        option.querySelector(".chat-sidebar__nav-item-name")?.textContent,
+      );
+    }
+  });
+
+  it("announces privacy once, in the row's accessible name", () => {
+    render(tree([PRIVATE]));
+
+    expect(row("Canal privado financeiro")).toBeInTheDocument();
+    expect(screen.queryAllByText(/privado/i)).toHaveLength(0);
+  });
+
+  it("keeps selection and unread state alongside the icon", () => {
+    render(
+      tree(
+        [
+          { ...PUBLIC, unreadCount: 2 },
+          { ...PRIVATE, unreadCount: 5, hasMentionUnread: true },
+        ],
+        "/chat/channel/fin",
+      ),
+    );
+
+    const privateRow = row("Canal privado financeiro");
+    expect(privateRow).toHaveAttribute("aria-selected", "true");
+    expect(privateRow).toHaveClass("chat-sidebar__nav-item--active");
+    expect(iconOf(privateRow)).toHaveAttribute("data-channel-icon", "private");
+    expect(within(privateRow).getByLabelText("5 não lidas, incluindo menção")).toBeInTheDocument();
+
+    const publicRow = row("Canal geral");
+    expect(publicRow).toHaveAttribute("aria-selected", "false");
+    expect(iconOf(publicRow)).toHaveAttribute("data-channel-icon", "public");
+    expect(within(publicRow).getByLabelText("2 não lidas")).toBeInTheDocument();
+  });
+
+  it("changes only the name on rename, never the identity", () => {
+    const { rerender } = render(tree([PUBLIC, PRIVATE]));
+
+    rerender(
+      tree([
+        { ...PUBLIC, name: "anuncios" },
+        { ...PRIVATE, name: "diretoria" },
+      ]),
+    );
+
+    expect(screen.queryByRole("option", { name: "Canal geral" })).not.toBeInTheDocument();
+    expect(iconOf(row("Canal anuncios"))).toHaveAttribute("data-channel-icon", "public");
+    expect(iconOf(row("Canal privado diretoria"))).toHaveAttribute("data-channel-icon", "private");
   });
 });

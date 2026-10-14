@@ -1394,6 +1394,284 @@ assert_equals "configured value after cutover" false "$(configured_level "$state
 [[ ! -s "$state/configmap-patch-log" ]] || fail "cutover patched the ConfigMap"
 pass
 
+echo
+echo "--- manual presence (issue #798) ---"
+
+# The same capability machinery as the notification levels, on its own key: a
+# change to one gate must never move the other.
+PRESENCE_KEY=CHAT_MANUAL_PRESENCE_ENABLED
+
+set_presence_state() {
+  local state="$1" configured="$2" blue_env="$3" green_env="$4"
+  mkdir -p "$state/configmap" "$state/pod-env-blue" "$state/pod-env-green"
+  printf '%s' "$configured" >"$state/configmap/$PRESENCE_KEY"
+  [[ "$blue_env" == "unset" ]] || printf '%s' "$blue_env" >"$state/pod-env-blue/$PRESENCE_KEY"
+  [[ "$green_env" == "unset" ]] || printf '%s' "$green_env" >"$state/pod-env-green/$PRESENCE_KEY"
+}
+
+configured_presence() {
+  cat "$1/configmap/$PRESENCE_KEY" 2>/dev/null || printf ''
+}
+
+PRESENCE_ACTIVATED_FILE='configmap-annotation/nchat.io%manual-presence-activated'
+
+# A slot whose chat-service and notification-service — the two manual presence
+# readers — run a release from issue #798 on: their pod templates and their pods
+# carry the capability the release's own manifests stamp.
+make_presence_capable() {
+  local state="$1" slot="$2" service component
+  mkdir -p "$state/capability" "$state/pod-capability"
+  for service in chat-service notification-service; do
+    component="$(component_for "$service")"
+    printf 'v1' >"$state/capability/$service-$slot"
+    printf 'v1' >"$state/pod-capability/$component-$slot"
+  done
+}
+
+presence_activated() { cat "$1/$PRESENCE_ACTIVATED_FILE" 2>/dev/null || printf ''; }
+
+mark_presence_activated() {
+  mkdir -p "$1/configmap-annotation"
+  printf '2026-10-02T09:00:00Z' >"$1/$PRESENCE_ACTIVATED_FILE"
+}
+
+# Nothing an enable that was refused may leave behind: the key untouched, no
+# activation recorded, nothing restarted.
+assert_presence_untouched() {
+  local state="$1"
+  assert_equals "configured value" false "$(configured_presence "$state")"
+  assert_equals "activation" "" "$(presence_activated "$state")"
+  [[ ! -s "$state/rollout-log" ]] || fail "a refused enable restarted something"
+}
+
+begin "manual-presence reports its own key and what each slot loaded"
+state="$(new_state blue "blue green")"
+set_presence_state "$state" false false false
+status=0; run "$state" "$SCRIPTS/manual-presence.sh" --status || status=$?
+expect_exit 0 "$status"
+grep -q "$PRESENCE_KEY=false" "$WORK/out.txt" || fail "the configured value was not reported"
+grep -q "slot green pods: false" "$WORK/out.txt" || fail "a slot's loaded value was not reported"
+[[ ! -s "$state/rollout-log" ]] || fail "--status restarted something"
+pass
+
+begin "manual-presence opens its gate, records it, restarts both slots (B: both compatible)"
+state="$(new_state blue "blue green")"
+set_levels_state "$state" false false false
+set_presence_state "$state" false true true
+make_presence_capable "$state" blue
+make_presence_capable "$state" green
+status=0; run "$state" "$SCRIPTS/manual-presence.sh" --set true || status=$?
+expect_exit 0 "$status"
+assert_equals "configured value" true "$(configured_presence "$state")"
+assert_equals "the other gate" false "$(configured_level "$state")"
+[[ -n "$(presence_activated "$state")" ]] || fail "the activation was not recorded on nchat-config"
+assert_equals "restarted deployments" "deployment/chat-service-blue
+deployment/chat-service-green" "$(restarted_deployments "$state")"
+grep -q "drain-old" "$WORK/out.txt" || fail "the precondition was not stated"
+pass
+
+begin "manual-presence keeps the first activation when opened again"
+state="$(new_state blue "blue green")"
+set_presence_state "$state" true true true
+make_presence_capable "$state" blue
+make_presence_capable "$state" green
+mark_presence_activated "$state"
+status=0; run "$state" "$SCRIPTS/manual-presence.sh" --set true || status=$?
+expect_exit 0 "$status"
+assert_equals "activation" "2026-10-02T09:00:00Z" "$(presence_activated "$state")"
+[[ ! -s "$state/annotate-log" ]] || fail "an activation already recorded was written again"
+pass
+
+begin "manual-presence opens with the previous slot drained to zero (B: old template, no pods)"
+state="$(new_state blue "blue green")"
+set_presence_state "$state" false true unset
+make_presence_capable "$state" blue
+for service in "${SERVICES[@]}"; do
+  set_rollout "$state" "$service-green" 1 1 0 0 0 0 0
+  : >"$state/observed/$(component_for "$service")-green"
+done
+status=0; run "$state" "$SCRIPTS/manual-presence.sh" --set true || status=$?
+expect_exit 0 "$status"
+assert_equals "configured value" true "$(configured_presence "$state")"
+pass
+
+begin "manual-presence refuses while the previous slot still runs a build from before #798 (A)"
+state="$(new_state blue "blue green")"
+set_presence_state "$state" false false false
+make_presence_capable "$state" blue
+status=0; run "$state" "$SCRIPTS/manual-presence.sh" --set true || status=$?
+[[ "$status" -ne 0 ]] || fail "enabled with an incompatible reader alive"
+assert_presence_untouched "$state"
+grep -q "slot green cannot honour manual presence" "$WORK/err.txt" || fail "the incompatible slot was not named"
+grep -q "deployment chat-service-green" "$WORK/err.txt" || fail "the incompatible workload was not named"
+[[ ! -s "$state/configmap-patch-log" ]] || fail "the ConfigMap was patched"
+pass
+
+begin "manual-presence refuses when one reader of a compatible slot lacks it (C)"
+state="$(new_state blue "blue green")"
+set_presence_state "$state" false false false
+make_presence_capable "$state" blue
+make_presence_capable "$state" green
+rm "$state/pod-capability/notification-green"
+status=0; run "$state" "$SCRIPTS/manual-presence.sh" --set true || status=$?
+[[ "$status" -ne 0 ]] || fail "enabled with a notification-service pod from before #798"
+assert_presence_untouched "$state"
+grep -q "pod notification-green-0 (notification-service-green)" "$WORK/err.txt" || fail "the pod was not named"
+pass
+
+begin "manual-presence refuses a slot caught half-way through its restart (G)"
+state="$(new_state blue "blue green")"
+set_presence_state "$state" false false false
+make_presence_capable "$state" blue
+make_presence_capable "$state" green
+mkdir -p "$state/pods"
+# The new template is in place; one pod is new, the other still the old build —
+# and it is not even Ready yet, which does not stop it holding a WebSocket.
+jq -n --arg sha "$RELEASE_A" '{apiVersion: "v1", kind: "List", items: [
+  {metadata: {name: "chat-green-new", annotations: {"nchat.io/capability-manual-presence": "v1"}},
+   status: {phase: "Running", conditions: [{type: "Ready", status: "True"}]}},
+  {metadata: {name: "chat-green-old", annotations: {"nchat.io/release-sha": $sha}},
+   status: {phase: "Running", conditions: [{type: "Ready", status: "False"}]}},
+  {metadata: {name: "chat-green-gone"}, status: {phase: "Succeeded"}}]}' >"$state/pods/chat-green.json"
+status=0; run "$state" "$SCRIPTS/manual-presence.sh" --set true || status=$?
+[[ "$status" -ne 0 ]] || fail "enabled with a slot half-restarted"
+assert_presence_untouched "$state"
+grep -q "pod chat-green-old" "$WORK/err.txt" || fail "the old pod was not named"
+grep -q "chat-green-gone" "$WORK/err.txt" && fail "a finished pod was counted as serving"
+pass
+
+begin "manual-presence fails closed when the readers cannot be read (F)"
+for failure in pods-list-fails deployment-read-fails; do
+  state="$(new_state blue "blue green")"
+  set_presence_state "$state" false false false
+  make_presence_capable "$state" blue
+  make_presence_capable "$state" green
+  printf '1' >"$state/$failure"
+  status=0; run "$state" "$SCRIPTS/manual-presence.sh" --set true || status=$?
+  [[ "$status" -ne 0 ]] || fail "$failure: enabled without proving anything"
+  grep -q "could not read the manual presence readers" "$WORK/err.txt" || fail "$failure: refused for another reason"
+  assert_presence_untouched "$state"
+done
+pass
+
+begin "manual-presence stops before the patch when the activation cannot be recorded"
+state="$(new_state blue "blue green")"
+set_presence_state "$state" false false false
+make_presence_capable "$state" blue
+make_presence_capable "$state" green
+printf '1' >"$state/configmap-annotate-fails"
+status=0; run "$state" "$SCRIPTS/manual-presence.sh" --set true || status=$?
+[[ "$status" -ne 0 ]] || fail "enabled without recording the activation"
+assert_presence_untouched "$state"
+pass
+
+begin "after activation, rollback to a slot from before #798 fails closed (D)"
+state="$(new_state green "blue green")"
+make_presence_capable "$state" green
+mark_presence_activated "$state"
+status=0; run "$state" "$SCRIPTS/rollback.sh" --target blue "5xx after cutover" || status=$?
+[[ "$status" -ne 0 ]] || fail "rolled back onto a build that ignores manual presence"
+assert_all_on "$state" green
+[[ ! -s "$state/patch-log" ]] || fail "a Service was moved"
+grep -q "manual presence has been enabled in production" "$WORK/err.txt" || fail "the refusal does not explain itself"
+grep -q -- "--set false" "$WORK/err.txt" || fail "the refusal does not say closing the gate is not enough"
+pass
+
+begin "after activation, rollback to a compatible slot proceeds (E)"
+state="$(new_state green "blue green")"
+make_presence_capable "$state" blue
+make_presence_capable "$state" green
+mark_presence_activated "$state"
+status=0; run "$state" "$SCRIPTS/rollback.sh" --target blue "5xx after cutover" || status=$?
+expect_exit 0 "$status"
+assert_all_on "$state" blue
+pass
+
+begin "after activation, rollback to a slot where one reader predates #798 is refused"
+state="$(new_state green "blue green")"
+make_presence_capable "$state" green
+mark_presence_activated "$state"
+printf 'v1' >"$state/capability/chat-service-blue"
+status=0; run "$state" "$SCRIPTS/rollback.sh" --target blue "5xx after cutover" || status=$?
+[[ "$status" -ne 0 ]] || fail "one reader without the capability was promoted"
+grep -q "notification-service-blue" "$WORK/err.txt" || fail "the reader was not named"
+assert_all_on "$state" green
+pass
+
+begin "rollback fails closed when it cannot tell whether manual presence was enabled"
+state="$(new_state green "blue green")"
+printf '1' >"$state/configmap-read-fails"
+status=0; run "$state" "$SCRIPTS/rollback.sh" --target blue "5xx after cutover" || status=$?
+[[ "$status" -ne 0 ]] || fail "rolled back without knowing"
+grep -q "could not read whether manual presence was ever enabled" "$WORK/err.txt" || fail "refused for another reason"
+assert_all_on "$state" green
+pass
+
+begin "before any activation, rollback is unchanged"
+state="$(new_state green "blue green")"
+status=0; run "$state" "$SCRIPTS/rollback.sh" --target blue "5xx after cutover" || status=$?
+expect_exit 0 "$status"
+assert_all_on "$state" blue
+pass
+
+begin "after activation, cutover refuses a candidate from before #798"
+state="$(new_state blue "blue green")"
+make_presence_capable "$state" blue
+mark_presence_activated "$state"
+SMOKE="$(evidence green "$RELEASE_A" "$RELEASE_ID_A")" MANIFEST_DIR="$MANIFEST_A" \
+  run "$state" "$SCRIPTS/cutover.sh" --target green && fail "promoted a build that ignores manual presence"
+assert_all_on "$state" blue
+grep -q "slot green runs a build from before issue #798" "$WORK/err.txt" || fail "the refusal does not explain itself"
+pass
+
+begin "after activation, cutover to a compatible candidate proceeds"
+state="$(new_state blue "blue green")"
+make_presence_capable "$state" blue
+make_presence_capable "$state" green
+mark_presence_activated "$state"
+SMOKE="$(evidence green "$RELEASE_A" "$RELEASE_ID_A")" MANIFEST_DIR="$MANIFEST_A" \
+  run "$state" "$SCRIPTS/cutover.sh" --target green || fail "cutover failed: $(tail -2 "$WORK/err.txt")"
+assert_all_on "$state" green
+pass
+
+begin "manual-presence closes its gate the same way (rollback of the feature)"
+state="$(new_state green "blue green")"
+set_presence_state "$state" true false false
+status=0; run "$state" "$SCRIPTS/manual-presence.sh" --set false || status=$?
+expect_exit 0 "$status"
+assert_equals "configured value" false "$(configured_presence "$state")"
+pass
+
+begin "manual-presence fails when a slot's pods still carry the old value"
+state="$(new_state blue "blue green")"
+set_presence_state "$state" false true false
+make_presence_capable "$state" blue
+make_presence_capable "$state" green
+status=0; run "$state" "$SCRIPTS/manual-presence.sh" --set true || status=$?
+[[ "$status" -ne 0 ]] || fail "a stale slot was reported as success"
+grep -q "stale value" "$WORK/err.txt" || fail "the failure does not name the stale slot problem"
+pass
+
+begin "manual-presence refuses a value that is not a boolean, and no mode"
+state="$(new_state blue "blue green")"
+set_presence_state "$state" false false false
+for bad in maybe TRUE 1 ""; do
+  status=0; run "$state" "$SCRIPTS/manual-presence.sh" --set "$bad" || status=$?
+  [[ "$status" -ne 0 ]] || fail "accepted '$bad'"
+done
+status=0; run "$state" "$SCRIPTS/manual-presence.sh" || status=$?
+[[ "$status" -ne 0 ]] || fail "ran with no mode"
+[[ ! -s "$state/rollout-log" ]] || fail "a refused run still restarted something"
+pass
+
+begin "the ordinary deploy and cutover never touch the manual presence key"
+state="$(new_state blue "blue green")"
+set_presence_state "$state" false false false
+SMOKE="$(evidence green "$RELEASE_A" "$RELEASE_ID_A")" MANIFEST_DIR="$MANIFEST_A" \
+  run "$state" "$SCRIPTS/cutover.sh" --target green || fail "cutover failed"
+assert_equals "configured value after cutover" false "$(configured_presence "$state")"
+pass
+
 # Placed before the Kustomize gate below on purpose: these cases drive only the
 # fake kubectl, so they run wherever the suite runs rather than only where the
 # pinned Kustomize build can be installed.
@@ -1757,6 +2035,198 @@ begin "an unknown smoke argument is refused"
 state="$(new_state blue "blue")"
 status=0; run "$state" "$SCRIPTS/smoke.sh" --target blue --force || status=$?
 expect_exit 1 "$status"
+pass
+
+echo
+echo "--- incompatible releases after manual presence (issue #798) ---"
+
+# Release checkouts as the control plane sees them: the repository's own
+# manifests, and copies with the manual presence capability taken out of one
+# reader or both, or with a reader's manifest missing altogether.
+RELEASES="$WORK/releases"
+make_release_tree() {
+  local name="$1" strip="$2" tree="$RELEASES/$1"
+  rm -rf "$tree"; mkdir -p "$tree"
+  cp -a "$ROOT_DIR/infra" "$tree/infra"
+  local service
+  for service in $strip; do
+    sed -i '/nchat.io\/capability-manual-presence/d' "$tree/infra/k8s/base/services/$service/deployment.yaml"
+  done
+  printf '%s' "$tree"
+}
+RELEASE_CURRENT="$(make_release_tree current "")"
+RELEASE_OLD="$(make_release_tree old "chat-service notification-service")"
+RELEASE_CHAT_ONLY="$(make_release_tree chat-only "notification-service")"
+RELEASE_NOTIFICATION_ONLY="$(make_release_tree notification-only "chat-service")"
+RELEASE_PARTIAL="$(make_release_tree partial "")"
+rm "$RELEASE_PARTIAL/infra/k8s/base/services/notification-service/deployment.yaml"
+
+# Nothing a refused preparation may have done to the cluster.
+assert_nothing_started() {
+  local state="$1"
+  [[ ! -d "$state/applied" ]] || fail "something was applied"
+  [[ ! -s "$state/patch-log" ]] || fail "a Service was patched"
+  [[ ! -s "$state/rollout-log" ]] || fail "something was restarted"
+  [[ ! -f "$state/scale-log" ]] || fail "something was scaled"
+}
+
+begin "before manual presence was ever enabled, any release may be prepared"
+state="$(new_state blue "blue green")"
+status=0; run "$state" "$SCRIPTS/require-release-capability.sh" "$RELEASE_OLD" || status=$?
+expect_exit 0 "$status"
+grep -q "never enabled" "$WORK/out.txt" || fail "Phase 1 was not reported"
+pass
+
+begin "after activation, a compatible release may be prepared"
+state="$(new_state blue "blue green")"
+mark_presence_activated "$state"
+status=0; run "$state" "$SCRIPTS/require-release-capability.sh" "$RELEASE_CURRENT" || status=$?
+expect_exit 0 "$status"
+pass
+
+begin "after activation, a release from before #798 is refused before anything starts"
+state="$(new_state blue "blue green")"
+mark_presence_activated "$state"
+status=0; run "$state" "$SCRIPTS/require-release-capability.sh" "$RELEASE_OLD" || status=$?
+[[ "$status" -ne 0 ]] || fail "an incompatible release was accepted"
+grep -q "chat-service: its pod template does not carry" "$WORK/err.txt" || fail "chat-service was not named"
+grep -q "notification-service: its pod template does not carry" "$WORK/err.txt" || fail "notification-service was not named"
+assert_nothing_started "$state"
+pass
+
+begin "after activation, one incompatible reader is enough to refuse"
+for case in "$RELEASE_CHAT_ONLY:notification-service" "$RELEASE_NOTIFICATION_ONLY:chat-service"; do
+  state="$(new_state blue "blue green")"
+  mark_presence_activated "$state"
+  status=0; run "$state" "$SCRIPTS/require-release-capability.sh" "${case%%:*}" || status=$?
+  [[ "$status" -ne 0 ]] || fail "${case##*:} without the capability was accepted"
+  grep -q "${case##*:}: its pod template does not carry" "$WORK/err.txt" || fail "${case##*:} was not named"
+  assert_nothing_started "$state"
+done
+pass
+
+begin "after activation, a release whose manifests are partial fails closed"
+state="$(new_state blue "blue green")"
+mark_presence_activated "$state"
+status=0; run "$state" "$SCRIPTS/require-release-capability.sh" "$RELEASE_PARTIAL" || status=$?
+[[ "$status" -ne 0 ]] || fail "a release that does not render was accepted"
+grep -q "do not render" "$WORK/err.txt" || fail "the refusal does not say why"
+pass
+
+begin "the release check fails closed when the activation cannot be read"
+state="$(new_state blue "blue green")"
+printf '1' >"$state/configmap-read-fails"
+status=0; run "$state" "$SCRIPTS/require-release-capability.sh" "$RELEASE_CURRENT" || status=$?
+[[ "$status" -ne 0 ]] || fail "prepared without knowing whether manual presence was enabled"
+grep -q "could not read whether manual presence was ever enabled" "$WORK/err.txt" || fail "refused for another reason"
+pass
+
+# deploy.sh repeats the rule on the exact manifest it is about to apply. A
+# release tree is a copy of this repository with the capability taken out of
+# its notification-service, deploying with its own scripts.
+begin "deploy.sh refuses an incompatible candidate after activation, before migrations and apply"
+tree="$WORK/release-root"
+rm -rf "$tree"; mkdir -p "$tree"
+cp -a "$ROOT_DIR/scripts" "$ROOT_DIR/infra" "$tree/"
+sed -i '/nchat.io\/capability-manual-presence/d' "$tree/infra/k8s/base/services/notification-service/deployment.yaml"
+state="$(new_state blue "blue green")"
+mark_presence_activated "$state"
+status=0; release_run "$state" "$tree/scripts/deploy/nchat-prod/deploy.sh" || status=$?
+[[ "$status" -ne 0 ]] || fail "deployed a candidate that ignores Do Not Disturb"
+grep -q "notification-service: its pod template does not carry" "$WORK/err.txt" || fail "the refusal does not name the reader"
+[[ ! -s "$state/apply-log" ]] || fail "something was applied: $(cat "$state/apply-log")"
+assert_nothing_started "$state"
+pass
+
+begin "deploy.sh deploys a compatible candidate after activation"
+state="$(new_state blue "blue green")"
+mark_presence_activated "$state"
+status=0; release_run "$state" "$SCRIPTS/deploy.sh" || status=$?
+expect_exit 0 "$status"
+pass
+
+# The supported manual deploy runs from the control plane — this checkout —
+# and names the release checkout to deploy. The release below is not a copy of
+# this repository with something taken out: it is the real tree of the last
+# commit before #798, read from history, with that commit's own deploy
+# scripts, Makefile and manifests.
+PRE_798_SHA=b2ad1a679963af4505de4fce4c11335edc08be51
+PRE_798="$WORK/pre-798"
+any_mutation() {
+  local state="$1" log
+  for log in apply-log wait-log delete-log patch-log rollout-log scale-log annotate-log configmap-patch-log release-state-write-log; do
+    [[ -s "$state/$log" ]] && { echo "$log: $(head -1 "$state/$log")"; return 0; }
+  done
+  [[ -d "$state/applied" ]] && { echo "applied: $(ls "$state/applied")"; return 0; }
+  return 1
+}
+
+begin "the release from before #798 is read from history, as it shipped"
+rm -rf "$PRE_798"; mkdir -p "$PRE_798"
+if ! git -C "$ROOT_DIR" cat-file -e "$PRE_798_SHA^{commit}" 2>/dev/null; then
+  fail "commit $PRE_798_SHA is not in this clone; these cases need the history (fetch-depth: 0)"
+else
+  git -C "$ROOT_DIR" archive "$PRE_798_SHA" Makefile package.json scripts infra | tar -x -C "$PRE_798"
+fi
+[[ -f "$PRE_798/scripts/deploy/nchat-prod/deploy.sh" ]] || fail "the old release has no deploy.sh"
+[[ ! -e "$PRE_798/scripts/deploy/nchat-prod/require-release-capability.sh" ]] || fail "not a release from before #798"
+grep -rq "capability-manual-presence" "$PRE_798/infra" "$PRE_798/scripts" && fail "the old release already knows the capability"
+grep -q "^prod-blue-green-deploy-release:" "$PRE_798/Makefile" && fail "the old release already has the guarded entrypoint"
+pass
+
+begin "after activation, the manual entrypoint refuses the real old release before any of it runs"
+state="$(new_state blue "blue green")"
+mark_presence_activated "$state"
+status=0; release_run "$state" "$SCRIPTS/deploy-release.sh" "$PRE_798" || status=$?
+[[ "$status" -ne 0 ]] || fail "the old release was deployed"
+grep -q "chat-service: its pod template does not carry" "$WORK/err.txt" || fail "chat-service was not named"
+grep -q "notification-service: its pod template does not carry" "$WORK/err.txt" || fail "notification-service was not named"
+grep -q "handing over" "$WORK/out.txt" && fail "the old release's deploy.sh was started"
+if mutation="$(any_mutation "$state")"; then fail "the cluster was touched: $mutation"; fi
+pass
+
+begin "after activation, an unreadable activation refuses the old release before any of it runs"
+state="$(new_state blue "blue green")"
+printf '1' >"$state/configmap-read-fails"
+status=0; release_run "$state" "$SCRIPTS/deploy-release.sh" "$PRE_798" || status=$?
+[[ "$status" -ne 0 ]] || fail "deployed without knowing whether manual presence was enabled"
+grep -q "handing over" "$WORK/out.txt" && fail "the old release's deploy.sh was started"
+if mutation="$(any_mutation "$state")"; then fail "the cluster was touched: $mutation"; fi
+pass
+
+begin "before activation, the manual entrypoint hands the old release to its own deploy.sh (Phase 1)"
+state="$(new_state blue "blue green")"
+status=0; release_run "$state" "$SCRIPTS/deploy-release.sh" "$PRE_798" || status=$?
+expect_exit 0 "$status"
+grep -q "never enabled" "$WORK/out.txt" || fail "Phase 1 was not reported"
+grep -q "handing over" "$WORK/out.txt" || fail "the release's deploy.sh was not run"
+grep -q "candidate.yaml" "$state/apply-log" 2>/dev/null || fail "the old release's candidate was not applied"
+pass
+
+begin "after activation, the manual entrypoint deploys a compatible release"
+state="$(new_state blue "blue green")"
+mark_presence_activated "$state"
+status=0; release_run "$state" "$SCRIPTS/deploy-release.sh" "$ROOT_DIR" || status=$?
+expect_exit 0 "$status"
+grep -q "candidate.yaml" "$state/apply-log" 2>/dev/null || fail "the compatible candidate was not applied"
+pass
+
+begin "the manual entrypoint refuses a checkout that is not a release"
+state="$(new_state blue "blue green")"
+status=0; release_run "$state" "$SCRIPTS/deploy-release.sh" "$WORK/nowhere" || status=$?
+[[ "$status" -ne 0 ]] || fail "accepted a missing release checkout"
+if mutation="$(any_mutation "$state")"; then fail "the cluster was touched: $mutation"; fi
+pass
+
+# The interface itself: the old target no longer deploys anything here, and an
+# old checkout mistaken for the control plane has no guarded target to run.
+begin "the retired direct target refuses, and an old checkout has no guarded target"
+status=0; make -s -C "$ROOT_DIR" prod-blue-green-deploy >"$WORK/out.txt" 2>"$WORK/err.txt" || status=$?
+[[ "$status" -ne 0 ]] || fail "the retired target succeeded"
+grep -q "prod-blue-green-deploy-release" "$WORK/err.txt" || fail "the retired target does not point at its replacement"
+status=0; make -s -C "$PRE_798" prod-blue-green-deploy-release RELEASE_CHECKOUT="$PRE_798" >"$WORK/out.txt" 2>"$WORK/err.txt" || status=$?
+[[ "$status" -ne 0 ]] || fail "an old checkout ran a guarded deploy it does not have"
+grep -q "No rule to make target" "$WORK/err.txt" || fail "an old checkout failed for another reason: $(cat "$WORK/err.txt")"
 pass
 
 echo

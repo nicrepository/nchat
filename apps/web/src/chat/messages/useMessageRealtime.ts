@@ -9,6 +9,7 @@ import {
   type WSAcknowledgementUpdatedEvent,
   type WSConversationEventMessage,
   type WSMembersAddedEvent,
+  type WSConversationUpdatedEvent,
   type WSMessageBlockedEvent,
   type WSMessageCreatedEvent,
   type WSMessageLinkSafetyChangedEvent,
@@ -38,6 +39,7 @@ type MessageUpdate = NonNullable<WSMessageUpdatedEvent["message_update"]>;
 export interface RealtimeListeners {
   onPinUpdated?: (event: WSPinUpdatedEvent) => void;
   onMembersAdded?: (event: WSMembersAddedEvent) => void;
+  onConversationUpdated?: (event: WSConversationUpdatedEvent) => void;
   /**
    * Issue #469: called on a conversation.event for the active target, after
    * the timeline has reconciled it.
@@ -51,6 +53,12 @@ export interface RealtimeListeners {
   onConversationEvent?: (event: WSConversationEventMessage) => void;
   onAttachmentStatus?: (event: WSAttachmentStatusEvent) => void;
   onTypingUpdated?: (event: WSTypingUpdatedEvent) => void;
+  /**
+   * Issue #896: called when the subscription comes back ready — the resync
+   * point below — so state kept outside the timeline (the pins) re-reads what a
+   * disconnect may have hidden from it.
+   */
+  onSubscriptionReady?: () => void;
 }
 
 export interface MessageRealtime {
@@ -290,6 +298,7 @@ export function useMessageRealtime({
   );
 
   const { reconcilePendingLinkScans, refreshAuthoritativeMessageSecurity } = reconciliation;
+  const { onSubscriptionReady } = listeners;
   const handleSubscribed = useCallback(() => {
     dispatch({ type: "ws_subscription_ready" });
     reconcilePendingLinkScans();
@@ -300,8 +309,10 @@ export function useMessageRealtime({
     // mechanism the two calls above already use; nothing new was invented for
     // acknowledgement, and no event was added to the protocol.
     reconcileAcknowledgements?.();
+    onSubscriptionReady?.();
   }, [
     dispatch,
+    onSubscriptionReady,
     reconcileAcknowledgements,
     reconcilePendingLinkScans,
     refreshAuthoritativeMessageSecurity,
@@ -324,6 +335,10 @@ export function useMessageRealtime({
 
   const target = { kind, targetId };
   const handlePinUpdated = useForwardedTargetEvent(target, listeners.onPinUpdated);
+  const handleConversationUpdated = useForwardedTargetEvent(
+    target,
+    listeners.onConversationUpdated,
+  );
   const handleMembersAdded = useForwardedTargetEvent(target, listeners.onMembersAdded);
   const handleTypingUpdated = useForwardedTargetEvent(target, listeners.onTypingUpdated);
   const handleAttachmentStatus = useForwardedTargetEvent(
@@ -371,6 +386,7 @@ export function useMessageRealtime({
     onTypingUpdated: handleTypingUpdated,
     onPinUpdated: handlePinUpdated,
     onMembersAdded: handleMembersAdded,
+    onConversationUpdated: handleConversationUpdated,
     onAttachmentStatus: handleAttachmentStatus,
     onConversationEvent: handleConversationEvent,
     onAcknowledgementUpdated: handleAcknowledgementUpdated,

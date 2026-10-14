@@ -30,10 +30,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearTokens, setTokens } from "../lib/authSession";
 import { flushResizeObservers, observedElements } from "../setupTests";
 import ChatMessageArea from "./ChatMessageArea";
+import { withMessageJump } from "./useConversationTarget";
 import { isCatalogedEmoji, loadEmojiCatalog, resetEmojiCatalogCache } from "./emoji/emojiCatalog";
 import { avatarColorFor } from "./messageDisplay";
 import type { Message, MessagePage, MessageSecuritySnapshot } from "./chatTypes";
 import type { MessageLink } from "./messageLinks";
+import type { ReadProgress } from "./readCursor";
+import type { ReadTarget } from "./readCursorWriter";
+import { acceptServerRead, applyReadProgress, type ReadRow } from "./sidebarReadState";
 import type {
   WSClientErrorEvent,
   WSMessageCreatedEvent,
@@ -255,6 +259,15 @@ vi.mock("./filesApi", () => ({
     limit: number,
     signal?: AbortSignal,
   ) => mockFetchChannelAttachments(target, limit, signal),
+  // The panel reads pages (issue #897); every fixture here is a single page.
+  fetchConversationAttachmentPage: (
+    target: { kind: "channel" | "dm"; id: string },
+    page: { limit: number },
+    signal?: AbortSignal,
+  ) =>
+    Promise.resolve(mockFetchChannelAttachments(target, page.limit, signal)).then(
+      (attachments) => ({ attachments, nextCursor: null }),
+    ),
   // The panel's file rows render a thumbnail and a video player. Neither is
   // exercised here — no fixture is previewable or a video — but both modules
   // read the export at render time, so it has to exist.
@@ -455,7 +468,11 @@ function renderChannelAreaForUser(currentUserId = "me-123") {
       <Routes>
         <Route
           path="/chat"
-          element={<ParentWithContext ctx={{ currentUserId, channels: [], dms: [] }} />}
+          element={
+            <ParentWithContext
+              ctx={{ currentUserId, workspaceId: "workspace-1", channels: [], dms: [] }}
+            />
+          }
         >
           <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
         </Route>
@@ -500,6 +517,7 @@ function renderPendingReferenceState(state: unknown) {
             <ParentWithContext
               ctx={{
                 currentUserId: "me-123",
+                workspaceId: "workspace-1",
                 channels: [
                   { id: "destination", name: "Destino", type: "public", canWrite: true },
                   {
@@ -688,6 +706,7 @@ function renderForwardingArea(messages: Message[]) {
             <ParentWithContext
               ctx={{
                 currentUserId: "me-123",
+                workspaceId: "workspace-1",
                 channels: [
                   { id: "current", name: "Atual", type: "public", canWrite: true },
                   {
@@ -838,6 +857,7 @@ describe("ChatMessageArea — RF-08 forwarding", () => {
     );
     const ctx: ChatOutletContext = {
       currentUserId: "me-123",
+      workspaceId: "workspace-1",
       channels: [
         { id: "current", name: "Atual", type: "public", canWrite: true },
         { id: "next", name: "Próximo", type: "public", canWrite: true },
@@ -890,7 +910,7 @@ describe("ChatMessageArea — RF-08 forwarding", () => {
     );
     expect(screen.getAllByTestId("chat-message-forwarded")).toHaveLength(1);
     expect(screen.getByText("<img src=x onerror=alert(1)>")).toBeVisible();
-    expect(document.querySelector("img")).toBeNull();
+    expect(document.querySelector("img[src='x']")).toBeNull();
   });
 });
 
@@ -908,6 +928,7 @@ describe("ChatMessageArea — channel header", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "me-123",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                 }}
@@ -925,6 +946,46 @@ describe("ChatMessageArea — channel header", () => {
     expect(header).toHaveTextContent("geral");
   });
 
+  // Issue #1024: the header draws the same ChannelIcon as the sidebar, from the
+  // visibility the sidebar payload already carries, and says "privado" in words.
+  it.each([
+    ["public", "Canal geral"],
+    ["private", "Canal privado geral"],
+  ] as const)("draws a %s channel's identity and names it", async (type, heading) => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  workspaceId: "workspace-1",
+                  channels: [{ id: "geral", name: "geral", type, canWrite: true }],
+                  dms: [],
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const header = await screen.findByTestId("chat-msg-header");
+    expect(within(header).getByRole("heading", { level: 1, name: heading })).toHaveTextContent(
+      /^geral$/,
+    );
+    expect(header.querySelector("svg[data-channel-icon]")).toHaveAttribute(
+      "data-channel-icon",
+      type,
+    );
+    expect(header.querySelector("img")).toBeNull();
+  });
+
   it("renders DM header with DM name", async () => {
     mockFetchDMMessages.mockResolvedValue(emptyPage);
     render(
@@ -936,6 +997,7 @@ describe("ChatMessageArea — channel header", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "me-123",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [{ id: "dm-juliane", type: "1:1", name: "dm-juliane", participants: [] }],
                 }}
@@ -964,6 +1026,7 @@ describe("ChatMessageArea — channel header", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "me-123",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [{ id: "dm-1", type: "1:1", name: "Juliane", participants: [] }],
                 }}
@@ -988,7 +1051,11 @@ describe("ChatMessageArea — channel header", () => {
         <Routes>
           <Route
             path="/chat"
-            element={<ParentWithContext ctx={{ currentUserId: "me-123", channels: [], dms }} />}
+            element={
+              <ParentWithContext
+                ctx={{ currentUserId: "me-123", workspaceId: "workspace-1", channels: [], dms }}
+              />
+            }
           >
             <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
           </Route>
@@ -1030,8 +1097,8 @@ describe("ChatMessageArea — channel header", () => {
     ]);
 
     const header = await screen.findByTestId("chat-msg-header");
-    expect(header.querySelector("img")).toBeNull();
-    expect(header).toHaveTextContent("JL");
+    expect(header.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
+    expect(header).toHaveTextContent("Juliane Lino");
   });
 
   it("falls back to initials when the DM header avatar fails to load", async () => {
@@ -1048,8 +1115,10 @@ describe("ChatMessageArea — channel header", () => {
     const header = await screen.findByTestId("chat-msg-header");
     fireEvent.error(header.querySelector("img") as HTMLImageElement);
 
-    await waitFor(() => expect(header.querySelector("img")).toBeNull());
-    expect(header).toHaveTextContent("JL");
+    await waitFor(() =>
+      expect(header.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/),
+    );
+    expect(header).toHaveTextContent("Juliane Lino");
   });
 
   it("keeps the group DM header on its title with no avatar image", async () => {
@@ -1075,6 +1144,7 @@ describe("ChatMessageArea — channel header", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "me-123",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                   joinResourceCall,
@@ -1108,6 +1178,7 @@ describe("ChatMessageArea — channel header", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "me-123",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                   joinResourceCall: vi.fn(),
@@ -1142,6 +1213,7 @@ describe("ChatMessageArea — channel header", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "me-123",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [{ id: "dm-grp", type: "group", name: "Equipe Infra", participants: [] }],
                   joinResourceCall,
@@ -1177,6 +1249,7 @@ describe("ChatMessageArea — channel header", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "me-123",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [
                     {
@@ -1225,6 +1298,7 @@ describe("ChatMessageArea — channel header", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "me-123",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [
                     {
@@ -1301,6 +1375,7 @@ describe("ChatMessageArea — channel header", () => {
     mockFetchDMMessages.mockResolvedValue(emptyPage);
     const ctx: ChatOutletContext = {
       currentUserId: "me-123",
+      workspaceId: "workspace-1",
       channels: [],
       dms: [dmWith(avatarUrl, name)],
     };
@@ -1322,6 +1397,7 @@ describe("ChatMessageArea — channel header", () => {
   ) => {
     const ctx: ChatOutletContext = {
       currentUserId: "me-123",
+      workspaceId: "workspace-1",
       channels: [],
       dms: [dmWith(avatarUrl, name)],
     };
@@ -1343,8 +1419,10 @@ describe("ChatMessageArea — channel header", () => {
     // A fails → initials fallback.
     expect(header.querySelector("img")).toHaveAttribute("src", "/avatar-a.png");
     fireEvent.error(header.querySelector("img") as HTMLImageElement);
-    await waitFor(() => expect(header.querySelector("img")).toBeNull());
-    expect(header).toHaveTextContent("JL");
+    await waitFor(() =>
+      expect(header.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/),
+    );
+    expect(header).toHaveTextContent("Juliane Lino");
 
     // Navigate to B (same header instance) → B renders.
     rerenderHeaderCtx(rerender, "/avatar-b.png");
@@ -1363,12 +1441,14 @@ describe("ChatMessageArea — channel header", () => {
     const { rerender } = renderHeaderCtx("/avatar-a.png");
     const header = await screen.findByTestId("chat-msg-header");
     fireEvent.error(header.querySelector("img") as HTMLImageElement);
-    await waitFor(() => expect(header.querySelector("img")).toBeNull());
+    await waitFor(() =>
+      expect(header.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/),
+    );
 
     // Re-render with the identical failed URL: no new attempt, stays initials.
     rerenderHeaderCtx(rerender, "/avatar-a.png");
-    expect(header.querySelector("img")).toBeNull();
-    expect(header).toHaveTextContent("JL");
+    expect(header.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
+    expect(header).toHaveTextContent("Juliane Lino");
   });
 
   it("falls back in the header when a valid avatar is replaced by an absent one", async () => {
@@ -1377,15 +1457,19 @@ describe("ChatMessageArea — channel header", () => {
     expect(header.querySelector("img")).toHaveAttribute("src", "/avatar-a.png");
 
     rerenderHeaderCtx(rerender, undefined);
-    await waitFor(() => expect(header.querySelector("img")).toBeNull());
-    expect(header).toHaveTextContent("JL");
+    await waitFor(() =>
+      expect(header.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/),
+    );
+    expect(header).toHaveTextContent("Juliane Lino");
   });
 
   it("shows B's avatar and name even when A and B share a name but differ by URL", async () => {
     const { rerender } = renderHeaderCtx("/avatar-a.png", "Ana");
     const header = await screen.findByTestId("chat-msg-header");
     fireEvent.error(header.querySelector("img") as HTMLImageElement);
-    await waitFor(() => expect(header.querySelector("img")).toBeNull());
+    await waitFor(() =>
+      expect(header.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/),
+    );
 
     rerenderHeaderCtx(rerender, "/avatar-b.png", "Ana");
     const image = await waitFor(() => {
@@ -1467,6 +1551,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                   getResourceCall: () => call,
@@ -1498,6 +1583,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                   getResourceCall: () => call,
@@ -1535,6 +1621,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                   getResourceCall: () => makeResourceCall(),
@@ -1572,6 +1659,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [
                     { id: "geral", name: "geral", type: "public", canWrite: true },
                     { id: "outro", name: "outro", type: "public", canWrite: true },
@@ -1607,6 +1695,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [
                     {
@@ -1643,6 +1732,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [{ id: "grupo-1", type: "group", name: "Infra Squad", participants: [] }],
                   getResourceCall: () =>
@@ -1674,6 +1764,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [{ id: "grupo-1", type: "group", name: "Infra Squad", participants: [] }],
                   getResourceCall: () =>
@@ -1712,6 +1803,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [
                     {
                       id: "infraestrutura",
@@ -1749,6 +1841,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                   getResourceCall: () => makeResourceCall(),
@@ -1780,6 +1873,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                   getResourceCall: () => makeResourceCall(),
@@ -1811,6 +1905,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                   getResourceCall: () => makeResourceCall(),
@@ -1841,6 +1936,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                   getResourceCall: () => makeResourceCall(),
@@ -1872,6 +1968,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                   getResourceCall: () => terminalCall,
@@ -1902,6 +1999,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                   getResourceCall: () => call,
@@ -1940,6 +2038,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                   getResourceCall: () => call,
@@ -1975,6 +2074,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                   getResourceCall: () => makeResourceCall(),
@@ -2015,6 +2115,7 @@ describe("ChatMessageArea — #673 icon call controls", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                   getResourceCall: () => null,
@@ -2049,6 +2150,7 @@ describe("ChatMessageArea — #673 icon call controls", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [
                     {
@@ -2124,6 +2226,7 @@ describe("ChatMessageArea — #673 active direct call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [directDM],
                   directCallSession: directCallSession(),
@@ -2157,6 +2260,7 @@ describe("ChatMessageArea — #673 active direct call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [directDM],
                   directCallSession: directCallSession({ callType: "video" }),
@@ -2184,6 +2288,7 @@ describe("ChatMessageArea — #673 active direct call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [
                     directDM,
@@ -2223,6 +2328,7 @@ describe("ChatMessageArea — #673 active direct call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [{ id: "dm-grp", type: "group", name: "Equipe Infra", participants: [] }],
                   directCallSession: directCallSession(),
@@ -2250,6 +2356,7 @@ describe("ChatMessageArea — #673 active direct call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                   directCallSession: directCallSession(),
@@ -2277,6 +2384,7 @@ describe("ChatMessageArea — #673 active direct call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [directDM],
                   directCallSession: undefined,
@@ -2305,6 +2413,7 @@ describe("ChatMessageArea — #673 active direct call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [directDM],
                   directCallSession: directCallSession({ onLeave }),
@@ -2334,6 +2443,7 @@ describe("ChatMessageArea — #673 active direct call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [directDM],
                   directCallSession: directCallSession({
@@ -2367,6 +2477,7 @@ describe("ChatMessageArea — #673 active direct call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [directDM],
                   directCallSession: directCallSession({ onOpenFullCall }),
@@ -2395,6 +2506,7 @@ describe("ChatMessageArea — #673 active direct call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [directDM],
                   directCallSession: directCallSession(),
@@ -2418,6 +2530,7 @@ describe("ChatMessageArea — #673 active direct call bar", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "user-an",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [directDM],
                   directCallSession: directCallSession(),
@@ -3580,6 +3693,7 @@ describe("ChatMessageArea — RF-12 typing indicator display name", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "me-123",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [
                     {
@@ -4547,6 +4661,7 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
           <Outlet
             context={{
               currentUserId: "me-123",
+              workspaceId: "workspace-1",
               channels: [
                 { id: "destination", name: "Destino", type: "public" },
                 { id: rf09SourceChannelID, name: "Origem privada", type: "private" },
@@ -4626,6 +4741,7 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "me-123",
+                  workspaceId: "workspace-1",
                   channels: [
                     {
                       id: rf09SourceChannelID,
@@ -4695,30 +4811,6 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
     await waitFor(() =>
       expect(screen.queryByTestId("chat-composer-reference")).not.toBeInTheDocument(),
     );
-  });
-
-  it("loads and highlights a directly navigated source outside the latest page", async () => {
-    const focused = makeMessage({ id: "older-message", bodyText: "mensagem antiga" });
-    mockFetchChannelMessages.mockResolvedValue(emptyPage);
-    mockFetchChannelMessage.mockResolvedValue(focused);
-    render(
-      <MemoryRouter initialEntries={["/chat/channel/source?message=older-message"]}>
-        <Routes>
-          <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
-        </Routes>
-      </MemoryRouter>,
-    );
-
-    expect(await screen.findByText("mensagem antiga")).toBeInTheDocument();
-    expect(mockFetchChannelMessage).toHaveBeenCalledWith(
-      "source",
-      "older-message",
-      expect.any(AbortSignal),
-    );
-    expect(window.Element.prototype.scrollIntoView).toHaveBeenCalledWith({
-      behavior: "smooth",
-      block: "center",
-    });
   });
 });
 
@@ -5139,6 +5231,215 @@ describe("ChatMessageArea — infinite scroll", () => {
     vi.unstubAllGlobals();
   });
 
+  it("pages back to a directly navigated source outside the latest page, then highlights it", async () => {
+    // #1088: the target is reached through the ordinary history — the page it
+    // belongs to — never spliced in on its own beside a page it is not part of.
+    // The sentinel's observer never fires here, so the older page can only have
+    // been asked for by the opening resolution's bounded search.
+    const focused = makeMessage({ id: "older-message", bodyText: "mensagem antiga" });
+    mockFetchChannelMessages.mockImplementation((_id: string, cursor?: string) =>
+      Promise.resolve(
+        cursor === "cursor-older"
+          ? { messages: [focused], nextCursor: "" }
+          : {
+              messages: [makeMessage({ id: "latest", bodyText: "recente" })],
+              nextCursor: "cursor-older",
+            },
+      ),
+    );
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/source?message=older-message"]}>
+        <Routes>
+          <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("mensagem antiga")).toBeInTheDocument();
+    expect(mockFetchChannelMessages).toHaveBeenCalledWith(
+      "source",
+      "cursor-older",
+      expect.any(AbortSignal),
+    );
+    expect(mockFetchChannelMessage).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(window.Element.prototype.scrollIntoView).toHaveBeenCalledWith({
+        behavior: "smooth",
+        block: "center",
+      }),
+    );
+    expect(
+      document.querySelector('[data-message-id="older-message"].chat-msg-area__msg--highlight'),
+    ).not.toBeNull();
+  });
+  it("never lets a page searched for in the conversation left behind move the next one", async () => {
+    // #1088 item 10: A is still paging back to its deep link when the reader
+    // opens B; A's page arriving afterwards must not land, travel or highlight.
+    const user = userEvent.setup();
+    let resolveOlderA!: (page: MessagePage) => void;
+    mockFetchChannelMessages.mockImplementation((id: string, cursor?: string) => {
+      if (id === "canal-b") {
+        return Promise.resolve(messagePage([makeMessage({ id: "b-1", bodyText: "conversa B" })]));
+      }
+      if (cursor === "cursor-a") return new Promise<MessagePage>((r) => (resolveOlderA = r));
+      return Promise.resolve({
+        messages: [makeMessage({ id: "a-latest", bodyText: "recente de A" })],
+        nextCursor: "cursor-a",
+      });
+    });
+
+    function TwoChannels() {
+      const navigate = useNavigate();
+      return (
+        <div>
+          <button onClick={() => navigate("/chat/channel/canal-b")}>Ir para B</button>
+          <Routes>
+            <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Routes>
+        </div>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/canal-a?message=a-old"]}>
+        <TwoChannels />
+      </MemoryRouter>,
+    );
+    await waitFor(() =>
+      expect(mockFetchChannelMessages).toHaveBeenCalledWith(
+        "canal-a",
+        "cursor-a",
+        expect.any(AbortSignal),
+      ),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Ir para B" }));
+    expect(await screen.findByText("conversa B")).toBeInTheDocument();
+    await act(async () =>
+      resolveOlderA({
+        messages: [makeMessage({ id: "a-old", bodyText: "alvo de A" })],
+        nextCursor: "",
+      }),
+    );
+
+    expect(screen.queryByText("alvo de A")).not.toBeInTheDocument();
+    expect(document.querySelector(".chat-msg-area__msg--highlight")).toBeNull();
+    expect(window.Element.prototype.scrollIntoView).not.toHaveBeenCalledWith({
+      behavior: "smooth",
+      block: "center",
+    });
+  });
+
+  /**
+   * #1088: a conversation whose page n holds one message and points at page
+   * n+1, up to `last`. `holds(n)` names the message on page n.
+   */
+  function chainPages(last: number, holds: (n: number) => string) {
+    mockFetchChannelMessages.mockImplementation((_id: string, cursor?: string) => {
+      const n = cursor ? Number(cursor.slice(1)) : 0;
+      return Promise.resolve({
+        messages: [makeMessage({ id: holds(n), bodyText: `pagina ${n}` })],
+        nextCursor: n === last ? "" : `p${n + 1}`,
+      });
+    });
+  }
+
+  /** Opens the deep link, with a control that asks for the same message again. */
+  function openDeepLink(messageId: string) {
+    function AskAgain() {
+      const navigate = useNavigate();
+      return (
+        <button
+          onClick={() =>
+            navigate(`/chat/channel/source?message=${messageId}`, {
+              state: withMessageJump(undefined),
+            })
+          }
+        >
+          Ir para a mensagem
+        </button>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={[`/chat/channel/source?message=${messageId}`]}>
+        <AskAgain />
+        <Routes>
+          <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  /** Waits for pages from..to to arrive in order, one round each. */
+  async function pagesArrive(from: number, to: number) {
+    for (let n = from; n <= to; n += 1) {
+      expect(await screen.findByText(`pagina ${n}`)).toBeInTheDocument();
+    }
+  }
+
+  const travelled = () =>
+    vi
+      .mocked(window.Element.prototype.scrollIntoView)
+      .mock.calls.filter(([options]) => (options as ScrollIntoViewOptions)?.block === "center");
+
+  it("reaches a target found exactly on the last page the cap allows", async () => {
+    // Before the fix, asking for that page spent the cap at once and the
+    // opening fell back to the tail while the page was still on its way.
+    chainPages(12, (n) => (n === 10 ? "target" : `h-${n}`));
+    openDeepLink("target");
+
+    await pagesArrive(0, 10);
+
+    await waitFor(() =>
+      expect(
+        document.querySelector('[data-message-id="target"].chat-msg-area__msg--highlight'),
+      ).not.toBeNull(),
+    );
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(11);
+  });
+
+  it("keeps paging after a page that only repeated loaded messages", async () => {
+    // Page 1 repeats page 0's message: the array is unchanged, the cursor moved.
+    chainPages(3, (n) => (n === 1 ? "h-0" : n === 2 ? "target" : `h-${n}`));
+    openDeepLink("target");
+
+    expect(await screen.findByText("pagina 2")).toBeInTheDocument();
+    expect(mockFetchChannelMessages).toHaveBeenCalledWith("source", "p2", expect.any(AbortSignal));
+    await waitFor(() => expect(travelled()).toHaveLength(1));
+  });
+
+  it("follows no deep link once the bounded search has given up on it, until asked again", async () => {
+    // The target sits past the cap. Once the search settles elsewhere, the
+    // reader paging back by hand to the target must not be yanked to it — but
+    // asking for it again travels, once (#896).
+    chainPages(12, (n) => (n === 12 ? "target" : `h-${n}`));
+    openDeepLink("target");
+
+    // The initial page plus exactly MAX_BOUNDARY_SEARCH_PAGES, then it stops.
+    await pagesArrive(0, 10);
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(11);
+
+    for (const n of [11, 12]) {
+      act(() => {
+        capturedIOCallback?.(
+          [{ isIntersecting: true } as IntersectionObserverEntry],
+          {} as IntersectionObserver,
+        );
+      });
+      expect(await screen.findByText(`pagina ${n}`)).toBeInTheDocument();
+    }
+    expect(document.querySelector(".chat-msg-area__msg--highlight")).toBeNull();
+    expect(travelled()).toHaveLength(0);
+
+    await userEvent.setup().click(screen.getByRole("button", { name: "Ir para a mensagem" }));
+
+    await waitFor(() => expect(travelled()).toHaveLength(1));
+    expect(
+      document.querySelector('[data-message-id="target"].chat-msg-area__msg--highlight'),
+    ).not.toBeNull();
+    // Neither asked for again nor reloaded: the same conversation, the same pages.
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(13);
+  });
+
   it("loads older messages when top sentinel becomes visible and renders them", async () => {
     const cursor = "dGVzdC1jdXJzb3I";
     const oldMsg = makeMessage({ id: "old-1", bodyText: "Mensagem antiga" });
@@ -5514,6 +5815,7 @@ describe("ChatMessageArea — route decoding", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "me-123",
+                  workspaceId: "workspace-1",
                   channels: [
                     { id: "equipe infra", name: "Equipe Infra", type: "public", canWrite: true },
                   ],
@@ -5614,6 +5916,7 @@ function ParentWithContext({
         <SidebarDetailsPanel
           target={sidebarTarget}
           currentUserId={ctx.currentUserId}
+          workspaceId="workspace-1"
           canonicalName=""
           coordinator={coordinator}
           onClose={() => setSidebarTarget(null)}
@@ -5677,7 +5980,7 @@ describe("ChatMessageArea — one open-DM flow across real surfaces (issue #895)
             path="/chat"
             element={
               <ParentWithContext
-                ctx={{ currentUserId: "me-123", channels: [], dms: [] }}
+                ctx={{ currentUserId: "me-123", workspaceId: "workspace-1", channels: [], dms: [] }}
                 sidebarTargets={[groupA, groupB]}
                 onRender={options.onRender}
                 onNavigate={options.onNavigate}
@@ -5952,7 +6255,11 @@ describe("ChatMessageArea — message alignment", () => {
         <Routes>
           <Route
             path="/chat/channel"
-            element={<ParentWithContext ctx={{ currentUserId: "me-123", channels: [], dms: [] }} />}
+            element={
+              <ParentWithContext
+                ctx={{ currentUserId: "me-123", workspaceId: "workspace-1", channels: [], dms: [] }}
+              />
+            }
           >
             <Route path=":id" element={<ChatMessageArea kind="channel" />} />
           </Route>
@@ -5974,7 +6281,11 @@ describe("ChatMessageArea — message alignment", () => {
         <Routes>
           <Route
             path="/chat/channel"
-            element={<ParentWithContext ctx={{ currentUserId: "me-123", channels: [], dms: [] }} />}
+            element={
+              <ParentWithContext
+                ctx={{ currentUserId: "me-123", workspaceId: "workspace-1", channels: [], dms: [] }}
+              />
+            }
           >
             <Route path=":id" element={<ChatMessageArea kind="channel" />} />
           </Route>
@@ -6072,7 +6383,13 @@ describe("ChatMessageArea — sender display", () => {
             path="/chat"
             element={
               <ParentWithContext
-                ctx={{ currentUserId: "me-123", channels: [], dms: [], refreshConversations }}
+                ctx={{
+                  currentUserId: "me-123",
+                  workspaceId: "workspace-1",
+                  channels: [],
+                  dms: [],
+                  refreshConversations,
+                }}
               />
             }
           >
@@ -6198,7 +6515,13 @@ describe("ChatMessageArea — sender display", () => {
             path="/chat"
             element={
               <ParentWithContext
-                ctx={{ currentUserId: "me-123", channels: [], dms: [], refreshConversations }}
+                ctx={{
+                  currentUserId: "me-123",
+                  workspaceId: "workspace-1",
+                  channels: [],
+                  dms: [],
+                  refreshConversations,
+                }}
               />
             }
           >
@@ -6266,7 +6589,13 @@ describe("ChatMessageArea — sender display", () => {
             path="/chat"
             element={
               <ParentWithContext
-                ctx={{ currentUserId: "me-123", channels: [], dms: [], refreshConversations }}
+                ctx={{
+                  currentUserId: "me-123",
+                  workspaceId: "workspace-1",
+                  channels: [],
+                  dms: [],
+                  refreshConversations,
+                }}
               />
             }
           >
@@ -6342,7 +6671,13 @@ describe("ChatMessageArea — sender display", () => {
             path="/chat"
             element={
               <ParentWithContext
-                ctx={{ currentUserId: "me-123", channels: [], dms: [], refreshConversations }}
+                ctx={{
+                  currentUserId: "me-123",
+                  workspaceId: "workspace-1",
+                  channels: [],
+                  dms: [],
+                  refreshConversations,
+                }}
               />
             }
           >
@@ -6443,6 +6778,7 @@ describe("ChatMessageArea — sender display", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "me-123",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [{ id: "group-1", type: "group", name: "Grupo", participants: [] }],
                 }}
@@ -6474,6 +6810,7 @@ describe("ChatMessageArea — sender display", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "me-123",
+                  workspaceId: "workspace-1",
                   channels: [],
                   dms: [
                     {
@@ -6510,7 +6847,11 @@ describe("ChatMessageArea — sender display", () => {
         <Routes>
           <Route
             path="/chat/channel"
-            element={<ParentWithContext ctx={{ currentUserId: "me-123", channels: [], dms: [] }} />}
+            element={
+              <ParentWithContext
+                ctx={{ currentUserId: "me-123", workspaceId: "workspace-1", channels: [], dms: [] }}
+              />
+            }
           >
             <Route path=":id" element={<ChatMessageArea kind="channel" />} />
           </Route>
@@ -6543,7 +6884,13 @@ describe("ChatMessageArea — #795 mention click opens DM", () => {
             path="/chat"
             element={
               <ParentWithContext
-                ctx={{ currentUserId: "me-123", channels: [], dms: [], refreshConversations }}
+                ctx={{
+                  currentUserId: "me-123",
+                  workspaceId: "workspace-1",
+                  channels: [],
+                  dms: [],
+                  refreshConversations,
+                }}
               />
             }
           >
@@ -6698,6 +7045,7 @@ describe("ChatMessageArea — resolved display name", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "ch-uuid-001", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                 }}
@@ -6727,6 +7075,7 @@ describe("ChatMessageArea — resolved display name", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "",
+                  workspaceId: "workspace-1",
                   channels: [{ id: "ch-uuid-001", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                 }}
@@ -6918,6 +7267,18 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
     vi.unstubAllGlobals();
   });
 
+  // #1082: the page-attention spies a read-cursor test installs (see attended()).
+  const attention: { mockRestore: () => void }[] = [];
+  afterEach(() => {
+    for (const spy of attention.splice(0)) spy.mockRestore();
+  });
+  // A test that leaves the reader in history persists that anchor when it
+  // unmounts — after every afterEach here — so the next test opening the same
+  // conversation starts from a clean slate instead.
+  beforeEach(() => {
+    sessionStorage.clear();
+  });
+
   function bottomSentinelCallback(): IntersectionObserverCallback {
     const sentinel = screen.getByTestId("chat-bottom-sentinel");
     const instance = ioInstances.find((i) => i.element === sentinel);
@@ -6952,7 +7313,11 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
         <Routes>
           <Route
             path="/chat"
-            element={<ParentWithContext ctx={{ channels: [], dms: [], ...ctx }} />}
+            element={
+              <ParentWithContext
+                ctx={{ channels: [], dms: [], workspaceId: "workspace-1", ...ctx }}
+              />
+            }
           >
             <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
           </Route>
@@ -6961,6 +7326,50 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
     );
   }
 
+  // #1082 seventh round: a direct link can mount the timeline before the
+  // sidebar has loaded. The opening position needs the conversation's unread
+  // count, so the timeline waits for it instead of settling on a guessed 0 —
+  // which opened such a conversation at the tail, with no "Novas mensagens".
+  it("waits for the sidebar before deciding where a conversation opens", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({ id: "m1", senderId: "other-1", bodyText: "Lida 1" }),
+        makeMessage({ id: "m2", senderId: "other-1", bodyText: "Não lida 1" }),
+        makeMessage({ id: "m3", senderId: "other-1", bodyText: "Não lida 2" }),
+      ]),
+    );
+    const tree = (
+      ctx: Partial<ChatOutletContext> & Pick<ChatOutletContext, "currentUserId" | "channels">,
+    ) => (
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={<ParentWithContext ctx={{ dms: [], workspaceId: "workspace-1", ...ctx }} />}
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>
+    );
+    // The sidebar is still loading: no user, no rows, and the shell says so.
+    const { rerender } = render(tree({ currentUserId: "", channels: [], sidebarLoading: true }));
+    await waitFor(() => expect(mockFetchChannelMessages).toHaveBeenCalled());
+    await act(async () => {});
+    expect(screen.getByRole("status", { name: "Carregando mensagens" })).toBeInTheDocument();
+    expect(screen.queryByText("Não lida 1")).not.toBeInTheDocument();
+
+    // The sidebar arrives: two unread.
+    rerender(
+      tree({
+        currentUserId: "me-123",
+        channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 2 }],
+      }),
+    );
+    await screen.findByText("Não lida 1");
+    expect(screen.getByRole("separator", { name: "Novas mensagens" })).toBeInTheDocument();
+  });
+
   it("opens directly at the bottom, without smooth scroll, when there is no unread", async () => {
     mockFetchChannelMessages.mockResolvedValue(
       messagePage([makeMessage({ id: "m1", bodyText: "Última mensagem" })]),
@@ -6968,6 +7377,7 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
 
     renderWithContext("geral", {
       currentUserId: "me-123",
+      workspaceId: "workspace-1",
       channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 0 }],
     });
 
@@ -6992,6 +7402,7 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
 
     renderWithContext("geral", {
       currentUserId: "me-123",
+      workspaceId: "workspace-1",
       channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 2 }],
     });
 
@@ -7013,43 +7424,534 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
     expect(scrollMock).not.toHaveBeenCalledWith(expect.objectContaining({ behavior: "smooth" }));
   });
 
-  it("does not call mark-read just from opening a conversation with unread", async () => {
-    mockFetchChannelMessages.mockResolvedValue(
-      messagePage([
-        makeMessage({ id: "m1", senderId: "other-1", bodyText: "Não lida 1" }),
-        makeMessage({ id: "m2", senderId: "other-1", bodyText: "Não lida 2" }),
-      ]),
-    );
-    const markRead = vi.fn();
+  // ── #1082: read state follows what was seen, not the tail ────────────────
 
-    renderWithContext("geral", {
-      currentUserId: "me-123",
-      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 2 }],
-      markRead,
+  const minute = (n: number) => `2026-07-15T10:${String(n).padStart(2, "0")}:00.000Z`;
+  const fromOther = (n: number, overrides: Partial<Message> = {}) =>
+    makeMessage({
+      id: `m${n}`,
+      senderId: "other-1",
+      bodyText: `Mensagem ${n}`,
+      createdAt: minute(n),
+      ...overrides,
     });
 
-    await screen.findByText("Não lida 1");
-    expect(markRead).not.toHaveBeenCalled();
+  /**
+   * The boxes a browser would report: the list spans 0..400, and each listed
+   * message row sits where the test says. Anything else falls back to the
+   * suite's default layout.
+   */
+  function layOutRows(rows: Record<string, [top: number, bottom: number]>) {
+    layoutSpy.mockImplementation(function (this: Element) {
+      if (this.classList.contains("chat-msg-area__list")) {
+        return domRect({ top: 0, bottom: 400, right: 1024, width: 1024, height: 400 });
+      }
+      const box = rows[this.getAttribute("data-message-id") ?? ""];
+      if (box) {
+        return domRect({
+          top: box[0],
+          bottom: box[1],
+          right: 400,
+          width: 400,
+          height: box[1] - box[0],
+        });
+      }
+      return layoutRect.call(this);
+    });
+  }
+
+  function attended(visibility: DocumentVisibilityState = "visible", focused = true) {
+    attention.push(
+      vi.spyOn(document, "visibilityState", "get").mockReturnValue(visibility),
+      vi.spyOn(document, "hasFocus").mockReturnValue(focused),
+    );
+  }
+
+  const readProgressSpy = () => vi.fn<(target: ReadTarget, progress: ReadProgress) => void>();
+
+  function openWithUnread(reportReadProgress: ReturnType<typeof readProgressSpy>, unreadCount = 4) {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([fromOther(1), fromOther(2), fromOther(3), fromOther(4), fromOther(5)]),
+    );
+    return renderWithContext("geral", {
+      currentUserId: "me-123",
+      workspaceId: "workspace-1",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount }],
+      reportReadProgress,
+    });
+  }
+
+  it("does not report any reading just from opening a conversation with unread", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    openWithUnread(reportReadProgress);
+
+    await screen.findByText("Mensagem 2");
+    // Nothing has a box on screen yet: nothing was seen.
+    expect(reportReadProgress).not.toHaveBeenCalled();
   });
 
-  it("calls markRead once the bottom sentinel confirms the real tail was reached", async () => {
-    mockFetchChannelMessages.mockResolvedValue(
-      messagePage([makeMessage({ id: "m1", senderId: "other-1", bodyText: "Última" })]),
-    );
-    const markRead = vi.fn();
+  it("advances the cursor to the latest row actually seen, long before the tail", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    openWithUnread(reportReadProgress);
+    await screen.findByText("Mensagem 2");
 
-    renderWithContext("geral", {
-      currentUserId: "me-123",
-      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 1 }],
-      markRead,
+    // m2 and m3 are on screen; m4 is mounted but below the fold, m5 further.
+    layOutRows({ m1: [-60, -20], m2: [100, 140], m3: [200, 240], m4: [420, 460], m5: [480, 520] });
+    fireEvent.scroll(screen.getByRole("log"));
+
+    await waitFor(() =>
+      expect(reportReadProgress).toHaveBeenLastCalledWith(
+        { kind: "channel", targetId: "geral" },
+        expect.objectContaining({
+          readThrough: expect.objectContaining({ id: "m3" }),
+        }),
+      ),
+    );
+
+    // Further down: the cursor keeps advancing with each row seen.
+    layOutRows({ m3: [-60, -20], m4: [100, 140], m5: [200, 240] });
+    fireEvent.scroll(screen.getByRole("log"));
+    await waitFor(() =>
+      expect(reportReadProgress).toHaveBeenLastCalledWith(
+        { kind: "channel", targetId: "geral" },
+        expect.objectContaining({
+          readThrough: expect.objectContaining({ id: "m5" }),
+        }),
+      ),
+    );
+
+    // Back up into history: reading never goes backwards.
+    const reports = reportReadProgress.mock.calls.length;
+    layOutRows({ m1: [100, 140], m2: [200, 240] });
+    fireEvent.scroll(screen.getByRole("log"));
+    expect(reportReadProgress).toHaveBeenCalledTimes(reports);
+  });
+
+  it("reads nothing while the tab is hidden, and catches up when it becomes visible", async () => {
+    attended("hidden");
+    const reportReadProgress = readProgressSpy();
+    openWithUnread(reportReadProgress);
+    await screen.findByText("Mensagem 2");
+    layOutRows({ m2: [100, 140], m3: [200, 240] });
+    fireEvent.scroll(screen.getByRole("log"));
+    expect(reportReadProgress).not.toHaveBeenCalled();
+
+    attended("visible");
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
     });
 
-    await screen.findByText("Última");
-    expect(markRead).not.toHaveBeenCalled();
+    expect(reportReadProgress).toHaveBeenLastCalledWith(
+      { kind: "channel", targetId: "geral" },
+      { readThrough: expect.objectContaining({ id: "m3" }) },
+    );
+  });
 
+  it("reads nothing while the window has no focus, and catches up when it regains it", async () => {
+    attended("visible", false);
+    const reportReadProgress = readProgressSpy();
+    openWithUnread(reportReadProgress);
+    await screen.findByText("Mensagem 2");
+    layOutRows({ m2: [100, 140] });
+    fireEvent.scroll(screen.getByRole("log"));
+    expect(reportReadProgress).not.toHaveBeenCalled();
+
+    attended("visible", true);
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    expect(reportReadProgress).toHaveBeenLastCalledWith(
+      { kind: "channel", targetId: "geral" },
+      { readThrough: expect.objectContaining({ id: "m2" }) },
+    );
+  });
+
+  it("does not let the reader's own message carry the cursor past unseen messages", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        fromOther(1),
+        fromOther(2),
+        fromOther(3),
+        fromOther(4, { senderId: "me-123", bodyText: "Minha resposta" }),
+      ]),
+    );
+    renderWithContext("geral", {
+      currentUserId: "me-123",
+      workspaceId: "workspace-1",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 2 }],
+      reportReadProgress,
+    });
+    await screen.findByText("Minha resposta");
+
+    // Only the own message is on screen; m2 and m3 are not.
+    layOutRows({ m2: [-200, -160], m3: [-120, -80], m4: [100, 140] });
+    fireEvent.scroll(screen.getByRole("log"));
+
+    expect(reportReadProgress).not.toHaveBeenCalled();
+  });
+
+  it("does not take the tail sentinel alone as reading", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    openWithUnread(reportReadProgress, 1);
+    await screen.findByText("Mensagem 5");
+
+    // The tail is confirmed, but no row has been exposed by the rule.
     fireBottomSentinel(true);
 
-    expect(markRead).toHaveBeenCalledWith({ kind: "channel", targetId: "geral" });
+    expect(reportReadProgress).not.toHaveBeenCalled();
+  });
+
+  // Finding 9 (#1082 review): a rendered conversation event has a box, and is
+  // read by it — the tail has nothing to do with it.
+  it("reads a conversation event on screen by its own geometry, nowhere near the tail", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        fromOther(1),
+        fromOther(2),
+        fromOther(3, {
+          kind: "system",
+          eventType: "conversation_renamed",
+          eventPayload: { oldName: "a", newName: "b" },
+          bodyText: "",
+        }),
+        fromOther(4),
+      ]),
+    );
+    renderWithContext("geral", {
+      currentUserId: "me-123",
+      workspaceId: "workspace-1",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 3 }],
+      reportReadProgress,
+    });
+    await screen.findByText("Mensagem 2");
+
+    // The event row is on screen; m4 is below the fold. No sentinel fires.
+    layOutRows({ m2: [100, 140], m3: [200, 230], m4: [450, 490] });
+    fireEvent.scroll(screen.getByRole("log"));
+
+    expect(reportReadProgress).toHaveBeenLastCalledWith(
+      { kind: "channel", targetId: "geral" },
+      { readThrough: expect.objectContaining({ id: "m3" }) },
+    );
+  });
+
+  // R6 (#1082 third review): an event is read only by its own exposure. One
+  // this build has no copy for still draws a row, and a neighbour's exposure —
+  // even the reader's own message right after it — does not read it.
+  it("does not read an event by adjacency, even one this build has no copy for", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        fromOther(1),
+        fromOther(2),
+        fromOther(3, {
+          kind: "system",
+          eventType: "conversation_from_the_future" as Message["eventType"],
+          bodyText: "",
+        }),
+        fromOther(4, { senderId: "me-123", bodyText: "Minha resposta" }),
+      ]),
+    );
+    renderWithContext("geral", {
+      currentUserId: "me-123",
+      workspaceId: "workspace-1",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 2 }],
+      reportReadProgress,
+    });
+    await screen.findByText("Minha resposta");
+    expect(screen.getByRole("log").querySelector('[data-message-id="m3"]')).not.toBeNull();
+
+    // m2 and the own m4 are on screen; the event between them is not.
+    layOutRows({ m2: [100, 140], m3: [-60, -40], m4: [200, 240] });
+    fireEvent.scroll(screen.getByRole("log"));
+    expect(reportReadProgress).toHaveBeenLastCalledWith(
+      { kind: "channel", targetId: "geral" },
+      { readThrough: expect.objectContaining({ id: "m2" }) },
+    );
+
+    layOutRows({ m2: [100, 140], m3: [160, 180], m4: [200, 240] });
+    fireEvent.scroll(screen.getByRole("log"));
+    expect(reportReadProgress).toHaveBeenLastCalledWith(
+      { kind: "channel", targetId: "geral" },
+      { readThrough: expect.objectContaining({ id: "m3" }) },
+    );
+  });
+
+  it("does not re-raise the badge when a row it already read grows", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    openWithUnread(reportReadProgress);
+    await screen.findByText("Mensagem 2");
+    layOutRows({ m2: [100, 140], m3: [200, 240], m4: [420, 460] });
+    fireEvent.scroll(screen.getByRole("log"));
+    await waitFor(() =>
+      expect(reportReadProgress).toHaveBeenLastCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          readThrough: expect.objectContaining({ id: "m3" }),
+        }),
+      ),
+    );
+    const reports = reportReadProgress.mock.calls.length;
+
+    // An image in m3 finishes loading: it grows and pushes m3's top out of view.
+    layOutRows({ m2: [-300, -260], m3: [-200, 380], m4: [420, 460] });
+    fireEvent.scroll(screen.getByRole("log"));
+
+    // Nothing was un-read, and nothing new was claimed.
+    expect(reportReadProgress).toHaveBeenCalledTimes(reports);
+  });
+
+  it("does not move the cursor back for a deep link into read history", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([fromOther(1), fromOther(2), fromOther(3), fromOther(4), fromOther(5)]),
+    );
+    renderWithContext("geral?message=m1", {
+      currentUserId: "me-123",
+      workspaceId: "workspace-1",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 0 }],
+      reportReadProgress,
+    });
+    await screen.findByText("Mensagem 1");
+
+    layOutRows({ m1: [100, 140], m2: [200, 240] });
+    fireEvent.scroll(screen.getByRole("log"));
+
+    expect(reportReadProgress).not.toHaveBeenCalled();
+  });
+
+  it("advances to a deep-linked newer message only once it is actually seen", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([fromOther(1), fromOther(2), fromOther(3), fromOther(4), fromOther(5)]),
+    );
+    renderWithContext("geral?message=m5", {
+      currentUserId: "me-123",
+      workspaceId: "workspace-1",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 3 }],
+      reportReadProgress,
+    });
+    await screen.findByText("Mensagem 5");
+    // Loaded and mounted, but nothing exposed yet: the jump alone reads nothing.
+    fireEvent.scroll(screen.getByRole("log"));
+    expect(reportReadProgress).not.toHaveBeenCalled();
+
+    layOutRows({ m5: [180, 220] });
+    fireEvent.scroll(screen.getByRole("log"));
+
+    expect(reportReadProgress).toHaveBeenLastCalledWith(
+      { kind: "channel", targetId: "geral" },
+      { readThrough: expect.objectContaining({ id: "m5" }) },
+    );
+  });
+
+  // #1082 sixth review (H3), through the real loader: since #1088 a deep link
+  // pages back through contiguous history until it reaches the message. What
+  // the timeline holds is still no evidence about the server's count.
+  it("reports a deep-linked read reached by paging back, which the sidebar does not take off its base", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    // The base counted m3, m4 and m5 past m2. The recent page holds m4 and m5;
+    // the next one back brings m3, with more history still behind it.
+    mockFetchChannelMessages.mockImplementation((_id: string, cursor?: string) =>
+      Promise.resolve(
+        cursor === "cursor-older"
+          ? { messages: [fromOther(3)], nextCursor: "cursor-oldest" }
+          : { messages: [fromOther(4), fromOther(5)], nextCursor: "cursor-older" },
+      ),
+    );
+    const base = { unreadCount: 3, readThrough: { id: "m2", createdAt: minute(2) } };
+    renderWithContext("geral?message=m3", {
+      currentUserId: "me-123",
+      workspaceId: "workspace-1",
+      channels: [
+        {
+          id: "geral",
+          name: "Geral",
+          type: "public",
+          canWrite: true,
+          unreadCount: 3,
+          serverRead: { ...base, startedAt: 1, receivedAt: 2 },
+        },
+      ],
+      reportReadProgress,
+    });
+    await screen.findByText("Mensagem 3");
+    const held = [...screen.getByRole("log").querySelectorAll("[data-message-id]")].map((row) =>
+      row.getAttribute("data-message-id"),
+    );
+    expect(held).toEqual(["m3", "m4", "m5"]);
+
+    layOutRows({ m3: [180, 220] });
+    fireEvent.scroll(screen.getByRole("log"));
+    const progress = reportReadProgress.mock.lastCall![1];
+    expect(progress).toEqual({ readThrough: expect.objectContaining({ id: "m3" }) });
+
+    // The sidebar row on that base: the cursor moves (and goes to the writer),
+    // the count stays the server's 3 until the server answers the write.
+    let row = acceptServerRead({ id: "geral" } as ReadRow, base, { startedAt: 1, receivedAt: 2 });
+    row = applyReadProgress(row, progress);
+    expect(row).toMatchObject({
+      unreadCount: 3,
+      readThrough: expect.objectContaining({ id: "m3" }),
+    });
+  });
+
+  /**
+   * The list's scroll geometry, which jsdom never computes: every list element
+   * reads these values, and writes to scrollTop land in them.
+   */
+  function stubListScroll(geometry: {
+    scrollTop: number;
+    scrollHeight: number;
+    clientHeight: number;
+  }) {
+    const isList = (el: Element) => el.classList.contains("chat-msg-area__list");
+    for (const key of ["scrollHeight", "clientHeight"] as const) {
+      Object.defineProperty(HTMLElement.prototype, key, {
+        configurable: true,
+        get(this: HTMLElement) {
+          return isList(this) ? geometry[key] : 0;
+        },
+      });
+    }
+    Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return isList(this) ? geometry.scrollTop : 0;
+      },
+      set(this: HTMLElement, value: number) {
+        if (isList(this)) geometry.scrollTop = value;
+      },
+    });
+    return () => {
+      for (const key of ["scrollHeight", "clientHeight", "scrollTop"]) {
+        Reflect.deleteProperty(HTMLElement.prototype, key);
+      }
+    };
+  }
+
+  // Finding 7 (#1082 review): a deep link owns the scrollport until it lands.
+  it("does not read the frames a deep link scrolls through before it lands", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    const geometry = { scrollTop: 0, scrollHeight: 2000, clientHeight: 400 };
+    const restoreScroll = stubListScroll(geometry);
+    try {
+      // m3 is on screen where the timeline starts; m5, the link, is far below.
+      layOutRows({ m3: [100, 140], m5: [1500, 1540] });
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([fromOther(1), fromOther(2), fromOther(3), fromOther(4), fromOther(5)]),
+      );
+      renderWithContext("geral?message=m5", {
+        currentUserId: "me-123",
+        workspaceId: "workspace-1",
+        channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 3 }],
+        reportReadProgress,
+      });
+      await screen.findByText("Mensagem 5");
+
+      // Mid-trip: m3 is exposed, but nobody chose to look at it.
+      fireEvent.scroll(screen.getByRole("log"));
+      expect(reportReadProgress).not.toHaveBeenCalled();
+
+      // Landed: m5 is centred where the jump sent it.
+      geometry.scrollTop = 1320;
+      layOutRows({ m3: [-1220, -1180], m5: [180, 220] });
+      fireEvent.scroll(screen.getByRole("log"));
+
+      expect(reportReadProgress).toHaveBeenLastCalledWith(
+        { kind: "channel", targetId: "geral" },
+        expect.objectContaining({
+          readThrough: expect.objectContaining({ id: "m5" }),
+        }),
+      );
+    } finally {
+      restoreScroll();
+    }
+  });
+
+  // Finding 6 (#1082 review): the timeline follows the server's later point.
+  it("adopts a later server read point without writing it back", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([fromOther(1), fromOther(2), fromOther(3), fromOther(4), fromOther(5)]),
+    );
+    const tree = (serverReadThrough?: { id: string; createdAt: string }) => (
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  workspaceId: "workspace-1",
+                  dms: [],
+                  channels: [
+                    {
+                      id: "geral",
+                      name: "Geral",
+                      type: "public",
+                      canWrite: true,
+                      unreadCount: serverReadThrough ? 0 : 2,
+                      serverRead: serverReadThrough && {
+                        unreadCount: 0,
+                        readThrough: serverReadThrough,
+                        startedAt: 1,
+                        receivedAt: 2,
+                      },
+                    },
+                  ],
+                  reportReadProgress,
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>
+    );
+    const { rerender } = render(tree());
+    await screen.findByText("Mensagem 2");
+    scrollAwayFromBottom(screen.getByRole("log"));
+    expect(await screen.findByRole("button", { name: /2 novas mensagens/ })).toBeInTheDocument();
+
+    // Another device read everything: the sidebar row now says so.
+    rerender(tree({ id: "m5", createdAt: minute(5) }));
+
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    ).toBeInTheDocument();
+    // Adopted, not echoed: the server already holds that point.
+    expect(reportReadProgress).not.toHaveBeenCalled();
+  });
+
+  it("shows the reader's progress on the control, not a count frozen at opening", async () => {
+    attended();
+    const reportReadProgress = readProgressSpy();
+    openWithUnread(reportReadProgress);
+    await screen.findByText("Mensagem 2");
+    const list = screen.getByRole("log");
+
+    layOutRows({ m2: [100, 140] });
+    scrollAwayFromBottom(list);
+
+    expect(await screen.findByRole("button", { name: /3 novas mensagens/ })).toBeInTheDocument();
   });
 
   it("shows the go-to-bottom button once the user scrolls away from the bottom threshold", async () => {
@@ -7602,7 +8504,11 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
         <Routes>
           <Route
             path="/chat"
-            element={<ParentWithContext ctx={{ currentUserId: "me-123", channels: [], dms: [] }} />}
+            element={
+              <ParentWithContext
+                ctx={{ currentUserId: "me-123", workspaceId: "workspace-1", channels: [], dms: [] }}
+              />
+            }
           >
             <Route
               path="channel/:id"
@@ -7648,6 +8554,7 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
       );
       renderWithContext("geral", {
         currentUserId: "me-123",
+        workspaceId: "workspace-1",
         channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 0 }],
       });
       const list = await screen.findByRole("log");
@@ -7871,6 +8778,7 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
       );
       const { unmount } = renderWithContext("geral", {
         currentUserId: "me-123",
+        workspaceId: "workspace-1",
         channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 0 }],
       });
       await screen.findByText("Última mensagem");
@@ -8457,7 +9365,9 @@ function renderChannelSwitcher(currentUserId = "me-123") {
         <button type="button" onClick={() => navigate("/chat/channel/outro")}>
           ir para outro canal
         </button>
-        <ParentWithContext ctx={{ currentUserId, channels: [], dms: [] }} />
+        <ParentWithContext
+          ctx={{ currentUserId, workspaceId: "workspace-1", channels: [], dms: [] }}
+        />
       </>
     );
   }
@@ -8499,7 +9409,9 @@ function renderChannelsWithMutableNames(
         <button type="button" onClick={() => setChannels(afterRename)}>
           aplicar renomeacao
         </button>
-        <ParentWithContext ctx={{ currentUserId: "me-123", channels, dms: [] }} />
+        <ParentWithContext
+          ctx={{ currentUserId: "me-123", workspaceId: "workspace-1", channels, dms: [] }}
+        />
       </>
     );
   }
@@ -8787,12 +9699,16 @@ describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
 
     await userEvent.click(detailsToggle());
 
+    // One usePins instance: the bar shows its latest pin, the panel the whole
+    // collection in the server's order (issue #896).
     const bar = await screen.findByTestId("chat-pins");
-    const card = await screen.findByTestId("chat-details-pin");
+    const list = await screen.findByRole("list", { name: "Mensagens fixadas" });
     expect(bar).toHaveTextContent("pin recente");
-    expect(card).toHaveTextContent("pin recente");
     expect(bar).not.toHaveTextContent("pin antigo");
-    expect(card).not.toHaveTextContent("pin antigo");
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveTextContent("pin antigo");
+    expect(rows[1]).toHaveTextContent("pin recente");
   });
 
   it("updates the bar and the panel together after an unpin", async () => {
@@ -8809,7 +9725,7 @@ describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
     renderChannelAreaForUser();
     await screen.findByTestId("chat-msg-bubble");
     await userEvent.click(detailsToggle());
-    await screen.findByTestId("chat-details-pin");
+    await screen.findByRole("list", { name: "Mensagens fixadas" });
 
     await userEvent.click(
       within(screen.getByTestId("chat-pins")).getByRole("button", { name: "Desafixar mensagem" }),
@@ -8834,6 +9750,280 @@ describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
       expect.any(Number),
       expect.any(AbortSignal),
     );
+  });
+});
+
+// ── Mensagens fixadas no painel de detalhes (issue #896) ─────────────────────
+
+describe("ChatMessageArea — mensagens fixadas no painel (#896)", () => {
+  function LocationProbe() {
+    const location = useLocation();
+    return <span data-testid="location">{`${location.pathname}${location.search}`}</span>;
+  }
+
+  function renderWithLocation() {
+    return render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <>
+                <ParentWithContext
+                  ctx={{
+                    currentUserId: "me-123",
+                    workspaceId: "workspace-1",
+                    channels: [],
+                    dms: [],
+                  }}
+                />
+                <LocationProbe />
+              </>
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  function pinned(id: string, bodyText: string, pinnedAt = "2026-07-15T12:00:00.000Z") {
+    return {
+      message: makeMessage({ id, senderDisplayName: "Bruno", bodyText }),
+      pinnedByUserId: "u2",
+      pinnedAt,
+    };
+  }
+
+  function pinsList() {
+    return screen.findByRole("list", { name: "Mensagens fixadas" });
+  }
+
+  function lastWSOptions() {
+    const call = vi.mocked(useChatWebSocket).mock.lastCall;
+    if (!call) throw new Error("useChatWebSocket was never called");
+    return call[0];
+  }
+
+  it("opens the panel from the pins already loaded, without fetching them again", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchPins.mockResolvedValue([pinned("m-a", "primeiro")]);
+    renderWithLocation();
+    await screen.findByTestId("chat-pins");
+    const requestsBefore = mockFetchPins.mock.calls.length;
+
+    await userEvent.click(detailsToggle());
+
+    expect(await pinsList()).toHaveTextContent("primeiro");
+    expect(mockFetchPins.mock.calls.length).toBe(requestsBefore);
+  });
+
+  it("navigates to the pinned message through the conversation's deep link", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchPins.mockResolvedValue([pinned("m/a b", "primeiro")]);
+    renderWithLocation();
+    await screen.findByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+    const list = await pinsList();
+
+    await userEvent.click(
+      within(list).getByRole("button", { name: /^Ir para a mensagem de Bruno/ }),
+    );
+
+    expect(screen.getByTestId("location")).toHaveTextContent("/chat/channel/geral?message=m%2Fa+b");
+    // Same conversation, panel still open: navigating is not closing.
+    expect(screen.getByTestId("chat-conversation-details")).toBeInTheDocument();
+  });
+
+  it("travels to the same pinned message again on a second activation", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m-a", bodyText: "fixada" }), makeMessage({ id: "m-b" })]),
+    );
+    mockFetchPins.mockResolvedValue([pinned("m-a", "fixada")]);
+    renderWithLocation();
+    await screen.findAllByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+    const list = await pinsList();
+    const target = () => document.querySelector('[data-message-id="m-a"]');
+    const open = () => within(list).getByRole("button", { name: /^Ir para a mensagem de Bruno/ });
+
+    await userEvent.click(open());
+    await waitFor(() => expect(target()).toHaveClass("chat-msg-area__msg--highlight"));
+    // The highlight ends; the URL still names m-a.
+    await waitFor(() => expect(target()).not.toHaveClass("chat-msg-area__msg--highlight"), {
+      timeout: 3_000,
+    });
+    expect(screen.getByTestId("location")).toHaveTextContent("?message=m-a");
+
+    await userEvent.click(open());
+
+    await waitFor(() => expect(target()).toHaveClass("chat-msg-area__msg--highlight"));
+    expect(screen.getByTestId("location")).toHaveTextContent("/chat/channel/geral?message=m-a");
+  });
+
+  it("does not move focus when a pin whose unpin was refused later leaves by realtime", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockUnpinMessage.mockRejectedValueOnce(new Error("forbidden"));
+    mockFetchPins
+      .mockResolvedValueOnce([pinned("m-a", "primeiro"), pinned("m-b", "segundo")])
+      .mockResolvedValue([pinned("m-b", "segundo")]);
+    renderWithLocation();
+    await screen.findByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+    const list = await pinsList();
+    const unpinFirst = () =>
+      within(within(list).getAllByRole("listitem")[0]).getByRole("button", {
+        name: /^Desafixar mensagem de Bruno/,
+      });
+
+    await userEvent.click(within(list).getAllByRole("button", { name: /^Desafixar mensagem/ })[0]);
+
+    // Refused: said so, released, still listed, focus where the reader left it.
+    expect(await screen.findByText("Não foi possível desafixar a mensagem.")).toBeVisible();
+    await waitFor(() => expect(unpinFirst()).not.toHaveAttribute("aria-disabled"));
+    expect(list).toHaveTextContent("primeiro");
+    expect(unpinFirst()).toHaveFocus();
+
+    // Someone else unpins it; the realtime reload removes the row under focus.
+    act(() =>
+      lastWSOptions().onPinUpdated?.({
+        type: "pin.updated",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m-a",
+        pin: { message_id: "m-a", actor_user_id: "u2", pinned: false },
+      }),
+    );
+    await waitFor(() => expect(within(list).getAllByRole("listitem")).toHaveLength(1));
+
+    for (const button of within(list).getAllByRole("button")) {
+      expect(button).not.toHaveFocus();
+    }
+    expect(mockUnpinMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the list and offers a retry when the read after an unpin fails", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchPins
+      .mockResolvedValueOnce([pinned("m-a", "primeiro")])
+      .mockRejectedValueOnce(new Error("pins indisponível"))
+      .mockResolvedValue([]);
+    renderWithLocation();
+    await screen.findByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+    const list = await pinsList();
+
+    await userEvent.click(
+      within(list).getByRole("button", { name: /^Desafixar mensagem de Bruno/ }),
+    );
+
+    expect(
+      await screen.findByText("Não foi possível atualizar as mensagens fixadas."),
+    ).toBeVisible();
+    expect(list).toHaveTextContent("primeiro");
+    // Not reported as a failed unpin, and not left pending.
+    expect(screen.queryByText("Não foi possível desafixar a mensagem.")).not.toBeInTheDocument();
+    expect(
+      within(list).getByRole("button", { name: /^Desafixar mensagem de Bruno/ }),
+    ).not.toHaveAttribute("aria-disabled");
+
+    await userEvent.click(screen.getByRole("button", { name: "Tentar novamente" }));
+
+    expect(await screen.findByTestId("chat-details-pin-empty")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Não foi possível atualizar as mensagens fixadas."),
+    ).not.toBeInTheDocument();
+    expect(mockUnpinMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("unpins without navigating and converges on the authoritative reload", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchPins
+      .mockResolvedValueOnce([pinned("m-a", "primeiro"), pinned("m-b", "segundo")])
+      .mockResolvedValue([pinned("m-b", "segundo")]);
+    renderWithLocation();
+    await screen.findByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+    const list = await pinsList();
+
+    const unpin = within(list).getAllByRole("button", { name: /^Desafixar mensagem de Bruno/ });
+    await userEvent.click(unpin[0]);
+
+    expect(mockUnpinMessage).toHaveBeenCalledWith({ kind: "channel", id: "geral" }, "m-a");
+    await waitFor(() => expect(within(list).getAllByRole("listitem")).toHaveLength(1));
+    expect(list).toHaveTextContent("segundo");
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/chat\/channel\/geral$/);
+  });
+
+  it("converges on a pin.updated event without a page reload", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchPins
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([pinned("m-a", "fixado por outra pessoa")]);
+    renderWithLocation();
+    await screen.findByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+    expect(await screen.findByTestId("chat-details-pin-empty")).toBeInTheDocument();
+
+    act(() =>
+      lastWSOptions().onPinUpdated?.({
+        type: "pin.updated",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m-a",
+        pin: { message_id: "m-a", actor_user_id: "u2", pinned: true },
+      }),
+    );
+
+    expect(await pinsList()).toHaveTextContent("fixado por outra pessoa");
+  });
+
+  it("re-reads the pins when the subscription comes back after a reconnect", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchPins
+      .mockResolvedValueOnce([pinned("m-a", "antes da queda")])
+      .mockResolvedValue([pinned("m-b", "depois da queda")]);
+    renderWithLocation();
+    await screen.findByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+    expect(await pinsList()).toHaveTextContent("antes da queda");
+
+    act(() =>
+      wsMockState.capturedSubscribed?.({
+        type: "subscribed",
+        operation: "subscribe",
+        target_type: "channel",
+        target_id: "geral",
+      }),
+    );
+
+    await waitFor(async () => expect(await pinsList()).toHaveTextContent("depois da queda"));
+    expect(await pinsList()).not.toHaveTextContent("antes da queda");
+  });
+
+  it("never shows the previous channel's pins after a switch, even when they answer late", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    let resolveGeral!: (value: unknown[]) => void;
+    mockFetchPins.mockImplementation((target: { id: string }) =>
+      target.id === "geral"
+        ? new Promise<unknown[]>((resolve) => {
+            resolveGeral = resolve;
+          })
+        : Promise.resolve([pinned("m-outro", "pin do outro canal")]),
+    );
+    renderChannelSwitcher();
+    await screen.findByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+    expect(await screen.findByText("Carregando mensagens fixadas…")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "ir para outro canal" }));
+    expect(await pinsList()).toHaveTextContent("pin do outro canal");
+
+    await act(async () => resolveGeral([pinned("m-geral", "pin do geral")]));
+
+    expect(screen.queryByText("pin do geral")).not.toBeInTheDocument();
+    expect(await pinsList()).toHaveTextContent("pin do outro canal");
   });
 });
 
@@ -8955,6 +10145,7 @@ function renderDMWithContext(
             <ParentWithContext
               ctx={{
                 currentUserId,
+                workspaceId: "workspace-1",
                 channels: [],
                 dms: [
                   {
@@ -9081,12 +10272,13 @@ describe("ChatMessageArea — painel de detalhes do grupo (#441)", () => {
 
     await userEvent.click(groupToggle());
 
-    // One usePins instance, one selectLatestPin result, shared by both surfaces.
+    // One usePins instance shared by both surfaces: the bar's latest pin, the
+    // panel's collection (issue #896).
     const bar = await screen.findByTestId("chat-pins");
-    const card = await screen.findByTestId("chat-details-pin");
+    const list = await screen.findByRole("list", { name: "Mensagens fixadas" });
     expect(bar).toHaveTextContent("pin recente");
-    expect(card).toHaveTextContent("pin recente");
-    expect(card).not.toHaveTextContent("pin antigo");
+    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
+    expect(list).toHaveTextContent("pin recente");
   });
 
   it("keeps the group section rendered when only the files request fails", async () => {
@@ -9122,6 +10314,7 @@ function renderCrossTypeSwitcher(currentUserId = "me-123") {
         <ParentWithContext
           ctx={{
             currentUserId,
+            workspaceId: "workspace-1",
             channels: [],
             dms: [
               { id: groupConversationId, type: "group", name: "Time de Infra", participants: [] },
@@ -9333,6 +10526,7 @@ function renderDirectSwitcher(currentUserId = "me-123") {
         <ParentWithContext
           ctx={{
             currentUserId,
+            workspaceId: "workspace-1",
             channels: [],
             dms: [
               {
@@ -10443,7 +11637,13 @@ function renderInlineRenameHost(channel: ChatOutletContext["channels"][number]) 
     };
     return (
       <ParentWithContext
-        ctx={{ currentUserId: "me-123", channels, dms: [], renameChannel: rename }}
+        ctx={{
+          currentUserId: "me-123",
+          workspaceId: "workspace-1",
+          channels,
+          dms: [],
+          renameChannel: rename,
+        }}
       />
     );
   }

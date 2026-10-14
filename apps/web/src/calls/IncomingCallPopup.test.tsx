@@ -5,6 +5,8 @@ import IncomingCallPopup from "./IncomingCallPopup";
 
 const baseProps = {
   name: "Caio Almeida",
+  userId: "user-caio",
+  workspaceId: "workspace-1",
   callType: "video" as const,
   onAccept: vi.fn(),
   onReject: vi.fn(),
@@ -16,23 +18,22 @@ describe("IncomingCallPopup — identity", () => {
     expect(screen.getByText("Caio Almeida")).toBeInTheDocument();
   });
 
-  it("shows two-letter initials, not a single raw character, when there is no avatar", () => {
+  it("shows a deterministic Blobatar when there is no avatar", () => {
     const { container } = render(<IncomingCallPopup {...baseProps} />);
-    expect(container.querySelector(".incoming-call__avatar")).toHaveTextContent("CA");
+    expect(container.querySelector(".incoming-call__avatar img")?.getAttribute("src")).toMatch(
+      /^data:image\/svg\+xml/,
+    );
   });
 
   it("renders the personalized avatar image when avatarUrl is set", () => {
-    const { container } = render(<IncomingCallPopup {...baseProps} avatarUrl="https://x/a.png" />);
-    expect(container.querySelector("img")).toHaveAttribute("src", "https://x/a.png");
+    const { container } = render(<IncomingCallPopup {...baseProps} avatarUrl="/a.png" />);
+    expect(container.querySelector("img")).toHaveAttribute("src", "/a.png");
   });
 
-  it("falls back to initials, not a broken-image glyph, when the avatar fails to load", () => {
-    const { container } = render(
-      <IncomingCallPopup {...baseProps} avatarUrl="https://x/broken.png" />,
-    );
+  it("falls back to Blobatar, not a broken-image glyph, when the avatar fails to load", () => {
+    const { container } = render(<IncomingCallPopup {...baseProps} avatarUrl="/broken.png" />);
     fireEvent.error(container.querySelector("img")!);
-    expect(container.querySelector("img")).not.toBeInTheDocument();
-    expect(container.querySelector(".incoming-call__avatar")).toHaveTextContent("CA");
+    expect(container.querySelector("img")?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
   });
 
   it("marks the avatar as decorative — the adjacent name already identifies the person", () => {

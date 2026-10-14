@@ -277,7 +277,8 @@
    stated explicitly rather than left to the browser default over a tinted
    background. Deliberately not `outline: none`. */
 .chat-details__link-action:focus-visible,
-.chat-details__wide-action:focus-visible {
+.chat-details__wide-action:focus-visible,
+.chat-details__profile-copy:focus-visible {
   outline: 2px solid var(--color-primary, #6d28d9);
   outline-offset: 2px;
 }
@@ -560,28 +561,16 @@
   color: var(--color-success-ink, #166534);
 }
 
-.chat-details__profile-status--away {
+.chat-details__profile-status--busy,
+.chat-details__profile-status--dnd {
   background: var(--color-danger-tint, #fee2e2);
   color: var(--color-danger-ink, #991b1b);
 }
 
-/* The badge's own dot. Inline in a pill rather than pinned to an avatar, so it
-   is not PresenceDot — but it reads the same tokens, so the two can only ever
-   agree on what each state looks like. */
-.chat-details__status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex: none;
-  background: var(--presence-offline);
-}
-
-.chat-details__status-dot--online {
-  background: var(--presence-online);
-}
-
-.chat-details__status-dot--away {
-  background: var(--presence-away);
+.chat-details__profile-status--away,
+.chat-details__profile-status--brb {
+  background: var(--presence-away-tint);
+  color: var(--presence-away-ink);
 }
 
 .chat-details__profile-meta {
@@ -619,12 +608,61 @@
   overflow-wrap: anywhere;
 }
 
-/* ── Pinned message ─────────────────────────────────────────────────────── */
-
-.chat-details__pin {
+/* The copyable e-mail (issue #898): the address stays the value, and its
+   feedback sits under it, so the row keeps the card's right-aligned column. */
+.chat-details__profile-copy-value {
   display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+
+/* Reads as a link-like control in the primary colour — interactive, never a
+   destructive action — and wraps like any other value instead of widening the
+   panel with a long address. */
+.chat-details__profile-copy {
+  max-width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  font: inherit;
+  text-align: right;
+  color: var(--color-primary, #6d28d9);
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.chat-details__profile-copy:hover {
+  text-decoration-style: solid;
+}
+
+/* The words carry the outcome; colour only repeats it. */
+.chat-details__profile-copy-feedback {
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.chat-details__profile-copy-feedback--success {
+  color: var(--color-success-ink, #166534);
+}
+
+.chat-details__profile-copy-feedback--error {
+  color: var(--color-danger-ink, #991b1b);
+}
+
+/* ── Pinned messages (issue #896) ──────────────────────────────────────── */
+
+/* The row is the positioning context for its navigation button's stretch
+   below, which is what makes the whole card activatable without putting the
+   body — possibly a list or a code block — inside a <button>. */
+.chat-details__pin {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
   gap: 10px;
-  margin-top: 10px;
+  min-width: 0;
   padding: 10px 12px;
   border: 1px solid var(--color-border, #e8e3f0);
   border-radius: var(--radius-md, 10px);
@@ -638,21 +676,109 @@
 }
 
 .chat-details__pin-text {
+  flex: 1;
   min-width: 0;
 }
 
+/* A compact preview: three lines at most, and long unbroken content wraps
+   inside the panel instead of widening it. */
 .chat-details__pin-body {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
   font-size: 13px;
   line-height: 1.45;
   color: var(--color-ink, #16121f);
-  /* Long unbroken content must wrap inside the panel, never widen it. */
   overflow-wrap: anywhere;
 }
 
-.chat-details__pin-by {
+.chat-details__pin-body pre {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.chat-details__pin-open {
+  display: block;
   margin-top: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
   font-size: 11px;
   color: var(--color-muted, #7c7390);
+  text-align: start;
+  cursor: pointer;
+}
+
+/* The stretch: the button's hit area and focus ring cover the whole row. The
+   ring is drawn inside the row so the expanded list's scroll container never
+   clips it. */
+.chat-details__pin-open::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: var(--radius-md, 10px);
+}
+
+.chat-details__pin-open:hover::after {
+  box-shadow: inset 0 0 0 1px var(--color-primary, #6d28d9);
+}
+
+.chat-details__pin-open:focus-visible {
+  outline: none;
+}
+
+.chat-details__pin-open:focus-visible::after {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: -2px;
+}
+
+/* Above the stretch, so a press here unpins and never navigates. Same box as
+   the member removal control: 36px drawn, inside a row taller than 44px. */
+.chat-details__pin-unpin {
+  position: relative;
+  z-index: 1;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  margin: -6px -6px -6px 0;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  color: var(--color-muted, #7c7390);
+  cursor: pointer;
+}
+
+.chat-details__pin-unpin .material-symbols-outlined {
+  font-size: 20px;
+}
+
+.chat-details__pin-unpin:hover:not([aria-disabled="true"]) {
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary, #6d28d9);
+}
+
+.chat-details__pin-unpin:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+/* In flight. Not `disabled`, which would drop focus to <body> mid-request. */
+.chat-details__pin-unpin[aria-disabled="true"] {
+  cursor: progress;
+  opacity: 0.72;
+}
+
+/* The empty state takes focus when the last pin is unpinned; it is text, so the
+   ring is the UA's and only for keyboard focus. */
+.chat-details__empty:focus:not(:focus-visible) {
+  outline: none;
 }
 
 /* ── Files ──────────────────────────────────────────────────────────────── */
@@ -713,6 +839,48 @@
   border-radius: var(--radius-sm, 6px);
   object-fit: cover;
   background: var(--color-primary-tint, #f3ebfb);
+}
+
+/* The icon or thumbnail, the name and the metadata. A div for a file that
+   offers nothing, the button itself for a clean one (issue #897) — the same
+   layout either way, so becoming actionable never reflows the row. */
+.chat-details__file-main {
+  flex: 1 1 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.chat-details__file-action {
+  margin: 0;
+  padding: 4px;
+  border: none;
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+.chat-details__file-action:hover {
+  background: var(--color-primary-tint, #f3ebfb);
+}
+
+.chat-details__file-action[aria-disabled="true"] {
+  cursor: progress;
+}
+
+.chat-details__file-action:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+.chat-details__file-note {
+  flex: 1 0 100%;
+  font-size: 12px;
+  color: var(--color-danger-ink, #991b1b);
 }
 
 .chat-details__file-text {

@@ -171,7 +171,7 @@ func TestPGXChannelStoreCreateForActiveMemberPostgreSQL(t *testing.T) {
 		{name: "no actor at all", workspaceID: chanWorkspace, actor: "", slug: "by-nobody", wantErr: domain.ErrForbidden},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			created, err := store.CreateChannelForActiveMember(ctx, storage.CreateChannelInput{
+			created, err := createForActiveMember(ctx, store, storage.CreateChannelInput{
 				WorkspaceID: test.workspaceID,
 				Slug:        test.slug,
 				DisplayName: test.slug,
@@ -206,7 +206,7 @@ func TestPGXChannelStoreCreateForActiveMemberSeedsPrivateMembershipPostgreSQL(t 
 	store := storage.NewPGXChannelStore(pool)
 	ctx := t.Context()
 
-	private, err := store.CreateChannelForActiveMember(ctx, storage.CreateChannelInput{
+	private, err := createForActiveMember(ctx, store, storage.CreateChannelInput{
 		WorkspaceID:             chanWorkspace,
 		Slug:                    "private-room",
 		DisplayName:             "Private Room",
@@ -223,7 +223,7 @@ func TestPGXChannelStoreCreateForActiveMemberSeedsPrivateMembershipPostgreSQL(t 
 		t.Fatalf("private creator memberships = %d, want 1", n)
 	}
 
-	public, err := store.CreateChannelForActiveMember(ctx, storage.CreateChannelInput{
+	public, err := createForActiveMember(ctx, store, storage.CreateChannelInput{
 		WorkspaceID:                  chanWorkspace,
 		Slug:                         "public-room",
 		DisplayName:                  "Public Room",
@@ -252,7 +252,7 @@ func TestPublicChannelMembershipTriggerCoversOldSlotAndLaterActivationPostgreSQL
 	store := storage.NewPGXChannelStore(pool)
 	ctx := t.Context()
 
-	public, err := store.CreateChannelForActiveMember(ctx, storage.CreateChannelInput{
+	public, err := createForActiveMember(ctx, store, storage.CreateChannelInput{
 		WorkspaceID: chanWorkspace,
 		Slug:        "public-from-old-slot",
 		DisplayName: "Public From Old Slot",
@@ -345,7 +345,7 @@ func TestPGXChannelStoreCreateLosesToConcurrentRevocationPostgreSQL(t *testing.T
 	}
 	done := make(chan result, 1)
 	go func() {
-		channel, err := store.CreateChannelForActiveMember(context.Background(), storage.CreateChannelInput{
+		channel, err := createForActiveMember(context.Background(), store, storage.CreateChannelInput{
 			WorkspaceID: chanWorkspace,
 			Slug:        "race-room",
 			DisplayName: "Race Room",
@@ -396,7 +396,7 @@ func TestPGXChannelStoreCreateWinsAgainstLaterRevocationPostgreSQL(t *testing.T)
 	store := storage.NewPGXChannelStore(pool)
 	ctx := t.Context()
 
-	channel, err := store.CreateChannelForActiveMember(ctx, storage.CreateChannelInput{
+	channel, err := createForActiveMember(ctx, store, storage.CreateChannelInput{
 		WorkspaceID: chanWorkspace,
 		Slug:        "won-room",
 		DisplayName: "Won Room",
@@ -607,4 +607,11 @@ func TestPGXChannelStoreDisplayNameConstraintPostgreSQL(t *testing.T) {
 			t.Fatalf("re-applying the migration must work: %v", err)
 		}
 	})
+}
+
+// createForActiveMember unwraps the creation result for the tests that only
+// look at the channel row.
+func createForActiveMember(ctx context.Context, store *storage.PGXChannelStore, input storage.CreateChannelInput) (domain.Channel, error) {
+	result, err := store.CreateChannelForActiveMember(ctx, input)
+	return result.Channel, err
 }

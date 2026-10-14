@@ -3,6 +3,7 @@ package storage_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -120,9 +121,10 @@ func TestListDestinationAttachmentsUsesAnIndexablePredicatePerKind(t *testing.T)
 				}
 			}
 
-			// Both kinds share the argument order, so only the SQL varies.
+			// Both kinds share the argument order, so only the SQL varies. The
+			// limit is one past the page: the probe row that proves a next page.
 			if pool.lastArgs[0] != testWorkspaceID || pool.lastArgs[1] != tt.destinationID ||
-				pool.lastArgs[3] != 5 {
+				pool.lastArgs[3] != 6 || len(pool.lastArgs) != 4 {
 				t.Fatalf("unexpected arguments: %v", pool.lastArgs)
 			}
 			wantStatuses := []string{
@@ -131,8 +133,12 @@ func TestListDestinationAttachmentsUsesAnIndexablePredicatePerKind(t *testing.T)
 			if !reflect.DeepEqual(pool.lastArgs[2], wantStatuses) {
 				t.Fatalf("expected the listable status set %v, got %v", wantStatuses, pool.lastArgs[2])
 			}
-			if len(got) != 1 || got[0].ID != "a-1" {
-				t.Fatalf("unexpected rows: %+v", got)
+			if len(got.Attachments) != 1 || got.Attachments[0].ID != "a-1" || got.Next != nil {
+				t.Fatalf("unexpected page: %+v", got)
+			}
+			// Without a cursor the statement carries no position at all.
+			if strings.Contains(pool.lastSQL, "$5") {
+				t.Fatalf("a first page must not bind a cursor:\n%s", pool.lastSQL)
 			}
 		})
 	}
@@ -180,11 +186,12 @@ func TestListDestinationAttachmentsMapsRowsAndOrderingFaithfully(t *testing.T) {
 		}}, nil
 	}}
 
-	got, err := storage.NewPGXAttachmentStore(pool).
+	page, err := storage.NewPGXAttachmentStore(pool).
 		ListDestinationAttachments(context.Background(), listQuery(5))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	got := page.Attachments
 
 	if len(got) != 2 || got[0].ID != "a-1" || got[1].ID != "a-2" {
 		t.Fatalf("unexpected rows: %+v", got)
@@ -211,8 +218,9 @@ func TestListDestinationAttachmentsClampsTheLimit(t *testing.T) {
 				ListDestinationAttachments(context.Background(), listQuery(tt.asked)); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if pool.lastArgs[3] != tt.want {
-				t.Fatalf("expected limit %d, got %v", tt.want, pool.lastArgs[3])
+			// The clamped page plus the one probe row.
+			if pool.lastArgs[3] != tt.want+1 {
+				t.Fatalf("expected limit %d, got %v", tt.want+1, pool.lastArgs[3])
 			}
 		})
 	}
@@ -237,6 +245,30 @@ func TestListDestinationAttachmentsSurfacesIterationFailures(t *testing.T) {
 	if _, err := storage.NewPGXAttachmentStore(pool).
 		ListDestinationAttachments(context.Background(), listQuery(0)); err == nil {
 		t.Fatal("expected the iteration failure to surface")
+	}
+}
+
+func TestListDestinationAttachmentsSurfacesQueryFailures(t *testing.T) {
+	dbErr := errors.New("connection refused")
+	pool := &fakePool{query: func(string, ...any) (pgx.Rows, error) {
+		return nil, dbErr
+	}}
+	page, err := storage.NewPGXAttachmentStore(pool).
+		ListDestinationAttachments(context.Background(), listQuery(5))
+	if !errors.Is(err, dbErr) || len(page.Attachments) != 0 || page.Next != nil {
+		t.Fatalf("page = %+v, error = %v, want the database failure without a page", page, err)
+	}
+}
+
+func TestListDestinationAttachmentsRejectsAMalformedRowAndClosesRows(t *testing.T) {
+	rows := &valueRows{rows: [][]any{{"only", "two"}}}
+	pool := &fakePool{query: func(string, ...any) (pgx.Rows, error) {
+		return rows, nil
+	}}
+	page, err := storage.NewPGXAttachmentStore(pool).
+		ListDestinationAttachments(context.Background(), listQuery(5))
+	if err == nil || len(page.Attachments) != 0 || page.Next != nil || !rows.closed {
+		t.Fatalf("page = %+v, error = %v, closed = %v, want failure and cleanup", page, err, rows.closed)
 	}
 }
 
@@ -274,5 +306,107 @@ func TestListDestinationAttachmentsRejectsAnUnknownKind(t *testing.T) {
 	}
 	if pool.lastSQL != "" {
 		t.Fatal("an unknown destination kind must never reach the database")
+	}
+}
+
+// Issue #897: a next page is offered only when the probe row came back, and the
+// cursor names the last row actually served — never the probe.
+func TestListDestinationAttachmentsPagesWithTheProbeRow(t *testing.T) {
+	newest := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	rowsOf := func(n int) [][]any {
+		rows := make([][]any, 0, n)
+		for i := range n {
+			rows = append(rows, attachmentRowValues(
+				fmt.Sprintf("00000000-0000-4000-8000-%012d", n-i), string(domain.StatusClean),
+				fmt.Sprintf("f-%d.pdf", i), "application/pdf", 1, newest,
+			))
+		}
+		return rows
+	}
+
+	for name, tt := range map[string]struct {
+		limit    int
+		returned int
+		wantRows int
+		wantNext bool
+	}{
+		"empty":           {limit: 5, returned: 0, wantRows: 0},
+		"one":             {limit: 5, returned: 1, wantRows: 1},
+		"below compact":   {limit: 5, returned: 4, wantRows: 4},
+		"exactly compact": {limit: 5, returned: 5, wantRows: 5},
+		"compact probe":   {limit: 5, returned: 6, wantRows: 5, wantNext: true},
+		"exactly default": {limit: 20, returned: 20, wantRows: 20},
+		"default probe":   {limit: 20, returned: 21, wantRows: 20, wantNext: true},
+		"exactly maximum": {limit: 50, returned: 50, wantRows: 50},
+		"maximum probe":   {limit: 50, returned: 51, wantRows: 50, wantNext: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rows := rowsOf(tt.returned)
+			pool := &fakePool{query: func(string, ...any) (pgx.Rows, error) {
+				return &valueRows{rows: rows}, nil
+			}}
+
+			page, err := storage.NewPGXAttachmentStore(pool).
+				ListDestinationAttachments(context.Background(), listQuery(tt.limit))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if pool.lastArgs[3] != tt.limit+1 {
+				t.Fatalf("expected limit plus probe %d, got %v", tt.limit+1, pool.lastArgs[3])
+			}
+			if len(page.Attachments) != tt.wantRows {
+				t.Fatalf("expected %d rows, got %d", tt.wantRows, len(page.Attachments))
+			}
+			if (page.Next != nil) != tt.wantNext {
+				t.Fatalf("next page = %+v, want present=%v", page.Next, tt.wantNext)
+			}
+			if !tt.wantNext {
+				return
+			}
+			last := page.Attachments[len(page.Attachments)-1]
+			if page.Next.ID != last.ID || !page.Next.CreatedAt.Equal(last.CreatedAt) {
+				t.Fatalf("the cursor must name the last served row %+v, got %+v", last, page.Next)
+			}
+		})
+	}
+}
+
+// The cursor continues strictly after the previous page in the listing's own
+// order, as bind parameters, whichever destination kind is listed.
+func TestListDestinationAttachmentsContinuesAfterTheCursor(t *testing.T) {
+	cursor := domain.AttachmentListCursor{
+		CreatedAt: time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC),
+		ID:        "0f9c4a61-5d1e-4c1b-9d7e-2a4b6c8d0e1f",
+	}
+	for _, kind := range []domain.DestinationKind{domain.DestinationKindChannel, domain.DestinationKindDM} {
+		t.Run(string(kind), func(t *testing.T) {
+			pool := &fakePool{query: func(string, ...any) (pgx.Rows, error) {
+				return &valueRows{}, nil
+			}}
+			query := destinationQuery(kind, testChannelID, 5)
+			query.Before = &cursor
+
+			if _, err := storage.NewPGXAttachmentStore(pool).
+				ListDestinationAttachments(context.Background(), query); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			predicate := "AND (a.created_at, a.id) < ($5::timestamptz, $6::uuid)"
+			predicateAt := strings.Index(pool.lastSQL, predicate)
+			orderAt := strings.Index(pool.lastSQL, "ORDER BY a.created_at DESC, a.id DESC")
+			if predicateAt < 0 || orderAt < predicateAt {
+				t.Fatalf("expected the keyset predicate before the order:\n%s", pool.lastSQL)
+			}
+			if strings.Contains(pool.lastSQL, " OR ") {
+				t.Fatalf("the keyset predicate must stay a row comparison:\n%s", pool.lastSQL)
+			}
+			if len(pool.lastArgs) != 6 || pool.lastArgs[4] != cursor.CreatedAt || pool.lastArgs[5] != cursor.ID {
+				t.Fatalf("the cursor must be bound, never interpolated: %v", pool.lastArgs)
+			}
+			// The destination binding is unchanged by the cursor.
+			if pool.lastArgs[0] != testWorkspaceID || pool.lastArgs[1] != testChannelID {
+				t.Fatalf("a cursor must not move the destination binding: %v", pool.lastArgs)
+			}
+		})
 	}
 }
