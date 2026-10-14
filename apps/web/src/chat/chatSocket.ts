@@ -140,6 +140,11 @@ let refCount = 0;
 let attempt = 0;
 let consecutiveFailures = 0;
 let reachedOpen = false;
+/**
+ * The server closed with a code that says retrying cannot help (1008). Only an
+ * explicit new session or a fresh acquire may clear it; nothing implicit does.
+ */
+let nonRetryable = false;
 let reconnectTimer: number | null = null;
 let stabilityTimer: number | null = null;
 let status: ChatSocketStatus = "disconnected";
@@ -411,10 +416,12 @@ function ensureOnlineListener(): void {
   if (onlineListener) return;
   onlineListener = () => {
     // Implicit trigger only: back online must never pull the connection out
-    // of a fatal "failed" state on its own — that recovery is reserved for
+    // of a non-retryable failure on its own — that recovery is reserved for
     // an explicit new session (handleAuthChange) or a fresh acquireChatSocket
     // call, both of which call connect() directly and are not guarded here.
-    if (refCount === 0 || status === "failed") return;
+    // A give-up after retryable failures is different (issue #947): the network
+    // coming back is exactly the news it was waiting for.
+    if (refCount === 0 || nonRetryable) return;
     // Back online is an explicit signal, so it also clears a bounded give-up.
     consecutiveFailures = 0;
     clearReconnectTimer();
@@ -432,8 +439,20 @@ function removeOnlineListener(): void {
 function scheduleReconnect(): void {
   if (refCount === 0 || reconnectTimer !== null || socket) return;
   if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+    // Issue #947: the quick retries are spent, but every failure was retryable,
+    // so this is not a verdict. Report the failure and keep probing at the
+    // ceiling — one attempt per window per tab — so the tab recovers on its own
+    // instead of staying stale until a reload. Only a non-retryable close stops
+    // the connection for good.
     setStatus("failed");
-    devLog("giving up after consecutive failures", { consecutiveFailures });
+    devLog("quick retries exhausted; probing at the ceiling", { consecutiveFailures });
+    reconnectTimer = window.setTimeout(
+      () => {
+        reconnectTimer = null;
+        connect();
+      },
+      computeBackoffDelay(RECONNECT_MAX_EXPONENT, randomSource),
+    );
     return;
   }
   if (typeof navigator !== "undefined" && navigator.onLine === false) {
@@ -485,6 +504,9 @@ function connect(): void {
     // is enforced here rather than assumed from the transport.
     if (socket !== created || reachedOpen) return;
     reachedOpen = true;
+    // An open connection is no longer under a non-retryable verdict: only an
+    // explicit session change or acquire could have produced it.
+    nonRetryable = false;
     setStatus("connected");
     // A fresh connection is itself evidence the user is here — the server marks
     // them online on register — so the throttle starts spent, and the next real
@@ -546,6 +568,7 @@ function connect(): void {
       // burst and loop forever. Stop until an explicit new session or a new
       // acquire retries — see handleAuthChange and acquireChatSocket.
       clearReconnectTimer();
+      nonRetryable = true;
       setStatus("failed");
       devLog("stopped after policy violation close");
       return;
@@ -566,6 +589,7 @@ function handleAuthChange(): void {
   discardSocket();
   attempt = 0;
   consecutiveFailures = 0;
+  nonRetryable = false;
   // Subscriptions are authorized against an identity, so none of them survive it
   // changing. Consumers that are still mounted declare their targets again on
   // the next open, which is what re-derives them under the new session.
@@ -644,6 +668,7 @@ export function acquireChatSocket(listener: ChatSocketListener): ChatSocketHandl
       clearSubscriptionOwnership();
       attempt = 0;
       consecutiveFailures = 0;
+      nonRetryable = false;
       lastActivitySentAt = 0;
       setStatus("disconnected");
     },
@@ -665,6 +690,7 @@ export function _resetChatSocket(randomForTests: () => number = Math.random): vo
   lastActivitySentAt = 0;
   attempt = 0;
   consecutiveFailures = 0;
+  nonRetryable = false;
   reachedOpen = false;
   generation = 0;
   status = "disconnected";

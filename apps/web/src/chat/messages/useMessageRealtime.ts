@@ -87,6 +87,11 @@ interface Options {
    * names the message, so exactly that message is asked about.
    */
   reconcileAcknowledgement?: (messageId: string) => void;
+  /**
+   * Issue #947. Reads back what the socket may have missed while it was down,
+   * or while the server could not prove access to deliver it.
+   */
+  catchUpTimeline?: () => void;
   /** Told when an event took a message out of the timeline. */
   notifyRemoved: () => void;
   listeners: RealtimeListeners;
@@ -120,6 +125,7 @@ export function useMessageRealtime({
   reconciliation,
   reconcileAcknowledgements,
   reconcileAcknowledgement,
+  catchUpTimeline,
   notifyRemoved,
   listeners,
 }: Options): MessageRealtime {
@@ -301,6 +307,10 @@ export function useMessageRealtime({
   const { onSubscriptionReady } = listeners;
   const handleSubscribed = useCallback(() => {
     dispatch({ type: "ws_subscription_ready" });
+    // Issue #947. The timeline itself: a message persisted while the socket was
+    // down, or withheld because the server could not prove access, is read back
+    // from the listing — the events that would have carried it are gone.
+    catchUpTimeline?.();
     reconcilePendingLinkScans();
     refreshAuthoritativeMessageSecurity();
     // Issue #824. A subscription that comes back ready is this client's only
@@ -311,6 +321,7 @@ export function useMessageRealtime({
     reconcileAcknowledgements?.();
     onSubscriptionReady?.();
   }, [
+    catchUpTimeline,
     dispatch,
     onSubscriptionReady,
     reconcileAcknowledgements,

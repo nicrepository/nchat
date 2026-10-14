@@ -95,6 +95,7 @@ export function useMessageLoading({
     olderPageAbort.current?.abort();
     fallbacks.abortAll();
     scope.retarget(loadKey);
+    scope.markLoaded(null);
 
     const controller = new AbortController();
     pageAbort.current = controller;
@@ -104,6 +105,7 @@ export function useMessageLoading({
       (page) => {
         if (!scope.isCurrent(loadKey)) return;
         dispatch({ type: "loaded", page: sanitizePage(page) });
+        scope.markLoaded(loadKey);
       },
       (error: unknown) => {
         if (!scope.isCurrent(loadKey)) return;
@@ -144,17 +146,18 @@ export function useMessageLoading({
 
     dispatch({ type: "prepending" });
 
+    // The cursor travels with the answer: the reducer applies it only while the
+    // timeline still continues from that cursor (issue #947).
+    const settle = () => {
+      if (olderPageAbort.current === controller) paging.current.loadingMore = false;
+      return scope.isCurrent(loadKey);
+    };
     gateway.fetchPage(cursor, controller.signal).then(
       (page) => {
-        paging.current.loadingMore = false;
-        if (!scope.isCurrent(loadKey)) return;
-        dispatch({ type: "prepended", page: sanitizePage(page) });
+        if (settle()) dispatch({ type: "prepended", page: sanitizePage(page), cursor });
       },
       (error: unknown) => {
-        paging.current.loadingMore = false;
-        if (!scope.isCurrent(loadKey)) return;
-        if (isAbortError(error)) return;
-        dispatch({ type: "prepend_error" });
+        if (settle() && !isAbortError(error)) dispatch({ type: "prepend_error", cursor });
       },
     );
   }, [dispatch, gateway, sanitizePage, scope]);

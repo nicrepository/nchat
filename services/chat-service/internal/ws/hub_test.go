@@ -229,6 +229,7 @@ func newTestHub(auth SubscriptionAuthorizer) *Hub {
 		// as its own echo.
 		presenceInstanceID: "runtime-" + uuid.NewString(),
 		reconcileSignal:    make(chan struct{}, 1),
+		syncSignal:         make(chan struct{}, 1),
 	}
 }
 
@@ -1785,7 +1786,9 @@ func TestHub_Broadcast_AuthError_SkipsDeliveryKeepsSubscription(t *testing.T) {
 }
 
 func TestHub_Broadcast_AuthError_ThenRecovery_Delivers(t *testing.T) {
-	// After a transient error clears, the next broadcast delivers normally.
+	// After a transient error clears, the next broadcast delivers normally —
+	// and, since issue #947, also tells the client about the delivery it missed
+	// (msg-1 is never replayed; the client reads it back on the sync signal).
 	auth := &fakeAuthorizer{}
 	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", true)
 
@@ -1804,8 +1807,9 @@ func TestHub_Broadcast_AuthError_ThenRecovery_Delivers(t *testing.T) {
 	evt2, data2 := makeEvent("ws-1", TargetTypeChannel, "ch-1", "msg-2")
 	h.handleBroadcast(broadcastReq{event: evt2, data: data2})
 
-	if n := len(c.outbox); n != 1 {
-		t.Fatalf("expected 1 event after recovery, got %d", n)
+	frames := drainOutboxFrames(t, c)
+	if len(frames) != 2 || frames[0].fields["message_id"] != "msg-2" || frames[1].frameType() != SyncRequiredType {
+		t.Fatalf("expected msg-2 then one sync signal after recovery, got %d frames", len(frames))
 	}
 }
 

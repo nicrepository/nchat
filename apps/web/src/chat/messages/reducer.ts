@@ -9,6 +9,7 @@
  * dispatcher rather than a second copy of every switch.
  */
 
+import { reduceCatchUp } from "./catchUpReducer";
 import { reduceComposer } from "./composerReducer";
 import { reduceConversation } from "./conversationReducer";
 import { reduceEditing } from "./editingReducer";
@@ -35,6 +36,7 @@ function reduceLinkSafetyGroup(state: MessagesState, action: Action): MessagesSt
 
 export function reducer(state: MessagesState, action: Action): MessagesState {
   return (
+    reduceCatchUp(state, action, reducer) ??
     reduceHistory(state, action) ??
     reduceComposer(state, action) ??
     reduceLinkSafetyGroup(state, action) ??

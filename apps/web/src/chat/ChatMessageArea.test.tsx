@@ -2679,6 +2679,39 @@ describe("ChatMessageArea — error state", () => {
   });
 });
 
+// ── Issue #947: the connection notice and an owed reconciliation (CQ947-R2-04) ─
+
+describe("ChatMessageArea — the connection notice while a reconciliation is owed", () => {
+  const subscribed = () =>
+    act(() =>
+      wsMockState.capturedSubscribed?.({
+        type: "subscribed",
+        operation: "subscribe",
+        target_type: "channel",
+        target_id: "geral",
+      }),
+    );
+
+  it("keeps one notice through a reconnect, and clears it only once a catch-up lands", async () => {
+    mockFetchChannelMessages.mockResolvedValueOnce(emptyPage);
+    renderChannelArea("geral");
+    await screen.findByTestId("chat-msg-empty");
+    mockFetchChannelMessages.mockRejectedValue(new Error("503"));
+
+    subscribed();
+    expect(await screen.findByTestId("chat-realtime-error")).toBeInTheDocument();
+
+    // A healthy subscription clears the realtime failure, not the owed read.
+    subscribed();
+    await waitFor(() => expect(mockFetchChannelMessages).toHaveBeenCalledTimes(3));
+    expect(screen.getAllByTestId("chat-realtime-error")).toHaveLength(1);
+
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    subscribed();
+    await waitFor(() => expect(screen.queryByTestId("chat-realtime-error")).toBeNull());
+  });
+});
+
 // ── Empty state ───────────────────────────────────────────────────────────────
 
 describe("ChatMessageArea — empty state", () => {
@@ -11171,7 +11204,8 @@ describe("ChatMessageArea — RF-21 link safety", () => {
     expect(screen.getByTestId("chat-msg-bubble")).toHaveTextContent("veja");
     expect(screen.getByTestId("chat-msg-bubble")).toHaveTextContent("agora");
     expect(mockFetchChannelMessage).toHaveBeenCalledWith("geral", "msg-blocked", expect.anything());
-    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
+    // The second listing read is the #947 catch-up, merged in place — not a reload.
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(2);
   });
 
   it("restores the body when the blocked link was edited away offline", async () => {
@@ -11222,7 +11256,8 @@ describe("ChatMessageArea — RF-21 link safety", () => {
     expect(screen.queryByText("Link bloqueado por segurança")).toBeNull();
     expect(screen.queryByRole("link")).toBeNull();
     expect(mockFetchChannelMessage).toHaveBeenCalledWith("geral", "msg-blocked", expect.anything());
-    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
+    // The second listing read is the #947 catch-up, merged in place — not a reload.
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(2);
   });
 
   it("keeps the span-level body when the aggregate condemnation arrives and the re-read fails", async () => {

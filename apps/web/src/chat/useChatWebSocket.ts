@@ -924,6 +924,36 @@ export function useChatWebSocket({
       return true;
     }
 
+    /**
+     * Issue #947. The server withheld a delivery to this connection because it
+     * could not prove access, and has since proven it: the target is to be read
+     * back. The answer is the one a resubscription already triggers — this
+     * hook's resync point — so consumers need nothing new.
+     *
+     * Decided by the named target alone. The server cleared its gap when it
+     * queued this frame, so dropping it because some *other* target of this
+     * consumer is still pending would lose it for good. A target that is itself
+     * still pending is left to its acknowledgement, which resynchronises anyway.
+     */
+    function routeSyncRequired(
+      control: SubscriptionControl,
+      d: Record<string, unknown>,
+      incoming: IncomingTarget,
+    ): boolean {
+      if (d["type"] !== "conversation.sync_required") return false;
+      if (incoming.type && control.confirmed.has(incoming.key)) {
+        onSubscribedRef.current?.(
+          control.primaryAcknowledgement ?? {
+            type: "subscribed",
+            operation: "subscribe",
+            target_type: incoming.type,
+            target_id: incoming.id,
+          },
+        );
+      }
+      return true;
+    }
+
     // An event with no recognised target type is not one this protocol produces
     // and is dropped.
     function routeConversationEvent(d: Record<string, unknown>, incoming: IncomingTarget): boolean {
@@ -1021,6 +1051,7 @@ export function useChatWebSocket({
         if (routeClientError(control, d, generation, incoming)) return;
         if (routeUnscopedEvent(d, incoming)) return;
         if (!control.expected.has(incoming.key)) return;
+        if (routeSyncRequired(control, d, incoming)) return;
         if (routeSubscribedTargetEvent(d, incoming)) return;
         // Mutating actions remain scoped to the primary target.
         if (incoming.key !== primaryTargetKey) return;
