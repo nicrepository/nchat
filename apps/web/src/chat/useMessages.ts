@@ -71,8 +71,10 @@ interface UseMessagesOptions {
   targetId: string;
   bodyFormat?: "v2" | "v3";
   currentUserId: string;
-  /** Direct-navigation target resolved through the authorized single-message GET. */
+  /** A `?message=` target, reached by paging back through history (#1088). */
   focusMessageId?: string;
+  /** Which request asked for focusMessageId (issue #896); asking again may reload (#1099). */
+  focusRequest?: string;
   onOwnReactionConfirmed?: (emoji: string) => void;
   /** RF-05: called on a pin.updated event for the active target (refetch pins). */
   onPinUpdated?: (event: WSPinUpdatedEvent) => void;
@@ -187,6 +189,7 @@ export function useMessages({
   bodyFormat = kind === "channel" ? "v3" : "v2",
   currentUserId,
   focusMessageId,
+  focusRequest,
   onOwnReactionConfirmed,
   onPinUpdated,
   onMembersAdded,
@@ -260,6 +263,8 @@ export function useMessages({
     nextCursor: state.nextCursor,
     loadingMore: state.loadingMore,
     focusMessageId,
+    focusRequest,
+    focusLoaded: !!focusMessageId && state.messages.some((m) => m.id === focusMessageId),
   });
   useReferenceRevalidation({ scope, gateway, dispatch, messages: state.messages });
   const catchUpTimeline = useTimelineCatchUp({

@@ -532,6 +532,11 @@ type QuotedMessage struct {
 	// body does — and a message condemned after being quoted has to stop
 	// showing through the quote (issue #135, CQ-002).
 	LinkSafety MessageLinkSafety
+	// AuthorDisplayName is the quoted author's name, joined server-side from the
+	// same row the quote is read from (issue #1099), so the preview never depends
+	// on the original being among the pages a client happens to hold. Empty only
+	// when the author's account no longer exists.
+	AuthorDisplayName string
 }
 
 // MessageReference is the one-level, read-time preview of a cross-target

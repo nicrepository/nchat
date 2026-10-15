@@ -24,7 +24,8 @@ function applyLoaded(state: MessagesState, action: ActionOf<"loaded">): Messages
     realtimeError: null,
     actionError: null,
     pendingReactions: new Map(),
-    replyTo: null,
+    // "loading" already decided whether the reply survives this load.
+    replyTo: state.replyTo,
     linkSafetyCorrections: state.linkSafetyCorrections,
     pendingEdits: new Map(),
     syncError: null,
@@ -79,7 +80,7 @@ export function reduceHistory(state: MessagesState, action: Action): MessagesSta
         realtimeError: null,
         actionError: null,
         pendingReactions: new Map(),
-        replyTo: null,
+        replyTo: action.keepReply ? state.replyTo : null,
       };
     case "loaded":
       return applyLoaded(state, action);

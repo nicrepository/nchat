@@ -14,6 +14,7 @@ import {
   normalizeLinkSafety,
   normalizeMessagePriority,
   parseMessageAttachments,
+  parseQuoteAuthorDisplayName,
   type Message,
 } from "../chatTypes";
 import { safeAvatarUrl } from "../chatApi";
@@ -36,6 +37,7 @@ function quotedFromPayload(quoted: WSQuotePayload): NonNullable<Message["quoted"
     createdAt: quoted.created_at ?? "",
     updatedAt: quoted.updated_at ?? quoted.created_at ?? "",
     linkSafetyState: normalizeLinkSafety(quoted.link_safety_state),
+    authorDisplayName: parseQuoteAuthorDisplayName(quoted.author_display_name),
   };
 }
 

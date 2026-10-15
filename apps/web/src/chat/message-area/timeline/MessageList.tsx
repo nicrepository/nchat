@@ -9,7 +9,7 @@
  * left it.
  */
 
-import { useMemo } from "react";
+import { useCallback, useMemo, type RefObject } from "react";
 import type { DirectMessageAccess } from "../../directMessage";
 
 import AttachmentViewerHost from "../../AttachmentViewerHost";
@@ -24,6 +24,7 @@ import type { LastMutation } from "../../useMessages";
 import type { TimelinePosition } from "../../messages/messageOrder";
 import type { ReadProgress } from "../../readCursor";
 import { useConversationViewport } from "../viewport/useConversationViewport";
+import type { FocusReturn } from "../viewport/useListBoundaries";
 import MessageTimelineItem, {
   type ConversationMessageActions,
   type TimelineRowContext,
@@ -69,6 +70,11 @@ export interface MessageListProps {
   focusMessageId?: string;
   /** Issue #896: which request asked for focusMessageId. */
   focusRequest?: string;
+  /**
+   * #1099: which target focus returns to once a reopened list settles. Held
+   * by the caller, because following a target can unmount this list.
+   */
+  focusReturnRef: RefObject<FocusReturn | null>;
   /** #492: `${kind}:${targetId}` — keys the per-conversation viewport anchor. */
   conversationKey: string;
   /** #492: the sidebar's unread_count for this target as of opening it. */
@@ -115,7 +121,8 @@ export default function MessageList(props: MessageListProps) {
     virtualized,
     virtualizer,
     highlightedMessageId,
-    jumpToMessage,
+    targetMissed,
+    armFocusReturn,
     scrollButton,
     onScrollButtonClick,
     focusList,
@@ -130,6 +137,7 @@ export default function MessageList(props: MessageListProps) {
     initialAnchor,
     focusMessageId,
     focusRequest,
+    focusReturnRef: props.focusReturnRef,
     onLoadMore,
     onCaptureAnchor,
     onReadProgress,
@@ -139,6 +147,19 @@ export default function MessageList(props: MessageListProps) {
   const messagesById = useMemo(
     () => new Map(messages.map((message) => [message.id, message])),
     [messages],
+  );
+  // Issue #1099: following a quote, loaded or not, makes its original the
+  // conversation's one message target, so the latest request always wins — a
+  // search still under way for an earlier one stops being followed. A loaded
+  // original is jumped to in place; one no page has reached yet reopens the
+  // conversation, whose bounded backward search (#1088) pages it in.
+  const { onOpenMessageTarget } = actions;
+  const followQuote = useCallback(
+    (messageId: string) => {
+      armFocusReturn(messageId);
+      onOpenMessageTarget(messageId);
+    },
+    [armFocusReturn, onOpenMessageTarget],
   );
   const context: TimelineRowContext = {
     currentUserId,
@@ -163,7 +184,7 @@ export default function MessageList(props: MessageListProps) {
       key={row.key}
       row={row}
       context={context}
-      actions={{ ...actions, onQuoteJump: jumpToMessage }}
+      actions={{ ...actions, onQuoteJump: followQuote }}
       reactionMenu={reactionMenu}
       highlightedMessageId={highlightedMessageId}
       unreadDividerRef={unreadDividerRef}
@@ -223,6 +244,19 @@ export default function MessageList(props: MessageListProps) {
           <div ref={bottomRef} data-testid="chat-bottom-sentinel" />
         </div>
       </div>
+      {targetMissed && (
+        // #1099: the message asked for could not be reached — removed, no
+        // longer visible, or beyond the bounded search. Said without telling
+        // those apart, outside the scroller so it is seen wherever the
+        // fallback landed, and never by highlighting a guess.
+        <div
+          className="chat-msg-area__target-missed"
+          role="status"
+          data-testid="message-target-missed"
+        >
+          Não foi possível localizar a mensagem no histórico.
+        </div>
+      )}
       <ScrollToBottomButton state={scrollButton} onClick={onScrollButtonClick} />
     </div>
   );

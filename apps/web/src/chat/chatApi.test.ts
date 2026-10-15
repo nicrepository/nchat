@@ -1602,6 +1602,36 @@ describe("fetchChannelMessages", () => {
     expect(url).toContain("?before=cursor%3D%3Dabc");
   });
 
+  // Issue #1099: the quote names its author from the server's projection,
+  // parsed strictly. "" — blank included — is the server saying the author no
+  // longer exists; a pre-#1099 payload without the field, or a malformed
+  // value, says nothing and maps to undefined.
+  it.each([
+    ["a projected name", "Ana Antiga", "Ana Antiga"],
+    ["a pre-#1099 payload", undefined, undefined],
+    ["an author that no longer exists", "", ""],
+    ["a blank name", "   ", ""],
+    ["a malformed name", { name: "Ana" }, undefined],
+    ["a number", 42, undefined],
+  ])("maps a quote's author_display_name from %s", async (_case, raw, expected) => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({
+          quoted: {
+            id: "parent",
+            author_id: "user-parent",
+            body: "Salve",
+            created_at: "2024-01-15T09:00:00Z",
+            ...(raw === undefined ? {} : { author_display_name: raw }),
+          },
+        }),
+      ]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].quoted?.authorDisplayName).toBe(expected);
+    expect(page.messages[0].quoted?.bodyText).toBe("Salve");
+  });
+
   it("does not append before param when cursor is absent", async () => {
     mockAuthFetch.mockResolvedValue(msgListEnvelope());
     await fetchChannelMessages("geral");

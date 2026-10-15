@@ -156,6 +156,8 @@ export interface WSQuotePayload {
   updated_at?: string;
   /** Absent on a pre-#135 server; treated as "unknown" by the reader. */
   link_safety_state?: string;
+  /** Issue #1099. Absent on a pre-#1099 server; parsed, never trusted. */
+  author_display_name?: unknown;
 }
 
 export interface WSMessageCreatedEvent {

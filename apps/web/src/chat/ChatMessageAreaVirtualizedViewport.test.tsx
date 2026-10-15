@@ -1133,6 +1133,53 @@ describe("a virtualized timeline", { timeout: 30_000 }, () => {
     );
   });
 
+  it("pages back to a quoted message no loaded page holds, and highlights it with the window still virtual", async () => {
+    // #1099: the original sits on an older page, so it is in no row at all —
+    // not merely unmounted. The quote still names its author and still offers
+    // the jump; following it pages back and lands on exactly that row.
+    const quoting = message(HISTORY_SIZE, {
+      id: "m-quoting",
+      quoted: {
+        id: "m--15",
+        authorId: OTHER_USER,
+        authorDisplayName: "Autora Antiga",
+        bodyText: "Salve",
+        bodyFormat: "v1",
+        isRemoved: false,
+      },
+    } as Partial<Message>);
+    mockFetchChannelMessages.mockImplementation((_id: string, before?: string) =>
+      Promise.resolve(
+        before === "older"
+          ? { messages: history(20, -20), nextCursor: "" }
+          : { messages: [...history(), quoting], nextCursor: "older" },
+      ),
+    );
+    await openVirtualizedChannel();
+    await scrollToTail();
+
+    const jump = await screen.findByRole("button", {
+      name: "Ir para mensagem original de Autora Antiga",
+    });
+    expect(mockFetchChannelMessages).not.toHaveBeenCalledWith("geral", "older");
+    await act(async () => {
+      jump.click();
+    });
+
+    await waitFor(() => expect(mockFetchChannelMessages).toHaveBeenCalledWith("geral", "older"));
+    await settleUntil(() => {
+      expect(
+        document
+          .querySelector('[data-message-id="m--15"]')
+          ?.closest(".chat-msg-area__msg--highlight"),
+      ).not.toBeNull();
+    });
+    expect(document.querySelectorAll(".chat-msg-area__msg--highlight")).toHaveLength(1);
+    // Still a window over the history, not the whole of it mounted.
+    expect(screen.getByTestId("chat-virtual-canvas")).toBeInTheDocument();
+    expect(scrollport.mountedBubbles()).toBeLessThan(HISTORY_SIZE + 21);
+  });
+
   it("opens on a deep-linked message that is nowhere near the initial window", async () => {
     mockFetchChannelMessages.mockResolvedValue({ messages: history(), nextCursor: "" });
 

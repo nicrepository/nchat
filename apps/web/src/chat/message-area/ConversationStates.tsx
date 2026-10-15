@@ -9,7 +9,7 @@
  * having to say anything about it.
  */
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type Ref } from "react";
 
 import { IconForum, IconLock, IconWarning } from "./icons";
 
@@ -42,16 +42,18 @@ export function LoadingSkeleton() {
 
 interface ErrorStateProps {
   onRetry: () => void;
+  /** #1099: lets the timeline hand focus to the recovery a failed trip leaves. */
+  retryRef?: Ref<HTMLButtonElement>;
 }
 
-export function ErrorState({ onRetry }: ErrorStateProps) {
+export function ErrorState({ onRetry, retryRef }: ErrorStateProps) {
   return (
     <div className="chat-msg-area__error" role="alert" data-testid="chat-msg-error">
       <div className="chat-msg-area__error-icon">
         <IconWarning />
       </div>
       <p className="chat-msg-area__error-msg">Não foi possível carregar as mensagens.</p>
-      <button type="button" className="chat-msg-area__retry-btn" onClick={onRetry}>
+      <button ref={retryRef} type="button" className="chat-msg-area__retry-btn" onClick={onRetry}>
         Tentar novamente
       </button>
     </div>
