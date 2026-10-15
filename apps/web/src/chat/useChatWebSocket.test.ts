@@ -2173,3 +2173,114 @@ describe("useChatWebSocket", () => {
     first.unmount();
   });
 });
+
+// Issue #947. The server sends conversation.sync_required, to this connection
+// only, after it skipped a delivery it could not authorize and has since proven
+// access again. It names a target and nothing else; the consumer's answer is the
+// same resynchronisation a resubscription triggers.
+describe("useChatWebSocket — server-requested resync (issue #947)", () => {
+  function renderWithResync(onSubscribed = vi.fn()) {
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        additionalTargets: [{ kind: "dm", targetId: "dm-2" }],
+        onMessageCreated: vi.fn(),
+        onSubscribed,
+      }),
+    );
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(subscribed("channel", "ch-1")));
+    act(() => socket.simulateMessage(subscribed("dm", "dm-2")));
+    expect(onSubscribed).toHaveBeenCalledOnce();
+    return { socket, onSubscribed };
+  }
+
+  it("resynchronises when the server asks for a target this consumer watches", () => {
+    const { socket, onSubscribed } = renderWithResync();
+
+    act(() =>
+      socket.simulateMessage({
+        type: "conversation.sync_required",
+        target_type: "dm",
+        target_id: "dm-2",
+      }),
+    );
+
+    expect(onSubscribed).toHaveBeenCalledTimes(2);
+  });
+
+  // #947 follow-up (P4). One target whose subscription never completes — a
+  // transient refusal that outlived its retries, a target still being added —
+  // must not swallow the resync of a target that is live. The server cleared
+  // its gap when it queued the signal; dropping it here loses it for good.
+  it("resynchronises a confirmed target while another one is still pending", () => {
+    const onSubscribed = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        additionalTargets: [{ kind: "dm", targetId: "dm-2" }],
+        onMessageCreated: vi.fn(),
+        onSubscribed,
+      }),
+    );
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(subscribed("channel", "ch-1")));
+    expect(onSubscribed).not.toHaveBeenCalled();
+
+    act(() =>
+      socket.simulateMessage({
+        type: "conversation.sync_required",
+        target_type: "channel",
+        target_id: "ch-1",
+      }),
+    );
+
+    expect(onSubscribed).toHaveBeenCalledOnce();
+  });
+
+  it("leaves the resync of a still-pending target to its acknowledgement", () => {
+    const onSubscribed = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        additionalTargets: [{ kind: "dm", targetId: "dm-2" }],
+        onMessageCreated: vi.fn(),
+        onSubscribed,
+      }),
+    );
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(subscribed("channel", "ch-1")));
+
+    act(() =>
+      socket.simulateMessage({
+        type: "conversation.sync_required",
+        target_type: "dm",
+        target_id: "dm-2",
+      }),
+    );
+    expect(onSubscribed).not.toHaveBeenCalled();
+    act(() => socket.simulateMessage(subscribed("dm", "dm-2")));
+    expect(onSubscribed).toHaveBeenCalledOnce();
+  });
+
+  it("ignores a resync request for a target this consumer does not watch", () => {
+    const { socket, onSubscribed } = renderWithResync();
+
+    act(() =>
+      socket.simulateMessage({
+        type: "conversation.sync_required",
+        target_type: "channel",
+        target_id: "ch-other",
+      }),
+    );
+    act(() => socket.simulateMessage({ type: "conversation.sync_required" }));
+
+    expect(onSubscribed).toHaveBeenCalledOnce();
+  });
+});

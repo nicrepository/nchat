@@ -43,6 +43,20 @@ export interface PendingReactions {
   intents: Map<string, ReactionIntent>;
 }
 
+/**
+ * An edit this reader made that the server has not confirmed yet (issue #947).
+ *
+ * `editCount` is the version the edit claims — the drawn one plus one — so a
+ * server copy can say whether it already carries this edit (or a later one)
+ * without any local clock being compared.
+ */
+export interface PendingEdit {
+  body: string;
+  bodyFormat: Message["bodyFormat"];
+  editedAt: string;
+  editCount: number;
+}
+
 /** A versioned link-safety verdict this client holds for one message. */
 export type LinkSafetyChange = { state: Message["linkSafetyState"]; updatedAt: string };
 
@@ -83,6 +97,14 @@ export interface MessagesState {
   replyTo: Message | null;
   /** Versioned corrections that arrived before their message.created payload. */
   linkSafetyCorrections: LinkSafetyCorrections;
+  /** Issue #947: this reader's unconfirmed edits, by message, so a rebase can redraw them. */
+  pendingEdits: Map<string, PendingEdit>;
+  /**
+   * Issue #947: a reconciliation the timeline still owes. Unlike realtimeError
+   * no other event clears it — only a catch-up that was actually applied, or a
+   * fresh load — so the reader is never told the view is current while it is not.
+   */
+  syncError: string | null;
 }
 
 /**
@@ -154,8 +176,13 @@ export type Action =
   | { type: "link_updated"; messageId: string; link: MessageLink }
   | { type: "security_snapshots_refreshed"; snapshots: MessageSecuritySnapshot[] }
   | { type: "prepending" }
-  | { type: "prepended"; page: MessagePage }
-  | { type: "prepend_error" }
+  /**
+   * `cursor` is the one the page was requested with. A page whose cursor is no
+   * longer the timeline's belongs to a timeline that has since been replaced
+   * (issue #947) and is ignored, whatever the transport did with the abort.
+   */
+  | { type: "prepended"; page: MessagePage; cursor: string }
+  | { type: "prepend_error"; cursor: string }
   | { type: "ws_received"; message: Message }
   | {
       type: "edit_optimistic";
@@ -186,7 +213,16 @@ export type Action =
   | { type: "ws_fetch_error"; error: string }
   | { type: "attachment_status"; attachmentId: string; status: ChannelAttachment["status"] }
   | { type: "attachments_reconciled"; attachments: ChannelAttachment[] }
-  | { type: "ws_subscription_ready" };
+  | { type: "ws_subscription_ready" }
+  /**
+   * Issue #947: a catch-up read landed. Stitched onto what is held, or —
+   * `replace`, for a gap too long to stitch — the timeline becomes what was
+   * read. `journal` is what the server said while the read was in flight, to be
+   * rebased on top of it (see catchUpReducer.ts).
+   */
+  | { type: "caught_up"; page: MessagePage; replace: boolean; journal: Action[] }
+  /** A catch-up attempt failed; the reconciliation is still owed. */
+  | { type: "catch_up_failed"; error: string };
 
 /** The action of one specific type, narrowed out of the union. */
 export type ActionOf<T extends Action["type"]> = Extract<Action, { type: T }>;
@@ -211,6 +247,8 @@ export const initialState: MessagesState = {
   pendingReactions: new Map(),
   replyTo: null,
   linkSafetyCorrections: new Map(),
+  pendingEdits: new Map(),
+  syncError: null,
 };
 
 /** Which conversation a piece of message work belongs to. */

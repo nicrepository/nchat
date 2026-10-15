@@ -653,6 +653,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         <ConversationNotices
           sendError={state.sendError}
           realtimeError={state.realtimeError}
+          syncError={state.syncError}
           actionError={state.actionError}
           pinError={pinError}
           acknowledgeError={acknowledgeError}

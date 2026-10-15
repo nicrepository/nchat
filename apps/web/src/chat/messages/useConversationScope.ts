@@ -38,6 +38,14 @@ export interface ConversationScope {
   rememberDeleted(messageId: string, deletedAt: string | null): void;
   /** Forgets the tombstones of a previous conversation. */
   retarget(key: string): void;
+  /**
+   * Issue #947: whether `key`'s first page has been applied. Written by the
+   * loader as it happens, never derived from a render — the render on which
+   * the route has moved still carries the previous conversation's "ready".
+   */
+  isLoaded(key: string): boolean;
+  /** Records the conversation whose first page was applied; null while loading. */
+  markLoaded(key: string | null): void;
 }
 
 export function useConversationScope(
@@ -60,6 +68,7 @@ export function useConversationScope(
 
   const tombstones = useRef<Map<string, string | null>>(new Map());
   const tombstoneTarget = useRef(key);
+  const loadedKey = useRef<string | null>(null);
 
   const sanitize = useCallback((message: Message): Message => {
     if (tombstones.current.has(message.id)) {
@@ -106,6 +115,10 @@ export function useConversationScope(
         if (tombstoneTarget.current === candidate) return;
         tombstones.current.clear();
         tombstoneTarget.current = candidate;
+      },
+      isLoaded: (candidate) => loadedKey.current === candidate,
+      markLoaded(candidate) {
+        loadedKey.current = candidate;
       },
     }),
     [kind, targetId, sanitize],

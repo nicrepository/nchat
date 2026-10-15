@@ -4633,7 +4633,8 @@ describe("useMessages — reconnect reconciliation of withheld messages", () => 
     expect(result.current.state.sendError).toBe("Este link foi bloqueado por segurança.");
     expect(result.current.state.sending).toBe(false);
     // Recovered without the user reloading anything.
-    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
+    // The second listing read is the #947 catch-up, merged in place — not a reload.
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(2);
   });
 
   // RF-21 inconclusive: the scan itself finished terminal-but-undecided, so the

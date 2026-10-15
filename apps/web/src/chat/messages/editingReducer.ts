@@ -21,30 +21,66 @@ import type {
   LinkSafetyChange,
   LinkSafetyCorrections,
   MessagesState,
+  PendingEdit,
 } from "./types";
+
+/**
+ * What an unconfirmed edit draws: its body, under the version it claims.
+ *
+ * Shared by the optimistic edit and by a catch-up rebase (issue #947), so the
+ * rule for "this message is being edited" lives here only.
+ */
+export function withOptimisticEdit(message: Message, edit: PendingEdit): Message {
+  return {
+    ...message,
+    bodyText: edit.body,
+    bodyFormat: edit.bodyFormat,
+    isEdited: true,
+    editCount: edit.editCount,
+    editedAt: edit.editedAt,
+    // The new body has not yet received the server's verdict. Keeping the
+    // old body's clearance — or its link entities — here would briefly
+    // authorize different links.
+    linkSafetyState: "unknown" as const,
+    links: undefined,
+  };
+}
 
 function applyEditOptimistic(
   state: MessagesState,
   action: ActionOf<"edit_optimistic">,
 ): MessagesState {
-  const messages = state.messages.map((message) =>
-    message.id === action.messageId
-      ? {
-          ...message,
-          bodyText: action.body,
-          bodyFormat: action.bodyFormat,
-          isEdited: true,
-          editCount: message.editCount + 1,
-          editedAt: action.editedAt,
-          // The new body has not yet received the server's verdict. Keeping the
-          // old body's clearance — or its link entities — here would briefly
-          // authorize different links.
-          linkSafetyState: "unknown" as const,
-          links: undefined,
-        }
-      : message,
-  );
-  return { ...state, messages, lastMutation: "none" };
+  const target = state.messages.find((message) => message.id === action.messageId);
+  if (!target) return { ...state, lastMutation: "none" };
+  // The version this edit claims is the drawn one plus one; a server copy that
+  // already reaches it carries this edit (or a later one).
+  const edit: PendingEdit = {
+    body: action.body,
+    bodyFormat: action.bodyFormat,
+    editedAt: action.editedAt,
+    editCount: target.editCount + 1,
+  };
+  return {
+    ...state,
+    messages: state.messages.map((message) =>
+      message === target ? withOptimisticEdit(message, edit) : message,
+    ),
+    pendingEdits: new Map(state.pendingEdits).set(action.messageId, edit),
+    lastMutation: "none",
+  };
+}
+
+/** The pending edits without the one for `messageId`, once `settled` says it is over. */
+function settlePendingEdit(
+  pendingEdits: Map<string, PendingEdit>,
+  messageId: string,
+  settled: (edit: PendingEdit) => boolean,
+): Map<string, PendingEdit> {
+  const edit = pendingEdits.get(messageId);
+  if (!edit || !settled(edit)) return pendingEdits;
+  const next = new Map(pendingEdits);
+  next.delete(messageId);
+  return next;
 }
 
 /** The confirmed edit written onto the message, unless a newer verdict outranks it. */
@@ -86,6 +122,13 @@ function applyEditConfirmed(
         : message,
     ),
     linkSafetyCorrections,
+    // A confirmation of this version or a later one settles the edit; an older
+    // one (the first of two quick edits) leaves the newer intent pending.
+    pendingEdits: settlePendingEdit(
+      state.pendingEdits,
+      action.message.id,
+      (edit) => action.message.editCount >= edit.editCount,
+    ),
     lastMutation: "none",
   };
 }
@@ -93,6 +136,11 @@ function applyEditConfirmed(
 function applyEditRevert(state: MessagesState, action: ActionOf<"edit_revert">): MessagesState {
   return {
     ...state,
+    pendingEdits: settlePendingEdit(
+      state.pendingEdits,
+      action.message.id,
+      (edit) => edit.editedAt === action.optimisticEditedAt,
+    ),
     messages: state.messages.map((message) =>
       message.id === action.message.id &&
       !message.isRemoved &&

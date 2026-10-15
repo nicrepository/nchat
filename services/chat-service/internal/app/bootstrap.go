@@ -265,6 +265,9 @@ func (b *bootstrap) buildPresence() {
 	if metrics := newHubPresenceMetrics(b.metrics); metrics != nil {
 		rt.options = append(rt.options, ws.WithPresenceMetrics(metrics))
 	}
+	if metrics := newHubDeliveryMetrics(b.metrics); metrics != nil {
+		rt.options = append(rt.options, ws.WithDeliveryMetrics(metrics))
+	}
 	// Manual states, calls and last seen (issue #798). Checked on the concrete
 	// pointer: a nil store in the interface would be a non-nil source.
 	if b.stores.presence != nil {

@@ -35,6 +35,7 @@ helper do pacote) e da `t.Skip` quando ele nao existe, ou exige uma build tag.
 | `chat-service` criacao de canal privado com membros (#1025)     | `CHANNEL_CREATION_TEST_DATABASE_URL` + `-run`   | `Tests / Go Integration` |     12 |
 | `chat-service` identidade de grupo (#1026)                      | `CHAT_TEST_DATABASE_URL` + `-run`               | `Tests / Go Integration` |      6 |
 | `media-service/internal/storage`                                | `MEDIA_TEST_DATABASE_URL` + `-tags integration` | `Tests / Go Integration` |      1 |
+| `chat-service/internal/ws` duas replicas sobre Valkey (#947)    | `CHAT_TEST_VALKEY_URL` + `-run`                 | `Tests / Go Integration` |      3 |
 | `chat-service` Link Safety, outbox, prioridade, ack, lembrete   | `CHAT_TEST_DATABASE_URL`, 127 testes nomeados   | `Tests / Go Coverage`    |    127 |
 | `notification-service/internal/storage`                         | `NOTIFICATION_TEST_DATABASE_URL`, nomeados      | `Tests / Go Coverage`    |    113 |
 | `file-service` storage + linkpreview (Link Safety)              | `FILE_TEST_DATABASE_URL`, nomeados              | `Tests / Go Coverage`    |      8 |
@@ -49,6 +50,15 @@ de storage que ela exercita ja e medido pelos testes pgxmock. Por isso o owner e
 `Tests / Go Integration`, com banco proprio (`channel_creation_test`), porque o fixture
 reseta o schema `chat`. `go-integration-test.sh` recusa uma entrada cujo `-run` nao casa
 nenhum teste, para que um rename nao a desligue em silencio.
+
+A familia #947 (`TestSyncRecoveryValkey_*`) sobe dois hubs — duas replicas — com conexoes
+proprias a um Valkey real (o job provisiona a mesma imagem do overlay de producao). Prova
+entrega entre replicas, a falha da re-checagem de autorizacao na replica que recebe, a
+recuperacao sem novo broadcast restrita a conexao afetada, unsubscribe e reconexao durante a
+recuperacao, e a liberacao das goroutines. **Nao** e um teste ponta a ponta: o autorizador e
+as conexoes sao dubles (a falha transitoria de autorizacao e injetada), nao ha HTTP, PostgreSQL
+nem navegador no caminho. Cada caso usa um workspace proprio, portanto um canal do bus
+proprio. As demais suites Valkey de `internal/ws` (presenca) continuam sem owner.
 
 Comandos: `make test-integration-go` (`scripts/ci/go-integration-test.sh`) e
 `make go-coverage-check` (`scripts/ci/go-coverage-check.sh`, que chama
