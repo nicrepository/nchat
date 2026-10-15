@@ -710,3 +710,171 @@ describe("a fact during the read, then a stale read, means the read then the fac
     );
   });
 });
+
+/**
+ * CQ947-R3-01: a single-message read accepted during the read is a server fact
+ * about the whole message, reactions included. A reaction does not move
+ * updated_at (reaction_store.go), so the stale listing copy and the read can
+ * carry the same version and different reactions; only the journal's order can
+ * say which list is current.
+ */
+describe("CQ947-R3-01 — an accepted message snapshot keeps its reactions through the rebase", () => {
+  function rebasedUnder(before: MessagesState, facts: Action[], read: Message[], replace: boolean) {
+    let live = before;
+    const { result } = renderHook(() =>
+      useCatchUpJournal((action) => {
+        live = reducer(live, action);
+      }),
+    );
+    const open = result.current.open();
+    for (const fact of facts) result.current.dispatch(fact);
+    result.current.close(open);
+    result.current.dispatch(caughtUp(read, open.entries, replace));
+    return live;
+  }
+
+  const snapshotOf = (copy: Message): Action => ({
+    type: "message_snapshot",
+    message: copy,
+    insertIfMissing: false,
+  });
+  const counts = (state: MessagesState, id: string) =>
+    byId(state, id).reactions.map(({ emoji, count, reactedByMe }) => ({
+      emoji,
+      count,
+      reactedByMe,
+    }));
+  const modes: Array<[string, boolean]> = [
+    ["stitched", false],
+    ["replaced", true],
+  ];
+
+  it.each(modes)("keeps a reaction the snapshot added (%s)", (_mode, replace) => {
+    const before = loaded([message(1), message(2)]);
+    const snapshot = snapshotOf(message(2, { reactions: thumbs(["u3"], false) }));
+    const stale = [message(1), message(2)];
+
+    const state = rebasedUnder(before, [snapshot], stale, replace);
+
+    expect(counts(state, "m-2")).toEqual([{ emoji: "👍", count: 1, reactedByMe: false }]);
+    expect(state.syncError).toBeNull();
+    expect(state.pendingReactions.size).toBe(0);
+    expect(counts(state, "m-2")).toEqual(
+      counts(run(before, caughtUp(stale, [], replace), snapshot), "m-2"),
+    );
+  });
+
+  it.each(modes)("keeps a reaction the snapshot removed (%s)", (_mode, replace) => {
+    const before = loaded([message(1), message(2, { reactions: thumbs(["u3"], false) })]);
+    const snapshot = snapshotOf(message(2));
+    const stale = [message(1), message(2, { reactions: thumbs(["u3"], false) })];
+
+    const state = rebasedUnder(before, [snapshot], stale, replace);
+
+    expect(byId(state, "m-2").reactions).toEqual([]);
+    expect(state.syncError).toBeNull();
+  });
+
+  it.each(modes)(
+    "lets a rejected snapshot change nothing, reactions included (%s)",
+    (_m, replace) => {
+      const before = run(loaded([message(1), message(2)]), {
+        type: "reaction_optimistic",
+        messageId: "m-2",
+        emoji: "❤️",
+      });
+      const older = snapshotOf(edited(2, "v1", 1));
+      const listed = { ...edited(2, "v2", 2, latest), reactions: thumbs(["u3", "u4"], false) };
+
+      const state = rebasedUnder(before, [older], [message(1), listed], replace);
+
+      expect(byId(state, "m-2")).toMatchObject({ bodyText: "v2", editCount: 2 });
+      expect(state.pendingReactions.get("m-2")?.confirmed).toEqual(listed.reactions);
+      expect(counts(state, "m-2").sort((a, b) => a.emoji.localeCompare(b.emoji))).toEqual([
+        { emoji: "❤️", count: 1, reactedByMe: true },
+        { emoji: "👍", count: 2, reactedByMe: false },
+      ]);
+    },
+  );
+
+  describe.each(modes)("with this reader's toggle still pending (%s)", (_mode, replace) => {
+    const before = run(loaded([message(1), message(2)]), {
+      type: "reaction_optimistic",
+      messageId: "m-2",
+      emoji: "👍",
+    });
+
+    it("rebases the intent on the snapshot's list", () => {
+      const others = thumbs(["u3"], false);
+
+      const state = rebasedUnder(
+        before,
+        [snapshotOf(message(2, { reactions: others }))],
+        [message(1), message(2)],
+        replace,
+      );
+
+      expect(counts(state, "m-2")).toEqual([{ emoji: "👍", count: 2, reactedByMe: true }]);
+      expect(state.pendingReactions.get("m-2")).toEqual({
+        confirmed: others,
+        intents: new Map([["👍", "added"]]),
+      });
+    });
+
+    it("does not count the toggle twice once the snapshot already has it", () => {
+      const persisted = thumbs(["me", "u3"], true);
+
+      const state = rebasedUnder(
+        before,
+        [snapshotOf(message(2, { reactions: persisted }))],
+        [message(1), message(2)],
+        replace,
+      );
+
+      expect(counts(state, "m-2")).toEqual([{ emoji: "👍", count: 2, reactedByMe: true }]);
+      expect(state.pendingReactions.get("m-2")?.confirmed).toEqual(persisted);
+    });
+  });
+
+  describe.each(modes)("in the order the facts were accepted (%s)", (_mode, replace) => {
+    const before = loaded([message(1), message(2)]);
+    const stale = [message(1), message(2)];
+    const readThenFacts = (facts: Action[]) =>
+      counts(run(before, caughtUp(stale, [], replace), ...facts), "m-2");
+
+    it("reaction_snapshot, then message_snapshot, then the read", () => {
+      const facts: Action[] = [
+        { type: "reaction_snapshot", messageId: "m-2", reactions: thumbs(["u3"], false) },
+        snapshotOf(message(2, { reactions: thumbs(["u3", "u4"], false) })),
+      ];
+
+      const state = rebasedUnder(before, facts, stale, replace);
+
+      expect(counts(state, "m-2")).toEqual([{ emoji: "👍", count: 2, reactedByMe: false }]);
+      expect(counts(state, "m-2")).toEqual(readThenFacts(facts));
+    });
+
+    it("message_snapshot, then reaction_updated, then the read", () => {
+      const facts: Action[] = [
+        snapshotOf(message(2, { reactions: thumbs(["me"], true) })),
+        reactionEvent("m-2", "👍", ["me", "u4"], "u4", true),
+      ];
+
+      const state = rebasedUnder(before, facts, stale, replace);
+
+      expect(counts(state, "m-2")).toEqual([{ emoji: "👍", count: 2, reactedByMe: true }]);
+      expect(counts(state, "m-2")).toEqual(readThenFacts(facts));
+    });
+
+    it("message_snapshot, then reaction_snapshot, then the read", () => {
+      const facts: Action[] = [
+        snapshotOf(message(2, { reactions: thumbs(["u3", "u4"], false) })),
+        { type: "reaction_snapshot", messageId: "m-2", reactions: thumbs(["u3"], false) },
+      ];
+
+      const state = rebasedUnder(before, facts, stale, replace);
+
+      expect(counts(state, "m-2")).toEqual([{ emoji: "👍", count: 1, reactedByMe: false }]);
+    });
+  });
+});

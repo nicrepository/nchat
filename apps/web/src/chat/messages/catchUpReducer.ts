@@ -130,7 +130,12 @@ function stillCurrent(state: MessagesState, entry: Action): boolean {
   return !drawnIsNewer(held, entry.message);
 }
 
-/** The journal replayed on top of the base; reaction lists are collected, not drawn. */
+/**
+ * The journal replayed on top of the base; reaction lists are collected, not
+ * drawn. A single-message read that is still current states one too: a reaction
+ * moves no updated_at, so the listing may carry the same version with an older
+ * list, and only the journal's order says the read's is the newer (CQ947-R3-01).
+ */
 function replayJournal(
   base: MessagesState,
   journal: Action[],
@@ -149,7 +154,11 @@ function replayJournal(
       serverReactions.set(...stated);
       return state;
     }
-    return stillCurrent(state, entry) ? replay(state, entry) : state;
+    if (!stillCurrent(state, entry)) return state;
+    if (entry.type === "message_snapshot") {
+      serverReactions.set(entry.message.id, entry.message.reactions);
+    }
+    return replay(state, entry);
   }, base);
 }
 

@@ -62,22 +62,28 @@ vi.mock("./useChatWebSocket", async () => {
   };
 });
 
-const { mockFetchChannelMessages, mockFetchDMMessages, mockEditMessage, mockPostChannelMessage } =
-  vi.hoisted(() => ({
-    mockEditMessage: vi.fn<(id: string, body: string, format: string) => Promise<Message>>(),
-    mockPostChannelMessage:
-      vi.fn<(id: string, body: string, options: unknown) => Promise<Message>>(),
-    mockFetchChannelMessages:
-      vi.fn<(id: string, cursor?: string, signal?: AbortSignal) => Promise<MessagePage>>(),
-    mockFetchDMMessages:
-      vi.fn<(id: string, cursor?: string, signal?: AbortSignal) => Promise<MessagePage>>(),
-  }));
+const {
+  mockFetchChannelMessages,
+  mockFetchChannelMessage,
+  mockFetchDMMessages,
+  mockEditMessage,
+  mockPostChannelMessage,
+} = vi.hoisted(() => ({
+  mockEditMessage: vi.fn<(id: string, body: string, format: string) => Promise<Message>>(),
+  mockPostChannelMessage: vi.fn<(id: string, body: string, options: unknown) => Promise<Message>>(),
+  mockFetchChannelMessages:
+    vi.fn<(id: string, cursor?: string, signal?: AbortSignal) => Promise<MessagePage>>(),
+  mockFetchChannelMessage:
+    vi.fn<(id: string, messageId: string, signal?: AbortSignal) => Promise<Message>>(),
+  mockFetchDMMessages:
+    vi.fn<(id: string, cursor?: string, signal?: AbortSignal) => Promise<MessagePage>>(),
+}));
 
 vi.mock("./chatApi", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./chatApi")>()),
   fetchChannelMessages: mockFetchChannelMessages,
   fetchDMMessages: mockFetchDMMessages,
-  fetchChannelMessage: vi.fn(),
+  fetchChannelMessage: mockFetchChannelMessage,
   fetchDMMessage: vi.fn(),
   fetchChannelMessageSecuritySnapshots: vi.fn().mockResolvedValue([]),
   fetchDMMessageSecuritySnapshots: vi.fn().mockResolvedValue([]),
@@ -1479,5 +1485,76 @@ describe("useMessages — the backoff leaves nothing on the signal (CQ947-R2-03)
 
     expect(mockFetchChannelMessages.mock.calls.length).toBe(calls);
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("useMessages — a message read back during the catch-up keeps its reactions (CQ947-R3-01)", () => {
+  /** A message.updated that names the message and nothing else: it is read back. */
+  const routeOnlyUpdate = (n: number): WSMessageUpdatedEvent =>
+    ({
+      type: "message.updated",
+      target_type: "channel",
+      target_id: "ch-1",
+      message_id: message(n).id,
+    }) as WSMessageUpdatedEvent;
+
+  /** Announces message n and lets its single-message read land. */
+  async function readBack(copy: Message) {
+    const n = Number(copy.id.slice(2));
+    mockFetchChannelMessage.mockResolvedValueOnce(copy);
+    act(() => capturedOnMessageUpdated?.(routeOnlyUpdate(n)));
+    await waitFor(() => expect(mockFetchChannelMessage).toHaveBeenCalled());
+    await act(async () => {});
+  }
+
+  beforeEach(() => mockFetchChannelMessage.mockReset());
+
+  // The reaction moved no updated_at: the read and the listing carry the same
+  // version of message 2, and only the read has the reaction.
+  it("keeps the reaction when the stale listing lands after the read", async () => {
+    const view = await loadedWith(range(1, 3));
+    const listing = deferred<MessagePage>();
+    mockFetchChannelMessages.mockImplementationOnce(() => listing.promise);
+    resubscribe();
+    await waitFor(() => expect(mockFetchChannelMessages).toHaveBeenCalledTimes(2));
+
+    await readBack(reacted(2, "👍", ["user-3"]));
+    expect(byId(view.result.current.state.messages, 2).reactions).toHaveLength(1);
+    await act(async () => listing.resolve(page(range(1, 3))));
+
+    const state = view.result.current.state;
+    expect(byId(state.messages, 2).reactions[0]).toMatchObject({ emoji: "👍", count: 1 });
+    expect(syncNotice(state)).toBeFalsy();
+    expect(ids(state.messages)).toEqual(ids(range(1, 3)));
+  });
+
+  it("keeps the reaction when the read replaces the timeline", async () => {
+    const view = await loadedWith(range(1, 3));
+    const first = deferred<MessagePage>();
+    mockFetchChannelMessages.mockImplementationOnce(() => first.promise);
+    for (let p = 1; p < catchUpMaxPages; p += 1) {
+      const newest = 1000 - p * 50;
+      mockFetchChannelMessages.mockResolvedValueOnce(page(range(newest - 49, newest), `p${p + 1}`));
+    }
+    resubscribe();
+    await waitFor(() => expect(mockFetchChannelMessages).toHaveBeenCalledTimes(2));
+    act(() =>
+      capturedOnMessageCreated?.({
+        type: "message.created",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: message(1000).id,
+        payload: payloadOf(message(1000)),
+      } as WSMessageCreatedEvent),
+    );
+
+    await readBack(reacted(1000, "👍", ["user-3"]));
+    expect(byId(view.result.current.state.messages, 1000).reactions).toHaveLength(1);
+    await act(async () => first.resolve(page(range(951, 1000), "p1")));
+
+    const state = view.result.current.state;
+    expect(state.messages).toHaveLength(50 * catchUpMaxPages);
+    expect(byId(state.messages, 1000).reactions[0]).toMatchObject({ emoji: "👍", count: 1 });
+    expect(syncNotice(state)).toBeFalsy();
   });
 });
