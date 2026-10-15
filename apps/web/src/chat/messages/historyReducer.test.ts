@@ -66,3 +66,28 @@ describe("olderPagesSettled", () => {
     });
   });
 });
+
+// Issue #1099: following a quote reloads the same conversation toward its
+// original; the reply being composed is the reader's, and only leaving the
+// conversation discards it.
+describe("the reply across a reload", () => {
+  const replying = (): MessagesState => ({ ...loaded(message("m1")), replyTo: message("m1") });
+
+  it("survives a reload of the same conversation", () => {
+    const reloading = reducer(replying(), { type: "loading", keepReply: true });
+    expect(reloading.replyTo?.id).toBe("m1");
+    const reloaded = reducer(reloading, {
+      type: "loaded",
+      page: { messages: [message("m9")], nextCursor: "" },
+    });
+    expect(reloaded.replyTo?.id).toBe("m1");
+  });
+
+  it("is discarded when another conversation loads", () => {
+    const reloading = reducer(replying(), { type: "loading" });
+    expect(reloading.replyTo).toBeNull();
+    expect(
+      reducer(reloading, { type: "loaded", page: { messages: [], nextCursor: "" } }).replyTo,
+    ).toBeNull();
+  });
+});

@@ -116,7 +116,7 @@ func listMessageWithQuoteCols() []string {
 	return append(listMessageCols(),
 		"quote_id", "quote_author_id", "quote_body_text", "quote_body_format",
 		"quote_status", "quote_deleted_at", "quote_created_at", "quote_updated_at",
-		"quote_link_safety_state",
+		"quote_link_safety_state", "quote_author_display_name",
 	)
 }
 
@@ -133,11 +133,11 @@ func listMessageWithQuoteRow(id, workspaceID, channelID, dmID string, now time.T
 }
 
 func emptyQuoteRow() []any {
-	return []any{"", "", "", "", "", (*time.Time)(nil), (*time.Time)(nil), (*time.Time)(nil), ""}
+	return []any{"", "", "", "", "", (*time.Time)(nil), (*time.Time)(nil), (*time.Time)(nil), "", ""}
 }
 
 func quoteRow(id, authorID, body, format, status string, deletedAt *time.Time, createdAt time.Time) []any {
-	return []any{id, authorID, body, format, status, deletedAt, &createdAt, &createdAt, ""}
+	return []any{id, authorID, body, format, status, deletedAt, &createdAt, &createdAt, "", "Parent Author"}
 }
 
 func listMessageRowWithQuote(id, workspaceID, channelID, dmID string, now time.Time, quote []any) []any {
@@ -551,6 +551,51 @@ func TestPGXMessageStore_CreateMessage_ReturnsQuotedParent(t *testing.T) {
 	}
 	if msg.Quoted == nil || msg.Quoted.ID != "msg-parent" || msg.Quoted.BodyText != "parent body" {
 		t.Fatalf("quoted parent not scanned: %+v", msg.Quoted)
+	}
+	// Issue #1099: the name comes back with the same row, so the broadcast built
+	// from this message names the quoted author without a second read.
+	if msg.Quoted.AuthorDisplayName != "Parent Author" {
+		t.Fatalf("quoted author name = %q, want Parent Author", msg.Quoted.AuthorDisplayName)
+	}
+	checkExpectations(t, mock)
+}
+
+// TestPGXMessageStore_QuoteAuthorJoinedToQuotedRow pins the issue #1099
+// projection to the quoted row itself: the name is joined on the parent's own
+// sender, and the parent is only ever joined inside the reply's conversation,
+// so the name is exactly as visible as the quote already was.
+func TestPGXMessageStore_QuoteAuthorJoinedToQuotedRow(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	mock.ExpectQuery(`(?s)COALESCE\(qu\.display_name, ''\).*`+
+		`LEFT JOIN chat\.messages q\s+ON q\.id = m\.parent_message_id.*`+
+		`q\.dm_conversation_id IS NOT DISTINCT FROM m\.dm_conversation_id\s+`+
+		`LEFT JOIN auth\.users qu\s+ON qu\.id = q\.sender_id`).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
+			AddRow(listMessageRowWithQuote("msg-1", "ws-1", "ch-1", "", now,
+				quoteRow("msg-parent", "user-parent", "parent body", "v2", "active", nil, now))...).
+			AddRow(listMessageRowWithQuote("msg-2", "ws-1", "ch-1", "", now,
+				quoteRow("msg-parent", "user-parent", "parent body", "v2", "active", nil, now))...))
+	// The batch reads every listing already makes, and nothing per quote: two
+	// quotes, no extra query (no N+1).
+	expectReactionBatch(mock, emptyReactionRows())
+	expectAttachmentBatch(mock, emptyAttachmentRows())
+
+	store := storage.NewPGXMessageStore(mock)
+	out, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1", Limit: 50,
+	})
+	if err != nil {
+		t.Fatalf("ListChannelMessages: %v", err)
+	}
+	for _, msg := range out.Messages {
+		if msg.Quoted == nil || msg.Quoted.AuthorDisplayName != "Parent Author" {
+			t.Fatalf("quoted author name not projected: %+v", msg.Quoted)
+		}
+	}
+	if len(out.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(out.Messages))
 	}
 	checkExpectations(t, mock)
 }

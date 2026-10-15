@@ -72,6 +72,8 @@ case "$MODULE" in
       TestTwoURLConcurrentEditsUseStableLockOrderPostgreSQL
       TestMessageSecuritySnapshotsAreOneAuthorizedProjectionPostgreSQL
       TestMaliciousBodyIsWithheldFromEveryProjectionPostgreSQL
+      # Issue #1099. The quoted author named by the same statement as the quote.
+      TestQuoteAuthorDisplayNameProjectionPostgreSQL
       # Issue #807. Per-target convergence (the deadline that ends every
       # pending row, the policy terminal's compare-and-set, the fan-out index
       # bound to the current body) and the workspace-scoped preview queue with

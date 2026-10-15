@@ -35,12 +35,34 @@ export interface OpenPositionState {
   target: NavigationTarget | null;
   /** Where the one instant positioning scroll lands, once decided. */
   scrollTarget: ScrollTarget;
+  /**
+   * The request the decision was made for: its `?message=` ("" for none) and
+   * the navigation that asked for it (issue #1099). Any other request — a new
+   * target, or the same one asked for again — is fresh, not the one that missed.
+   */
+  settledFor: SettledRequest | null;
+}
+
+export interface SettledRequest {
+  messageId: string;
+  request: string;
+}
+
+/** Whether the current `?message=` is still the request the opening settled for. */
+export function isSameRequest(
+  settled: SettledRequest | null,
+  focusMessageId = "",
+  focusRequest = "",
+): boolean {
+  return settled?.messageId === focusMessageId && settled.request === focusRequest;
 }
 
 // The search's progress is this hook's own state, not something the caller supplies.
 interface Params extends Omit<ResolutionInput, "searchAttempts" | "searchedAt" | "resolved"> {
   core: ViewportCore;
   onLoadMore: () => void;
+  /** Which navigation asked for `focusMessageId`; only recorded, never decided on. */
+  focusRequest: string;
 }
 
 /**
@@ -68,12 +90,14 @@ interface Params extends Omit<ResolutionInput, "searchAttempts" | "searchedAt" |
 export function useOpenPositionResolution({
   core,
   onLoadMore,
+  focusRequest,
   ...input
 }: Params): OpenPositionState {
   const [resolved, setResolved] = useState(false);
   const [firstUnreadMessageId, setFirstUnreadMessageId] = useState<string | null>(null);
   const [scrollTarget, setScrollTarget] = useState<ScrollTarget>(undefined);
   const [target, setTarget] = useState<NavigationTarget | null>(null);
+  const [settledFor, setSettledFor] = useState<SettledRequest | null>(null);
   const [searchAttempts, setSearchAttempts] = useState(0);
   const [searchedAt, setSearchedAt] = useState(-1);
 
@@ -102,6 +126,8 @@ export function useOpenPositionResolution({
     setResolved(true);
     setFirstUnreadMessageId(decision.firstUnreadMessageId);
     setTarget(decision.target);
+    // A fresh object is safe here: a decision settles once (resolved gates it).
+    setSettledFor({ messageId: input.focusMessageId ?? "", request: focusRequest });
     setScrollTarget(decision.scrollTarget);
     core.setPhase(decision.phase);
   }
@@ -113,7 +139,7 @@ export function useOpenPositionResolution({
     if (searchAttempts > 0) onLoadMoreRef.current();
   }, [searchAttempts]);
 
-  return { firstUnreadMessageId, resolved, target, scrollTarget };
+  return { firstUnreadMessageId, resolved, target, scrollTarget, settledFor };
 }
 
 /**

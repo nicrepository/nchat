@@ -62,9 +62,16 @@ export const withheldBodyNotice = "Conteúdo ocultado por segurança.";
 
 interface QuoteBlockProps {
   quote: NonNullable<Message["quoted"]>;
-  authorLabel: string;
+  authorLabel: string | undefined;
   canJump: boolean;
   onJump?: (messageId: string) => void;
+}
+
+/** A quote whose author nobody has told this client about (issue #1099). */
+const UNATTRIBUTED_QUOTE = "Mensagem citada";
+
+function jumpLabel(authorLabel: string | undefined): string {
+  return authorLabel ? `Ir para mensagem original de ${authorLabel}` : "Ir para mensagem original";
 }
 
 function QuoteBlock({ quote, authorLabel, canJump, onJump }: QuoteBlockProps) {
@@ -83,12 +90,12 @@ function QuoteBlock({ quote, authorLabel, canJump, onJump }: QuoteBlockProps) {
       role={canJump ? "button" : undefined}
       tabIndex={canJump ? 0 : undefined}
       aria-disabled={canJump ? undefined : true}
-      aria-label={canJump ? `Ir para mensagem original de ${authorLabel}` : undefined}
+      aria-label={canJump ? jumpLabel(authorLabel) : undefined}
       onClick={canJump ? jump : undefined}
       onKeyDown={handleKeyDown}
       data-testid="chat-message-quote"
     >
-      <div className="chat-msg-area__quote-author">{authorLabel}</div>
+      <div className="chat-msg-area__quote-author">{authorLabel ?? UNATTRIBUTED_QUOTE}</div>
       <div className="chat-msg-area__quote-excerpt">
         {quote.isRemoved ? (
           "Mensagem original indisponível."
@@ -466,7 +473,7 @@ function MessageContextBlocks({
       {message.quoted && (
         <QuoteBlock
           quote={message.quoted}
-          authorLabel={quoteAuthorLabel ?? "Usuário desconhecido"}
+          authorLabel={quoteAuthorLabel}
           canJump={canJumpToQuote}
           onJump={onQuoteJump}
         />

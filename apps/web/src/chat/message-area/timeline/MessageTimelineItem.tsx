@@ -31,6 +31,12 @@ export interface TimelineMessageActions {
   onForwardMessage?: (message: Message) => void;
   onReferenceJump: (reference: NonNullable<Message["reference"]>) => void;
   onQuoteJump: (messageId: string) => void;
+  /**
+   * Travels to a message of this conversation that is not loaded, through the
+   * same `?message=` target a pin or a search result uses (issue #1099), so the
+   * bounded backward search of #1088 brings it in.
+   */
+  onOpenMessageTarget: (messageId: string) => void;
   onOpenAuthorDM?: MessageBubbleProps["onOpenAuthorDM"];
   /** Opens a DM when a `@user` mention in a message body is clicked (issue #795). */
   onMentionClick?: (mentionType: MentionType, id: string) => void;
@@ -84,7 +90,11 @@ export interface TimelineRowContext {
    * knows exactly one recipient — its own author — and subscribes to that one.
    */
   directMessage?: DirectMessageAccess;
-  /** Every loaded message, so a quote can name its author and offer the jump. */
+  /**
+   * Every loaded message — only a fallback for naming a quote's author when the
+   * server sent no name (issue #1099). Whether a quote can be followed never
+   * depends on it.
+   */
   messagesById: Map<string, Message>;
   /**
    * Issue #824. The server's summary for each message that asked for
@@ -240,7 +250,7 @@ function TimelineMessageRow({
       pickerOpen={reactionMenu.openPickerMessageId === message.id}
       onPickerOpenChange={reactionMenu.onPickerOpenChange}
       quoteAuthorLabel={quoted ? quoteAuthorLabel(quoted, context.messagesById) : undefined}
-      canJumpToQuote={quoted ? context.messagesById.has(quoted.id) : false}
+      canJumpToQuote={quoted ? canFollowQuote(quoted) : false}
       onQuoteJump={actions.onQuoteJump}
       onReferenceJump={actions.onReferenceJump}
       onOpenAuthorDM={actions.onOpenAuthorDM}
@@ -262,10 +272,34 @@ function TimelineMessageRow({
   );
 }
 
+/**
+ * Who wrote the quoted message (issue #1099): the server's own projection
+ * first, so a quote of a message no loaded page holds still names its author.
+ * An explicit "" is the server saying the identity is not available, and a
+ * name cached from the loaded original must not override that. Only a field
+ * that never arrived (a pre-#1099 payload) falls back to the loaded original;
+ * with none loaded the quote stays unattributed — undefined — because a cache
+ * miss says nothing about who wrote it.
+ */
 function quoteAuthorLabel(
   quote: NonNullable<Message["quoted"]>,
   messagesById: Map<string, Message>,
-) {
+): string | undefined {
+  // The server's projection, when it sent one, outranks anything cached — an
+  // empty one included: it says the author's identity is not available.
+  if (quote.authorDisplayName !== undefined) {
+    return quote.authorDisplayName || "Usuário desconhecido";
+  }
+  // An older payload with no projection at all: the original, if loaded.
   const parent = messagesById.get(quote.id);
-  return parent ? senderLabel(parent) : "Usuário desconhecido";
+  return parent ? senderLabel(parent) : undefined;
+}
+
+/**
+ * Whether the quote offers "go to the original" (issue #1099). The server only
+ * attaches a quote whose original lives in this same conversation, so anything
+ * but a removed original is a destination — loaded or not; the jump finds it.
+ */
+function canFollowQuote(quote: NonNullable<Message["quoted"]>): boolean {
+  return quote.id !== "" && !quote.isRemoved;
 }

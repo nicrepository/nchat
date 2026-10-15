@@ -878,14 +878,15 @@ func domainQuoteToWSPayload(q *domain.QuotedMessage) *ws.QuotePayload {
 		deletedAt = &t
 	}
 	payload := &ws.QuotePayload{
-		ID:              q.ID,
-		AuthorID:        q.AuthorID,
-		BodyFormat:      string(q.BodyFormat),
-		LinkSafetyState: string(q.LinkSafety),
-		IsRemoved:       q.Status == domain.MessageStatusDeleted || deletedAt != nil,
-		DeletedAt:       deletedAt,
-		CreatedAt:       q.CreatedAt,
-		UpdatedAt:       q.UpdatedAt,
+		ID:                q.ID,
+		AuthorID:          q.AuthorID,
+		BodyFormat:        string(q.BodyFormat),
+		LinkSafetyState:   string(q.LinkSafety),
+		AuthorDisplayName: q.AuthorDisplayName,
+		IsRemoved:         q.Status == domain.MessageStatusDeleted || deletedAt != nil,
+		DeletedAt:         deletedAt,
+		CreatedAt:         q.CreatedAt,
+		UpdatedAt:         q.UpdatedAt,
 	}
 	if !payload.IsRemoved {
 		payload.Body = q.BodyText

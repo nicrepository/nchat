@@ -759,6 +759,7 @@ func quoteScanTargets(quote *domain.QuotedMessage, opt *quoteOptionals) []any {
 		(*string)(&quote.BodyFormat), (*string)(&quote.Status),
 		&opt.deletedAt, &opt.createdAt, &opt.updatedAt,
 		(*string)(&quote.LinkSafety),
+		&quote.AuthorDisplayName,
 	}
 }
 
@@ -789,7 +790,15 @@ func quotedMessageColumns(alias string) string {
 	` + alias + `.deleted_at,
 	` + alias + `.created_at,
 	` + alias + `.updated_at,
-	COALESCE(` + alias + `.link_safety_state, '')`
+	COALESCE(` + alias + `.link_safety_state, ''),
+	COALESCE(` + quoteAuthorAlias(alias) + `.display_name, '')`
+}
+
+// quoteAuthorAlias names the auth.users join that carries the quoted author's
+// display name (issue #1099), derived from the quote's own alias so the column
+// and the join can never disagree.
+func quoteAuthorAlias(quoteAlias string) string {
+	return quoteAlias + "u"
 }
 
 func listMessageWithQuoteColumns(alias, userParam, quoteAlias string) string {
@@ -802,7 +811,9 @@ func quotedMessageJoin(alias, quoteAlias string) string {
 		  ON ` + quoteAlias + `.id = ` + alias + `.parent_message_id
 		 AND ` + quoteAlias + `.workspace_id = ` + alias + `.workspace_id
 		 AND ` + quoteAlias + `.channel_id IS NOT DISTINCT FROM ` + alias + `.channel_id
-		 AND ` + quoteAlias + `.dm_conversation_id IS NOT DISTINCT FROM ` + alias + `.dm_conversation_id`
+		 AND ` + quoteAlias + `.dm_conversation_id IS NOT DISTINCT FROM ` + alias + `.dm_conversation_id
+		LEFT JOIN auth.users ` + quoteAuthorAlias(quoteAlias) + `
+		  ON ` + quoteAuthorAlias(quoteAlias) + `.id = ` + quoteAlias + `.sender_id`
 }
 
 // scanMessageWithSenderAndQuote reads a single message row including sender

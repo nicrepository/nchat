@@ -125,7 +125,8 @@ export interface MessagesState {
 export type SendResult = { status: "sent" } | { status: "stale" };
 
 export type Action =
-  | { type: "loading" }
+  /** keepReply: the same conversation reloading, so the reply survives (#1099). */
+  | { type: "loading"; keepReply?: boolean }
   | { type: "loaded"; page: MessagePage }
   | { type: "error" }
   /**

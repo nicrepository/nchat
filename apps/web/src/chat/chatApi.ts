@@ -24,6 +24,7 @@ import {
   normalizeMessagePriority,
   parseDMConversationType,
   parseMessageAttachments,
+  parseQuoteAuthorDisplayName,
   parseReactionUsers,
   type AddMembersResult,
   type Channel,
@@ -1056,6 +1057,8 @@ interface QuoteResponse {
   created_at: string;
   updated_at?: string;
   link_safety_state?: string;
+  /** Issue #1099. Absent on a pre-#1099 server; parsed, never trusted. */
+  author_display_name?: unknown;
 }
 
 interface ReferenceResponse {
@@ -1403,6 +1406,7 @@ function mapQuote(r: QuoteResponse): Message["quoted"] {
     createdAt: r.created_at ?? "",
     updatedAt: r.updated_at ?? r.created_at ?? "",
     linkSafetyState: normalizeLinkSafety(r.link_safety_state),
+    authorDisplayName: parseQuoteAuthorDisplayName(r.author_display_name),
   };
 }
 

@@ -189,6 +189,8 @@ interface RawQuote {
   is_removed: boolean;
   deleted_at?: string | null;
   created_at: string;
+  /** Issue #1099: the server's projection of the quoted author's name. */
+  author_display_name?: string;
 }
 
 interface MessagingScenarioOptions {

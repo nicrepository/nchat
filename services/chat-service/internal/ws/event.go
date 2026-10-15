@@ -557,6 +557,8 @@ type QuotePayload struct {
 	DeletedAt       *time.Time `json:"deleted_at,omitempty"`
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
+	// Issue #1099: the same projection the HTTP quote carries, "" included.
+	AuthorDisplayName string `json:"author_display_name"`
 }
 
 type ReactionPayload struct {

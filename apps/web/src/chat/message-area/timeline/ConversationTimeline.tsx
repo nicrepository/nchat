@@ -7,7 +7,7 @@
  * the page around it.
  */
 
-import { useMemo } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import type { DirectMessageAccess } from "../../directMessage";
 
 import type { CallParticipantProfile } from "../../chatApi";
@@ -25,6 +25,12 @@ import type { ConversationDetailsKind } from "../../useConversationDetailsPanel"
 import type { TimelinePosition } from "../../messages/messageOrder";
 import type { ReadProgress } from "../../readCursor";
 import { EmptyState, ErrorState, LoadingSkeleton } from "../ConversationStates";
+import {
+  dropFocusReturn,
+  followFocusReturn,
+  holdFocusReturn,
+  type FocusReturn,
+} from "../viewport/useListBoundaries";
 import MessageList from "./MessageList";
 import type { ConversationMessageActions } from "./MessageTimelineItem";
 
@@ -93,8 +99,29 @@ export default function ConversationTimeline(props: ConversationTimelineProps) {
     () => recipientIdentityResolver(kind, targetId, props.detailsKind),
     [kind, targetId, props.detailsKind],
   );
+  // #1099: outlives the list, which a followed target can unmount and remount.
+  const focusReturnRef = useRef<FocusReturn | null>(null);
+  useEffect(() => () => dropFocusReturn(focusReturnRef), []);
+  const { focusMessageId: focusTarget, focusRequest = "" } = props;
+  // #1099: a route that left the trip — back where it was asked from, say —
+  // cancels the return there and then, whether or not a list is mounted.
+  useLayoutEffect(() => {
+    followFocusReturn(focusReturnRef, focusTarget, focusRequest);
+  }, [focusTarget, focusRequest]);
+  // #1099: the reopening a followed target needed failed before any list came
+  // back. Focus, lost with the old list, goes to the way to try again, which
+  // stays ours: a retry that succeeds still lands focus on the target.
+  const claimRetryFocus = useCallback(
+    (retry: HTMLButtonElement | null) => {
+      const pending = followFocusReturn(focusReturnRef, focusTarget, focusRequest);
+      if (retry && pending) holdFocusReturn(pending, retry);
+    },
+    [focusTarget, focusRequest],
+  );
   if (state.status === "loading") return <LoadingSkeleton />;
-  if (state.status === "error") return <ErrorState onRetry={props.onRetry} />;
+  if (state.status === "error") {
+    return <ErrorState onRetry={props.onRetry} retryRef={claimRetryFocus} />;
+  }
   if (state.status !== "ready") return null;
   if (state.messages.length === 0) return <EmptyState kind={kind} name={name} />;
   // #1082: where the conversation opens depends on its unread count, which
@@ -131,6 +158,7 @@ export default function ConversationTimeline(props: ConversationTimelineProps) {
       onEmojiToneChange={props.onEmojiToneChange}
       focusMessageId={props.focusMessageId}
       focusRequest={props.focusRequest}
+      focusReturnRef={focusReturnRef}
       conversationKey={props.conversationKey}
       unreadCountAtOpen={props.unreadCountAtOpen}
       initialAnchor={props.initialAnchor}

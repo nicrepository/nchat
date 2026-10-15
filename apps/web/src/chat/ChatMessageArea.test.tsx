@@ -25,7 +25,7 @@ import type {
   ChatOutletContext,
 } from "./ChatShell";
 import type { Call } from "./callState";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
 import { flushResizeObservers, observedElements } from "../setupTests";
@@ -33,7 +33,12 @@ import ChatMessageArea from "./ChatMessageArea";
 import { withMessageJump } from "./useConversationTarget";
 import { isCatalogedEmoji, loadEmojiCatalog, resetEmojiCatalogCache } from "./emoji/emojiCatalog";
 import { avatarColorFor } from "./messageDisplay";
-import type { Message, MessagePage, MessageSecuritySnapshot } from "./chatTypes";
+import {
+  parseQuoteAuthorDisplayName,
+  type Message,
+  type MessagePage,
+  type MessageSecuritySnapshot,
+} from "./chatTypes";
 import type { MessageLink } from "./messageLinks";
 import type { ReadProgress } from "./readCursor";
 import type { ReadTarget } from "./readCursorWriter";
@@ -43,6 +48,7 @@ import type {
   WSMessageCreatedEvent,
   WSMessageLinkSafetyChangedEvent,
   WSMessageLinkUpdatedEvent,
+  WSMessagePayload,
   WSMessageUpdatedEvent,
   WSReactionUpdatedEvent,
   WSSubscribedEvent,
@@ -184,6 +190,8 @@ const {
 }));
 
 vi.mock("./chatApi", () => ({
+  // The realtime payload mapper's avatar normaliser; no payload here has one.
+  safeAvatarUrl: () => undefined,
   MessageEditError: class MessageEditError extends Error {
     readonly status: number;
     readonly reason: string;
@@ -4161,30 +4169,180 @@ describe("ChatMessageArea — send message", () => {
     expect(mockFetchChannelMessage).not.toHaveBeenCalled();
   });
 
-  it("uses a safe author fallback for an active quote whose parent is unavailable", async () => {
-    mockFetchChannelMessages.mockResolvedValue(
-      messagePage([
-        makeMessage({
-          id: "m2",
-          quoted: {
-            id: "missing-parent",
-            authorId: "",
-            bodyText: "trecho preservado",
-            bodyFormat: "v3",
-            isRemoved: false,
-            deletedAt: null,
-            createdAt: new Date().toISOString(),
-            linkSafetyState: "",
-          },
-        }),
-      ]),
-    );
-    renderChannelAreaForUser();
+  // Issue #1099: an original outside every loaded page. What the quote says
+  // about its author is only what the server said: a name, "" for an author
+  // that no longer exists, or nothing at all (a pre-#1099 payload) — which is
+  // left unattributed rather than called unknown on a cache miss.
+  const unloadedQuoteCases = [
+    ["a projected name", "Ana Antiga", "Ana Antiga", "Ir para mensagem original de Ana Antiga"],
+    [
+      "an author that no longer exists",
+      "",
+      "Usuário desconhecido",
+      "Ir para mensagem original de Usuário desconhecido",
+    ],
+    ["a pre-#1099 payload", undefined, "Mensagem citada", "Ir para mensagem original"],
+  ] as const;
 
-    const quote = await screen.findByTestId("chat-message-quote");
-    expect(quote).toHaveTextContent("Usuário desconhecido");
+  function expectQuoteLabel(quote: HTMLElement, header: string, jumpName: string) {
+    expect(quote).toHaveTextContent(header);
+    expect(quote).toHaveAccessibleName(jumpName);
     expect(quote).toHaveTextContent("trecho preservado");
-  });
+    if (header !== "Usuário desconhecido") {
+      expect(quote).not.toHaveTextContent("Usuário desconhecido");
+    }
+  }
+
+  it.each(unloadedQuoteCases)(
+    "names an unloaded quote's author over HTTP from %s",
+    async (_case, raw, header, jumpName) => {
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([
+          makeMessage({
+            id: "m2",
+            quoted: {
+              id: "missing-parent",
+              authorId: "user-parent",
+              bodyText: "trecho preservado",
+              bodyFormat: "v3",
+              isRemoved: false,
+              deletedAt: null,
+              createdAt: new Date().toISOString(),
+              linkSafetyState: "",
+              authorDisplayName: parseQuoteAuthorDisplayName(raw),
+            },
+          }),
+        ]),
+      );
+      renderChannelAreaForUser();
+
+      expectQuoteLabel(await screen.findByTestId("chat-message-quote"), header, jumpName);
+    },
+  );
+
+  it.each(unloadedQuoteCases)(
+    "names an unloaded quote's author over realtime from %s",
+    async (_case, raw, header, jumpName) => {
+      mockFetchChannelMessages.mockResolvedValue(emptyPage);
+      renderChannelArea("geral");
+      await screen.findByTestId("chat-msg-empty");
+      const now = new Date().toISOString();
+
+      act(() => {
+        wsMockState.capturedWSMessageCreated?.({
+          type: "message.created",
+          workspace_id: "ws-1",
+          target_type: "channel",
+          target_id: "geral",
+          message_id: "m-ws",
+          event_id: "evt-quote",
+          created_at: now,
+          payload: {
+            id: "m-ws",
+            sender_id: "other-1",
+            sender_display_name: "Bruno",
+            kind: "text",
+            body_text: "resposta",
+            created_at: now,
+            updated_at: now,
+            quoted: {
+              id: "missing-parent",
+              author_id: "user-parent",
+              body: "trecho preservado",
+              created_at: now,
+              ...(raw === undefined ? {} : { author_display_name: raw }),
+            },
+          } as WSMessagePayload,
+        });
+      });
+
+      expectQuoteLabel(await screen.findByTestId("chat-message-quote"), header, jumpName);
+    },
+  );
+
+  // The original is loaded, and the name it was cached with is stale: only a
+  // payload without the field may fall back to it.
+  const loadedQuoteCases = [
+    ["a projected name", "Ana Nova", "Ana Nova"],
+    ["an explicitly empty projection", "", "Usuário desconhecido"],
+    ["a pre-#1099 payload", undefined, "Nome Antigo"],
+  ] as const;
+  const cachedOriginal = () =>
+    makeMessage({ id: "parent", senderId: "user-parent", senderDisplayName: "Nome Antigo" });
+
+  function expectLoadedQuoteLabel(quote: HTMLElement, header: string) {
+    expect(quote).toHaveTextContent(header);
+    expect(quote).toHaveAccessibleName(`Ir para mensagem original de ${header}`);
+    if (header !== "Nome Antigo") expect(quote).not.toHaveTextContent("Nome Antigo");
+  }
+
+  it.each(loadedQuoteCases)(
+    "with the original loaded, labels an HTTP quote from %s",
+    async (_case, raw, header) => {
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([
+          cachedOriginal(),
+          makeMessage({
+            id: "m2",
+            quoted: {
+              id: "parent",
+              authorId: "user-parent",
+              bodyText: "trecho preservado",
+              bodyFormat: "v3",
+              isRemoved: false,
+              deletedAt: null,
+              createdAt: new Date().toISOString(),
+              linkSafetyState: "",
+              authorDisplayName: parseQuoteAuthorDisplayName(raw),
+            },
+          }),
+        ]),
+      );
+      renderChannelAreaForUser();
+
+      expectLoadedQuoteLabel(await screen.findByTestId("chat-message-quote"), header);
+    },
+  );
+
+  it.each(loadedQuoteCases)(
+    "with the original loaded, labels a realtime quote from %s",
+    async (_case, raw, header) => {
+      mockFetchChannelMessages.mockResolvedValue(messagePage([cachedOriginal()]));
+      renderChannelArea("geral");
+      await screen.findByText("Olá, mundo!");
+      const now = new Date().toISOString();
+
+      act(() => {
+        wsMockState.capturedWSMessageCreated?.({
+          type: "message.created",
+          workspace_id: "ws-1",
+          target_type: "channel",
+          target_id: "geral",
+          message_id: "m-ws",
+          event_id: "evt-quote-loaded",
+          created_at: now,
+          payload: {
+            id: "m-ws",
+            sender_id: "other-1",
+            sender_display_name: "Bruno",
+            kind: "text",
+            body_text: "resposta",
+            created_at: now,
+            updated_at: now,
+            quoted: {
+              id: "parent",
+              author_id: "user-parent",
+              body: "trecho preservado",
+              created_at: now,
+              ...(raw === undefined ? {} : { author_display_name: raw }),
+            },
+          } as WSMessagePayload,
+        });
+      });
+
+      expectLoadedQuoteLabel(await screen.findByTestId("chat-message-quote"), header);
+    },
+  );
 
   it("clicking a loaded quote scrolls to the original message", async () => {
     const parent = makeMessage({ id: "m1", senderDisplayName: "Ana", bodyText: "original" });
@@ -4222,6 +4380,9 @@ describe("ChatMessageArea — send message", () => {
       block: "center",
     });
     expect(scrollIntoViewMock.mock.contexts[0]).toBe(originalMessageElement);
+    // #1099: a loaded original is a jump within the pages already on screen —
+    // nothing is reloaded or fetched for it.
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
   });
 
   it("keyboard jump highlights the original message briefly", async () => {
@@ -5471,6 +5632,693 @@ describe("ChatMessageArea — infinite scroll", () => {
     ).not.toBeNull();
     // Neither asked for again nor reloaded: the same conversation, the same pages.
     expect(mockFetchChannelMessages).toHaveBeenCalledTimes(13);
+  });
+
+  // ── Issue #1099: a quote whose original no loaded page holds ──────────────
+
+  const quoteOf = (id: string): NonNullable<Message["quoted"]> => ({
+    id,
+    authorId: "user-old",
+    authorDisplayName: "Ana Antiga",
+    bodyText: "Salve",
+    bodyFormat: "v2",
+    isRemoved: false,
+    deletedAt: null,
+    createdAt: "2026-01-01T10:00:00Z",
+    linkSafetyState: "",
+  });
+
+  /**
+   * A channel whose newest page holds one reply quoting "original", which sits
+   * `at` pages back; every other page holds one filler. Older pages fail while
+   * `failing()` says so.
+   */
+  function quotePages(at: number, failing = () => false) {
+    mockFetchChannelMessages.mockImplementation((id: string, cursor?: string) => {
+      if (id === "canal-b") {
+        return Promise.resolve(messagePage([makeMessage({ id: "b-1", bodyText: "conversa B" })]));
+      }
+      const n = cursor ? Number(cursor.slice(1)) : 0;
+      if (n > 0 && failing()) return Promise.reject(new Error("offline"));
+      const only =
+        n === 0
+          ? makeMessage({ id: "reply", bodyText: "resposta recente", quoted: quoteOf("original") })
+          : makeMessage({ id: n === at ? "original" : `h-${n}`, bodyText: `pagina ${n}` });
+      return Promise.resolve({ messages: [only], nextCursor: n === 12 ? "" : `p${n + 1}` });
+    });
+  }
+
+  /** The conversation, a probe of the URL, a way to leave for another one, and a pin. */
+  function openQuotingConversation() {
+    function Controls() {
+      const navigate = useNavigate();
+      const location = useLocation();
+      return (
+        <div>
+          <output data-testid="location-search">{location.search}</output>
+          <button onClick={() => navigate("/chat/channel/canal-b")}>Ir para B</button>
+          <button onClick={() => navigate(-1)}>Voltar</button>
+          {/* A pin's way in: a marked request that never arms a focus return. */}
+          <button onClick={() => navigate("?message=near", { state: withMessageJump(undefined) })}>
+            Fixada
+          </button>
+        </div>
+      );
+    }
+    return render(
+      <MemoryRouter initialEntries={["/chat/channel/source"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{ currentUserId: "me-123", workspaceId: "workspace-1", channels: [], dms: [] }}
+              />
+            }
+          >
+            <Route
+              path="channel/:id"
+              element={
+                <>
+                  <Controls />
+                  <ChatMessageArea kind="channel" />
+                </>
+              }
+            />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  const findQuote = () =>
+    screen.findByRole("button", { name: "Ir para mensagem original de Ana Antiga" });
+  const originalHighlighted = () =>
+    document.querySelector('[data-message-id="original"].chat-msg-area__msg--highlight');
+  /**
+   * Puts focus on the quote the way a reader gets there: after the opened
+   * conversation has handed its initial focus to the composer. Focusing it any
+   * earlier races that hand-off, which lands whenever the editor is ready.
+   */
+  const focusQuoteOnceOpened = async () => {
+    await waitFor(() => expect(screen.getByTestId("chat-composer-input")).toHaveFocus());
+    const quote = await findQuote();
+    quote.focus();
+    return quote;
+  };
+  /** Document-level focusin listeners added during the test and not removed since. */
+  function watchFocusInListeners() {
+    const live = new Set<EventListenerOrEventListenerObject>();
+    const add = vi.spyOn(document, "addEventListener");
+    const remove = vi.spyOn(document, "removeEventListener");
+    onTestFinished(() => {
+      add.mockRestore();
+      remove.mockRestore();
+    });
+    return () => {
+      for (const [type, listener] of add.mock.calls) if (type === "focusin") live.add(listener);
+      for (const [type, listener] of remove.mock.calls)
+        if (type === "focusin") live.delete(listener);
+      return live.size;
+    };
+  }
+  /** Loads from the newest page: the opening, and each reload a target owes. */
+  const newestPageLoads = () =>
+    mockFetchChannelMessages.mock.calls.filter(([, cursor]) => !cursor).length;
+
+  it("names the author of a quote whose original no loaded page holds, and offers the jump", async () => {
+    quotePages(3);
+    openQuotingConversation();
+
+    const quote = await findQuote();
+    expect(quote).toHaveTextContent("Ana Antiga");
+    expect(quote).not.toHaveTextContent("Usuário desconhecido");
+    expect(quote).toHaveAttribute("tabindex", "0");
+    expect(quote).not.toHaveAttribute("aria-disabled");
+    // Named before anything was fetched for it: the name is the server's.
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it("pages back to a quoted original on click and highlights exactly it", async () => {
+    quotePages(3);
+    openQuotingConversation();
+
+    await userEvent.setup().click(await findQuote());
+
+    expect(await screen.findByText("pagina 3")).toBeInTheDocument();
+    await waitFor(() => expect(originalHighlighted()).not.toBeNull());
+    expect(document.querySelectorAll(".chat-msg-area__msg--highlight")).toHaveLength(1);
+    expect(screen.getByTestId("location-search")).toHaveTextContent("?message=original");
+    // Bounded by the destination: no page past the one that held it.
+    expect(mockFetchChannelMessages).not.toHaveBeenCalledWith(
+      "source",
+      "p4",
+      expect.any(AbortSignal),
+    );
+    expect(screen.queryByTestId("message-target-missed")).not.toBeInTheDocument();
+  });
+
+  it.each([["Enter"], [" "]])("follows the quote from the keyboard with %j", async (key) => {
+    quotePages(2);
+    openQuotingConversation();
+
+    fireEvent.keyDown(await findQuote(), { key });
+
+    await waitFor(() => expect(originalHighlighted()).not.toBeNull());
+  });
+
+  it("brings keyboard focus to the original once the reopened list reaches it", async () => {
+    quotePages(2);
+    openQuotingConversation();
+    const quote = await focusQuoteOnceOpened();
+    const liveFocusInListeners = watchFocusInListeners();
+
+    fireEvent.keyDown(quote, { key: "Enter" });
+
+    await waitFor(() => expect(originalHighlighted()).not.toBeNull());
+    await waitFor(() =>
+      expect(document.querySelector('[data-message-id="original"]')).toHaveFocus(),
+    );
+    // The return watched the reader's focus only while it was pending.
+    expect(liveFocusInListeners()).toBe(0);
+  });
+
+  it("leaves focus where the reader moved it while the history was paging in", async () => {
+    quotePages(2);
+    openQuotingConversation();
+    const quote = await focusQuoteOnceOpened();
+
+    fireEvent.keyDown(quote, { key: "Enter" });
+    const input = await screen.findByTestId("chat-composer-input");
+    input.focus();
+
+    await waitFor(() => expect(originalHighlighted()).not.toBeNull());
+    expect(input).toHaveFocus();
+  });
+
+  it("leaves focus on another message the reader chose while the original was paging in", async () => {
+    let resolveOlder!: (page: MessagePage) => void;
+    mockFetchChannelMessages.mockImplementation((_id: string, cursor?: string) => {
+      if (cursor) return new Promise<MessagePage>((r) => (resolveOlder = r));
+      return Promise.resolve({
+        messages: [
+          makeMessage({ id: "near", bodyText: "logo acima" }),
+          makeMessage({ id: "reply", bodyText: "resposta recente", quoted: quoteOf("original") }),
+        ],
+        nextCursor: "p1",
+      });
+    });
+    openQuotingConversation();
+    const quote = await focusQuoteOnceOpened();
+    const liveFocusInListeners = watchFocusInListeners();
+
+    fireEvent.keyDown(quote, { key: "Enter" });
+    await waitFor(() =>
+      expect(mockFetchChannelMessages).toHaveBeenCalledWith(
+        "source",
+        "p1",
+        expect.any(AbortSignal),
+      ),
+    );
+    // Pending: the return is watching for the reader's own focus.
+    expect(liveFocusInListeners()).toBe(1);
+    // The reopened list is up; the reader moves to another message of it.
+    const near = await waitFor(() => {
+      const row = document.querySelector<HTMLElement>('[data-message-id="near"]');
+      expect(row).not.toBeNull();
+      return row!;
+    });
+    near.focus();
+    // Cancelled by that choice, and no longer watching.
+    expect(liveFocusInListeners()).toBe(0);
+
+    await act(async () =>
+      resolveOlder({
+        messages: [makeMessage({ id: "original", bodyText: "pagina 1" })],
+        nextCursor: "",
+      }),
+    );
+
+    await waitFor(() => expect(originalHighlighted()).not.toBeNull());
+    expect(near).toHaveFocus();
+  });
+
+  it("drops the focus return when another target replaces the quote's trip", async () => {
+    let resolveOlder!: (page: MessagePage) => void;
+    mockFetchChannelMessages.mockImplementation((_id: string, cursor?: string) => {
+      if (cursor) return new Promise<MessagePage>((r) => (resolveOlder = r));
+      return Promise.resolve({
+        messages: [
+          makeMessage({ id: "near", bodyText: "logo acima" }),
+          makeMessage({ id: "reply", bodyText: "resposta recente", quoted: quoteOf("original") }),
+        ],
+        nextCursor: "p1",
+      });
+    });
+    openQuotingConversation();
+    const quote = await focusQuoteOnceOpened();
+    const liveFocusInListeners = watchFocusInListeners();
+
+    fireEvent.keyDown(quote, { key: "Enter" });
+    await waitFor(() =>
+      expect(mockFetchChannelMessages).toHaveBeenCalledWith(
+        "source",
+        "p1",
+        expect.any(AbortSignal),
+      ),
+    );
+    expect(liveFocusInListeners()).toBe(1);
+    // A pin, followed without moving focus: the quote's trip is replaced.
+    fireEvent.click(screen.getByRole("button", { name: "Fixada" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("location-search")).toHaveTextContent("?message=near"),
+    );
+    await waitFor(() => expect(liveFocusInListeners()).toBe(0));
+
+    await act(async () =>
+      resolveOlder({
+        messages: [makeMessage({ id: "original", bodyText: "pagina 1" })],
+        nextCursor: "",
+      }),
+    );
+
+    expect(await screen.findByText("pagina 1")).toBeInTheDocument();
+    expect(document.querySelector('[data-message-id="original"]')).not.toHaveFocus();
+  });
+
+  describe("when the reader goes back while the original is paging in", () => {
+    /** The opening answers at once; every older page waits for the returned release. */
+    function pendingHistory() {
+      const pending: Array<(page: MessagePage) => void> = [];
+      mockFetchChannelMessages.mockImplementation((_id: string, cursor?: string) => {
+        if (cursor) return new Promise<MessagePage>((r) => pending.push(r));
+        return Promise.resolve({
+          messages: [
+            makeMessage({ id: "reply", bodyText: "resposta recente", quoted: quoteOf("original") }),
+          ],
+          nextCursor: "p1",
+        });
+      });
+      return () =>
+        act(async () =>
+          pending.splice(0).forEach((resolve) =>
+            resolve({
+              messages: [makeMessage({ id: "original", bodyText: "pagina 1" })],
+              nextCursor: "",
+            }),
+          ),
+        );
+    }
+    const olderPagesAsked = (times: number) =>
+      waitFor(() =>
+        expect(mockFetchChannelMessages.mock.calls.filter(([, cursor]) => cursor)).toHaveLength(
+          times,
+        ),
+      );
+    const backAtOrigin = async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Voltar" }));
+      await waitFor(() => expect(screen.getByTestId("location-search")).toBeEmptyDOMElement());
+    };
+
+    it("cancels the focus return on the way back, and no late answer revives it", async () => {
+      const resolveOlder = pendingHistory();
+      openQuotingConversation();
+      const quote = await focusQuoteOnceOpened();
+      const liveFocusInListeners = watchFocusInListeners();
+
+      fireEvent.keyDown(quote, { key: "Enter" });
+      await olderPagesAsked(1);
+      expect(liveFocusInListeners()).toBe(1);
+
+      await backAtOrigin();
+
+      // Cancelled at once, before anything else settles.
+      expect(liveFocusInListeners()).toBe(0);
+      await findQuote();
+      await resolveOlder();
+      expect(document.querySelector('[data-message-id="original"]')).not.toHaveFocus();
+      expect(liveFocusInListeners()).toBe(0);
+      expect(screen.getByTestId("location-search")).toBeEmptyDOMElement();
+    });
+
+    it("follows a new request after the cancelled one, and lands its focus", async () => {
+      const resolveOlder = pendingHistory();
+      openQuotingConversation();
+      fireEvent.keyDown(await focusQuoteOnceOpened(), { key: "Enter" });
+      await olderPagesAsked(1);
+      await backAtOrigin();
+      const liveFocusInListeners = watchFocusInListeners();
+
+      const again = await findQuote();
+      again.focus();
+      fireEvent.keyDown(again, { key: "Enter" });
+      await olderPagesAsked(2);
+      expect(liveFocusInListeners()).toBe(1);
+      await resolveOlder();
+
+      await waitFor(() =>
+        expect(document.querySelector('[data-message-id="original"]')).toHaveFocus(),
+      );
+      expect(liveFocusInListeners()).toBe(0);
+    });
+
+    it("cancels the focus return the failed reopening had handed to the retry", async () => {
+      let newest = 0;
+      mockFetchChannelMessages.mockImplementation(() => {
+        if (newest++ === 1) return Promise.reject(new Error("offline"));
+        return Promise.resolve({
+          messages: [
+            makeMessage({ id: "reply", bodyText: "resposta recente", quoted: quoteOf("original") }),
+          ],
+          nextCursor: "",
+        });
+      });
+      openQuotingConversation();
+      const quote = await focusQuoteOnceOpened();
+      const liveFocusInListeners = watchFocusInListeners();
+
+      fireEvent.keyDown(quote, { key: "Enter" });
+      const retry = await screen.findByRole("button", { name: "Tentar novamente" });
+      await waitFor(() => expect(retry).toHaveFocus());
+      expect(liveFocusInListeners()).toBe(1);
+
+      await backAtOrigin();
+
+      expect(liveFocusInListeners()).toBe(0);
+      expect(await findQuote()).toBeInTheDocument();
+    });
+  });
+
+  it("stops watching the reader's focus when the conversation unmounts mid-trip", async () => {
+    mockFetchChannelMessages.mockImplementation((_id: string, cursor?: string) => {
+      if (cursor) return new Promise<MessagePage>(() => {});
+      return Promise.resolve({
+        messages: [
+          makeMessage({ id: "reply", bodyText: "resposta recente", quoted: quoteOf("original") }),
+        ],
+        nextCursor: "p1",
+      });
+    });
+    const { unmount } = openQuotingConversation();
+    const quote = await focusQuoteOnceOpened();
+    const liveFocusInListeners = watchFocusInListeners();
+
+    fireEvent.keyDown(quote, { key: "Enter" });
+    await waitFor(() => expect(liveFocusInListeners()).toBe(1));
+    unmount();
+
+    expect(liveFocusInListeners()).toBe(0);
+  });
+
+  describe("when the reopening a quote needs fails", () => {
+    /** The opening answers; the reopening toward "original" fails until `failing()` stops. */
+    function failingReopen(failing: () => boolean) {
+      let newest = 0;
+      mockFetchChannelMessages.mockImplementation((_id: string, cursor?: string) => {
+        if (!cursor && newest++ > 0 && failing()) return Promise.reject(new Error("offline"));
+        const n = cursor ? Number(cursor.slice(1)) : 0;
+        const only =
+          n === 0
+            ? makeMessage({
+                id: "reply",
+                bodyText: "resposta recente",
+                quoted: quoteOf("original"),
+              })
+            : makeMessage({ id: "original", bodyText: "pagina 1" });
+        return Promise.resolve({ messages: [only], nextCursor: n === 0 ? "p1" : "" });
+      });
+    }
+
+    it("hands focus to the retry, and a retry from the keyboard still reaches the original", async () => {
+      const user = userEvent.setup();
+      let offline = true;
+      failingReopen(() => offline);
+      openQuotingConversation();
+      const quote = await focusQuoteOnceOpened();
+
+      fireEvent.keyDown(quote, { key: "Enter" });
+
+      const retry = await screen.findByRole("button", { name: "Tentar novamente" });
+      await waitFor(() => expect(retry).toHaveFocus());
+
+      offline = false;
+      await user.keyboard("{Enter}");
+
+      await waitFor(() => expect(originalHighlighted()).not.toBeNull());
+      await waitFor(() =>
+        expect(document.querySelector('[data-message-id="original"]')).toHaveFocus(),
+      );
+    });
+
+    it("does not hand the retry focus for a trip another target replaced", async () => {
+      let newest = 0;
+      const rejections: Array<(error: Error) => void> = [];
+      mockFetchChannelMessages.mockImplementation(() => {
+        if (newest++ > 0) {
+          return new Promise<MessagePage>((_r, reject) => rejections.push(reject));
+        }
+        return Promise.resolve({
+          messages: [
+            makeMessage({ id: "reply", bodyText: "resposta recente", quoted: quoteOf("original") }),
+          ],
+          nextCursor: "p1",
+        });
+      });
+      openQuotingConversation();
+      const quote = await focusQuoteOnceOpened();
+      const liveFocusInListeners = watchFocusInListeners();
+
+      fireEvent.keyDown(quote, { key: "Enter" });
+      await waitFor(() => expect(newest).toBe(2));
+      fireEvent.click(screen.getByRole("button", { name: "Fixada" }));
+      await waitFor(() =>
+        expect(screen.getByTestId("location-search")).toHaveTextContent("?message=near"),
+      );
+      await act(async () => rejections.forEach((reject) => reject(new Error("offline"))));
+
+      expect(await screen.findByRole("button", { name: "Tentar novamente" })).not.toHaveFocus();
+      expect(liveFocusInListeners()).toBe(0);
+    });
+
+    it("leaves focus where the reader put it while the reopening was failing", async () => {
+      let rejectReopen!: (error: Error) => void;
+      let newest = 0;
+      mockFetchChannelMessages.mockImplementation(() => {
+        if (newest++ > 0) return new Promise<MessagePage>((_r, reject) => (rejectReopen = reject));
+        return Promise.resolve({
+          messages: [
+            makeMessage({ id: "reply", bodyText: "resposta recente", quoted: quoteOf("original") }),
+          ],
+          nextCursor: "p1",
+        });
+      });
+      openQuotingConversation();
+      const quote = await focusQuoteOnceOpened();
+
+      fireEvent.keyDown(quote, { key: "Enter" });
+      await waitFor(() => expect(newest).toBe(2));
+      const elsewhere = screen.getByRole("button", { name: "Ir para B" });
+      elsewhere.focus();
+      await act(async () => rejectReopen(new Error("offline")));
+
+      expect(await screen.findByRole("button", { name: "Tentar novamente" })).not.toHaveFocus();
+      expect(elsewhere).toHaveFocus();
+    });
+  });
+
+  it("says when the original cannot be reached, and searches again when asked again", async () => {
+    let offline = true;
+    quotePages(2, () => offline);
+    openQuotingConversation();
+
+    await userEvent.setup().click(await findQuote());
+
+    // Every older page failed; the bounded search ends instead of looping.
+    expect(
+      await screen.findByText("Não foi possível localizar a mensagem no histórico."),
+    ).toBeInTheDocument();
+    expect(originalHighlighted()).toBeNull();
+    // The opening, the reload toward the target, and at most the capped pages.
+    expect(mockFetchChannelMessages.mock.calls.length).toBeLessThanOrEqual(2 + 10);
+
+    // The same quote again is a new, explicit request: it searches again.
+    offline = false;
+    await userEvent.setup().click(await findQuote());
+
+    await waitFor(() => expect(originalHighlighted()).not.toBeNull());
+    expect(newestPageLoads()).toBe(3);
+    expect(screen.queryByTestId("message-target-missed")).not.toBeInTheDocument();
+  });
+
+  it("keeps the reply and the draft being composed while it pages back", async () => {
+    const user = userEvent.setup();
+    quotePages(3);
+    openQuotingConversation();
+
+    fireEvent.mouseEnter(await screen.findByTestId("chat-msg-bubble"));
+    await user.click(screen.getByRole("button", { name: "Responder" }));
+    const input = screen.getByTestId("chat-composer-input");
+    await fillEditor(input, "rascunho");
+
+    await user.click(await findQuote());
+    await waitFor(() => expect(originalHighlighted()).not.toBeNull());
+
+    expect(screen.getByTestId("chat-composer-quote")).toHaveTextContent("resposta recente");
+    expect(screen.getByTestId("chat-composer-input")).toHaveTextContent("rascunho");
+  });
+
+  it("drops a page searched for a quote once the reader has left the conversation", async () => {
+    const user = userEvent.setup();
+    let resolveFirst!: (page: MessagePage) => void;
+    quotePages(1);
+    const paged = mockFetchChannelMessages.getMockImplementation()!;
+    mockFetchChannelMessages.mockImplementation((id: string, cursor?: string) =>
+      cursor === "p1" ? new Promise<MessagePage>((r) => (resolveFirst = r)) : paged(id, cursor),
+    );
+    openQuotingConversation();
+
+    await user.click(await findQuote());
+    await waitFor(() =>
+      expect(mockFetchChannelMessages).toHaveBeenCalledWith(
+        "source",
+        "p1",
+        expect.any(AbortSignal),
+      ),
+    );
+    await user.click(screen.getByRole("button", { name: "Ir para B" }));
+    expect(await screen.findByText("conversa B")).toBeInTheDocument();
+
+    await act(async () =>
+      resolveFirst({
+        messages: [makeMessage({ id: "original", bodyText: "pagina 1" })],
+        nextCursor: "",
+      }),
+    );
+
+    expect(screen.queryByText("pagina 1")).not.toBeInTheDocument();
+    expect(document.querySelector(".chat-msg-area__msg--highlight")).toBeNull();
+    expect(screen.queryByTestId("message-target-missed")).not.toBeInTheDocument();
+  });
+
+  it("lets a later quote replace one still being searched for, whatever answers late", async () => {
+    const user = userEvent.setup();
+    let resolveOlder!: (page: MessagePage) => void;
+    mockFetchChannelMessages.mockImplementation((_id: string, cursor?: string) => {
+      if (cursor) return new Promise<MessagePage>((r) => (resolveOlder = r));
+      return Promise.resolve({
+        messages: [
+          makeMessage({ id: "near", bodyText: "logo acima" }),
+          makeMessage({
+            id: "reply-b",
+            bodyText: "sobre o recente",
+            quoted: { ...quoteOf("near"), authorDisplayName: "Bruno" },
+          }),
+          makeMessage({ id: "reply", bodyText: "resposta recente", quoted: quoteOf("original") }),
+        ],
+        nextCursor: "p1",
+      });
+    });
+    openQuotingConversation();
+    const nearHighlighted = () =>
+      document.querySelector('[data-message-id="near"].chat-msg-area__msg--highlight');
+
+    // A: not loaded, so the conversation reopens and searches back for it.
+    await user.click(await findQuote());
+    await waitFor(() =>
+      expect(mockFetchChannelMessages).toHaveBeenCalledWith(
+        "source",
+        "p1",
+        expect.any(AbortSignal),
+      ),
+    );
+    // B, while A's page is still on its way: loaded, so jumped to in place.
+    await user.click(
+      await screen.findByRole("button", { name: "Ir para mensagem original de Bruno" }),
+    );
+    await waitFor(() => expect(nearHighlighted()).not.toBeNull());
+    expect(screen.getByTestId("location-search")).toHaveTextContent("?message=near");
+
+    // A's page answers late: it is history like any other, not a destination.
+    await act(async () =>
+      resolveOlder({
+        messages: [makeMessage({ id: "original", bodyText: "pagina 1" })],
+        nextCursor: "",
+      }),
+    );
+
+    expect(await screen.findByText("pagina 1")).toBeInTheDocument();
+    expect(originalHighlighted()).toBeNull();
+    expect(nearHighlighted()).not.toBeNull();
+    expect(screen.getByTestId("location-search")).toHaveTextContent("?message=near");
+    // The opening and A's reopening; B, already loaded, refetched nothing.
+    expect(newestPageLoads()).toBe(2);
+    expect(screen.queryByTestId("message-target-missed")).not.toBeInTheDocument();
+  });
+
+  it("follows a missed quote once a later page brought its original in, when asked again", async () => {
+    const user = userEvent.setup();
+    // A sits past the bounded search; B is on the newest page.
+    mockFetchChannelMessages.mockImplementation((_id: string, cursor?: string) => {
+      const n = cursor ? Number(cursor.slice(1)) : 0;
+      if (n > 0) {
+        return Promise.resolve({
+          messages: [
+            makeMessage({ id: n === 12 ? "original" : `h-${n}`, bodyText: `pagina ${n}` }),
+          ],
+          nextCursor: n === 12 ? "" : `p${n + 1}`,
+        });
+      }
+      return Promise.resolve({
+        messages: [
+          makeMessage({ id: "near", bodyText: "logo acima" }),
+          makeMessage({
+            id: "reply-b",
+            bodyText: "sobre o recente",
+            quoted: { ...quoteOf("near"), authorDisplayName: "Bruno" },
+          }),
+          makeMessage({ id: "reply", bodyText: "resposta recente", quoted: quoteOf("original") }),
+        ],
+        nextCursor: "p1",
+      });
+    });
+    openQuotingConversation();
+
+    // A: the bounded search gives up on it.
+    await user.click(await findQuote());
+    expect(await screen.findByTestId("message-target-missed")).toBeInTheDocument();
+    // B: loaded, followed in place.
+    await user.click(
+      await screen.findByRole("button", { name: "Ir para mensagem original de Bruno" }),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("location-search")).toHaveTextContent("?message=near"),
+    );
+    // The reader pages back by hand until A is loaded: nobody asked to go there.
+    for (const n of [11, 12]) {
+      act(() => {
+        capturedIOCallback?.(
+          [{ isIntersecting: true } as IntersectionObserverEntry],
+          {} as IntersectionObserver,
+        );
+      });
+      expect(await screen.findByText(`pagina ${n}`)).toBeInTheDocument();
+    }
+    expect(originalHighlighted()).toBeNull();
+
+    // A, asked for again: a new request, not the one that was missed.
+    await user.click(await findQuote());
+
+    await waitFor(() => expect(originalHighlighted()).not.toBeNull());
+    expect(screen.getByTestId("location-search")).toHaveTextContent("?message=original");
+    expect(screen.queryByTestId("message-target-missed")).not.toBeInTheDocument();
+    // Loaded, so followed in place: the opening and A's one reopening only.
+    expect(newestPageLoads()).toBe(2);
+
+    // And once more: each activation travels, none reloads.
+    const trips = travelled().length;
+    await user.click(await findQuote());
+    await waitFor(() => expect(travelled()).toHaveLength(trips + 1));
+    expect(newestPageLoads()).toBe(2);
   });
 
   it("loads older messages when top sentinel becomes visible and renders them", async () => {
