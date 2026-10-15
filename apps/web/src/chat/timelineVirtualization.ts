@@ -294,7 +294,9 @@ export function buildTimelineRows(
       message,
       isGrouped: message.senderId === lastSenderId && minute === lastMinute,
     });
-    lastSenderId = message.senderId;
+    // A system event carries its actor as sender but draws no bubble, so the
+    // actor's next message must open a run of its own (issue #1104).
+    lastSenderId = message.kind === "system" ? "" : message.senderId;
     lastMinute = minute;
   }
   return rows;

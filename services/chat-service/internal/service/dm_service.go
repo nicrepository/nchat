@@ -69,6 +69,18 @@ type CreateGroupConversationInput struct {
 	AvatarEmoji string
 }
 
+// CreateGroupConversationOutput is a committed group and who it was created for.
+//
+// InvitedUserIDs are every participant except the caller, as the eligibility
+// lookup resolved them — never the spelling the request carried (issue #1103).
+// They are what the post-commit conversation.available signal is addressed to,
+// and they are exactly the set the store wrote: the participant insert is
+// all-or-nothing, so a create that returns at all persisted every one of them.
+type CreateGroupConversationOutput struct {
+	Conversation   domain.DMConversation
+	InvitedUserIDs []string
+}
+
 // GetDMConversationInput identifies a visible DM conversation read.
 type GetDMConversationInput struct {
 	WorkspaceID    string
@@ -185,38 +197,28 @@ func (s *DMService) requireEligibleDMMember(ctx context.Context, workspaceID, us
 }
 
 // CreateGroupConversation creates an ad-hoc group DM and automatically includes the caller.
-func (s *DMService) CreateGroupConversation(ctx context.Context, input CreateGroupConversationInput) (domain.DMConversation, error) {
+func (s *DMService) CreateGroupConversation(ctx context.Context, input CreateGroupConversationInput) (CreateGroupConversationOutput, error) {
 	workspaceID := strings.TrimSpace(input.WorkspaceID)
 	rawCallerID := strings.TrimSpace(input.CallerID)
 	if workspaceID == "" || rawCallerID == "" {
-		return domain.DMConversation{}, fmt.Errorf("%w: workspace_id and caller_id are required", domain.ErrInvalidInput)
+		return CreateGroupConversationOutput{}, fmt.Errorf("%w: workspace_id and caller_id are required", domain.ErrInvalidInput)
 	}
 	callerID, err := canonicalizeUserID(rawCallerID)
 	if err != nil {
-		return domain.DMConversation{}, err
+		return CreateGroupConversationOutput{}, err
 	}
 	title, err := normalizeNewGroupIdentity(input.Title, input.AvatarEmoji)
 	if err != nil {
-		return domain.DMConversation{}, err
+		return CreateGroupConversationOutput{}, err
 	}
 	participantUserIDs, err := normalizeGroupDMParticipants(callerID, input.ParticipantUserIDs)
 	if err != nil {
-		return domain.DMConversation{}, err
+		return CreateGroupConversationOutput{}, err
 	}
 
-	// Every participant, the caller included, goes through the same eligibility
-	// rule as a 1:1 DM: active workspace, active membership, and an active,
-	// non-deleted account. A workspace membership alone is not enough — it
-	// outlives a suspended or deleted account. The failure is the undifferentiated
-	// ErrForbidden, so an ineligible, unknown and foreign-workspace participant
-	// are indistinguishable to the caller.
-	canonicalParticipants := make([]string, 0, len(participantUserIDs))
-	for _, uid := range participantUserIDs {
-		m, err := s.requireEligibleDMMember(ctx, workspaceID, uid)
-		if err != nil {
-			return domain.DMConversation{}, err
-		}
-		canonicalParticipants = append(canonicalParticipants, m.UserID)
+	canonicalParticipants, invitedUserIDs, err := s.resolveGroupParticipants(ctx, workspaceID, callerID, participantUserIDs)
+	if err != nil {
+		return CreateGroupConversationOutput{}, err
 	}
 
 	conversation, err := s.dms.CreateGroupConversation(ctx, storage.CreateGroupConversationInput{
@@ -227,9 +229,36 @@ func (s *DMService) CreateGroupConversation(ctx context.Context, input CreateGro
 		ParticipantUserIDs: canonicalParticipants,
 	})
 	if err != nil {
-		return domain.DMConversation{}, fmt.Errorf("create group conversation: %w", err)
+		return CreateGroupConversationOutput{}, fmt.Errorf("create group conversation: %w", err)
 	}
-	return conversation, nil
+	return CreateGroupConversationOutput{Conversation: conversation, InvitedUserIDs: invitedUserIDs}, nil
+}
+
+// resolveGroupParticipants resolves every participant of a new group, the
+// caller included, to its canonical ID, and reports separately the ones that
+// are not the caller — the people the group is announced to (issue #1103).
+//
+// Each goes through the same eligibility rule as a 1:1 DM: active workspace,
+// active membership, and an active, non-deleted account. A workspace membership
+// alone is not enough — it outlives a suspended or deleted account. The failure
+// is the undifferentiated ErrForbidden, so an ineligible, unknown and
+// foreign-workspace participant are indistinguishable to the caller.
+func (s *DMService) resolveGroupParticipants(
+	ctx context.Context, workspaceID, callerID string, participantUserIDs []string,
+) (all, invited []string, err error) {
+	all = make([]string, 0, len(participantUserIDs))
+	invited = make([]string, 0, len(participantUserIDs))
+	for _, uid := range participantUserIDs {
+		m, err := s.requireEligibleDMMember(ctx, workspaceID, uid)
+		if err != nil {
+			return nil, nil, err
+		}
+		all = append(all, m.UserID)
+		if uid != callerID {
+			invited = append(invited, m.UserID)
+		}
+	}
+	return all, invited, nil
 }
 
 // AddGroupParticipantsInput asks to add participants to an existing group DM

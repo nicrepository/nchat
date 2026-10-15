@@ -46,7 +46,7 @@ type fakeDMProvider struct {
 	searchErr        error
 	createOutput     service.CreateDirectConversationOutput
 	createErr        error
-	groupOutput      domain.DMConversation
+	groupOutput      service.CreateGroupConversationOutput
 	groupErr         error
 	lastSearchInput  service.SearchDMCandidatesInput
 	lastCreateInput  service.CreateDirectConversationInput
@@ -173,7 +173,7 @@ func (f *fakeDMProvider) GetGroupCallParticipantProfiles(
 	return f.callParticipantProfiles, f.callParticipantProfilesErr
 }
 
-func (f *fakeDMProvider) CreateGroupConversation(_ context.Context, input service.CreateGroupConversationInput) (domain.DMConversation, error) {
+func (f *fakeDMProvider) CreateGroupConversation(_ context.Context, input service.CreateGroupConversationInput) (service.CreateGroupConversationOutput, error) {
 	f.groupCreateCalls++
 	f.lastGroupInput = input
 	return f.groupOutput, f.groupErr
@@ -559,9 +559,9 @@ func TestDMHandler_CreateGroup_RejectsMalformedAndInjectedFields(t *testing.T) {
 }
 
 func TestDMHandler_CreateGroup_ForwardsServerIdentityAndReturnsOnlyConversationID(t *testing.T) {
-	provider := &fakeDMProvider{groupOutput: domain.DMConversation{
+	provider := &fakeDMProvider{groupOutput: service.CreateGroupConversationOutput{Conversation: domain.DMConversation{
 		ID: dmConversationID, WorkspaceID: testWorkspaceID, CreatedBy: msgTestUserID, Title: "Infra",
-	}}
+	}}}
 	recorder := httptest.NewRecorder()
 	dmTestHandler(provider).CreateGroup(recorder, groupRequest(
 		`{"participant_user_ids":["`+dmOtherUserID+`","`+dmSecondUserID+`"],"title":"Infra"}`,
@@ -591,7 +591,7 @@ func TestDMHandler_CreateGroup_ForwardsServerIdentityAndReturnsOnlyConversationI
 // The title is optional at the transport layer; the service owns trimming and
 // the length limit, so an absent field must reach it as an empty string.
 func TestDMHandler_CreateGroup_AcceptsAbsentTitle(t *testing.T) {
-	provider := &fakeDMProvider{groupOutput: domain.DMConversation{ID: dmConversationID}}
+	provider := &fakeDMProvider{groupOutput: service.CreateGroupConversationOutput{Conversation: domain.DMConversation{ID: dmConversationID}}}
 	recorder := httptest.NewRecorder()
 	dmTestHandler(provider).CreateGroup(recorder, groupRequest(
 		`{"participant_user_ids":["`+dmOtherUserID+`","`+dmSecondUserID+`"]}`,
@@ -654,7 +654,7 @@ func TestDMHandler_CreateGroup_IneligibleParticipantResponseIsOpaque(t *testing.
 // must not consume the direct-DM budget.
 func TestDMHandler_CreateGroup_RateLimitIsIndependentFromDirectCreate(t *testing.T) {
 	limiter := &fakeDMRateLimiter{}
-	provider := &fakeDMProvider{groupOutput: domain.DMConversation{ID: dmConversationID}}
+	provider := &fakeDMProvider{groupOutput: service.CreateGroupConversationOutput{Conversation: domain.DMConversation{ID: dmConversationID}}}
 	handler := dmTestHandlerWithLimiter(provider, limiter)
 	body := `{"participant_user_ids":["` + dmOtherUserID + `","` + dmSecondUserID + `"]}`
 
