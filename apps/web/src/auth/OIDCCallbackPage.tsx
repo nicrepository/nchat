@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
 
-import { setTokens } from "../lib/authSession";
+import { markFreshLogin, setTokens } from "../lib/authSession";
 import "../tokens.css";
 import "./auth.css";
 import { oidcExchange } from "./authApi";
@@ -39,6 +39,7 @@ export default function OIDCCallbackPage() {
       try {
         const result = await oidcExchange(code);
         setTokens(result.accessToken);
+        markFreshLogin("/");
         navigate("/", { replace: true });
       } catch {
         setError(SSO_ERROR);

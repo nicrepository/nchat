@@ -38,9 +38,16 @@ export interface NavDrawer {
   close: () => void;
 }
 
-export function useNavDrawer(pathname: string): NavDrawer {
+/**
+ * `openOnEntry` is read once, on mount (issue #1123): the shell asks for the
+ * navigation to be the first thing on screen when it is entered straight after
+ * a sign-in. It only takes effect at drawer widths — a column is already on
+ * screen — and nothing later re-reads it, so a rerender, a resize or a route
+ * change can never reopen the drawer on its own.
+ */
+export function useNavDrawer(pathname: string, openOnEntry = false): NavDrawer {
   const isDrawer = useMediaQuery(NAV_DRAWER_QUERY);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(() => openOnEntry && isDrawer);
 
   // Two structural reasons to close, both handled the way React documents an
   // adjustment to a changing input — during render, guarded, never in an effect
