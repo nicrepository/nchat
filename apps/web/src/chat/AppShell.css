@@ -267,6 +267,19 @@ body.chat-root-locked {
   }
 }
 
+/*
+ * A phone has no room for a conversation beside a 300px drawer, so the open
+ * navigation is the whole screen below the toggle rather than an overlay over a
+ * sliver of conversation (issue #1123). Same element, same drawer behaviour —
+ * only its width changes.
+ */
+@media (max-width: 767.98px) {
+  .chat-app > .chat-sidebar {
+    width: 100%;
+    padding-right: env(safe-area-inset-right);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .chat-app > .chat-sidebar {
     transition: none;

@@ -2,9 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   _resetListeners,
+  clearFreshLogin,
   clearTokens,
   getAccessToken,
   isAuthenticated,
+  isFreshLogin,
+  markFreshLogin,
   onAuthChange,
   setTokens,
 } from "./authSession";
@@ -101,5 +104,67 @@ describe("onAuthChange", () => {
     clearTokens();
     expect(listener.mock.calls).toEqual([["session"], ["refresh"], ["session"]]);
     unsub();
+  });
+});
+
+/** Issue #1123: the entry intention lives exactly as long as the session that set it. */
+describe("markFreshLogin", () => {
+  afterEach(() => {
+    clearFreshLogin();
+  });
+
+  it.each(["/", "/chat", "/chat/"])("sign-in into the chat's home (%s) is a fresh login", (to) => {
+    setTokens("at-a");
+    markFreshLogin(to);
+    expect(isFreshLogin()).toBe(true);
+  });
+
+  it.each([
+    "/call/c-1",
+    "/admin/users",
+    "/profile",
+    "/chat/dm/d-1",
+    "/chat/channel/c-1",
+    "/chat/search",
+  ])("sign-in with an explicit destination (%s) leaves no intention", (to) => {
+    setTokens("at-a");
+    markFreshLogin(to);
+    expect(isFreshLogin()).toBe(false);
+  });
+
+  it("logout and a silent recovery of another session do not inherit it", () => {
+    setTokens("at-a");
+    markFreshLogin("/");
+    clearTokens();
+    expect(isFreshLogin()).toBe(false);
+    setTokens("at-b");
+    expect(isFreshLogin()).toBe(false);
+  });
+
+  it("a session installed over it does not inherit it", () => {
+    setTokens("at-a");
+    markFreshLogin("/");
+    setTokens("at-b");
+    expect(isFreshLogin()).toBe(false);
+  });
+
+  it("a token rotation spends it too", () => {
+    setTokens("at-a");
+    markFreshLogin("/");
+    setTokens("at-a2", "refresh");
+    expect(isFreshLogin()).toBe(false);
+  });
+
+  it("marked before the session is installed, it never takes effect", () => {
+    markFreshLogin("/");
+    setTokens("at-a");
+    expect(isFreshLogin()).toBe(false);
+  });
+
+  it("is spent once", () => {
+    setTokens("at-a");
+    markFreshLogin("/");
+    clearFreshLogin();
+    expect(isFreshLogin()).toBe(false);
   });
 });
