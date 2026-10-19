@@ -3,7 +3,13 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes, useOutletContext } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { clearTokens, setTokens } from "../lib/authSession";
+import {
+  clearFreshLogin,
+  clearTokens,
+  isFreshLogin,
+  markFreshLogin,
+  setTokens,
+} from "../lib/authSession";
 import { issueCallToken, issueResourceCallToken } from "./callApi";
 import { fetchSidebarData, leaveConversation, markConversationRead } from "./chatApi";
 import AppShell, { ROOT_LOCK_CLASS } from "./AppShell";
@@ -1560,31 +1566,50 @@ describe("ChatShell — #673 directCallSession derivation", () => {
  * subject. Both are derived from the canonical list, so both must stop pointing
  * at a conversation this user is no longer in.
  */
+/**
+ * The shared shell with the chat's own child routes stubbed: the shell is what
+ * these suites drive, so each route only has to say which one rendered.
+ */
+function renderShellAt(path: string) {
+  return render(
+    <MemoryRouter initialEntries={[path]}>
+      <Routes>
+        <Route element={<AppShell />}>
+          <Route
+            path="/chat"
+            element={
+              <CallSessionProvider>
+                <ChatShell />
+              </CallSessionProvider>
+            }
+          >
+            <Route index element={<div>vazio</div>} />
+            <Route path="channel/:channelId" element={<div>mensagens</div>} />
+            <Route path="search" element={<div>busca</div>} />
+          </Route>
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+/** "Plataforma" (readingId) and "Infra" (otherId), both writable public channels. */
+function twoChannelSidebar(readingId: string, otherId: string) {
+  return {
+    currentUserId,
+    workspaceId: "workspace-1",
+    channels: [
+      { id: readingId, name: "Plataforma", type: "public" as const, canWrite: true },
+      { id: otherId, name: "Infra", type: "public" as const, canWrite: true },
+    ],
+    dms: [],
+    categories: [],
+  };
+}
+
 describe("ChatShell — leaving the conversation on screen", () => {
   const readingId = "00000000-0000-4000-8000-0000000005a1";
   const otherId = "00000000-0000-4000-8000-0000000005a2";
-
-  function renderShellAt(path: string) {
-    return render(
-      <MemoryRouter initialEntries={[path]}>
-        <Routes>
-          <Route element={<AppShell />}>
-            <Route
-              path="/chat"
-              element={
-                <CallSessionProvider>
-                  <ChatShell />
-                </CallSessionProvider>
-              }
-            >
-              <Route index element={<div>vazio</div>} />
-              <Route path="channel/:channelId" element={<div>mensagens</div>} />
-            </Route>
-          </Route>
-        </Routes>
-      </MemoryRouter>,
-    );
-  }
 
   function sidebarWith(channels: { id: string; name: string }[]) {
     return {
@@ -1892,46 +1917,11 @@ describe("ChatShell — navegação responsiva", () => {
   const readingId = "00000000-0000-4000-8000-0000000005b1";
   const otherId = "00000000-0000-4000-8000-0000000005b2";
 
-  function renderShellAt(path: string) {
-    return render(
-      <MemoryRouter initialEntries={[path]}>
-        <Routes>
-          <Route element={<AppShell />}>
-            <Route
-              path="/chat"
-              element={
-                <CallSessionProvider>
-                  <ChatShell />
-                </CallSessionProvider>
-              }
-            >
-              <Route index element={<div>vazio</div>} />
-              <Route path="channel/:channelId" element={<div>mensagens</div>} />
-            </Route>
-          </Route>
-        </Routes>
-      </MemoryRouter>,
-    );
-  }
-
-  function sidebarWithTwoChannels() {
-    return {
-      currentUserId,
-      workspaceId: "workspace-1",
-      channels: [
-        { id: readingId, name: "Plataforma", type: "public" as const, canWrite: true },
-        { id: otherId, name: "Infra", type: "public" as const, canWrite: true },
-      ],
-      dms: [],
-      categories: [],
-    };
-  }
-
   const toggle = () => screen.getByRole("button", { name: "Conversas" });
   const main = () => screen.getByRole("main");
 
   beforeEach(() => {
-    vi.mocked(fetchSidebarData).mockResolvedValue(sidebarWithTwoChannels());
+    vi.mocked(fetchSidebarData).mockResolvedValue(twoChannelSidebar(readingId, otherId));
   });
 
   afterEach(() => {
@@ -2074,6 +2064,216 @@ describe("ChatShell — navegação responsiva", () => {
       "aria-selected",
       "true",
     );
+  });
+});
+
+/**
+ * Issue #1123: entering the chat straight after a sign-in, with no destination
+ * of its own, starts with the conversation list on screen. Only the mark the
+ * sign-in flows leave decides it — a reload, a silent session recovery and a
+ * deep link all start without it or away from /chat.
+ */
+describe("ChatShell — navegação de entrada após login (#1123)", () => {
+  const readingId = "00000000-0000-4000-8000-000000001123";
+  const otherId = "00000000-0000-4000-8000-000000001124";
+
+  const shell = () => screen.getByTestId("chat-shell");
+  const main = () => screen.getByRole("main");
+
+  beforeEach(() => {
+    vi.mocked(fetchSidebarData).mockResolvedValue(twoChannelSidebar(readingId, otherId));
+  });
+
+  afterEach(() => {
+    clearFreshLogin();
+    sessionStorage.removeItem("nchat_at");
+    // @ts-expect-error -- jsdom does not define this by default; restore that.
+    delete window.matchMedia;
+  });
+
+  it("abre a navegação no primeiro acesso após login e fecha ao escolher a conversa", async () => {
+    stubViewport(true);
+    markFreshLogin("/");
+    const user = userEvent.setup();
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).toHaveAttribute("data-nav-open", "true");
+    expect(main()).toHaveAttribute("inert");
+    expect(screen.getByRole("button", { name: "Fechar conversas" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(isFreshLogin()).toBe(false);
+
+    await user.click(screen.getByRole("option", { name: /Infra/ }));
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+    expect(screen.getByText("mensagens")).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Infra/ })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("a navegação de entrada fecha com Escape e devolve o foco ao acionador", async () => {
+    stubViewport(true);
+    markFreshLogin("/");
+    const user = userEvent.setup();
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    // The sign-in form that had focus is gone; focus starts on the toggle, so
+    // the very first keystroke already reaches the drawer.
+    expect(screen.getByRole("button", { name: "Fechar conversas" })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByTestId("chat-sidebar")).toContainElement(
+      document.activeElement as HTMLElement,
+    );
+
+    await user.keyboard("{Escape}");
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(screen.getByRole("button", { name: "Conversas" })).toHaveFocus();
+  });
+
+  // Regression (code quality review): "/chat/" renders the same index route, so
+  // it is the same entry — a literal comparison with "/chat" missed it.
+  it("/chat/ após login é a mesma entrada que /chat", async () => {
+    stubViewport(true);
+    markFreshLogin("/");
+    renderShellAt("/chat/");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(screen.getByText("vazio")).toBeInTheDocument();
+    expect(shell()).toHaveAttribute("data-nav-open", "true");
+    expect(main()).toHaveAttribute("inert");
+  });
+
+  it("outra superfície do chat após login mantém o destino explícito", async () => {
+    stubViewport(true);
+    markFreshLogin("/");
+    renderShellAt("/chat/search");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(screen.getByText("busca")).toBeInTheDocument();
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(isFreshLogin()).toBe(false);
+  });
+
+  it("deep link após login abre o destino, não a navegação", async () => {
+    stubViewport(true);
+    markFreshLogin("/");
+    renderShellAt(`/chat/channel/${readingId}`);
+    await screen.findByRole("option", { name: /Plataforma/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+    expect(screen.getByText("mensagens")).toBeInTheDocument();
+    // Spent by this entry, so it cannot surface on a later one.
+    expect(isFreshLogin()).toBe(false);
+  });
+
+  it("refresh ou recuperação silenciosa da sessão não abre a navegação", async () => {
+    stubViewport(true);
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+  });
+
+  // Regression (second code quality review): the mark belongs to the session
+  // the sign-in installed. Each case is the order the app really runs them in.
+  it("login interativo: a sessão instalada e só então a intenção abrem a navegação", async () => {
+    stubViewport(true);
+    setTokens("at-a");
+    markFreshLogin("/");
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).toHaveAttribute("data-nav-open", "true");
+  });
+
+  it("login → logout → recuperação silenciosa de outra sessão não herda a intenção", async () => {
+    stubViewport(true);
+    setTokens("at-a");
+    markFreshLogin("/");
+    clearTokens();
+    setTokens("at-b");
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+  });
+
+  it("login → substituição da sessão não herda a intenção", async () => {
+    stubViewport(true);
+    setTokens("at-a");
+    markFreshLogin("/");
+    setTokens("at-b");
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+  });
+
+  for (const destination of ["/call/call-1123", "/admin/users", "/profile"]) {
+    it(`login para ${destination} não deixa intenção para uma ida posterior a /chat`, async () => {
+      stubViewport(true);
+      setTokens("at-a");
+      markFreshLogin(destination);
+      renderShellAt("/chat");
+      await screen.findByRole("option", { name: /Infra/ });
+
+      expect(shell()).not.toHaveAttribute("data-nav-open");
+    });
+  }
+
+  it("só a primeira entrada após o login abre a navegação", async () => {
+    stubViewport(true);
+    markFreshLogin("/");
+    const first = renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+    expect(shell()).toHaveAttribute("data-nav-open", "true");
+    first.unmount();
+
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+  });
+
+  it("em coluna o login não abre camada modal, e o resize nunca reabre a navegação", async () => {
+    const viewport = stubViewport(false);
+    markFreshLogin("/");
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(screen.queryByTestId("chat-nav-backdrop")).not.toBeInTheDocument();
+
+    viewport.resizeTo(true);
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+  });
+
+  it("sair e voltar à largura de drawer fecha a navegação de entrada sem recriar a conexão", async () => {
+    const viewport = stubViewport(true);
+    markFreshLogin("/");
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+    expect(shell()).toHaveAttribute("data-nav-open", "true");
+    const sockets = FakeWebSocket.instances.length;
+    const sidebarFetches = vi.mocked(fetchSidebarData).mock.calls.length;
+
+    viewport.resizeTo(false);
+    viewport.resizeTo(true);
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+    expect(FakeWebSocket.instances).toHaveLength(sockets);
+    expect(vi.mocked(fetchSidebarData).mock.calls).toHaveLength(sidebarFetches);
   });
 });
 

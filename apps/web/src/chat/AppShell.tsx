@@ -11,6 +11,7 @@ import {
 import {
   Outlet,
   useLocation,
+  useMatch,
   useNavigate,
   useNavigationType,
   type NavigateFunction,
@@ -31,7 +32,7 @@ import {
 } from "./directMessage";
 import { useChatSidebar } from "./useChatSidebar";
 import { useConversationDrafts, type ConversationDraftsApi } from "./useConversationDrafts";
-import { onAuthChange } from "../lib/authSession";
+import { clearFreshLogin, isFreshLogin, onAuthChange } from "../lib/authSession";
 import { disposeNotificationSoundPlayer } from "../notifications/notificationSound";
 import { createCommandRegistry } from "../commands/commandRegistry";
 import KeyboardShortcutsDialog from "../commands/KeyboardShortcutsDialog";
@@ -72,6 +73,25 @@ function detailsTargetExists(
 ): boolean {
   const collection = target.kind === "channel" ? ready.channels : ready.dms;
   return collection.some((item) => item.id === target.id);
+}
+
+/**
+ * The row-menu details panel's target while it is still valid, otherwise null.
+ *
+ * Two conditions, and both are about the target still being real. The route is
+ * part of the panel's identity, so navigating away closes it with no extra
+ * render pass; and the conversation must still be in the canonical list, so
+ * leaving the conversation the panel is showing closes it too — the row is
+ * gone, and a panel over a conversation this user can no longer see would keep
+ * polling for details it may not have.
+ */
+function liveDetailsTarget<T extends SidebarDetailsTarget & { pathname: string }>(
+  details: T | null,
+  pathname: string,
+  ready: { channels: Channel[]; dms: DMConversation[] },
+): T | null {
+  if (details?.pathname !== pathname) return null;
+  return detailsTargetExists(details, ready) ? details : null;
 }
 
 /**
@@ -218,6 +238,11 @@ function ChatNavBar({
         className="chat-app__nav-toggle"
         aria-controls={chatNavigationId}
         aria-expanded={open}
+        // React only honours this on mount, which is the one time it can be
+        // true: a drawer opened on entry after a sign-in (issue #1123). The
+        // form that had focus is gone, so focus starts at the control that
+        // owns the drawer, and Escape and Tab work from the first keystroke.
+        autoFocus={open}
         onClick={onToggle}
         data-testid="chat-nav-toggle"
       >
@@ -324,6 +349,28 @@ const EMPTY_CHANNELS: Channel[] = [];
 const EMPTY_DMS: DMConversation[] = [];
 const GLOBAL_SHORTCUT_SCOPE = ["global"] as const;
 const SEARCH_PATH = "/chat/search";
+/** Where a sign-in without a destination of its own lands ("/" redirects here). */
+const CHAT_HOME = "/chat";
+
+/**
+ * Whether this mount of the shell is the entry straight after a sign-in with no
+ * destination of its own (issue #1123).
+ *
+ * Two facts, both required. The sign-in flows left the in-memory mark — which a
+ * reload, a new tab and a silent session recovery never do. And the route is
+ * the chat's home: matched by the router rather than compared as a string, so
+ * "/chat/" is the same entry as "/chat", while a deep link to a conversation,
+ * the search or favourites keeps the destination it asked for.
+ *
+ * The mark is spent by this first entry whatever it decided. The answer is
+ * only read on mount (see useNavDrawer), so it going false afterwards changes
+ * nothing.
+ */
+function useLoginEntry(): boolean {
+  const atChatHome = useMatch(CHAT_HOME) !== null;
+  useEffect(clearFreshLogin, []);
+  return atChatHome && isFreshLogin();
+}
 
 /** "/profile" or "/profile/..." gets the settings label; everything else (today, only "/chat/...") gets the chat one. */
 function mainAriaLabel(pathname: string): string {
@@ -417,18 +464,10 @@ export default function AppShell() {
   const [sidebarDetails, setSidebarDetails] = useState<
     (SidebarDetailsTarget & { pathname: string }) | null
   >(null);
+  const workspaceId = state.status === "ready" ? state.workspaceId : "";
   const dms = state.status === "ready" ? state.dms : EMPTY_DMS;
   const channels = state.status === "ready" ? state.channels : EMPTY_CHANNELS;
-  // Two conditions, and both are about the target still being real. The route is
-  // part of the panel's identity, so navigating away closes it with no extra
-  // render pass; and the conversation must still be in the canonical list, so
-  // leaving the conversation the panel is showing closes it too — the row is
-  // gone, and a panel over a conversation this user can no longer see would keep
-  // polling for details it may not have.
-  const openDetailsTarget =
-    sidebarDetails?.pathname === pathname && detailsTargetExists(sidebarDetails, { channels, dms })
-      ? sidebarDetails
-      : null;
+  const openDetailsTarget = liveDetailsTarget(sidebarDetails, pathname, { channels, dms });
 
   const detailsCanonicalName = detailsTargetName(openDetailsTarget, { channels, dms });
 
@@ -452,12 +491,15 @@ export default function AppShell() {
   // The navigation is a column on wide viewports and a drawer below them
   // (issue #467). Only the open/closed boolean lives here; which of the two it
   // is at a given width is decided in AppShell.css.
+  // Entered straight after a sign-in, it starts open so the conversation list
+  // is the first thing on screen (issue #1123).
+  const loginEntry = useLoginEntry();
   const {
     open: navOpen,
     modal: navModal,
     toggle: toggleNav,
     close: setNavClosed,
-  } = useNavDrawer(pathname);
+  } = useNavDrawer(pathname, loginEntry);
   const navToggleRef = useRef<HTMLButtonElement>(null);
   // Closing always hands focus back to the control that opened the drawer: it
   // is the one element that is on screen in every drawer state, so a keyboard
@@ -580,7 +622,7 @@ export default function AppShell() {
       <SidebarDetailsPanel
         target={openDetailsTarget}
         currentUserId={currentUserId}
-        workspaceId={state.status === "ready" ? state.workspaceId : ""}
+        workspaceId={workspaceId}
         onRename={renameDetailsTarget}
         canonicalName={detailsCanonicalName}
         // The same coordinator the conversation's own surfaces use, so a
@@ -599,7 +641,7 @@ export default function AppShell() {
         <InAppMessageAlert
           key={inAppAlert.messageId}
           alert={inAppAlert}
-          workspaceId={state.status === "ready" ? state.workspaceId : ""}
+          workspaceId={workspaceId}
           onOpen={openInAppAlert}
           onDismiss={dismissInAppAlert}
         />
