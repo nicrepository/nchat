@@ -3,6 +3,7 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
 import {
   CURRENT_USER_ID,
   CURRENT_USER_NAME,
+  GROUP_DM_NAME,
   OTHER_CHANNEL_NAME,
   OTHER_USER_ID,
   OTHER_USER_NAME,
@@ -288,6 +289,116 @@ async function readSidebarNav(page: Page) {
 const navToggle = (page: Page) => page.getByTestId("chat-nav-toggle");
 const detailsToggle = (page: Page) => page.getByTestId("chat-details-toggle");
 const composer = (page: Page) => page.getByTestId("chat-composer-input");
+
+/** A conversation with unread messages the entry navigation must leave alone. */
+const PENDING_CHANNEL_NAME = "Canal com pendências";
+
+/**
+ * ISSUE #1123 — a real sign-in, not a seeded session.
+ *
+ * `startSignedOut` makes the one init script that seeds the session skip it, so
+ * the tab starts with no token at all and the only session is the one the
+ * login form or the SSO callback installs; a reload keeps it because
+ * sessionStorage survives one. A cold deep link has no refresh cookie either,
+ * so the silent recovery is refused and RequireAuth sends it to /login carrying
+ * the destination.
+ *
+ * The conversation is taller than any viewport, so it has a scroll position to
+ * keep, and a second channel carries an unread count to keep.
+ */
+async function installSignedOutStart(page: Page, testInfo: Parameters<typeof uniqueId>[0]) {
+  const targetId = uniqueId(testInfo, "login-entry");
+  const scenario = createScenario({
+    kind: "channel",
+    targetId,
+    targetName: LONG_NAME,
+    messages: Array.from({ length: 60 }, (_, index) =>
+      makeMessage({
+        id: `${targetId}-m${index}`,
+        body_text: `Mensagem número ${index} desta conversa.`,
+      }),
+    ),
+  });
+  scenario.sidebarChannels.push({
+    id: `${targetId}-pending`,
+    slug: "canal-com-pendencias",
+    display_name: PENDING_CHANNEL_NAME,
+    type: "public",
+    can_write: true,
+    unread_count: 4,
+  });
+  await installMessagingMocks(page, scenario, { startSignedOut: true });
+  const session = {
+    access_token: "e2e-login-at",
+    token_type: "Bearer",
+    expires_in: 3600,
+    user: {
+      id: CURRENT_USER_ID,
+      email: "e2e@example.test",
+      display_name: CURRENT_USER_NAME,
+      must_change_password: false,
+    },
+  };
+  await page.route("**/api/auth/refresh", (route) => route.fulfill({ status: 401 }));
+  await page.route("**/api/auth/login", (route) => route.fulfill({ status: 200, json: session }));
+  await page.route("**/api/auth/oidc/keycloak/exchange", (route) =>
+    route.fulfill({ status: 200, json: session }),
+  );
+  return { scenario, targetId };
+}
+
+/**
+ * Signs in through the form, and proves that is what happened: the page is the
+ * login page, there is no session yet, and the credentials really are posted.
+ */
+async function signInWithForm(page: Page) {
+  await expect(page).toHaveURL("/login");
+  expect(await page.evaluate(() => sessionStorage.getItem("nchat_at"))).toBeNull();
+  await page.getByLabel("E-mail corporativo").fill("e2e@example.test");
+  await page.getByLabel("Senha").fill("senha-e2e");
+  const posted = page.waitForRequest("**/api/auth/login");
+  await page.getByRole("button", { name: /^Entrar$/ }).click();
+  await posted;
+}
+
+/** The drawer opened on entry: list on screen, conversation inert behind it. */
+async function expectEntryNavigationOpen(page: Page, url = "/chat") {
+  await expect(page).toHaveURL(url);
+  await expect(page.getByTestId("chat-sidebar")).toBeVisible();
+  await expect(page.getByRole("option", { name: new RegExp(OTHER_CHANNEL_NAME) })).toBeVisible();
+  await expect(navToggle(page)).toHaveAttribute("aria-expanded", "true");
+  await expect(navToggle(page)).toHaveAccessibleName("Fechar conversas");
+  await expect(navToggle(page)).toBeFocused();
+  await expect(page.getByRole("main")).toHaveAttribute("inert", "");
+}
+
+/**
+ * The list's scroll position once it has stopped moving: ten frames in a row
+ * with the same value. A programmatic scroll is re-anchored by the virtualized
+ * rows as they are measured, so the first read after it is not yet a position
+ * the user would see.
+ */
+function settledScrollTop(list: Locator) {
+  return list.evaluate(
+    (el) =>
+      new Promise<number>((resolve) => {
+        let last = Number.NaN;
+        let stableFrames = 0;
+        const tick = () => {
+          stableFrames = el.scrollTop === last ? stableFrames + 1 : 0;
+          last = el.scrollTop;
+          if (stableFrames >= 10) resolve(last);
+          else requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      }),
+  );
+}
+
+const pendingBadge = (page: Page) =>
+  page
+    .getByRole("option", { name: new RegExp(PENDING_CHANNEL_NAME) })
+    .locator(".chat-sidebar__unread-badge");
 
 test.describe("layout responsivo", () => {
   test("celular: navega da lista para a conversa, volta, abre detalhes e envia", async ({
@@ -1094,4 +1205,188 @@ test.describe("layout responsivo", () => {
       await expectNoHorizontalScroll(page);
     });
   }
+});
+
+test.describe("navegação de entrada após login (#1123)", () => {
+  /** Below 768px the open navigation is the whole width; at 768px it is the 300px drawer. */
+  for (const { viewport, fullWidth } of [
+    { viewport: { width: 360, height: 800 }, fullWidth: true },
+    { viewport: { width: 390, height: 844 }, fullWidth: true },
+    { viewport: { width: 768, height: 1024 }, fullWidth: false },
+    { viewport: { width: 1023, height: 768 }, fullWidth: false },
+  ]) {
+    test(`${viewport.width}x${viewport.height}: login mostra a lista, escolher fecha e refresh não reabre`, async ({
+      page,
+    }, testInfo) => {
+      await page.setViewportSize(viewport);
+      await installSignedOutStart(page, testInfo);
+      await page.goto("/login");
+      await signInWithForm(page);
+
+      await expectEntryNavigationOpen(page);
+      const widths = await readColumnWidths(page);
+      if (fullWidth) expect(widths.sidebar).toBe(viewport.width);
+      else expect(widths.sidebar).toBeLessThanOrEqual(300);
+      await expectNoHorizontalScroll(page);
+
+      await page.getByRole("option", { name: new RegExp(OTHER_CHANNEL_NAME) }).click();
+      await expect(page.getByTestId("chat-sidebar")).toBeHidden();
+      await expect(page.getByRole("main")).not.toHaveAttribute("inert", "");
+      await expect(page.getByTestId("chat-msg-header")).toContainText(OTHER_CHANNEL_NAME);
+
+      // De volta à lista pelo controle, sem reload.
+      await navToggle(page).click();
+      await expect(page.getByTestId("chat-sidebar")).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(page.getByTestId("chat-sidebar")).toBeHidden();
+      await expect(navToggle(page)).toBeFocused();
+
+      // Refresh da conversa aberta não é um novo login.
+      await page.reload();
+      await expect(page.getByTestId("chat-msg-header")).toContainText(OTHER_CHANNEL_NAME);
+      await expect(navToggle(page)).toHaveAttribute("aria-expanded", "false");
+      await expect(page.getByTestId("chat-sidebar")).toBeHidden();
+    });
+  }
+
+  for (const { kind, name } of [
+    { kind: "DM", name: OTHER_USER_NAME },
+    { kind: "grupo", name: GROUP_DM_NAME },
+  ]) {
+    test(`celular: login → escolher ${kind} fecha a navegação e abre a conversa`, async ({
+      page,
+    }, testInfo) => {
+      await page.setViewportSize(PHONE);
+      await installSignedOutStart(page, testInfo);
+      await page.goto("/login");
+      await signInWithForm(page);
+      await expectEntryNavigationOpen(page);
+
+      await page.getByRole("option", { name: new RegExp(name) }).click();
+
+      await expect(page).toHaveURL(/\/chat\/dm\//);
+      await expect(page.getByTestId("chat-sidebar")).toBeHidden();
+      await expect(page.getByRole("main")).not.toHaveAttribute("inert", "");
+      await expect(page.getByTestId("chat-msg-header")).toContainText(name);
+      await expect(navToggle(page)).toHaveAttribute("aria-expanded", "false");
+      await expectNoHorizontalScroll(page);
+    });
+  }
+
+  test("/chat/ após login é a mesma entrada que /chat", async ({ page }, testInfo) => {
+    await page.setViewportSize(PHONE);
+    await installSignedOutStart(page, testInfo);
+    await page.goto("/chat/");
+    await signInWithForm(page);
+
+    await expectEntryNavigationOpen(page, "/chat/");
+  });
+
+  test("abrir e fechar a navegação preserva a rolagem da conversa e as não lidas", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize(PHONE);
+    await installSignedOutStart(page, testInfo);
+    await page.goto("/login");
+    await signInWithForm(page);
+    await expectEntryNavigationOpen(page);
+    await expect(pendingBadge(page)).toHaveAttribute("aria-label", "4 não lidas");
+
+    await page.getByRole("option", { name: new RegExp(LONG_NAME.slice(0, 20)) }).click();
+    const list = page.locator(".chat-msg-area__list");
+    await expect
+      .poll(() => list.evaluate((el) => el.scrollHeight - el.clientHeight))
+      .toBeGreaterThan(200);
+    await list.evaluate((el) => {
+      el.scrollTop = Math.round((el.scrollHeight - el.clientHeight) / 2);
+    });
+    const kept = await settledScrollTop(list);
+    // A position in the middle of the history: neither the top nor the tail.
+    expect(kept).toBeGreaterThan(0);
+    expect(
+      await list.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop),
+    ).toBeGreaterThan(0);
+
+    await navToggle(page).click();
+    await expect(page.getByTestId("chat-sidebar")).toBeVisible();
+    await expect(pendingBadge(page)).toHaveAttribute("aria-label", "4 não lidas");
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("chat-sidebar")).toBeHidden();
+
+    expect(await settledScrollTop(list)).toBe(kept);
+    await expect(page.getByTestId("chat-msg-header")).toContainText(LONG_NAME.slice(0, 20));
+  });
+
+  for (const viewport of [
+    { width: 1024, height: 768 },
+    { width: 1280, height: 720 },
+    { width: 1920, height: 1080 },
+  ]) {
+    test(`${viewport.width}x${viewport.height}: login mantém a coluna permanente, sem camada modal`, async ({
+      page,
+    }, testInfo) => {
+      await page.setViewportSize(viewport);
+      await installSignedOutStart(page, testInfo);
+      await page.goto("/login");
+      await signInWithForm(page);
+
+      await expect(page).toHaveURL("/chat");
+      await expect(page.getByTestId("chat-sidebar")).toBeVisible();
+      await expect(navToggle(page)).toBeHidden();
+      await expect(page.getByTestId("chat-nav-backdrop")).toHaveCount(0);
+      await expect(page.getByRole("main")).not.toHaveAttribute("inert", "");
+      await expectNoHorizontalScroll(page);
+    });
+  }
+
+  /**
+   * SSO has no destination of its own today: the callback always lands on "/",
+   * because the OIDC start URL carries no return path and the exchange returns
+   * none. So it is always the "no explicit destination" entry.
+   */
+  test("SSO no celular abre a mesma navegação de entrada", async ({ page }, testInfo) => {
+    await page.setViewportSize(PHONE);
+    await installSignedOutStart(page, testInfo);
+    const exchanged = page.waitForRequest("**/api/auth/oidc/keycloak/exchange");
+    await page.goto("/oidc-callback?code=opaque-e2e-code");
+    await exchanged;
+
+    await expectEntryNavigationOpen(page);
+  });
+
+  test("deep link protegido sobrevive ao login e abre a conversa, não a lista", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize(PHONE);
+    const { targetId } = await installSignedOutStart(page, testInfo);
+    await page.goto(`/chat/channel/${targetId}`);
+    await signInWithForm(page);
+
+    await expect(page).toHaveURL(`/chat/channel/${targetId}`);
+    await expect(page.getByTestId("chat-msg-header")).toContainText(LONG_NAME.slice(0, 20));
+    await expect(page.getByTestId("chat-sidebar")).toBeHidden();
+    await expect(navToggle(page)).toHaveAttribute("aria-expanded", "false");
+  });
+
+  test("redimensionar após o login não reabre a navegação nem perde o rascunho", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize(PHONE);
+    await installSignedOutStart(page, testInfo);
+    await page.goto("/login");
+    await signInWithForm(page);
+    await expectEntryNavigationOpen(page);
+
+    await page.getByRole("option", { name: new RegExp(OTHER_CHANNEL_NAME) }).click();
+    await fillComposer(page, "rascunho que atravessa o breakpoint");
+
+    for (const size of [{ width: 1024, height: 768 }, WIDE, { width: 1023, height: 768 }, PHONE]) {
+      await page.setViewportSize(size);
+      await expect(page.getByTestId("chat-msg-header")).toContainText(OTHER_CHANNEL_NAME);
+      await expect(composer(page)).toContainText("rascunho que atravessa o breakpoint");
+      await expectNoHorizontalScroll(page);
+    }
+    await expect(navToggle(page)).toHaveAttribute("aria-expanded", "false");
+    await expect(page.getByTestId("chat-sidebar")).toBeHidden();
+  });
 });

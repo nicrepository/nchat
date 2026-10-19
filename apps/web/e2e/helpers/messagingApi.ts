@@ -1353,6 +1353,14 @@ export async function installMessagingMocks(
      * call_not_found.
      */
     knownCalls?: Array<{ callId: string; event: Record<string, unknown> }>;
+    /**
+     * Start the tab with no session at all (issue #1123), so the spec signs in
+     * through the real login form or SSO callback. The access token is then
+     * never seeded: whatever the sign-in installs is the only session, and a
+     * reload keeps it the way a reload keeps a real one (sessionStorage
+     * survives it). Off by default — every other spec starts signed in.
+     */
+    startSignedOut?: boolean;
   } = {},
 ) {
   const expired = new Set(options.editWindowExpiredIds ?? []);
@@ -1371,7 +1379,13 @@ export async function installMessagingMocks(
   await page.context().grantPermissions(["camera", "microphone"], {
     origin: "http://localhost:5173",
   });
-  await installWebSocketMock(page, scenario, assertConversationAccess, options.knownCalls ?? []);
+  await installWebSocketMock(
+    page,
+    scenario,
+    assertConversationAccess,
+    options.knownCalls ?? [],
+    options.startSignedOut ?? false,
+  );
   await installSidebarMocks(page, scenario);
   await installInteractionMocks(page, scenario, assertConversationAccess);
   await installConversationMocks(page, scenario);
@@ -1870,6 +1884,7 @@ async function installWebSocketMock(
   scenario: MessagingScenario,
   assertConversationAccess: ConversationAccessGuard,
   knownCalls: Array<{ callId: string; event: Record<string, unknown> }>,
+  startSignedOut: boolean,
 ) {
   // Reaction toggles travel over the WebSocket, not REST (RF-08). The fake
   // socket below calls back into this exposed function so a toggle mutates
@@ -1931,6 +1946,7 @@ async function installWebSocketMock(
     (args) => {
       const {
         accessToken,
+        startSignedOut,
         targetKind,
         targetId,
         currentUserId,
@@ -1938,7 +1954,7 @@ async function installWebSocketMock(
         presence,
         knownCalls: knownCallList,
       } = args;
-      sessionStorage.setItem("nchat_at", accessToken);
+      if (!startSignedOut) sessionStorage.setItem("nchat_at", accessToken);
       const allowed = new Set(allowedTargets);
       const sockets = new Set<StableWebSocket>();
       let createdSockets = 0;
@@ -2236,6 +2252,7 @@ async function installWebSocketMock(
     },
     {
       accessToken: `e2e-at-${scenario.targetId}`,
+      startSignedOut,
       targetKind: scenario.kind,
       targetId: scenario.targetId,
       currentUserId: CURRENT_USER_ID,
