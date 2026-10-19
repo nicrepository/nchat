@@ -61,6 +61,18 @@ if sed -n '/nchat-chat-https:/,/nchat-files:/p' "$TRAEFIK_DYNAMIC_CONFIG" | grep
   exit 1
 fi
 
+# Issue #902: notification-service registers Web Push WITH the public prefix
+# (httpapi.RoutePushConfig is /api/notifications/push/config) and only its
+# probes without it. The local gateway must therefore rewrite exactly the three
+# probes and forward every other path verbatim. The check resolves the
+# middlewares each notifications router really uses, so renaming one does not
+# get around it. The k8s overlays carry no Traefik path middleware for it.
+python3 "$ROOT_DIR/scripts/ci/check_gateway_notifications.py" "$TRAEFIK_DYNAMIC_CONFIG"
+if grep -rqE 'strip-?notifications' "$ROOT_DIR/infra/k8s"; then
+  echo "No k8s overlay may strip /api/notifications: notification-service routes carry the prefix." >&2
+  exit 1
+fi
+
 # RF-32 (issue #458): the gateway must never buffer an upload body.
 #
 # Traefik's buffering middleware is the only native way to cap a request body,

@@ -631,8 +631,8 @@ func TestARefusedTokenIsRefusedWithoutSayingWhy(t *testing.T) {
 //
 // This is a partial wiring, constructed directly here. The production path
 // cannot produce it — WithPushSubscriptions takes all three together, and the
-// app either applies it or mounts nothing, which is the 404 that
-// TestRoutesAreAbsentWhenTheHandlerIsNotWired covers.
+// app either applies it or applies nothing, which is the 503 that
+// TestRoutesRefuseWith503WhenTheHandlerIsNotWired covers.
 func TestUnconfiguredAuthenticationRefusesInsteadOfServing(t *testing.T) {
 	for name, option := range map[string]Option{
 		"no validator": WithPushSubscriptions(nil, &fakeResolver{},
@@ -651,19 +651,25 @@ func TestUnconfiguredAuthenticationRefusesInsteadOfServing(t *testing.T) {
 			if response.Code != http.StatusServiceUnavailable {
 				t.Fatalf("status = %d", response.Code)
 			}
+			if code := errorCode(t, response); code != "service_unavailable" {
+				t.Fatalf("code = %q, want service_unavailable", code)
+			}
 		})
 	}
 }
 
-// Without the handler the routes are not mounted at all, and the catch-all
-// answers. Nothing here may become an unauthenticated success.
-func TestRoutesAreAbsentWhenTheHandlerIsNotWired(t *testing.T) {
+// Without the handler the routes are still registered but refuse everyone with
+// 503 (issue #902). Nothing here may become an unauthenticated success.
+func TestRoutesRefuseWith503WhenTheHandlerIsNotWired(t *testing.T) {
 	router := NewRouter(testConfig(), platformlog.New("notification-service", "test"))
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RoutePushSubscriptions, nil))
-	if response.Code != http.StatusNotFound {
+	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d", response.Code)
+	}
+	if code := errorCode(t, response); code != "service_unavailable" {
+		t.Fatalf("code = %q, want service_unavailable", code)
 	}
 }
 

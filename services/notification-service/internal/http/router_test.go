@@ -230,3 +230,82 @@ func TestMetricsRouteReturns200(t *testing.T) {
 		t.Fatal("expected non-empty metrics body")
 	}
 }
+
+// errorCode reads the machine-readable code of the error envelope. The code is
+// the contract; the message beside it is prose and is deliberately not asserted.
+func errorCode(t *testing.T, response *httptest.ResponseRecorder) string {
+	t.Helper()
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode error envelope: %v (%s)", err, response.Body.String())
+	}
+	return envelope.Error.Code
+}
+
+// Issue #902: the push routes are registered whether or not the subscription
+// dependencies were wired. A process that could not build them answers 503 from
+// Authenticate, never the catch-all's 404, and never runs a handler.
+func TestPushRoutesWithoutSubscriptionWiringAnswer503(t *testing.T) {
+	router := NewRouter(config.Config{ServiceName: "notification-service"}, nil)
+	for _, route := range []struct{ method, path string }{
+		{http.MethodGet, RoutePushConfig},
+		{http.MethodGet, RoutePushSubscriptions},
+		{http.MethodPost, RoutePushSubscriptions},
+		{http.MethodDelete, RoutePushSubscriptions + "/abc"},
+	} {
+		request := httptest.NewRequest(route.method, route.path, nil)
+		request.Header.Set("Authorization", "Bearer token")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s %s: status = %d, want 503", route.method, route.path, response.Code)
+		}
+		if code := errorCode(t, response); code != "service_unavailable" {
+			t.Fatalf("%s %s: code = %q, want service_unavailable", route.method, route.path, code)
+		}
+	}
+}
+
+// Issue #902: registering the routes unconditionally must not widen the surface.
+// A path nobody registered is still 404, a method nobody registered is still
+// answered by the catch-all (404, as before), and validator plus resolver
+// without a handler never reach a handler.
+func TestPushRouteSurfaceStaysClosedWhereItWasClosed(t *testing.T) {
+	wired := configRouter(workingNotificationConfig(), running)
+	for _, c := range []struct {
+		method, path string
+		want         int
+	}{
+		{http.MethodGet, "/api/notifications/push/unknown", http.StatusNotFound},
+		{http.MethodPost, RoutePushConfig, http.StatusNotFound},
+		{http.MethodDelete, RoutePushConfig, http.StatusNotFound},
+	} {
+		request := httptest.NewRequest(c.method, c.path, nil)
+		request.Header.Set("Authorization", "Bearer token")
+		response := httptest.NewRecorder()
+		wired.ServeHTTP(response, request)
+		if response.Code != c.want {
+			t.Fatalf("%s %s: status = %d, want %d", c.method, c.path, response.Code, c.want)
+		}
+		if code := errorCode(t, response); code != httputil.ErrCodeNotFound {
+			t.Fatalf("%s %s: code = %q, want %s", c.method, c.path, code, httputil.ErrCodeNotFound)
+		}
+	}
+
+	partial := NewRouter(workingNotificationConfig(), nil, WithPushSubscriptions(
+		fakeValidator{}, &fakeResolver{}, nil))
+	request := httptest.NewRequest(http.MethodPost, RoutePushSubscriptions, nil)
+	request.Header.Set("Authorization", "Bearer token")
+	response := httptest.NewRecorder()
+	partial.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("handler-less wiring: status = %d, want 503", response.Code)
+	}
+	if code := errorCode(t, response); code != "service_unavailable" {
+		t.Fatalf("handler-less wiring: code = %q, want service_unavailable", code)
+	}
+}
