@@ -146,8 +146,8 @@ func TestPushConfigReportsAStoppedWorkerAsUnavailableNotUnconfigured(t *testing.
 		t.Fatalf("status with a stopped worker = %d (%s)", response.Code, response.Body.String())
 	}
 	body := response.Body.String()
-	if !strings.Contains(body, errCodePushDeliveryUnavailable) {
-		t.Fatalf("body = %s, want the %s code", body, errCodePushDeliveryUnavailable)
+	if code := errorCode(t, response); code != errCodePushDeliveryUnavailable {
+		t.Fatalf("code = %q, want %s", code, errCodePushDeliveryUnavailable)
 	}
 	if strings.Contains(body, cfg.WebPush.VAPIDPublicKey) || strings.Contains(body, "vapid_public_key") {
 		t.Fatalf("a stopped worker still offered a key to subscribe with: %s", body)

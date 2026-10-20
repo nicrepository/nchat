@@ -29,12 +29,12 @@ type routerOptions struct {
 	// tokenValidator and principalResolver authenticate the push subscription
 	// routes. All three are set together by WithPushSubscriptions, and a process
 	// that cannot serve the feature — no database, no usable signing secret —
-	// simply never applies that option, so all three stay nil and the routes are
-	// not mounted at all. Such a request is answered by the catch-all: 404.
+	// simply never applies that option, so all three stay nil and Authenticate
+	// answers every push route with 503.
 	tokenValidator    accessTokenValidator
 	principalResolver PrincipalResolver
 	// pushSubscriptions serves those routes once they are authenticated. Nil is
-	// what mountPushSubscriptionRoutes reads as "this build does not serve them".
+	// what mountPushSubscriptionRoutes reads as "nothing to serve them with".
 	pushSubscriptions *PushSubscriptionHandler
 }
 
@@ -109,20 +109,18 @@ func NewRouter(cfg config.Config, logger *slog.Logger, opts ...Option) http.Hand
 // mounts a handler without it: a route that could ever be reached unauthenticated
 // would be one that reads or writes somebody's subscriptions with no idea whose.
 //
-// No handler means the routes are not registered and the catch-all answers 404,
-// which is how a process without a database or a signing secret behaves — see
-// pushSubscriptionOptions in the app package. A handler present without its two
-// authentication dependencies is a partial wiring the production path cannot
-// produce, because WithPushSubscriptions takes all three together; should a
-// caller construct it anyway, Authenticate refuses every request with 503 rather
-// than letting one through.
+// The routes are registered even when the process could not build what serves
+// them — no database, no usable signing secret (see pushSubscriptionOptions in
+// the app package). Authenticate then refuses every request with 503, so a client
+// is told the service is not ready rather than that the route does not exist
+// (issue #902). A handler without both authentication dependencies is treated the
+// same way, so a partial wiring can never reach a handler.
 func mountPushSubscriptionRoutes(mux *http.ServeMux, cfg config.Config, options routerOptions) {
+	validator, resolver := options.tokenValidator, options.principalResolver
 	if options.pushSubscriptions == nil {
-		return
+		validator, resolver = nil, nil
 	}
-	authenticate := Authenticate(options.tokenValidator, options.principalResolver)
-	// Mounted with the subscription routes and never without them: a key a
-	// browser cannot register a subscription for is a key it has no use for.
+	authenticate := Authenticate(validator, resolver)
 	mux.Handle("GET "+RoutePushConfig,
 		authenticate(PushConfig(cfg, options.notificationWorkerProbe)))
 	mux.Handle("POST "+RoutePushSubscriptions,

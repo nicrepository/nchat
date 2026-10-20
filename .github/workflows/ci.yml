@@ -487,6 +487,8 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Check dev environment config
         run: pnpm dev:env:config-check
+      - name: Test the notifications gateway guard
+        run: pnpm gateway:notifications-check-test
       - name: Check local gateway config
         run: pnpm gateway:config-check
       - name: Check web security headers
