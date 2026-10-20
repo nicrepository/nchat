@@ -41,9 +41,10 @@ export interface NavDrawer {
 /**
  * `openOnEntry` is read once, on mount (issue #1123): the shell asks for the
  * navigation to be the first thing on screen when it is entered straight after
- * a sign-in. It only takes effect at drawer widths — a column is already on
- * screen — and nothing later re-reads it, so a rerender, a resize or a route
- * change can never reopen the drawer on its own.
+ * a sign-in, or by reloading the page (issue #1130). It only takes effect at
+ * drawer widths — a column is already on screen — and nothing later re-reads
+ * it, so a rerender, a resize or a route change can never reopen the drawer on
+ * its own.
  */
 export function useNavDrawer(pathname: string, openOnEntry = false): NavDrawer {
   const isDrawer = useMediaQuery(NAV_DRAWER_QUERY);

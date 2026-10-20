@@ -33,6 +33,7 @@ import {
 import { useChatSidebar } from "./useChatSidebar";
 import { useConversationDrafts, type ConversationDraftsApi } from "./useConversationDrafts";
 import { clearFreshLogin, isFreshLogin, onAuthChange } from "../lib/authSession";
+import { useDocumentReloadEntry } from "../lib/documentEntry";
 import { disposeNotificationSoundPlayer } from "../notifications/notificationSound";
 import { createCommandRegistry } from "../commands/commandRegistry";
 import KeyboardShortcutsDialog from "../commands/KeyboardShortcutsDialog";
@@ -491,15 +492,17 @@ export default function AppShell() {
   // The navigation is a column on wide viewports and a drawer below them
   // (issue #467). Only the open/closed boolean lives here; which of the two it
   // is at a given width is decided in AppShell.css.
-  // Entered straight after a sign-in, it starts open so the conversation list
-  // is the first thing on screen (issue #1123).
+  // Entered straight after a sign-in (issue #1123) or by reloading the page
+  // (issue #1130), it starts open so the conversation list is the first thing
+  // on screen.
   const loginEntry = useLoginEntry();
+  const reloadEntry = useDocumentReloadEntry();
   const {
     open: navOpen,
     modal: navModal,
     toggle: toggleNav,
     close: setNavClosed,
-  } = useNavDrawer(pathname, loginEntry);
+  } = useNavDrawer(pathname, loginEntry || reloadEntry);
   const navToggleRef = useRef<HTMLButtonElement>(null);
   // Closing always hands focus back to the control that opened the drawer: it
   // is the one element that is on screen in every drawer state, so a keyboard

@@ -1215,7 +1215,7 @@ test.describe("navegação de entrada após login (#1123)", () => {
     { viewport: { width: 768, height: 1024 }, fullWidth: false },
     { viewport: { width: 1023, height: 768 }, fullWidth: false },
   ]) {
-    test(`${viewport.width}x${viewport.height}: login mostra a lista, escolher fecha e refresh não reabre`, async ({
+    test(`${viewport.width}x${viewport.height}: login mostra a lista, escolher fecha e refresh reabre sobre a conversa`, async ({
       page,
     }, testInfo) => {
       await page.setViewportSize(viewport);
@@ -1241,11 +1241,15 @@ test.describe("navegação de entrada após login (#1123)", () => {
       await expect(page.getByTestId("chat-sidebar")).toBeHidden();
       await expect(navToggle(page)).toBeFocused();
 
-      // Refresh da conversa aberta não é um novo login.
+      // Refresh da conversa aberta (#1130): a navegação volta a abrir, sobre a
+      // mesma rota, e fechá-la mostra a mesma conversa.
+      const url = page.url();
       await page.reload();
-      await expect(page.getByTestId("chat-msg-header")).toContainText(OTHER_CHANNEL_NAME);
-      await expect(navToggle(page)).toHaveAttribute("aria-expanded", "false");
+      await expectEntryNavigationOpen(page, new URL(url).pathname);
+      await page.keyboard.press("Escape");
       await expect(page.getByTestId("chat-sidebar")).toBeHidden();
+      await expect(page).toHaveURL(url);
+      await expect(page.getByTestId("chat-msg-header")).toContainText(OTHER_CHANNEL_NAME);
     });
   }
 
@@ -1389,4 +1393,195 @@ test.describe("navegação de entrada após login (#1123)", () => {
     await expect(navToggle(page)).toHaveAttribute("aria-expanded", "false");
     await expect(page.getByTestId("chat-sidebar")).toBeHidden();
   });
+});
+
+/**
+ * ISSUE #1130 — reloading an authenticated tab at drawer widths starts with the
+ * navigation open as well, over the route that was reloaded. A seeded session
+ * (sessionStorage, which a reload keeps) is the authenticated tab; the first
+ * `goto` is a direct navigation, never a reload, so each test also proves the
+ * deep link opened directly keeps showing its destination.
+ */
+test.describe("navegação de entrada após reload (#1130)", () => {
+  const socketLifecycle = (page: Page) =>
+    page.evaluate(() =>
+      (
+        window as unknown as {
+          __e2eWebSocketLifecycle: () => { created: number; closed: number; active: number };
+        }
+      ).__e2eWebSocketLifecycle(),
+    );
+
+  for (const { kind, conversationType, name } of [
+    { kind: "channel", conversationType: undefined, name: "Canal recarregado" },
+    { kind: "dm", conversationType: "direct", name: "Pessoa recarregada" },
+    { kind: "dm", conversationType: "group", name: "Grupo recarregado" },
+  ] as const) {
+    test(`celular: reload em ${conversationType ?? kind} abre a navegação e preserva a conversa`, async ({
+      page,
+    }, testInfo) => {
+      await page.setViewportSize(PHONE);
+      const targetId = uniqueId(testInfo, "reload-entry");
+      await installMessagingMocks(
+        page,
+        createScenario({ kind, conversationType, targetId, targetName: name, messages: [] }),
+      );
+      const url = `/chat/${kind}/${targetId}`;
+
+      // Deep link aberto diretamente: o destino, não a lista.
+      await page.goto(url);
+      await expect(page.getByTestId("chat-msg-header")).toContainText(name);
+      await expect(navToggle(page)).toHaveAttribute("aria-expanded", "false");
+      await expect(page.getByTestId("chat-sidebar")).toBeHidden();
+
+      await page.reload();
+      await expectEntryNavigationOpen(page, url);
+      await expect(page.getByRole("option", { name: new RegExp(name) })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      const sockets = await socketLifecycle(page);
+
+      await navToggle(page).click();
+      await expect(page.getByTestId("chat-sidebar")).toBeHidden();
+      await expect(page.getByRole("main")).not.toHaveAttribute("inert", "");
+      await expect(navToggle(page)).toBeFocused();
+      await expect(page).toHaveURL(url);
+      await expect(page.getByTestId("chat-msg-header")).toContainText(name);
+      expect(await socketLifecycle(page)).toEqual(sockets);
+      await expectNoHorizontalScroll(page);
+    });
+  }
+
+  for (const viewport of [
+    { width: 360, height: 800 },
+    { width: 390, height: 844 },
+    { width: 768, height: 1024 },
+    { width: 1023, height: 768 },
+  ]) {
+    test(`${viewport.width}x${viewport.height}: reload na Home abre a navegação`, async ({
+      page,
+    }, testInfo) => {
+      await page.setViewportSize(viewport);
+      await installMessagingMocks(
+        page,
+        createScenario({
+          kind: "channel",
+          targetId: uniqueId(testInfo, "reload-home"),
+          targetName: LONG_NAME,
+          messages: [],
+        }),
+      );
+      await page.goto("/chat");
+      await expect(page.getByTestId("chat-sidebar")).toBeHidden();
+
+      await page.reload();
+      await expectEntryNavigationOpen(page);
+      await expectNoHorizontalScroll(page);
+
+      await page.keyboard.press("Escape");
+      await expect(page.getByTestId("chat-sidebar")).toBeHidden();
+      await expect(navToggle(page)).toBeFocused();
+      await expect(page).toHaveURL("/chat");
+    });
+  }
+
+  test("após o reload, rascunho, rolagem e não lidas sobrevivem a abrir e fechar a navegação", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize(PHONE);
+    const { targetId } = await installSignedOutStart(page, testInfo);
+    await page.goto("/login");
+    await signInWithForm(page);
+    await expectEntryNavigationOpen(page);
+    await page.getByRole("option", { name: new RegExp(LONG_NAME.slice(0, 20)) }).click();
+    await expect(page).toHaveURL(`/chat/channel/${targetId}`);
+
+    await page.reload();
+    await expectEntryNavigationOpen(page, `/chat/channel/${targetId}`);
+    await expect(pendingBadge(page)).toHaveAttribute("aria-label", "4 não lidas");
+    await page.keyboard.press("Escape");
+
+    const list = page.locator(".chat-msg-area__list");
+    await expect
+      .poll(() => list.evaluate((el) => el.scrollHeight - el.clientHeight))
+      .toBeGreaterThan(200);
+    await list.evaluate((el) => {
+      el.scrollTop = Math.round((el.scrollHeight - el.clientHeight) / 2);
+    });
+    const kept = await settledScrollTop(list);
+    await fillComposer(page, "rascunho depois do reload");
+
+    await navToggle(page).click();
+    await expect(page.getByTestId("chat-sidebar")).toBeVisible();
+    await expect(pendingBadge(page)).toHaveAttribute("aria-label", "4 não lidas");
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("chat-sidebar")).toBeHidden();
+
+    expect(await settledScrollTop(list)).toBe(kept);
+    await expect(composer(page)).toContainText("rascunho depois do reload");
+    await expect(page).toHaveURL(`/chat/channel/${targetId}`);
+  });
+
+  test("após o reload, escolher, voltar no histórico e redimensionar não reabrem a navegação", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize(PHONE);
+    await installMessagingMocks(
+      page,
+      createScenario({
+        kind: "channel",
+        targetId: uniqueId(testInfo, "reload-internal"),
+        targetName: LONG_NAME,
+        messages: [],
+      }),
+    );
+    await page.goto("/chat");
+    await page.reload();
+    await expectEntryNavigationOpen(page);
+
+    await page.getByRole("option", { name: new RegExp(OTHER_CHANNEL_NAME) }).click();
+    await expect(page.getByTestId("chat-sidebar")).toBeHidden();
+    await navToggle(page).click();
+    await page.getByRole("option", { name: new RegExp(GROUP_DM_NAME) }).click();
+    await expect(page).toHaveURL(/\/chat\/dm\//);
+    await expect(page.getByTestId("chat-sidebar")).toBeHidden();
+
+    await page.goBack();
+    await expect(page.getByTestId("chat-msg-header")).toContainText(OTHER_CHANNEL_NAME);
+    for (const size of [{ width: 1024, height: 768 }, WIDE, { width: 1023, height: 768 }, PHONE]) {
+      await page.setViewportSize(size);
+      await expect(page.getByTestId("chat-msg-header")).toContainText(OTHER_CHANNEL_NAME);
+    }
+    await expect(navToggle(page)).toHaveAttribute("aria-expanded", "false");
+    await expect(page.getByTestId("chat-sidebar")).toBeHidden();
+    await expect(page.getByRole("main")).not.toHaveAttribute("inert", "");
+  });
+
+  for (const viewport of [
+    { width: 1024, height: 768 },
+    { width: 1280, height: 720 },
+    { width: 1920, height: 1080 },
+  ]) {
+    test(`${viewport.width}x${viewport.height}: reload mantém a coluna permanente, sem camada modal`, async ({
+      page,
+    }, testInfo) => {
+      await page.setViewportSize(viewport);
+      const targetId = uniqueId(testInfo, "reload-desktop");
+      await installMessagingMocks(
+        page,
+        createScenario({ kind: "channel", targetId, targetName: LONG_NAME, messages: [] }),
+      );
+      await page.goto(`/chat/channel/${targetId}`);
+      await page.reload();
+
+      await expect(page).toHaveURL(`/chat/channel/${targetId}`);
+      await expect(page.getByTestId("chat-sidebar")).toBeVisible();
+      await expect(page.getByTestId("chat-msg-header")).toContainText(LONG_NAME.slice(0, 20));
+      await expect(navToggle(page)).toBeHidden();
+      await expect(page.getByTestId("chat-nav-backdrop")).toHaveCount(0);
+      await expect(page.getByRole("main")).not.toHaveAttribute("inert", "");
+      await expectNoHorizontalScroll(page);
+    });
+  }
 });
