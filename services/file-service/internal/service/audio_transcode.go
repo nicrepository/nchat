@@ -2,15 +2,20 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	converterapi "github.com/nicrepository/nchat/services/file-service/internal/converter"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
 )
+
+// One conversion/delivery fits the existing 512 MiB pod and 64 MiB scratch volume.
+const audioConversionConcurrency = 1
 
 // AudioTranscoder produces a real MP3 encoding of arbitrary audio bytes (or an
 // audio-only WebM/MP4 recording), through the document-converter sidecar's
@@ -96,6 +101,21 @@ func (s *AttachmentService) downloadTranscodedAudio(
 	if record.Size <= 0 || record.Size > converterapi.MaxAudioInputBytes {
 		return Download{}, domain.ErrAudioTranscodeFailed
 	}
+	if err := ctx.Err(); err != nil {
+		return Download{}, err
+	}
+	select {
+	case s.audioSlots <- struct{}{}:
+	default:
+		return Download{}, domain.ErrUnavailable
+	}
+	retained := false
+	release := func() { <-s.audioSlots }
+	defer func() {
+		if !retained {
+			release()
+		}
+	}()
 	content, err := s.openDecryptedContent(ctx, record)
 	if err != nil {
 		return Download{}, err
@@ -103,30 +123,23 @@ func (s *AttachmentService) downloadTranscodedAudio(
 	defer func() { _ = content.Close() }()
 
 	mp3, err := s.audioTranscoder.ConvertAudio(ctx, format, content)
+	if errors.Is(err, converterapi.ErrBusy) {
+		return Download{}, domain.ErrUnavailable
+	}
 	if err != nil {
 		return Download{}, fmt.Errorf("%w: %w", domain.ErrAudioTranscodeFailed, err)
 	}
 
-	file, err := os.CreateTemp("", "nchat-audio-*.mp3")
+	file, err := spoolMP3(mp3)
 	if err != nil {
-		return Download{}, fmt.Errorf("%w: create temp file", domain.ErrAudioTranscodeFailed)
+		return Download{}, err
 	}
-	if _, err := file.Write(mp3); err != nil {
-		_ = file.Close()
-		_ = os.Remove(file.Name())
-		return Download{}, fmt.Errorf("%w: write temp file", domain.ErrAudioTranscodeFailed)
-	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		_ = file.Close()
-		_ = os.Remove(file.Name())
-		return Download{}, fmt.Errorf("%w: rewind temp file", domain.ErrAudioTranscodeFailed)
-	}
-
+	retained = true
 	return Download{
 		Filename:    withMP3Extension(record.Filename),
 		ContentType: "audio/mpeg",
 		Size:        int64(len(mp3)),
-		Content:     deleteOnCloseFile{file},
+		Content:     &admittedAudioContent{ReadSeekCloser: deleteOnCloseFile{file}, release: release},
 	}, nil
 }
 
@@ -140,4 +153,37 @@ func (f deleteOnCloseFile) Close() error {
 	closeErr := f.File.Close()
 	_ = os.Remove(f.Name())
 	return closeErr
+}
+
+// Retain the admission slot through delivery so slow clients cannot accumulate
+// unbounded MP3 scratch files after the conversion itself finishes.
+type admittedAudioContent struct {
+	io.ReadSeekCloser
+	release func()
+	once    sync.Once
+}
+
+func (c *admittedAudioContent) Close() error {
+	err := c.ReadSeekCloser.Close()
+	c.once.Do(c.release)
+	return err
+}
+
+func spoolMP3(mp3 []byte) (*os.File, error) {
+	file, err := os.CreateTemp("", "nchat-audio-*.mp3")
+	if err != nil {
+		return nil, fmt.Errorf("%w: create temp file", domain.ErrAudioTranscodeFailed)
+	}
+	if _, err := file.Write(mp3); err != nil {
+		_ = file.Close()
+		_ = os.Remove(file.Name())
+		return nil, fmt.Errorf("%w: write temp file", domain.ErrAudioTranscodeFailed)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		_ = file.Close()
+		_ = os.Remove(file.Name())
+		return nil, fmt.Errorf("%w: rewind temp file", domain.ErrAudioTranscodeFailed)
+	}
+
+	return file, nil
 }

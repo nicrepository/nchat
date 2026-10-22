@@ -114,7 +114,7 @@ const claimDueScansQuery = `
 	          COALESCE(a.channel_id::text, a.conversation_id::text),
 	          a.size_bytes, a.storage_object_key, a.envelope_version,
 	          a.wrapped_dek, COALESCE(a.kek_key_id, ''), a.dek_wrap_version,
-	          a.scan_attempts`
+	          a.scan_attempts, a.original_filename, a.declared_mime, a.format_policy_version`
 
 // ClaimDueScans leases up to batchSize attachments awaiting a verdict.
 func (s *PGXScanStore) ClaimDueScans(
@@ -151,6 +151,7 @@ func (s *PGXScanStore) ClaimDueScans(
 			&job.AttachmentID, &job.WorkspaceID, &destinationKind, &destinationID,
 			&job.Size, &job.StorageObjectKey, &envelopeVersion,
 			&job.WrappedDEK, &job.KEKKeyID, &keyWrapVersion, &attempts,
+			&job.Filename, &job.DeclaredMIME, &job.PolicyVersion,
 		); err != nil {
 			return nil, fmt.Errorf("scan claimed attachment: %w", err)
 		}

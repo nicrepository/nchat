@@ -1,11 +1,6 @@
 package service_test
 
-// Nic-Gravador compatibility task: Download must serve a real MP3 for any
-// audio attachment or voice message that is not already one, never the
-// stored container merely renamed. These tests exercise that behaviour
-// through the exported Download API, the same way every other download test
-// in this package does, with a fake AudioTranscoder standing in for the
-// document-converter sidecar.
+// Audio conversion is an explicit derivative; Download preserves the original.
 
 import (
 	"bytes"
@@ -26,9 +21,10 @@ import (
 // Recording every call's format is what lets a test assert *which* container
 // Download decided this attachment was, not just that some conversion ran.
 type fakeAudioTranscoder struct {
-	calls []converterapi.AudioFormat
-	mp3   []byte
-	err   error
+	calls     []converterapi.AudioFormat
+	mp3       []byte
+	err       error
+	onConvert func()
 }
 
 func (f *fakeAudioTranscoder) ConvertAudio(
@@ -39,6 +35,9 @@ func (f *fakeAudioTranscoder) ConvertAudio(
 	// test that forgets to close the upstream decrypted reader still behaves
 	// like production would, rather than leaving it half-read.
 	_, _ = io.Copy(io.Discard, source)
+	if f.onConvert != nil {
+		f.onConvert()
+	}
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -46,6 +45,18 @@ func (f *fakeAudioTranscoder) ConvertAudio(
 }
 
 const fakeMP3Payload = "\xff\xfb\x90\x44FAKE-MP3-PAYLOAD"
+
+func TestAudioDerivativeRechecksQuarantineAfterConversion(t *testing.T) {
+	f := newFixture(t)
+	payload := append([]byte("OggS"), make([]byte, 40)...)
+	record := uploadWithPurpose(t, f, payload, "recording.ogg", "audio/ogg", "", domain.StatusClean)
+	f.store.authorized = record
+	f.service.SetAudioTranscoder(&fakeAudioTranscoder{mp3: []byte(fakeMP3Payload), onConvert: func() { f.store.authorized.Status = domain.StatusRejected }})
+	_, err := f.service.DownloadMP3(context.Background(), downloadInput(record.ID))
+	if !errors.Is(err, domain.ErrNotDownloadable) {
+		t.Fatalf("derivative bypassed concurrent rejection: %v", err)
+	}
+}
 
 // uploadWithPurpose mirrors storedAttachment (attachment_service_test.go) but
 // lets the caller choose the upload purpose and declared MIME, and override
@@ -69,19 +80,20 @@ func uploadWithPurpose(
 		t.Fatalf("seed upload: %v", err)
 	}
 	created, uploaded, _ := f.store.snapshot()
+	index := len(created) - 1
 	return service.StoredAttachment{
 		ID: view.ID, WorkspaceID: testWorkspaceID, Kind: domain.DestinationKindChannel,
 		Status: status, Filename: view.Filename,
-		DeclaredMIME: created[0].DeclaredMIME, DetectedMIME: uploaded[0].DetectedMIME,
-		Size: uploaded[0].Size, StorageObjectKey: created[0].StorageObjectKey,
-		EnvelopeVersion:    created[0].EnvelopeVersion,
-		WrappedDEK:         uploaded[0].WrappedDEK,
-		KEKKeyID:           uploaded[0].KEKKeyID,
-		KeyWrapVersion:     created[0].KeyWrapVersion,
+		DeclaredMIME: created[index].DeclaredMIME, DetectedMIME: uploaded[index].DetectedMIME,
+		Size: uploaded[index].Size, StorageObjectKey: created[index].StorageObjectKey,
+		EnvelopeVersion:    created[index].EnvelopeVersion,
+		WrappedDEK:         uploaded[index].WrappedDEK,
+		KEKKeyID:           uploaded[index].KEKKeyID,
+		KeyWrapVersion:     created[index].KeyWrapVersion,
 		CreatedAt:          time.Now().UTC(),
 		SessionExpiresAt:   time.Now().Add(time.Hour),
-		AudioKind:          created[0].AudioKind,
-		DeclaredDurationMs: created[0].DeclaredDurationMs,
+		AudioKind:          created[index].AudioKind,
+		DeclaredDurationMs: created[index].DeclaredDurationMs,
 	}
 }
 
@@ -93,7 +105,7 @@ func TestDownloadTranscodesOggAudioToRealMP3(t *testing.T) {
 	record := uploadWithPurpose(t, f, payload, "recording.ogg", "audio/ogg", "", domain.StatusClean)
 	f.store.authorized = record
 
-	download, err := f.service.Download(context.Background(), downloadInput(record.ID))
+	download, err := f.service.DownloadMP3(context.Background(), downloadInput(record.ID))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -127,7 +139,7 @@ func TestDownloadTranscodesWavAudioToRealMP3(t *testing.T) {
 	record := uploadWithPurpose(t, f, payload, "clip.wav", "audio/wav", "", domain.StatusClean)
 	f.store.authorized = record
 
-	download, err := f.service.Download(context.Background(), downloadInput(record.ID))
+	download, err := f.service.DownloadMP3(context.Background(), downloadInput(record.ID))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -163,7 +175,7 @@ func TestDownloadTranscodesVoiceWebMToRealMP3(t *testing.T) {
 		t.Fatalf("test setup: expected the upload to be tagged voice, got %q", record.AudioKind)
 	}
 
-	download, err := f.service.Download(context.Background(), downloadInput(record.ID))
+	download, err := f.service.DownloadMP3(context.Background(), downloadInput(record.ID))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -198,7 +210,7 @@ func TestDownloadTranscodesVoiceMP4ToRealMP3(t *testing.T) {
 		t.Fatalf("test setup: expected the upload to be tagged voice, got %q", record.AudioKind)
 	}
 
-	download, err := f.service.Download(context.Background(), downloadInput(record.ID))
+	download, err := f.service.DownloadMP3(context.Background(), downloadInput(record.ID))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -259,17 +271,24 @@ func TestDownloadPassesThroughAlreadyMP3AudioWithoutTranscoding(t *testing.T) {
 	transcoder := &fakeAudioTranscoder{mp3: []byte(fakeMP3Payload)}
 	f.service.SetAudioTranscoder(transcoder)
 	payload := append([]byte("ID3"), bytes.Repeat([]byte("x"), 40)...)
-	record := uploadWithPurpose(t, f, payload, "song.MID3", "audio/mpeg", "", domain.StatusClean)
+	record := uploadWithPurpose(t, f, payload, "song.mp3", "audio/mpeg", "", domain.StatusClean)
 	f.store.authorized = record
 	if record.DetectedMIME != "audio/mpeg" {
 		t.Fatalf("test setup: expected the upload to sniff as audio/mpeg, got %q", record.DetectedMIME)
 	}
 
-	download, err := f.service.Download(context.Background(), downloadInput(record.ID))
+	download, err := f.service.DownloadMP3(context.Background(), downloadInput(record.ID))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	defer func() { _ = download.Content.Close() }()
+
+	if f.store.authorizedCalls != 1 {
+		t.Fatalf("MP3 metadata queried %d times", f.store.authorizedCalls)
+	}
+	if download.ContentType != "audio/mpeg" {
+		t.Fatalf("MP3 content type=%s", download.ContentType)
+	}
 
 	if !strings.HasSuffix(download.Filename, ".mp3") {
 		t.Fatalf("filename = %q, want a .mp3 suffix", download.Filename)
@@ -295,9 +314,12 @@ func TestDownloadPassThroughAlreadyMP3PropagatesStorageFailure(t *testing.T) {
 	f.store.authorized = record
 	f.objects.openErr = domain.ErrUnavailable
 
-	_, err := f.service.Download(context.Background(), downloadInput(record.ID))
+	download, err := f.service.DownloadMP3(context.Background(), downloadInput(record.ID))
 	if !errors.Is(err, domain.ErrUnavailable) {
 		t.Fatalf("error = %v, want ErrUnavailable", err)
+	}
+	if download.Filename != "" || download.Content != nil {
+		t.Fatal("failed open returned populated download")
 	}
 	if errors.Is(err, domain.ErrAudioTranscodeFailed) {
 		t.Fatal("already-MP3 content never transcodes, so its storage failure is not a transcode failure")
@@ -315,7 +337,7 @@ func TestDownloadFailsWhenTranscodingFailsRatherThanServingTheOriginal(t *testin
 	record := uploadWithPurpose(t, f, payload, "recording.ogg", "audio/ogg", "", domain.StatusClean)
 	f.store.authorized = record
 
-	download, err := f.service.Download(context.Background(), downloadInput(record.ID))
+	download, err := f.service.DownloadMP3(context.Background(), downloadInput(record.ID))
 	if !errors.Is(err, domain.ErrAudioTranscodeFailed) {
 		t.Fatalf("error = %v, want ErrAudioTranscodeFailed", err)
 	}
@@ -359,7 +381,7 @@ func TestDownloadRejectsAudioOverTheTranscodeSizeCapWithoutReadingIt(t *testing.
 	record.Size = converterapi.MaxAudioInputBytes + 1
 	f.store.authorized = record
 
-	_, err := f.service.Download(context.Background(), downloadInput(record.ID))
+	_, err := f.service.DownloadMP3(context.Background(), downloadInput(record.ID))
 	if !errors.Is(err, domain.ErrAudioTranscodeFailed) {
 		t.Fatalf("error = %v, want ErrAudioTranscodeFailed", err)
 	}
@@ -381,7 +403,7 @@ func TestDownloadTranscodePropagatesAStorageFailureWithoutCallingTheTranscoder(t
 	f.store.authorized = record
 	f.objects.openErr = domain.ErrUnavailable
 
-	_, err := f.service.Download(context.Background(), downloadInput(record.ID))
+	_, err := f.service.DownloadMP3(context.Background(), downloadInput(record.ID))
 	if !errors.Is(err, domain.ErrUnavailable) {
 		t.Fatalf("error = %v, want ErrUnavailable", err)
 	}
@@ -408,7 +430,7 @@ func TestDownloadTranscodedFilenameFallsBackWhenTheStoredNameIsEmpty(t *testing.
 	record.Filename = ""
 	f.store.authorized = record
 
-	download, err := f.service.Download(context.Background(), downloadInput(record.ID))
+	download, err := f.service.DownloadMP3(context.Background(), downloadInput(record.ID))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -434,7 +456,7 @@ func TestDownloadTranscodedFilenameFallsBackWhenTheStoredNameIsInvalidUTF8(t *te
 	record.Filename = string([]byte{0xff, 0xfe, 0x00})
 	f.store.authorized = record
 
-	download, err := f.service.Download(context.Background(), downloadInput(record.ID))
+	download, err := f.service.DownloadMP3(context.Background(), downloadInput(record.ID))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -461,8 +483,20 @@ func TestDownloadTranscodeFailsCleanlyWhenTheTempFileCannotBeCreated(t *testing.
 	// without touching the real temp directory any other test relies on.
 	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "does-not-exist"))
 
-	_, err := f.service.Download(context.Background(), downloadInput(record.ID))
+	_, err := f.service.DownloadMP3(context.Background(), downloadInput(record.ID))
 	if !errors.Is(err, domain.ErrAudioTranscodeFailed) {
 		t.Fatalf("error = %v, want ErrAudioTranscodeFailed", err)
+	}
+}
+
+func TestMP3LookupCancellationDoesNotOpenStorage(t *testing.T) {
+	f := newFixture(t)
+	f.store.authorizedErr = context.Canceled
+	_, err := f.service.DownloadMP3(context.Background(), downloadInput(testChannelID))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("lookup cancellation=%v", err)
+	}
+	if f.objects.openCount() != 0 {
+		t.Fatal("cancelled lookup opened storage")
 	}
 }

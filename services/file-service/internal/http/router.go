@@ -112,13 +112,14 @@ func registerAttachmentRoutes(
 	mux.Handle("GET "+RouteAttachment, authenticated(http.HandlerFunc(handler.GetMetadata)))
 	mux.Handle("DELETE "+RouteAttachment, authenticated(rateLimited(http.HandlerFunc(handler.CancelDraft))))
 	mux.Handle("GET "+RouteAttachmentContent, authenticated(http.HandlerFunc(handler.DownloadContent)))
+	mux.Handle("GET /attachments/{attachmentID}/audio.mp3", authenticated(rateLimited(http.HandlerFunc(handler.DownloadMP3))))
 	// The preview is authenticated exactly like the content it is derived from,
 	// and is not rate limited for the same reason the listing is not: it is a
 	// read, and the upload budget exists to protect writes.
 	mux.Handle("GET "+RouteAttachmentPreview, authenticated(http.HandlerFunc(handler.GetPreview)))
 	mux.Handle("GET "+RouteDocumentPreview, authenticated(http.HandlerFunc(handler.GetDocumentPreviewManifest)))
 	mux.Handle("GET "+RouteDocumentPreviewPage, authenticated(http.HandlerFunc(handler.GetDocumentPreviewPage)))
-	mux.Handle("POST "+RouteDocumentPreviewRegenerate, authenticated(http.HandlerFunc(handler.RegenerateDocumentPreview)))
+	mux.Handle("POST "+RouteDocumentPreviewRegenerate, authenticated(rateLimited(http.HandlerFunc(handler.RegenerateDocumentPreview))))
 }
 
 // registerLinkPreviewRoute wires RF-10.
