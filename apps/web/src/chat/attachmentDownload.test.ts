@@ -12,11 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mockContent = vi.hoisted(() => vi.fn());
 vi.mock("./filesApi", () => ({ fetchAttachmentContent: mockContent }));
 
-import {
-  attachmentDownloadFilename,
-  saveAttachmentToDisk,
-  voiceMessageFilename,
-} from "./attachmentDownload";
+import { attachmentDownloadFilename, saveAttachmentToDisk } from "./attachmentDownload";
 import type { ChannelAttachment } from "./chatTypes";
 
 const createObjectURL = vi.fn();
@@ -86,44 +82,14 @@ describe("saveAttachmentToDisk", () => {
   });
 });
 
-describe("voiceMessageFilename", () => {
-  // A message's attachment carries no date of its own (chat-service dates it by
-  // the message), so the name is built from the message's timestamp.
-  const SENT_AT = "2026-07-15T12:04:00.000Z";
-
-  it("names a recording by when it was sent, with a .mp3 extension regardless of the recorded container", () => {
-    // Local time by construction: the viewer reads their own clock, not UTC.
-    const sentAt = new Date(SENT_AT);
-    const pad = (value: number) => String(value).padStart(2, "0");
-    const expected =
-      `mensagem-de-voz-${sentAt.getFullYear()}-${pad(sentAt.getMonth() + 1)}` +
-      `-${pad(sentAt.getDate())}-${pad(sentAt.getHours())}${pad(sentAt.getMinutes())}.mp3`;
-
-    expect(voiceMessageFilename(SENT_AT)).toBe(expected);
-  });
-
-  it("keeps the .mp3 extension no matter what the recorded container's own extension is", () => {
-    // file-service always re-encodes voice-message downloads to real MP3 (see
-    // Download's audioTranscodeFormat) — this file never had to know the
-    // recorded container's extension to begin with, so there is nothing left
-    // to vary here.
-    expect(voiceMessageFilename(SENT_AT)).toMatch(/\.mp3$/);
-  });
-
-  it("uses .mp3 when the send time is missing or unusable", () => {
-    expect(voiceMessageFilename("")).toBe("mensagem-de-voz.mp3");
-    expect(voiceMessageFilename("ontem")).toBe("mensagem-de-voz.mp3");
-  });
-});
-
 describe("attachmentDownloadFilename", () => {
-  it("swaps a non-voice audio file's extension to .mp3", () => {
+  it("preserves a non-voice audio file's native extension", () => {
     const audioFile = attachment({
       filename: "gravação.ogg",
       contentType: "audio/ogg",
       audioKind: undefined,
     });
-    expect(attachmentDownloadFilename(audioFile)).toBe("gravação.mp3");
+    expect(attachmentDownloadFilename(audioFile)).toBe("gravação.ogg");
   });
 
   it("leaves a non-audio attachment's filename untouched", () => {
@@ -144,12 +110,12 @@ describe("attachmentDownloadFilename", () => {
     expect(attachmentDownloadFilename(noName)).toBe("arquivo");
   });
 
-  it("is case-insensitive about the extension it replaces", () => {
+  it("preserves upper-case native extensions", () => {
     const audioFile = attachment({
       filename: "gravação.OGG",
       contentType: "audio/ogg",
       audioKind: undefined,
     });
-    expect(attachmentDownloadFilename(audioFile)).toBe("gravação.mp3");
+    expect(attachmentDownloadFilename(audioFile)).toBe("gravação.OGG");
   });
 });

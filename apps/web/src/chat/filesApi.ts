@@ -268,6 +268,9 @@ export async function fetchAttachmentContent(
 export type AttachmentUploadErrorReason =
   | "too_large"
   | "unsupported"
+  | "blocked"
+  | "unrecognized"
+  | "inspection_limit"
   | "forbidden"
   | "unavailable"
   | "unknown";
@@ -318,7 +321,7 @@ function mapUploadError(error: unknown, maxUploadBytes: number | null): Attachme
     }
     switch (error.status) {
       case 415:
-        return new AttachmentUploadError("unsupported", "Formato de arquivo não suportado.");
+        return formatUploadError(error.code);
       case 401:
       case 403:
       case 404:
@@ -331,6 +334,25 @@ function mapUploadError(error: unknown, maxUploadBytes: number | null): Attachme
     }
   }
   return new AttachmentUploadError("unknown", "Não foi possível enviar o arquivo.");
+}
+
+function formatUploadError(code: string): AttachmentUploadError {
+  switch (code) {
+    case "file_policy_blocked":
+      return new AttachmentUploadError("blocked", "Arquivo bloqueado pela política de segurança.");
+    case "file_content_unrecognized":
+      return new AttachmentUploadError(
+        "unrecognized",
+        "O conteúdo não corresponde a um formato válido.",
+      );
+    case "file_inspection_limit":
+      return new AttachmentUploadError(
+        "inspection_limit",
+        "O arquivo excede os limites de inspeção segura.",
+      );
+    default:
+      return new AttachmentUploadError("unsupported", "Formato de arquivo não suportado.");
+  }
 }
 
 /**

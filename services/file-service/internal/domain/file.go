@@ -18,11 +18,14 @@ import (
 // Error categories. Handlers map these to HTTP statuses; nothing below ever
 // carries storage topology, driver text or crypto material.
 var (
-	ErrInvalidInput     = errors.New("invalid input")
-	ErrUnauthorized     = errors.New("unauthorized")
-	ErrNotFound         = errors.New("not found")
-	ErrUnavailable      = errors.New("service unavailable")
-	ErrUnsupportedMedia = fmt.Errorf("%w: unsupported media type", ErrInvalidInput)
+	ErrInvalidInput        = errors.New("invalid input")
+	ErrUnauthorized        = errors.New("unauthorized")
+	ErrNotFound            = errors.New("not found")
+	ErrUnavailable         = errors.New("service unavailable")
+	ErrUnsupportedMedia    = fmt.Errorf("%w: unsupported media type", ErrInvalidInput)
+	ErrFormatBlocked       = fmt.Errorf("%w: format blocked", ErrUnsupportedMedia)
+	ErrUnrecognizedContent = fmt.Errorf("%w: content unrecognized", ErrUnsupportedMedia)
+	ErrInspectionLimit     = fmt.Errorf("%w: inspection budget exceeded", ErrUnsupportedMedia)
 
 	// ErrTooLarge is returned when the plaintext exceeds the configured cap.
 	ErrTooLarge = errors.New("file too large")
@@ -353,7 +356,7 @@ func NormalizeFilename(raw string) (string, error) {
 
 	var builder strings.Builder
 	for _, r := range name {
-		if r == utf8.RuneError || unicode.IsControl(r) {
+		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
 			continue
 		}
 		builder.WriteRune(r)

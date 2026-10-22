@@ -943,7 +943,7 @@ func TestDownloadServesTheContentWithSafeHeaders(t *testing.T) {
 	// shared cache may keep it. Asserted on the route itself rather than on the
 	// global middleware: this response must carry the policy whoever else is in
 	// the chain.
-	if got := response.Header().Get("Cache-Control"); got != "private, no-store" {
+	if got := response.Header().Get("Cache-Control"); got != "private, no-store, no-transform" {
 		t.Fatalf("expected private, no-store, got %q", got)
 	}
 	if got := response.Header().Get("Content-Length"); got != strconv.Itoa(len(payload)) {
@@ -1159,7 +1159,7 @@ func TestDownloadServesTheRequestedByteRange(t *testing.T) {
 			// A partial response is the case that most needs the policy: a
 			// proxy caching one range of one caller's video would hand it to
 			// the next caller asking for the same bytes.
-			if got := response.Header().Get("Cache-Control"); got != "private, no-store" {
+			if got := response.Header().Get("Cache-Control"); got != "private, no-store, no-transform" {
 				t.Fatalf("expected private, no-store, got %q", got)
 			}
 			if !strings.HasPrefix(response.Header().Get("Content-Disposition"), "attachment;") {

@@ -159,3 +159,6 @@ kustomize_render.yaml
 # scripts/deploy, so running or importing any of it leaves these behind.
 __pycache__/
 *.py[cod]
+
+# Agent execution state (F-03 / #1128): local, not project source.
+/.swarm/
