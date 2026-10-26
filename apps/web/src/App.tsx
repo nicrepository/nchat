@@ -1,5 +1,5 @@
 import { lazy, Suspense } from "react";
-import { BrowserRouter, Navigate, Route, Routes } from "react-router";
+import { Navigate, Route, Routes } from "react-router";
 
 import "./App.css";
 import AdminUsersPage from "./admin/AdminUsersPage";
@@ -14,6 +14,7 @@ import ResetPasswordPage from "./auth/ResetPasswordPage";
 import AppShell from "./chat/AppShell";
 import ChatPlaceholder from "./chat/ChatPlaceholder";
 import ChatShell from "./chat/ChatShell";
+import { DocumentRouter } from "./lib/DocumentRouter";
 import ProfileSettingsShell from "./profile/ProfileSettingsShell";
 
 const AdminAntiSpamPage = lazy(() => import("./admin/AdminAntiSpamPage"));
@@ -32,7 +33,8 @@ const LiveKitSpikePage = import.meta.env.DEV
 
 export default function App() {
   return (
-    <BrowserRouter>
+    // The document's router: it also records leaving the reloaded entry (#1130).
+    <DocumentRouter>
       <Routes>
         <Route path="/login" element={<LoginPage />} />
         <Route path="/forgot-password" element={<ForgotPasswordPage />} />
@@ -170,6 +172,6 @@ export default function App() {
         <Route path="/" element={<Navigate to="/chat" replace />} />
         <Route path="*" element={<Navigate to="/chat" replace />} />
       </Routes>
-    </BrowserRouter>
+    </DocumentRouter>
   );
 }
