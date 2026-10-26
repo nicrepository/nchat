@@ -44,6 +44,24 @@ func enableUploads(t *testing.T) {
 	t.Setenv("SEAWEEDFS_FILER_URL", "http://seaweedfs-filer:8888")
 }
 
+func TestEnterpriseProfilesFailClosed(t *testing.T) {
+	for _, flag := range []string{"FILE_ENTERPRISE_DATA_ENABLED", "FILE_ENTERPRISE_OFFICE_ENABLED", "FILE_ENTERPRISE_ARCHIVES_ENABLED"} {
+		t.Run(flag, func(t *testing.T) {
+			enableUploads(t)
+			t.Setenv(flag, "invalid")
+			if err := Load().Validate(); err == nil {
+				t.Fatal("invalid profile accepted")
+			}
+			t.Setenv(flag, "true")
+			t.Setenv("FILE_MALWARE_SCAN_REQUIRED", "false")
+			t.Setenv("APP_ENV", "test")
+			if err := Load().Validate(); err == nil {
+				t.Fatal("enterprise profile bypassed antimalware")
+			}
+		})
+	}
+}
+
 func TestLoadDefaults(t *testing.T) {
 	unsetAppEnv(t)
 	cfg := Load()

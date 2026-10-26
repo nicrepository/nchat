@@ -115,9 +115,9 @@ func TestRenderXLSXFollowsWorkbookOrderThroughRelationships(t *testing.T) {
 	files := xlsxWorkbookParts(nil, `<row><c t="inlineStr"><is><t>rId1 sheet</t></is></c></row>`)
 	files["xl/workbook.xml"] = `<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>` +
 		`<sheet name="Declared first" sheetId="7" r:id="rId9"/><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>`
-	files["xl/_rels/workbook.xml.rels"] = `<Relationships>` +
-		`<Relationship Id="rId1" Target="worksheets/sheet1.xml"/>` +
-		`<Relationship Id="rId9" Target="/xl/worksheets/elsewhere.xml"/></Relationships>`
+	files["xl/_rels/workbook.xml.rels"] = `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+		`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>` +
+		`<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/elsewhere.xml"/></Relationships>`
 	files["xl/worksheets/elsewhere.xml"] = `<worksheet><sheetData><row><c t="inlineStr"><is><t>declared first</t></is></c></row></sheetData></worksheet>`
 
 	_, rows := renderXLSXRows(t, xlsxZipFixture(t, files))
@@ -273,19 +273,19 @@ func TestRenderXLSXRejectsBrokenPackages(t *testing.T) {
 		},
 		"relationship missing for the first sheet": {
 			mutate: func(files map[string]string) { files["xl/_rels/workbook.xml.rels"] = `<Relationships/>` },
-			want:   preview.ErrRender,
+			want:   preview.ErrUnsupported,
 		},
 		"relationship pointing at a missing part": {
 			mutate: func(files map[string]string) { delete(files, "xl/worksheets/sheet1.xml") },
-			want:   preview.ErrRender,
+			want:   preview.ErrUnsupported,
 		},
 		"sheet that is not XML": {
 			mutate: func(files map[string]string) { files["xl/worksheets/sheet1.xml"] = `<worksheet><sheetData><row>` },
-			want:   preview.ErrRender,
+			want:   preview.ErrUnsupported,
 		},
 		"shared strings that are not XML": {
 			mutate: func(files map[string]string) { files["xl/sharedStrings.xml"] = `<sst><si><t>x` },
-			want:   preview.ErrRender,
+			want:   preview.ErrUnsupported,
 		},
 		"sheet with no rows": {
 			mutate: func(files map[string]string) {

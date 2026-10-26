@@ -28,10 +28,10 @@ import { useId } from "react";
 
 import AttachmentThumbnail from "./AttachmentThumbnail";
 import AttachmentVideo from "./AttachmentVideo";
-import { isDocumentAttachment } from "./attachmentDocumentRules";
+import { canOpenDocumentPreview } from "./attachmentDocumentRules";
 import { useAttachmentDownload } from "./attachmentDownload";
 import { useAttachmentViewer } from "./attachmentViewer";
-import { isPreviewAvailable, type ChannelAttachment } from "./chatTypes";
+import { type ChannelAttachment } from "./chatTypes";
 import { formatFileSize } from "./conversationDetailsDisplay";
 import { AttachmentHydrationContext, useLazyAttachment } from "./lazyAttachment";
 import { formatDayLabel, formatTime } from "./messageDisplay";
@@ -120,7 +120,7 @@ function CleanFileAction({ file }: { file: ChannelAttachment }) {
   const viewer = useAttachmentViewer();
   const { state, download } = useAttachmentDownload(file);
   const metaId = useId();
-  const opensViewer = isDocumentAttachment(file) && isPreviewAvailable(file.previewStatus);
+  const opensViewer = canOpenDocumentPreview(file);
   const verb = opensViewer ? "Visualizar" : "Baixar";
 
   return (

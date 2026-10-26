@@ -3,10 +3,12 @@ package converter
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -190,5 +192,82 @@ func TestAudioRunnerConvertsRealAudioToDecodableMP3(t *testing.T) {
 				t.Fatalf("ffprobe codec_name = %q, want mp3 — the source was not actually re-encoded", codec)
 			}
 		})
+	}
+}
+
+func TestAudioRunnerAdmissionAndRelease(t *testing.T) {
+	root := t.TempDir()
+	command := filepath.Join(root, "ffmpeg")
+	writeScript(t, command, "#!/bin/sh\nexit 1\n")
+	runner := newTestAudioRunner(t, command, filepath.Join(root, "work"), time.Second)
+	runner.slots <- struct{}{}
+	if _, err := runner.ConvertAudio(context.Background(), AudioFormatOgg, []byte("OggS")); !errors.Is(err, ErrBusy) {
+		t.Fatalf("busy: %v", err)
+	}
+	<-runner.slots
+	if _, err := runner.ConvertAudio(context.Background(), AudioFormatOgg, []byte("OggS")); !errors.Is(err, ErrConversionFailed) {
+		t.Fatalf("failure: %v", err)
+	}
+	if err := os.Remove(command); err != nil {
+		t.Fatal(err)
+	}
+	writeScript(t, command, "#!/bin/sh\nfor last; do :; done\nprintf 'ID3audio' > \"$last\"\n")
+	if _, err := runner.ConvertAudio(context.Background(), AudioFormatOgg, []byte("OggS")); err != nil {
+		t.Fatalf("slot leaked after error: %v", err)
+	}
+	if len(runner.slots) != 0 {
+		t.Fatal("slot leaked after success")
+	}
+}
+
+func TestAudioRunnerCancellationCleansAndReleases(t *testing.T) {
+	root := t.TempDir()
+	command := filepath.Join(root, "ffmpeg")
+	signal := filepath.Join(root, "started")
+	blocked := filepath.Join(root, "blocked")
+	if err := syscall.Mkfifo(signal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(blocked, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The fixed test script signals process start, then blocks without a sleep.
+	writeScript(t, command, "#!/bin/sh\nprintf x > '"+signal+"'\nread line < '"+blocked+"'\n")
+	work := filepath.Join(root, "work")
+	runner := newTestAudioRunner(t, command, work, 10*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := runner.ConvertAudio(ctx, AudioFormatOgg, []byte("OggS")); done <- err }()
+	rootFS, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rootFS.Close() }()
+	reader, err := rootFS.OpenFile("started", os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Close() }()
+	started := make(chan error, 1)
+	go func() { var marker [1]byte; _, err := io.ReadFull(reader, marker[:]); started <- err }()
+	select {
+	case err := <-started:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case err := <-done:
+		t.Fatalf("process ended before barrier: %v", err)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel: %v", err)
+	}
+	entries, err := os.ReadDir(work)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("scratch leak: %v/%v", entries, err)
+	}
+	if len(runner.slots) != 0 {
+		t.Fatal("admission leaked after cancellation")
 	}
 }

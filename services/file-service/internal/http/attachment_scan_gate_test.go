@@ -288,7 +288,7 @@ func newGateFixture(t *testing.T) *gateFixture {
 		t.Fatalf("authorize upload: %v", err)
 	}
 	view, err := attachments.Upload(context.Background(), service.UploadInput{
-		Target: target, Filename: "report.bin", DeclaredMIME: "application/octet-stream",
+		Target: target, Filename: "report.txt", DeclaredMIME: "application/octet-stream",
 		Content: bytes.NewReader(gatePayload),
 	})
 	if err != nil {
@@ -300,9 +300,10 @@ func newGateFixture(t *testing.T) *gateFixture {
 	if view.Status != string(domain.StatusPendingScan) {
 		t.Fatalf("a fresh upload must be pending_scan, got %q", view.Status)
 	}
-	if objects.openCount() != 0 {
-		t.Fatalf("upload must not read the object back, opened %d times", objects.openCount())
+	if objects.openCount() == 0 {
+		t.Fatal("upload must inspect the encrypted object before finalizing")
 	}
+	objects.resetOpens()
 
 	return &gateFixture{
 		router:  newTestRouter(t, attachments, enabledConfig()),

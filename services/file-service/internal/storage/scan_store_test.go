@@ -28,6 +28,7 @@ func scanRow() []any {
 		[]byte("wrapped"), "kek-active",
 		pgtype.Int2{Int16: 2, Valid: true},
 		pgtype.Int2{Int16: 1, Valid: true},
+		"notes.txt", "text/plain", 0,
 	}
 }
 

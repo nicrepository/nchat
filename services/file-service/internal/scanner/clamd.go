@@ -318,7 +318,7 @@ func readVerdict(conn net.Conn) (Verdict, error) {
 	response := strings.TrimSpace(strings.TrimSuffix(reply, "\x00"))
 
 	switch {
-	case strings.HasSuffix(response, " OK"):
+	case response == "stream: OK":
 		return VerdictClean, nil
 	case strings.HasSuffix(response, " FOUND"):
 		// The signature name is deliberately dropped here rather than returned.

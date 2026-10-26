@@ -101,7 +101,7 @@ const claimDuePreviewsQuery = `
 	RETURNING a.id::text, a.workspace_id::text, COALESCE(a.detected_mime, ''), a.original_filename,
 	          a.size_bytes, a.storage_object_key, a.envelope_version,
 	          a.wrapped_dek, COALESCE(a.kek_key_id, ''), a.dek_wrap_version,
-	          a.preview_attempts`
+	          a.preview_attempts, a.format_policy_version, a.format_id`
 
 // ClaimDuePreviews leases up to batchSize attachments awaiting a preview.
 func (s *PGXPreviewStore) ClaimDuePreviews(
@@ -137,6 +137,7 @@ func (s *PGXPreviewStore) ClaimDuePreviews(
 			&job.AttachmentID, &job.WorkspaceID, &job.DetectedMIME, &job.OriginalFilename,
 			&job.Size, &job.StorageObjectKey, &envelopeVersion,
 			&job.WrappedDEK, &job.KEKKeyID, &keyWrapVersion, &attempts,
+			&job.PolicyVersion, &job.FormatID,
 		); err != nil {
 			return nil, fmt.Errorf("scan claimed preview: %w", err)
 		}

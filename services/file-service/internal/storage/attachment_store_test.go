@@ -36,6 +36,7 @@ func TestRegenerateDocumentPreviewUsesAnIdempotentFailedOrExpiredCAS(t *testing.
 			"preview_lifecycle_status IN ('failed', 'expired')",
 			"preview_lifecycle_status = 'pending'",
 			"preview_attempts = 0",
+			"updated_at <= now() - ($2 * interval '1 second')",
 			"status = 'clean'",
 			"deleted_at IS NULL",
 		} {
@@ -43,7 +44,7 @@ func TestRegenerateDocumentPreviewUsesAnIdempotentFailedOrExpiredCAS(t *testing.
 				t.Errorf("regeneration query missing %q:\n%s", fragment, sql)
 			}
 		}
-		if len(args) != 1 || args[0] != testAttachmentID {
+		if len(args) != 2 || args[0] != testAttachmentID || args[1] != int64((24*time.Hour)/time.Second) {
 			t.Errorf("arguments = %v", args)
 		}
 		return valueRow{values: []any{true}}
@@ -158,9 +159,9 @@ func TestCreatePendingAlwaysStartsAtPendingUpload(t *testing.T) {
 		newAttachment(domain.DestinationKindChannel, testChannelID)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	status, ok := pool.lastArgs[len(pool.lastArgs)-2].(string)
+	status, ok := pool.lastArgs[14].(string)
 	if !ok || status != string(domain.StatusPendingUpload) {
-		t.Fatalf("expected pending_upload, got %v", pool.lastArgs[len(pool.lastArgs)-2])
+		t.Fatalf("expected pending_upload, got %v", pool.lastArgs[14])
 	}
 }
 
@@ -172,7 +173,7 @@ func TestCreatePendingPersistsDraftExpiry(t *testing.T) {
 	if err := storage.NewPGXAttachmentStore(pool).CreatePending(context.Background(), attachment); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := pool.lastArgs[len(pool.lastArgs)-1]; got != attachment.DraftExpiresAt {
+	if got := pool.lastArgs[15]; got != attachment.DraftExpiresAt {
 		t.Fatalf("expected draft expiry %v, got %v", attachment.DraftExpiresAt, got)
 	}
 }

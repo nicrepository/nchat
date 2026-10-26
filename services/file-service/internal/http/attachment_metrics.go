@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
+	"github.com/nicrepository/nchat/services/file-service/internal/filepolicy"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -14,22 +15,26 @@ import (
 // never labels: they are unbounded, and two of them are the identifiers this
 // service exists to keep private.
 type AttachmentMetrics struct {
-	uploads         *prometheus.CounterVec
-	downloads       *prometheus.CounterVec
-	previews        *prometheus.CounterVec
-	previewAttempts *prometheus.CounterVec
-	previewDuration *prometheus.HistogramVec
-	linkPreviews    *prometheus.CounterVec
-	cleanups        *prometheus.CounterVec
-	scans           *prometheus.CounterVec
-	scanQueue       prometheus.Gauge
-	orphans         prometheus.Counter
+	inspections        *prometheus.CounterVec
+	inspectionDuration *prometheus.HistogramVec
+	uploads            *prometheus.CounterVec
+	downloads          *prometheus.CounterVec
+	previews           *prometheus.CounterVec
+	previewAttempts    *prometheus.CounterVec
+	previewDuration    *prometheus.HistogramVec
+	linkPreviews       *prometheus.CounterVec
+	cleanups           *prometheus.CounterVec
+	scans              *prometheus.CounterVec
+	scanQueue          prometheus.Gauge
+	orphans            prometheus.Counter
 }
 
 // NewAttachmentMetrics registers the attachment counters on the shared
 // registry. The app builds it so the service and the handlers share one set.
 func NewAttachmentMetrics(metrics *observability.Metrics) *AttachmentMetrics {
 	m := &AttachmentMetrics{
+		inspections:        prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nchat_file_format_inspections_total", Help: "Format inspection outcomes; no user metadata."}, []string{"family", "decision", "code", "mime_mismatch"}),
+		inspectionDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "nchat_file_format_inspection_duration_seconds", Help: "Bounded attachment format inspection duration."}, []string{"family"}),
 		uploads: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "nchat_file_uploads_total",
 			Help: "Attachment uploads by outcome.",
@@ -115,9 +120,25 @@ func NewAttachmentMetrics(metrics *observability.Metrics) *AttachmentMetrics {
 	}
 	// Register reports false when metrics are disabled; the counters still work
 	// as no-op accumulators, so callers never need a nil check.
-	metrics.Register(m.uploads, m.downloads, m.previews, m.previewAttempts, m.previewDuration, m.linkPreviews, m.cleanups,
+	metrics.Register(m.inspections, m.inspectionDuration, m.uploads, m.downloads, m.previews, m.previewAttempts, m.previewDuration, m.linkPreviews, m.cleanups,
 		m.scans, m.scanQueue, m.orphans)
 	return m
+}
+
+func (m *AttachmentMetrics) ObserveFileInspection(result filepolicy.Result, elapsed time.Duration) {
+	if m == nil {
+		return
+	}
+	family := result.Format.Family
+	if family == "" {
+		family = filepolicy.Unknown
+	}
+	mismatch := "false"
+	if result.MIMEMismatch {
+		mismatch = "true"
+	}
+	m.inspections.WithLabelValues(string(family), string(result.Decision), string(result.Code), mismatch).Inc()
+	m.inspectionDuration.WithLabelValues(string(family)).Observe(elapsed.Seconds())
 }
 
 func (m *AttachmentMetrics) ObserveDocumentPreview(format, result, reason string, duration time.Duration) {

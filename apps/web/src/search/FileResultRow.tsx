@@ -1,7 +1,7 @@
 import { useState, type MouseEvent } from "react";
 
 import { isImageAttachment } from "../chat/attachmentImageRules";
-import { isDocumentAttachment } from "../chat/attachmentDocumentRules";
+import { canOpenDocumentPreview } from "../chat/attachmentDocumentRules";
 import { fileIconFor } from "../chat/attachmentKinds";
 import { useAttachmentViewer } from "../chat/attachmentViewer";
 import { isPreviewAvailable, type ChannelAttachment } from "../chat/chatTypes";
@@ -40,7 +40,7 @@ function asAttachment(result: FileSearchResult): ChannelAttachment {
 function viewerFor(attachment: ChannelAttachment): "image" | "document" | null {
   if (attachment.status !== "clean" || !isPreviewAvailable(attachment.previewStatus)) return null;
   if (isImageAttachment(attachment)) return "image";
-  if (isDocumentAttachment(attachment)) return "document";
+  if (canOpenDocumentPreview(attachment)) return "document";
   return null;
 }
 

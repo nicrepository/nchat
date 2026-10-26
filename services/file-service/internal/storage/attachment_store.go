@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/nicrepository/nchat/libs/go/platform/authsession"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
+	"github.com/nicrepository/nchat/services/file-service/internal/filepolicy"
 	"github.com/nicrepository/nchat/services/file-service/internal/service"
 )
 
@@ -92,9 +94,9 @@ func (s *PGXAttachmentStore) CreatePending(ctx context.Context, attachment servi
 			storage_provider, storage_object_key,
 			envelope_version, dek_wrap_version,
 			audio_kind, declared_duration_ms,
-			status, draft_expires_at
+			status, draft_expires_at, format_policy_version
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
 		attachment.ID, attachment.WorkspaceID, attachment.UploaderID,
 		string(attachment.Destination.Kind), channelID, conversationID,
 		attachment.Filename, attachment.DeclaredMIME,
@@ -102,7 +104,7 @@ func (s *PGXAttachmentStore) CreatePending(ctx context.Context, attachment servi
 		attachment.EnvelopeVersion, attachment.KeyWrapVersion,
 		audioKind, declaredDurationMs,
 		string(domain.StatusPendingUpload),
-		attachment.DraftExpiresAt,
+		attachment.DraftExpiresAt, attachment.PolicyVersion,
 	)
 	if err != nil {
 		return fmt.Errorf("create pending attachment: %w", err)
@@ -159,7 +161,10 @@ func (s *PGXAttachmentStore) MarkUploaded(ctx context.Context, update service.Up
 		       ciphertext_size_bytes = $5,
 		       wrapped_dek = $6,
 		       kek_key_id = $7,
-		       preview_status = $9,
+		       format_policy_version = $10,
+ format_id = $11,
+ format_scan_version = CASE WHEN $2 = 'clean' THEN $10 ELSE 0 END,
+ preview_status = $9,
 		       preview_next_attempt_at = CASE WHEN $9 = 'pending' THEN now() ELSE NULL END,
 		       scan_next_attempt_at = CASE WHEN $2 = 'pending_scan' THEN now() ELSE NULL END,
 		       uploaded_at = now(),
@@ -170,7 +175,7 @@ func (s *PGXAttachmentStore) MarkUploaded(ctx context.Context, update service.Up
 		update.Size, update.CiphertextSize,
 		update.WrappedDEK, update.KEKKeyID,
 		string(domain.StatusPendingUpload),
-		string(update.PreviewStatus),
+		string(update.PreviewStatus), update.PolicyVersion, update.FormatID,
 	)
 	if err != nil {
 		return fmt.Errorf("mark attachment uploaded: %w", err)
@@ -457,16 +462,18 @@ func (s *PGXAttachmentStore) MarkScanRejected(
 //     cannot be approved — there is no stored object that was scanned;
 //   - deleted_at IS NULL, so a removed attachment cannot be brought back into
 //     circulation by a verdict that arrived late.
-const markScanCleanQuery = `
+var markScanCleanQuery = fmt.Sprintf(`
 	UPDATE files.attachments
 	   SET status = 'clean',
+ format_scan_version = %d,
 	       scan_next_attempt_at = NULL,
 	       updated_at = now()
 	 WHERE id = $1
 	   AND workspace_id = $2
 	   AND deleted_at IS NULL
 	   AND status IN ('pending_scan', 'clean')
-	RETURNING status, preview_status`
+ AND format_policy_version <= %d
+	RETURNING status, preview_status`, filepolicy.Version, filepolicy.Version)
 
 // MarkScanClean records that the antimalware scan found nothing.
 //
@@ -1065,6 +1072,11 @@ func previewStatusOf(stored pgtype.Text) domain.PreviewStatus {
 	return status
 }
 
+// Failed generations get at most one fresh three-attempt cycle per day.
+// updated_at is written by terminal transitions and the CAS below, so cooldown
+// survives restarts and concurrent clients. Normal 30-day expiry stays renewable.
+const previewRegenerationCooldown = 24 * time.Hour
+
 const regenerateDocumentPreviewQuery = `
 	WITH regenerated AS (
 		UPDATE files.attachments
@@ -1077,6 +1089,8 @@ const regenerateDocumentPreviewQuery = `
 		  AND deleted_at IS NULL
 		  AND status = 'clean'
 		  AND preview_lifecycle_status IN ('failed', 'expired')
+          AND (preview_lifecycle_status = 'expired'
+               OR updated_at <= now() - ($2 * interval '1 second'))
 		RETURNING 1
 	)
 	SELECT EXISTS (SELECT 1 FROM regenerated)
@@ -1091,7 +1105,7 @@ func (s *PGXAttachmentStore) RegenerateDocumentPreview(ctx context.Context, atta
 		return domain.ErrDependenciesUnavailable
 	}
 	var accepted bool
-	if err := s.pool.QueryRow(ctx, regenerateDocumentPreviewQuery, attachmentID).Scan(&accepted); err != nil {
+	if err := s.pool.QueryRow(ctx, regenerateDocumentPreviewQuery, attachmentID, int64(previewRegenerationCooldown/time.Second)).Scan(&accepted); err != nil {
 		return fmt.Errorf("regenerate document preview: %w", err)
 	}
 	if !accepted {
