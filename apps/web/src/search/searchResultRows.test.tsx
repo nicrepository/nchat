@@ -229,23 +229,36 @@ describe("search labels and history state", () => {
   });
 
   it("round-trips a search through history state and rejects anything malformed", () => {
-    const saved = withRestoredSearch({ keep: 1 }, { query: "backup", tab: "files" });
+    const saved = withRestoredSearch({ keep: 1 }, { query: "backup", tab: "files" }, "u1:w1");
     expect(saved.keep).toBe(1);
-    expect(readRestoredSearch(saved)).toEqual({ query: "backup", tab: "files" });
-    expect(readRestoredSearch(withRestoredSearch(null, { query: "a", tab: "all" }))).toEqual({
-      query: "a",
-      tab: "all",
-    });
+    expect(readRestoredSearch(saved, "u1:w1")).toEqual({ query: "backup", tab: "files" });
+    expect(
+      readRestoredSearch(withRestoredSearch(null, { query: "a", tab: "all" }, "u1:w1"), "u1:w1"),
+    ).toEqual({ query: "a", tab: "all" });
     for (const bad of [
       null,
       "x",
       {},
       { globalSearch: null },
-      { globalSearch: { query: 1, tab: "all" } },
-      { globalSearch: { query: "a".repeat(513), tab: "all" } },
-      { globalSearch: { query: "a", tab: "profile" } },
+      { globalSearch: { query: 1, tab: "all", owner: "u1:w1" } },
+      { globalSearch: { query: "a".repeat(513), tab: "all", owner: "u1:w1" } },
+      { globalSearch: { query: "a", tab: "profile", owner: "u1:w1" } },
     ]) {
-      expect(readRestoredSearch(bad)).toBeUndefined();
+      expect(readRestoredSearch(bad, "u1:w1")).toBeUndefined();
     }
+  });
+
+  it("restores a search only for the identity that left it (CQ-07)", () => {
+    const search = { query: "segredo", tab: "groups" } as const;
+    const byU1 = withRestoredSearch(null, search, "u1:w1");
+    expect(readRestoredSearch(byU1, "u1:w1")).toEqual(search);
+    // Another user, the same user in another workspace, or nobody confirmed.
+    expect(readRestoredSearch(byU1, "u2:w1")).toBeUndefined();
+    expect(readRestoredSearch(byU1, "u1:w2")).toBeUndefined();
+    expect(readRestoredSearch(byU1, null)).toBeUndefined();
+    // Left while nobody was confirmed, or before searches had owners: nobody's.
+    expect(readRestoredSearch(withRestoredSearch(null, search, null), "u1:w1")).toBeUndefined();
+    expect(readRestoredSearch({ globalSearch: search }, "u1:w1")).toBeUndefined();
+    expect(readRestoredSearch({ globalSearch: search }, null)).toBeUndefined();
   });
 });

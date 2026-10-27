@@ -32,14 +32,27 @@
 import { createContext, useContext, useEffect } from "react";
 import { type HistoryRouterProps, UNSAFE_createBrowserHistory } from "react-router";
 
+import { recordHistoryMove, startHistoryTrail } from "./historyTrail";
+
 type History = HistoryRouterProps["history"];
 
 // v5Compat: the listener hears PUSH and REPLACE too, not only POP — the same
 // options BrowserRouter creates its history with.
 const browserHistory = UNSAFE_createBrowserHistory({ v5Compat: true });
 
+/**
+ * The entry's position in the browser's list: the router keeps it in the
+ * history state as `idx` (#1124), the trail uses it to know which entries a
+ * PUSH cut off.
+ */
+function historyIndex(): number | null {
+  const idx: unknown = (window.history.state as { idx?: unknown } | null)?.idx;
+  return typeof idx === "number" ? idx : null;
+}
+
 let leftEntry = false;
 let spent = false;
+startHistoryTrail(browserHistory.location, historyIndex());
 
 /**
  * The browser history the app's router runs on (DocumentRouter): the same
@@ -62,6 +75,8 @@ export const documentHistory: History = {
   listen: (listener) =>
     browserHistory.listen((update) => {
       leftEntry = true;
+      // The same synchronous moment, for the trail the contextual Back reads (#1124).
+      recordHistoryMove(update.action, update.location, historyIndex());
       listener(update);
     }),
 };
@@ -94,4 +109,5 @@ export function useDocumentReloadEntry(): boolean {
 export function _resetDocumentEntry(): void {
   leftEntry = false;
   spent = false;
+  startHistoryTrail(browserHistory.location, historyIndex());
 }

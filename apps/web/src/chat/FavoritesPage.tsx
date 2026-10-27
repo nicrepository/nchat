@@ -5,6 +5,13 @@
  * Cursor pagination via "Carregar mais" — the list is short-lived and small,
  * so no infinite scroll (ponytail: add IntersectionObserver if usage grows).
  * Deleted messages (RF-14) render the standard placeholder.
+ *
+ * The list is the confirmed identity's (#1124, CQ-09 — see useSessionOwner):
+ * nothing is requested before an identity is confirmed, and while it is in
+ * doubt the list is not on screen at all — unmounted, with every request it
+ * made aborted and any answer still arriving dropped. Confirmed again, the
+ * list loads anew for that identity, so no favourite of one user is ever
+ * carried to the next, nor across the doubt.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -13,6 +20,8 @@ import { Link } from "react-router";
 import { fetchFavorites, unfavoriteMessage } from "./chatApi";
 import type { FavoriteItem } from "./chatTypes";
 import RichTextRenderer from "./RichTextRenderer";
+import SessionPending from "./SessionPending";
+import { useSessionOwner } from "./useSessionOwner";
 
 type Status = "loading" | "ready" | "error";
 
@@ -45,6 +54,23 @@ function formatDateTime(iso: string): string {
 }
 
 export default function FavoritesPage() {
+  const session = useSessionOwner();
+  return (
+    <div className="chat-favorites" data-testid="chat-favorites">
+      <header className="chat-favorites__header">
+        <h1 className="chat-favorites__title">Meus favoritos</h1>
+        <p className="chat-favorites__sub">Visíveis apenas para você.</p>
+      </header>
+      {session.settled ? (
+        <FavoritesList key={session.owner} />
+      ) : (
+        <SessionPending session={session} className="chat-favorites__status" />
+      )}
+    </div>
+  );
+}
+
+function FavoritesList() {
   const [state, setState] = useState<FavoritesState>({
     status: "loading",
     items: [],
@@ -61,14 +87,18 @@ export default function FavoritesPage() {
     const ctrl = new AbortController();
     abortRef.current = ctrl;
     fetchFavorites(undefined, ctrl.signal).then(
-      (page) =>
+      (page) => {
+        // An answer that outlived its request — superseded, or the list gone
+        // with the identity it was loaded for — is not shown.
+        if (ctrl.signal.aborted) return;
         setState({
           status: "ready",
           items: page.favorites,
           nextCursor: page.nextCursor,
           loadingMore: false,
           actionError: null,
-        }),
+        });
+      },
       () => {
         if (!ctrl.signal.aborted) setState((s) => ({ ...s, status: "error" }));
       },
@@ -88,20 +118,27 @@ export default function FavoritesPage() {
   const loadMore = useCallback(() => {
     setState((current) => {
       if (current.loadingMore || !current.nextCursor) return current;
-      fetchFavorites(current.nextCursor).then(
-        (page) =>
+      // A page belongs to the list it continues: reloading or unmounting the
+      // list aborts it, and an answer arriving after that is dropped.
+      const signal = abortRef.current?.signal;
+      fetchFavorites(current.nextCursor, signal).then(
+        (page) => {
+          if (signal?.aborted) return;
           setState((s) => ({
             ...s,
             items: [...s.items, ...page.favorites],
             nextCursor: page.nextCursor,
             loadingMore: false,
-          })),
-        () =>
+          }));
+        },
+        () => {
+          if (signal?.aborted) return;
           setState((s) => ({
             ...s,
             loadingMore: false,
             actionError: "Não foi possível carregar mais favoritos.",
-          })),
+          }));
+        },
       );
       return { ...current, loadingMore: true, actionError: null };
     });
@@ -123,12 +160,7 @@ export default function FavoritesPage() {
   }, []);
 
   return (
-    <div className="chat-favorites" data-testid="chat-favorites">
-      <header className="chat-favorites__header">
-        <h1 className="chat-favorites__title">Meus favoritos</h1>
-        <p className="chat-favorites__sub">Visíveis apenas para você.</p>
-      </header>
-
+    <>
       {state.status === "loading" && (
         <div className="chat-favorites__status" role="status">
           Carregando favoritos…
@@ -144,13 +176,36 @@ export default function FavoritesPage() {
         </div>
       )}
 
-      {state.status === "ready" && state.items.length === 0 && (
+      {state.status === "ready" && (
+        <FavoritesReady state={state} onLoadMore={loadMore} onRemove={removeFavorite} />
+      )}
+
+      {state.actionError && (
+        <div className="chat-favorites__status" role="alert">
+          {state.actionError}
+        </div>
+      )}
+    </>
+  );
+}
+
+/** The list once loaded: its items, or that there are none, and the next page. */
+function FavoritesReady({
+  state,
+  onLoadMore,
+  onRemove,
+}: {
+  state: FavoritesState;
+  onLoadMore: () => void;
+  onRemove: (messageId: string) => void;
+}) {
+  return (
+    <>
+      {state.items.length === 0 ? (
         <div className="chat-favorites__status" data-testid="chat-favorites-empty">
           Nenhuma mensagem favoritada ainda. Use a estrela no menu da mensagem para salvar.
         </div>
-      )}
-
-      {state.status === "ready" && state.items.length > 0 && (
+      ) : (
         <ul className="chat-favorites__list" aria-label="Mensagens favoritas">
           {state.items.map((item) => {
             const link = sourceLink(item);
@@ -188,7 +243,7 @@ export default function FavoritesPage() {
                     type="button"
                     className="chat-favorites__link-btn"
                     aria-label="Remover dos favoritos"
-                    onClick={() => removeFavorite(item.message.id)}
+                    onClick={() => onRemove(item.message.id)}
                   >
                     Remover
                   </button>
@@ -198,23 +253,16 @@ export default function FavoritesPage() {
           })}
         </ul>
       )}
-
-      {state.status === "ready" && state.nextCursor && (
+      {state.nextCursor && (
         <button
           type="button"
           className="chat-favorites__load-more"
-          onClick={loadMore}
+          onClick={onLoadMore}
           disabled={state.loadingMore}
         >
           {state.loadingMore ? "Carregando…" : "Carregar mais"}
         </button>
       )}
-
-      {state.actionError && (
-        <div className="chat-favorites__status" role="alert">
-          {state.actionError}
-        </div>
-      )}
-    </div>
+    </>
   );
 }

@@ -1208,12 +1208,17 @@ describe("fetchSidebarData", () => {
     mockAuthFetch.mockResolvedValue(undefined);
     await markConversationRead("dm", "dm-1", "m-9", { keepalive: true });
 
-    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/dm-1/read", {
-      method: "POST",
-      keepalive: true,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ last_read_message_id: "m-9", read_cursor: "message" }),
-    });
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/dm/dm-1/read",
+      {
+        method: "POST",
+        keepalive: true,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ last_read_message_id: "m-9", read_cursor: "message" }),
+      },
+      undefined,
+      expect.any(Function),
+    );
   });
 
   // R1 (#1082 review): a cursor declares itself, so a server without the cursor
@@ -1223,14 +1228,26 @@ describe("fetchSidebarData", () => {
     await markConversationRead("channel", "ch 1");
     await markConversationRead("dm", "dm 1", "message-1");
 
-    expect(mockAuthFetch).toHaveBeenNthCalledWith(1, "/api/chat/channels/ch%201/read", {
-      method: "POST",
-    });
-    expect(mockAuthFetch).toHaveBeenNthCalledWith(2, "/api/chat/dm/dm%201/read", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ last_read_message_id: "message-1", read_cursor: "message" }),
-    });
+    expect(mockAuthFetch).toHaveBeenNthCalledWith(
+      1,
+      "/api/chat/channels/ch%201/read",
+      {
+        method: "POST",
+      },
+      undefined,
+      expect.any(Function),
+    );
+    expect(mockAuthFetch).toHaveBeenNthCalledWith(
+      2,
+      "/api/chat/dm/dm%201/read",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ last_read_message_id: "message-1", read_cursor: "message" }),
+      },
+      undefined,
+      expect.any(Function),
+    );
   });
 
   // ISSUE #414 — the two ordering keys travel on the items the sidebar already

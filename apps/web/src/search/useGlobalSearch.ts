@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 
 import { classifySearchError, searchCategory } from "./searchApi";
 import {
@@ -147,6 +147,18 @@ function invalidated(state: GlobalSearchState): GlobalSearchState {
   return { ...state, generation: state.generation + 1, overview: idleLists(), tabs: idleLists() };
 }
 
+/**
+ * The session's identity is in doubt (CQ-10): the query and tab are the
+ * reader's and stay; the results came from a session now in doubt, and so does
+ * anything still answering for them.
+ */
+function searchReducer(
+  state: GlobalSearchState,
+  action: Action | { type: "SUSPEND" },
+): GlobalSearchState {
+  return action.type === "SUSPEND" ? invalidated(state) : reducer(state, action);
+}
+
 function reducer(state: GlobalSearchState, action: Action): GlobalSearchState {
   switch (action.type) {
     case "SET_QUERY": {
@@ -219,9 +231,21 @@ export interface UseGlobalSearchResult {
  *
  * Switching tabs does not abort anything: a request for the same query is
  * still valid and simply fills its slot for when the reader comes back.
+ *
+ * Not `enabled` — the session's identity in doubt (CQ-10) — nothing is
+ * requested, and turning disabled drops every result and every request in
+ * flight: once enabled again, the committed query is searched anew, under the
+ * identity just confirmed.
  */
-export function useGlobalSearch(restored?: RestoredSearch): UseGlobalSearchResult {
-  const [state, dispatch] = useReducer(reducer, restored, initialState);
+export function useGlobalSearch(restored?: RestoredSearch, enabled = true): UseGlobalSearchResult {
+  const [state, dispatch] = useReducer(searchReducer, restored, initialState);
+  // Dropped in the render that disables, not after it: no late answer is
+  // accepted in between (its generation is already gone).
+  const [suspended, setSuspended] = useState(!enabled);
+  if (suspended === enabled) {
+    setSuspended(!enabled);
+    if (!enabled) dispatch({ type: "SUSPEND" });
+  }
   const stateRef = useRef(state);
   const controllersRef = useRef(new Map<string, AbortController>());
 
@@ -279,7 +303,7 @@ export function useGlobalSearch(restored?: RestoredSearch): UseGlobalSearchResul
   // Keyed on which of those slots are idle, so a retry (which resets a slot to
   // idle) re-triggers this effect as reliably as a new query or tab does.
   const idleSlots =
-    state.activeQuery && !state.typing
+    enabled && state.activeQuery && !state.typing
       ? slotsInView(state.activeTab)
           .filter(([scope, category]) => state[scope][category].status === "idle")
           .map(([scope, category]) => `${scope}:${category}`)
@@ -294,6 +318,9 @@ export function useGlobalSearch(restored?: RestoredSearch): UseGlobalSearchResul
   }, [idleSlots, state.generation, run]);
 
   useEffect(() => abortAll, [abortAll]);
+  useEffect(() => {
+    if (!enabled) abortAll();
+  }, [enabled, abortAll]);
 
   // Aborting here, in the keystroke's own handler, is the earliest point the
   // old query's requests can be stopped; the generation bump in the reducer

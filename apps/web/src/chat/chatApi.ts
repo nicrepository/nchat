@@ -11,11 +11,11 @@ import { parseOwnership } from "./ownershipApi";
  * reaction allowlist is the sole exception and is deduplicated for the app lifetime.
  */
 
-import { authenticatedFetch } from "../lib/authClient";
+import { authenticatedFetch, type RequestSender } from "../lib/authClient";
 import { safeAvatarUrl } from "./avatarUrl";
 import { parseMessageLinks } from "./messageLinks";
 import type { TimelinePosition } from "./messages/messageOrder";
-import { ApiRequestError } from "../lib/api";
+import { ApiRequestError, apiFetch } from "../lib/api";
 import { onAuthChange } from "../lib/authSession";
 import {
   normalizeAcknowledgementState,
@@ -575,6 +575,14 @@ export type { ConversationReadState } from "./chatTypes";
  * `keepalive` lets the request outlive the page (issue #1082): a cursor read
  * just before the tab closes still reaches the server, authenticated like any
  * other call — which is why this is a keepalive fetch and not a beacon.
+ *
+ * Each call goes out once (CQ-17). On a 401 the client refreshes the token and
+ * would send the request again under whatever token the refresh installed —
+ * the cookie's account, possibly another user's — and after the caller may
+ * have stopped caring. A position belongs to the identity that read it, so
+ * that second dispatch is refused here, where every attempt goes out, and
+ * rejects with a 401: the caller decides whether to ask again, once it knows
+ * whose token is installed. The refresh itself still happens.
  */
 export async function markConversationRead(
   targetType: "channel" | "dm",
@@ -586,16 +594,32 @@ export async function markConversationRead(
     targetType === "channel"
       ? `${CHAT_BASE}/channels/${encodeURIComponent(targetId)}/read`
       : `${CHAT_BASE}/dm/${encodeURIComponent(targetId)}/read`;
-  const res = await authenticatedFetch<{ data?: ReadStateResponse }>(target, {
-    method: "POST",
-    ...(options.keepalive ? { keepalive: true } : {}),
-    ...(lastReadMessageId
-      ? {
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ last_read_message_id: lastReadMessageId, read_cursor: "message" }),
-        }
-      : {}),
-  });
+  let dispatched = false;
+  const once: RequestSender = (url, init, parse) => {
+    if (dispatched) {
+      return Promise.reject(new ApiRequestError(401, "replay_refused", "Read cursor not replayed"));
+    }
+    dispatched = true;
+    return apiFetch(url, init, parse);
+  };
+  const res = await authenticatedFetch<{ data?: ReadStateResponse }>(
+    target,
+    {
+      method: "POST",
+      ...(options.keepalive ? { keepalive: true } : {}),
+      ...(lastReadMessageId
+        ? {
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              last_read_message_id: lastReadMessageId,
+              read_cursor: "message",
+            }),
+          }
+        : {}),
+    },
+    undefined,
+    once,
+  );
   return res?.data ? readStateOf(res.data) : undefined;
 }
 

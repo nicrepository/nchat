@@ -6,6 +6,17 @@
  * this page owns what is inside: the query, the six tabs — "Tudo" by default —
  * and the result cards. No avatar of the signed-in user is drawn here: the
  * search is for finding things, not for identity.
+ *
+ * What it shows is the confirmed identity's (CQ-07, CQ-10, CQ-11 — see
+ * useSessionOwner). A search left for a result is recorded on its history
+ * entry with the identity that left it, and is brought back only for that
+ * identity — whichever Back, contextual or the browser's, lands here, and
+ * whenever. Until an identity is confirmed there is no field and no request:
+ * the page says it is confirming the session, and offers a retry if the
+ * sidebar failed. While the identity is in doubt again, the search keeps what
+ * the reader typed and the tab, shows none of it, drops the results it had and
+ * requests nothing; confirmed the same, it searches again; confirmed another,
+ * the view starts over.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
@@ -14,6 +25,8 @@ import { useLocation, useNavigate, type NavigateOptions } from "react-router";
 import "./GlobalSearchPage.css";
 
 import AttachmentViewerHost from "../chat/AttachmentViewerHost";
+import SessionPending from "../chat/SessionPending";
+import { useSessionOwner, type SessionOwner } from "../chat/useSessionOwner";
 import SearchOverview from "./SearchOverview";
 import SearchResultList, { SearchSkeleton } from "./SearchResultList";
 import SearchTabs from "./SearchTabs";
@@ -49,16 +62,42 @@ function isLoading(state: GlobalSearchState): boolean {
 }
 
 export default function GlobalSearchPage() {
+  const session = useSessionOwner();
+  if (session.owner === null) return <SearchPending session={session} />;
+  // Keyed on its owner: another identity's search is a new mount.
+  return <SearchView key={session.owner} owner={session.owner} session={session} />;
+}
+
+/** The page while nobody's search may be on screen. */
+function SearchPending({ session }: { session: SessionOwner }) {
+  return (
+    <main className="global-search" data-testid="global-search" aria-busy="true">
+      <div className="global-search__inner">
+        <h1 className="global-search__sr-only">Busca global</h1>
+        <SessionPending session={session} className="global-search__initial" />
+      </div>
+    </main>
+  );
+}
+
+/**
+ * The search itself, for `owner`. Not settled — its owner in doubt again — it
+ * stays mounted, so the same user's confirmed rotation finds the query and tab
+ * as they left them, but shows none of it and searches nothing.
+ */
+function SearchView({ owner, session }: { owner: string; session: SessionOwner }) {
+  const { settled } = session;
   const location = useLocation();
   const navigate = useNavigate();
   // Read once: a search the reader left for a result, brought back by Back.
-  const [restored] = useState(() => readRestoredSearch(location.state));
-  const { state, setQuery, setActiveTab, loadMore, retry } = useGlobalSearch(restored);
+  const [restored] = useState(() => readRestoredSearch(location.state, owner));
+  const { state, setQuery, setActiveTab, loadMore, retry } = useGlobalSearch(restored, settled);
   const inputRef = useRef<HTMLInputElement>(null);
   // The field takes focus on every entry into the search: the first open, and
   // a repeat open while already here — the shell replaces the history entry
   // rather than stacking one (issue #550), which gives it a new key.
-  useEffect(() => inputRef.current?.focus(), [location.key]);
+  // Shown again after a confirmation, the field is where the reader was.
+  useEffect(() => inputRef.current?.focus(), [location.key, settled]);
 
   // Record this search on its own history entry, then leave for the result.
   const { pathname, search, state: historyState } = location;
@@ -67,11 +106,11 @@ export default function GlobalSearchPage() {
     (to: string, options?: NavigateOptions) => {
       navigate(`${pathname}${search}`, {
         replace: true,
-        state: withRestoredSearch(historyState, { query: activeQuery, tab: activeTab }),
+        state: withRestoredSearch(historyState, { query: activeQuery, tab: activeTab }, owner),
       });
       navigate(to, options);
     },
-    [navigate, pathname, search, historyState, activeQuery, activeTab],
+    [navigate, pathname, search, historyState, activeQuery, activeTab, owner],
   );
 
   function closeSearch(event: KeyboardEvent<HTMLElement>) {
@@ -87,6 +126,8 @@ export default function GlobalSearchPage() {
 
   const loading = useMemo(() => isLoading(state), [state]);
   const view = panelView(state);
+
+  if (!settled) return <SearchPending session={session} />;
 
   return (
     <SearchNavigationContext.Provider value={openResult}>

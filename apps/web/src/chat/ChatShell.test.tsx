@@ -28,6 +28,7 @@ import { issueCallToken, issueResourceCallToken } from "./callApi";
 import { fetchSidebarData, leaveConversation, markConversationRead } from "./chatApi";
 import AppShell, { ROOT_LOCK_CLASS } from "./AppShell";
 import ChatShell, { type ChatOutletContext } from "./ChatShell";
+import type { useChatSidebar } from "./useChatSidebar";
 import CallSessionProvider from "../calls/CallSessionProvider";
 import { _resetChatSocket } from "./chatSocket";
 import { requestMediaPermission, type MediaPermissionResult } from "./mediaPermission";
@@ -133,6 +134,43 @@ function deferredValue<T>() {
 
 const currentUserId = "00000000-0000-4000-8000-000000000401";
 const callerId = "00000000-0000-4000-8000-000000000402";
+
+type ChatSidebarApi = ReturnType<typeof useChatSidebar>;
+
+/**
+ * useChatSidebar's whole answer, typed against the hook so a stand-in cannot
+ * fall behind its contract unnoticed: the shell reads `identityPending` and
+ * `confirmingIdentity` (#1124), and a partial stand-in without them failed in
+ * AppShell, not here. By default a sidebar loaded for currentUserId and
+ * confirmed for it — no identity check out, none being confirmed.
+ */
+function sidebarStub(overrides: Partial<ChatSidebarApi> = {}): ChatSidebarApi {
+  return {
+    state: {
+      status: "ready",
+      currentUserId,
+      workspaceId: "workspace-1",
+      channels: [],
+      dms: [],
+      categories: [],
+    },
+    retry: vi.fn(),
+    setPinned: vi.fn(),
+    markRead: vi.fn(),
+    reportReadProgress: vi.fn(),
+    renameChannel: vi.fn(),
+    renameGroup: vi.fn(),
+    setGroupAvatar: vi.fn(),
+    setMuted: vi.fn(),
+    setNotificationMode: vi.fn(),
+    leaveConversation: vi.fn(),
+    inAppAlert: null,
+    dismissInAppAlert: vi.fn(),
+    identityPending: () => false,
+    confirmingIdentity: false,
+    ...overrides,
+  };
+}
 const call = {
   call_id: "00000000-0000-4000-8000-000000000403",
   request_id: "00000000-0000-4000-8000-000000000404",
@@ -1215,15 +1253,10 @@ describe("ChatShell — #642 review, blocker 5 (leave rejection)", () => {
         resourcePresentationCall,
       }),
     }));
-    vi.doMock("./useChatSidebar", () => ({
-      useChatSidebar: () => ({
-        state: { status: "ready", currentUserId, channels: [], dms: [] },
-        retry: vi.fn(),
-        setPinned: vi.fn(),
-        markRead: vi.fn(),
-        renameChannel: vi.fn(),
-      }),
-    }));
+    vi.doMock("./useChatSidebar", () => {
+      const sidebar = sidebarStub();
+      return { useChatSidebar: () => sidebar };
+    });
     // Partial: only the component is stubbed out. ChatSidebar also exports
     // chatNavigationId, which the shell's navigation toggle points
     // `aria-controls` at (issue #467) — replacing the whole module would take
@@ -1312,15 +1345,10 @@ describe("ChatShell — #642 review, blocker 5 (leave rejection)", () => {
         resourcePresentationCall,
       }),
     }));
-    vi.doMock("./useChatSidebar", () => ({
-      useChatSidebar: () => ({
-        state: { status: "ready", currentUserId, channels: [], dms: [] },
-        retry: vi.fn(),
-        setPinned: vi.fn(),
-        markRead: vi.fn(),
-        renameChannel: vi.fn(),
-      }),
-    }));
+    vi.doMock("./useChatSidebar", () => {
+      const sidebar = sidebarStub();
+      return { useChatSidebar: () => sidebar };
+    });
     vi.doMock("./ChatSidebar", async () => {
       const actual = await vi.importActual<typeof import("./ChatSidebar")>("./ChatSidebar");
       return { ...actual, default: () => null };
@@ -1377,7 +1405,7 @@ describe("ChatShell — #673 directCallSession derivation", () => {
     vi.resetModules();
   });
 
-  function mockUseCallSession(overrides: Record<string, unknown> = {}) {
+  function mockUseCallSession(overrides: Record<string, unknown> = {}, sidebar = sidebarStub()) {
     vi.doMock("../calls/CallSessionProvider", () => ({
       useCallSession: () => ({
         calls: { call: null, start: vi.fn(), end: vi.fn() },
@@ -1401,15 +1429,7 @@ describe("ChatShell — #673 directCallSession derivation", () => {
         ...overrides,
       }),
     }));
-    vi.doMock("./useChatSidebar", () => ({
-      useChatSidebar: () => ({
-        state: { status: "ready", currentUserId, channels: [], dms: [] },
-        retry: vi.fn(),
-        setPinned: vi.fn(),
-        markRead: vi.fn(),
-        renameChannel: vi.fn(),
-      }),
-    }));
+    vi.doMock("./useChatSidebar", () => ({ useChatSidebar: () => sidebar }));
     vi.doMock("./ChatSidebar", async () => {
       const actual = await vi.importActual<typeof import("./ChatSidebar")>("./ChatSidebar");
       return { ...actual, default: () => null };
@@ -1574,6 +1594,62 @@ describe("ChatShell — #673 directCallSession derivation", () => {
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: "Alternar microfone" }));
     expect(toggleMicrophone).toHaveBeenCalledOnce();
+  });
+
+  // #1124 (CQ-13): the routes are handed an identity only once the sidebar is
+  // confirmed for it. While a rotated token is being confirmed, the sidebar
+  // still shows the previous token's user — and that is not an identity yet.
+  describe("the session identity handed to the routes", () => {
+    function SessionIdentityProbe() {
+      const ctx = useOutletContext<ChatOutletContext>();
+      return <span data-testid="session-identity">{String(ctx.sessionIdentity)}</span>;
+    }
+
+    const pendingCheck = { identityPending: () => true, confirmingIdentity: true };
+
+    it.each([
+      { name: "confirmed", sidebar: {}, identity: `${currentUserId}:workspace-1` },
+      { name: "being confirmed after a rotation", sidebar: pendingCheck, identity: "null" },
+      {
+        name: "changed to another user",
+        sidebar: {
+          state: {
+            status: "ready",
+            currentUserId: "user-b",
+            workspaceId: "workspace-1",
+            channels: [],
+            dms: [],
+            categories: [],
+          },
+        },
+        identity: "user-b:workspace-1",
+      },
+      {
+        name: "unavailable while loading",
+        sidebar: { state: { status: "loading" } },
+        identity: "null",
+      },
+    ] satisfies { name: string; sidebar: Partial<ChatSidebarApi>; identity: string }[])(
+      "is $identity when the sidebar is $name",
+      async ({ sidebar, identity }) => {
+        vi.resetModules();
+        mockUseCallSession({}, sidebarStub(sidebar));
+        const { default: ChatShellFresh } = await import("./ChatShell");
+        const { default: AppShellFresh } = await import("./AppShell");
+        render(
+          <MemoryRouter initialEntries={["/chat"]}>
+            <Routes>
+              <Route element={<AppShellFresh />}>
+                <Route path="/chat" element={<ChatShellFresh />}>
+                  <Route index element={<SessionIdentityProbe />} />
+                </Route>
+              </Route>
+            </Routes>
+          </MemoryRouter>,
+        );
+        expect(await screen.findByTestId("session-identity")).toHaveTextContent(identity);
+      },
+    );
   });
 });
 

@@ -6,7 +6,7 @@ import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 
 import { ApiRequestError } from "../lib/api";
-import { isAuthenticated, onAuthChange } from "../lib/authSession";
+import { getSessionGeneration, isAuthenticated, onAuthChange } from "../lib/authSession";
 
 import {
   fetchSidebarData,
@@ -550,6 +550,45 @@ function loadedAction(
   };
 }
 
+/** Whose sidebar it is: the user and the workspace, as confirmedIdentity keys them. */
+function identityOf({
+  currentUserId,
+  workspaceId,
+}: {
+  currentUserId: string;
+  workspaceId: string;
+}) {
+  return `${currentUserId}:${workspaceId}`;
+}
+
+/**
+ * The sidebar, as answered for the token installed when the answer arrives
+ * (#1124 CQ-13). The answer says whose token asked, and a rotation while it was
+ * out — even one labelled "refresh" — may have installed another account's:
+ * what came back speaks for the previous token, so it is asked again under the
+ * current one, failure included. Only an answer whose whole flight saw one
+ * session generation is handed on; `wanted` false (the caller's session is
+ * over) stops asking and lets the caller drop the answer.
+ *
+ * The answer is handed to `accept` / `refuse` in the very callback that checked
+ * the generation, never returned for a later `.then` to take: between two
+ * continuations another microtask — the refresh installing a token — can run,
+ * and an answer checked for G1 would be taken under G2 (R6).
+ */
+function fetchSidebarForCurrentToken<T>(
+  wanted: () => boolean,
+  accept: (data: Awaited<ReturnType<typeof fetchSidebarData>>) => T,
+  refuse: (error: unknown) => T,
+): Promise<T> {
+  const generation = getSessionGeneration();
+  const answered = () => generation === getSessionGeneration() || !wanted();
+  const again = () => fetchSidebarForCurrentToken(wanted, accept, refuse);
+  return fetchSidebarData().then(
+    (data) => (answered() ? accept(data) : again()),
+    (error: unknown) => (answered() ? refuse(error) : again()),
+  );
+}
+
 export function useChatSidebar() {
   const [state, dispatch] = useReducer(reducer, { status: "loading" });
   // The in-app surface of the delivery plan (issue #744). One alert, the newest,
@@ -581,13 +620,20 @@ export function useChatSidebar() {
   // accepted payload said — synchronous, so a write about to be sent asks the
   // server that is there now, not the one the last render saw.
   const capabilityRef = useRef(false);
-  // #1082 (security review SR-001): the user this session's read state
-  // was loaded for, and — after a refresh rotation, until the server has said
+  // #1082 (security review SR-001): the user (and workspace, #1124 CQ-13 —
+  // identityOf) this session's read state was loaded for, and — after a
+  // refresh rotation, until the server has said
   // whose token it is — the check every read write waits on. The refresh token
   // is a cookie every tab shares, so a rotation can hand this tab another
   // account's token; "refresh" is a claim, and this is where it is verified.
   const sessionUserRef = useRef<string | null>(null);
   const identityCheckRef = useRef<Promise<boolean> | null>(null);
+  // Whether a rotated token is still waiting for the server to say whose it is:
+  // until then the sidebar on screen is the previous identity's (#1124).
+  const identityPending = useCallback(() => identityCheckRef.current !== null, []);
+  // The same doubt, for what renders (CQ-07): a screen holding the previous
+  // identity's state keeps it off screen while this is true.
+  const [confirmingIdentity, setConfirmingIdentity] = useState(false);
 
   const load = useCallback(() => {
     if (loadPromiseRef.current) return loadPromiseRef.current;
@@ -596,23 +642,26 @@ export function useChatSidebar() {
     const startedAt = tick();
     const current = () => mountedRef.current && session === sessionRef.current;
 
-    const loading = fetchSidebarData()
-      .then((data) => {
+    const fail = (err: unknown) => {
+      if (current()) {
+        const message = err instanceof Error ? err.message : "Não foi possível carregar os dados.";
+        dispatch({ type: "error", error: message });
+      }
+    };
+    const loading = fetchSidebarForCurrentToken(
+      current,
+      (data) => {
         if (!current()) return;
         const { currentUserId, workspaceId } = data;
         const persistedUnread =
           currentUserId && workspaceId ? loadPersistedUnread(currentUserId, workspaceId) : [];
         capabilityRef.current = data.preciseReadCursor ?? false;
-        sessionUserRef.current = currentUserId;
+        sessionUserRef.current = identityOf(data);
         dispatch(loadedAction(data, persistedUnread, { startedAt, receivedAt: tick() }));
-      })
-      .catch((err: unknown) => {
-        if (current()) {
-          const message =
-            err instanceof Error ? err.message : "Não foi possível carregar os dados.";
-          dispatch({ type: "error", error: message });
-        }
-      })
+      },
+      fail,
+    )
+      .catch(fail)
       .finally(() => {
         if (loadPromiseRef.current === loading) loadPromiseRef.current = null;
       });
@@ -682,21 +731,25 @@ export function useChatSidebar() {
     const run = () => {
       const session = sessionRef.current;
       const startedAt = tick();
-      fetchSidebarData()
-        .then((data) => {
-          if (!mountedRef.current || session !== sessionRef.current) return;
+      const current = () => mountedRef.current && session === sessionRef.current;
+      // A failure leaves the sidebar on screen valid; the next event or
+      // navigation retries. Deliberately no error state and no retry loop — a
+      // failed hint must not blank a working sidebar.
+      const ignore = () => {};
+      fetchSidebarForCurrentToken(
+        current,
+        (data) => {
+          if (!current()) return;
           capabilityRef.current = data.preciseReadCursor ?? false;
           // previous is always defined at this call site (refreshSidebar only
           // ever runs once the sidebar is already "ready"), so mergeUnread
           // never consults the persisted cache — never worth a localStorage
           // read here.
           dispatch(loadedAction(data, [], { startedAt, receivedAt: tick() }));
-        })
-        .catch(() => {
-          // The sidebar on screen stays valid; the next event or navigation
-          // retries. Deliberately no error state and no retry loop — a failed
-          // hint must not blank a working sidebar.
-        })
+        },
+        ignore,
+      )
+        .catch(ignore)
         .finally(() => {
           if (refreshQueued.current && mountedRef.current) {
             refreshQueued.current = false;
@@ -732,9 +785,20 @@ export function useChatSidebar() {
    * longer has the precise cursor — a rollback reached this tab: positions
    * stop at once, nothing is acknowledged or retried, and the sidebar asks the
    * server for its authority instead.
+   *
+   * `live` says whether the writer that asked is still this session's — not
+   * replaced by a login, a logout or an account switch, not disposed by an
+   * unmount (CQ-16). It is asked at every point the write is about to go out,
+   * after each wait included, so a write held across a session change is
+   * dropped instead of sent with the next session's token.
    */
-  const sendReadCursor = useCallback<ReadWriteSender<TimedReadState>>(
-    (target, lastReadMessageId, options) => {
+  const sendReadCursor = useCallback(
+    (
+      target: ReadTarget,
+      lastReadMessageId: string | undefined,
+      options: { keepalive: boolean },
+      live: () => boolean,
+    ): ReturnType<ReadWriteSender<TimedReadState>> => {
       const session = sessionRef.current;
       const send = () => {
         const startedAt = tick();
@@ -753,11 +817,24 @@ export function useChatSidebar() {
       // A position read under one identity is never sent under another: while
       // a rotated token is unconfirmed, the write waits, and it is dropped if
       // the token turns out to be someone else's.
-      const check = identityCheckRef.current;
-      if (!check) return send();
-      return check.then((same) => {
-        if (!same) throw new Error("read cursor dropped: the session changed");
-        return send();
+      // A check that settled for one token is asked again on the way out: a
+      // rotation may have started another one before this continuation ran.
+      const confirmed = (): ReturnType<typeof send> => {
+        if (!live()) return Promise.reject(new Error("read cursor dropped: the session ended"));
+        const check = identityCheckRef.current;
+        if (!check) return send();
+        return check.then((same) => {
+          if (!same) throw new Error("read cursor dropped: the session changed");
+          return confirmed();
+        });
+      };
+      // The client never replays a cursor after a 401 (CQ-17): the refresh may
+      // have installed another user's token. It is asked again here, once, and
+      // through `confirmed` — so it goes out only while this writer lives and
+      // only under a token the server confirmed is still this session's user.
+      return confirmed().catch((error: unknown) => {
+        if (!(error instanceof ApiRequestError && error.status === 401)) throw error;
+        return confirmed();
       });
     },
     [tick, refreshSidebar],
@@ -778,8 +855,14 @@ export function useChatSidebar() {
   useEffect(() => {
     const start = () => {
       readWriterRef.current?.dispose();
-      const writer = createReadCursorWriter(
-        sendReadCursor,
+      const writer: ReadCursorWriter = createReadCursorWriter(
+        (target, lastReadMessageId, options) =>
+          sendReadCursor(
+            target,
+            lastReadMessageId,
+            options,
+            () => readWriterRef.current === writer,
+          ),
         (target, outcome) => {
           if (readWriterRef.current !== writer) return;
           dispatch({ type: "read_confirmed", target, outcome, receivedAt: tick() });
@@ -794,6 +877,7 @@ export function useChatSidebar() {
       capabilityRef.current = false;
       sessionUserRef.current = null;
       identityCheckRef.current = null;
+      setConfirmingIdentity(false);
       loadPromiseRef.current = null;
       start();
       dispatch({ type: "reload" });
@@ -801,22 +885,32 @@ export function useChatSidebar() {
     };
     const confirmIdentity = () => {
       const expected = sessionUserRef.current;
-      // Nothing was loaded for anyone yet: the load in flight is the new token's.
+      // Nothing was loaded for anyone yet: the load in flight asks again for the
+      // new token (fetchSidebarForCurrentToken), and only its answer loads.
       if (expected === null) return;
+      // A check already out asks again for this token too, and answers for it.
+      if (identityCheckRef.current) return;
       const session = sessionRef.current;
+      const current = () => mountedRef.current && session === sessionRef.current;
+      // Settled in the callback that checked the generation, not in a later
+      // continuation: a rotation landing in between must find no check out, or
+      // it would take this one — answered for the previous token — as its own.
       const settle = (same: boolean) => {
-        if (!mountedRef.current || session !== sessionRef.current) return false;
+        if (identityCheckRef.current === check) {
+          identityCheckRef.current = null;
+          setConfirmingIdentity(false);
+        }
+        if (!current()) return false;
         if (!same) changeSession();
         return same;
       };
-      const check = fetchSidebarData().then(
-        (data) => settle(data.currentUserId === expected),
+      const check: Promise<boolean> = fetchSidebarForCurrentToken(
+        current,
+        (data) => settle(identityOf(data) === expected),
         () => settle(false),
       );
       identityCheckRef.current = check;
-      void check.finally(() => {
-        if (identityCheckRef.current === check) identityCheckRef.current = null;
-      });
+      setConfirmingIdentity(true);
     };
     const unsubscribe = onAuthChange((change) => {
       if (change === "refresh") confirmIdentity();
@@ -1211,5 +1305,7 @@ export function useChatSidebar() {
     leaveConversation,
     inAppAlert,
     dismissInAppAlert,
+    identityPending,
+    confirmingIdentity,
   };
 }

@@ -71,6 +71,36 @@ const DetailsToggle = forwardRef<HTMLButtonElement, DetailsToggleProps>(function
   );
 });
 
+/**
+ * The header's Back (issue #1124), first in the strip, before the identity.
+ *
+ * Always rendered when the conversation offers a Back, and shown by the
+ * stylesheet only where the navigation is a drawer — the one band where the
+ * conversation is the whole screen. Above it the sidebar is a column on screen,
+ * and a Back would be a second way to a list that is already there. A real
+ * <button>, so Enter, Space, a click and a tap are the same activation.
+ */
+const BackButton = forwardRef<HTMLButtonElement, { onBack: () => void }>(function BackButton(
+  { onBack },
+  ref,
+) {
+  return (
+    <button
+      ref={ref}
+      type="button"
+      className="chat-msg-area__header-btn chat-msg-area__header-back"
+      aria-label="Voltar"
+      title="Voltar"
+      onClick={onBack}
+      data-testid="chat-header-back"
+    >
+      <span className="material-symbols-outlined" aria-hidden="true">
+        arrow_back
+      </span>
+    </button>
+  );
+});
+
 interface DirectCallActionsProps {
   onAudio: () => void;
   onVideo: () => void;
@@ -137,6 +167,8 @@ interface HeaderChannelProps {
   name: string;
   /** Issue #1024: from the sidebar payload the server already authorised. */
   isPrivate: boolean;
+  /** Issue #1124: the Back control, first in the header. */
+  back?: React.ReactNode;
   detailsToggle?: React.ReactNode;
   /** RF-24/#622: absent only when this header is not showing a resource call at all (never the case for a channel). */
   resourceCall?: ResourceCallHeaderState;
@@ -145,11 +177,13 @@ interface HeaderChannelProps {
 export function HeaderChannel({
   name,
   isPrivate,
+  back,
   detailsToggle,
   resourceCall,
 }: HeaderChannelProps) {
   return (
     <header className="chat-msg-area__header" data-testid="chat-msg-header">
+      {back}
       <span className="chat-msg-area__header-icon" aria-hidden="true">
         <ChannelIcon isPrivate={isPrivate} />
       </span>
@@ -186,6 +220,8 @@ interface HeaderDMProps {
   resourceCall?: ResourceCallHeaderState;
   /** A group opens its details, a 1:1 DM opens the other person's profile. */
   detailsToggle?: React.ReactNode;
+  /** Issue #1124: the Back control, first in the header. */
+  back?: React.ReactNode;
   /** The conversation being read; presence is resolved within it (RF-58). */
   presenceTarget?: string;
 }
@@ -262,6 +298,7 @@ export function HeaderDM({
   onStartCall,
   resourceCall,
   detailsToggle,
+  back,
   presenceTarget,
 }: HeaderDMProps) {
   const detail = usePresenceDetail(counterpart?.userId, presenceTarget);
@@ -270,6 +307,7 @@ export function HeaderDM({
 
   return (
     <header className="chat-msg-area__header" data-testid="chat-msg-header">
+      {back}
       <DMHeaderAvatar
         conversation={conversation}
         name={name}
@@ -314,6 +352,9 @@ interface ConversationHeaderProps {
   resourceCall: ResourceCallHeaderState | undefined;
   details: ConversationDetailsPanelState;
   detailsToggleRef: RefObject<HTMLButtonElement | null>;
+  /** Issue #1124: absent, the header offers no Back. */
+  onBack?: () => void;
+  backRef?: RefObject<HTMLButtonElement | null>;
 }
 
 /** The channel or DM header, and the details control both of them offer. */
@@ -329,7 +370,10 @@ export default function ConversationHeader({
   resourceCall,
   details,
   detailsToggleRef,
+  onBack,
+  backRef,
 }: ConversationHeaderProps) {
+  const back = onBack ? <BackButton ref={backRef} onBack={onBack} /> : undefined;
   const detailsToggle = details.supportsDetails ? (
     <DetailsToggle
       ref={detailsToggleRef}
@@ -344,6 +388,7 @@ export default function ConversationHeader({
         name={name}
         isPrivate={isPrivate}
         resourceCall={resourceCall}
+        back={back}
         detailsToggle={detailsToggle}
       />
     );
@@ -357,6 +402,7 @@ export default function ConversationHeader({
       presenceTarget={presenceTarget}
       onStartCall={onStartCall}
       resourceCall={resourceCall}
+      back={back}
       detailsToggle={detailsToggle}
     />
   );

@@ -1,6 +1,7 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router";
+import { StrictMode, useEffect, useState } from "react";
+import { MemoryRouter, Outlet, Route, Routes } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { FavoriteItem, FavoritesPage as FavoritesPageData } from "./chatTypes";
@@ -50,16 +51,46 @@ const page = (favorites: FavoriteItem[], nextCursor = ""): FavoritesPageData => 
   nextCursor,
 });
 
-function renderPage() {
+/** The confirmed identity the chat shell hands its routes, as the test sets it. */
+let setIdentity: (identity: string | null) => void = () => {};
+
+function Shell({ initial }: { initial: string | null }) {
+  const [sessionIdentity, set] = useState(initial);
+  useEffect(() => {
+    setIdentity = set;
+  }, []);
+  return <Outlet context={{ sessionIdentity }} />;
+}
+
+function renderPage(identity: string | null = "u1:w1") {
   return render(
     <MemoryRouter initialEntries={["/chat/favorites"]}>
-      <FavoritesPage />
+      <Routes>
+        <Route element={<Shell initial={identity} />}>
+          <Route path="/chat/favorites" element={<FavoritesPage />} />
+        </Route>
+      </Routes>
     </MemoryRouter>,
   );
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => (resolve = r));
+  return { promise, resolve };
+}
+
+const privateFavorite = (sender: string, body: string, id = `msg-${sender}`) =>
+  makeFavorite({
+    message: { ...makeFavorite().message, id, senderDisplayName: sender, bodyText: body },
+    channelId: "",
+    dmConversationId: `dm-${sender}`,
+  });
+
 beforeEach(() => {
   vi.clearAllMocks();
+  // Held answers a test never released must not reach the next one.
+  mockFetchFavorites.mockReset();
 });
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -147,7 +178,7 @@ describe("FavoritesPage", () => {
     const more = await screen.findByRole("button", { name: /carregar mais/i });
     await userEvent.click(more);
     await waitFor(() => expect(screen.getAllByTestId("favorite-item")).toHaveLength(2));
-    expect(mockFetchFavorites).toHaveBeenLastCalledWith("cursor-1");
+    expect(mockFetchFavorites).toHaveBeenLastCalledWith("cursor-1", expect.any(AbortSignal));
     expect(screen.queryByRole("button", { name: /carregar mais/i })).not.toBeInTheDocument();
   });
 
@@ -158,5 +189,136 @@ describe("FavoritesPage", () => {
     await userEvent.click(await screen.findByRole("button", { name: /carregar mais/i }));
     expect(await screen.findByRole("alert")).toHaveTextContent(/não foi possível carregar mais/i);
     expect(screen.getByRole("button", { name: /carregar mais/i })).toBeInTheDocument();
+  });
+
+  describe("whose favourites they are (CQ-09)", () => {
+    it("requests nothing and shows nothing before an identity is confirmed", async () => {
+      mockFetchFavorites.mockResolvedValue(page([privateFavorite("U2", "do u2")]));
+      renderPage(null);
+      expect(screen.getByRole("status")).toHaveTextContent("Confirmando sua sessão…");
+      expect(mockFetchFavorites).not.toHaveBeenCalled();
+
+      act(() => setIdentity("u2:w1"));
+      expect(await screen.findByText("U2")).toBeInTheDocument();
+    });
+
+    it("a loaded list leaves the screen while confirming; another user loads their own", async () => {
+      mockFetchFavorites.mockResolvedValueOnce(
+        page([privateFavorite("Remetente U1", "segredo-u1")]),
+      );
+      renderPage();
+      expect(await screen.findByText(/segredo-u1/)).toBeInTheDocument();
+
+      act(() => setIdentity(null));
+      expect(screen.queryByText(/segredo-u1/)).not.toBeInTheDocument();
+      expect(screen.queryByText("Remetente U1")).not.toBeInTheDocument();
+      expect(screen.queryByRole("link", { name: /ver na conversa/i })).not.toBeInTheDocument();
+      expect(screen.getByRole("status")).toHaveTextContent("Confirmando sua sessão…");
+
+      mockFetchFavorites.mockResolvedValueOnce(page([privateFavorite("Remetente U2", "do-u2")]));
+      act(() => setIdentity("u2:w1"));
+      expect(await screen.findByText(/do-u2/)).toBeInTheDocument();
+      expect(screen.queryByText(/segredo-u1/)).not.toBeInTheDocument();
+      expect(screen.queryByText("Remetente U1")).not.toBeInTheDocument();
+    });
+
+    it("a late answer for the previous identity never lands", async () => {
+      const late = deferred<ReturnType<typeof page>>();
+      mockFetchFavorites.mockReturnValueOnce(late.promise);
+      renderPage();
+      const [, signal] = mockFetchFavorites.mock.calls[0] as [unknown, AbortSignal];
+
+      act(() => setIdentity(null));
+      expect(signal.aborted).toBe(true);
+      mockFetchFavorites.mockResolvedValueOnce(page([]));
+      act(() => setIdentity("u2:w1"));
+      expect(await screen.findByTestId("chat-favorites-empty")).toBeInTheDocument();
+
+      await act(async () => late.resolve(page([privateFavorite("Remetente U1", "segredo-u1")])));
+      expect(screen.queryByText(/segredo-u1/)).not.toBeInTheDocument();
+      expect(screen.getByTestId("chat-favorites-empty")).toBeInTheDocument();
+    });
+
+    it("a late next page for the previous identity never lands", async () => {
+      const more = deferred<ReturnType<typeof page>>();
+      mockFetchFavorites
+        .mockResolvedValueOnce(page([privateFavorite("A", "primeira")], "c1"))
+        .mockReturnValueOnce(more.promise)
+        .mockResolvedValueOnce(page([]));
+      renderPage();
+      await userEvent.click(await screen.findByRole("button", { name: /carregar mais/i }));
+
+      act(() => setIdentity(null));
+      act(() => setIdentity("u2:w1"));
+      expect(await screen.findByTestId("chat-favorites-empty")).toBeInTheDocument();
+      await act(async () => more.resolve(page([privateFavorite("Remetente U1", "segredo-u1")])));
+      expect(screen.queryByText(/segredo-u1/)).not.toBeInTheDocument();
+      expect(screen.queryByText("Remetente U1")).not.toBeInTheDocument();
+    });
+
+    it("a next page answering after its list was reloaded is dropped", async () => {
+      const more = deferred<ReturnType<typeof page>>();
+      mockFetchFavorites
+        .mockResolvedValueOnce(page([privateFavorite("A", "primeira")], "c1"))
+        .mockReturnValueOnce(more.promise)
+        .mockResolvedValueOnce(page([privateFavorite("A", "primeira")], "c1"));
+      renderPage();
+      await userEvent.click(await screen.findByRole("button", { name: /carregar mais/i }));
+      const [, signal] = mockFetchFavorites.mock.calls[1] as [unknown, AbortSignal];
+
+      act(() => setIdentity(null));
+      expect(signal.aborted).toBe(true);
+      act(() => setIdentity("u1:w1"));
+      expect(await screen.findByText(/primeira/)).toBeInTheDocument();
+      await act(async () => more.resolve(page([privateFavorite("B", "segunda")])));
+      expect(screen.queryByText(/segunda/)).not.toBeInTheDocument();
+    });
+
+    it("an answer for a superseded load never overwrites the current one", async () => {
+      // StrictMode runs the load twice; the first, aborted, answers last.
+      const first = deferred<ReturnType<typeof page>>();
+      mockFetchFavorites
+        .mockReturnValueOnce(first.promise)
+        .mockResolvedValueOnce(page([privateFavorite("A", "atual")]));
+      render(
+        <StrictMode>
+          <MemoryRouter initialEntries={["/chat/favorites"]}>
+            <Routes>
+              <Route element={<Shell initial="u1:w1" />}>
+                <Route path="/chat/favorites" element={<FavoritesPage />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </StrictMode>,
+      );
+      expect(await screen.findByText(/atual/)).toBeInTheDocument();
+      await act(async () => first.resolve(page([privateFavorite("B", "superada")])));
+      expect(screen.queryByText(/superada/)).not.toBeInTheDocument();
+      expect(screen.getByText(/atual/)).toBeInTheDocument();
+    });
+
+    it("another identity confirmed with no doubt in between still starts over", async () => {
+      mockFetchFavorites.mockResolvedValueOnce(
+        page([privateFavorite("Remetente U1", "segredo-u1")]),
+      );
+      renderPage();
+      expect(await screen.findByText(/segredo-u1/)).toBeInTheDocument();
+
+      mockFetchFavorites.mockResolvedValueOnce(page([privateFavorite("Remetente U2", "do-u2")]));
+      act(() => setIdentity("u2:w1"));
+      expect(screen.queryByText(/segredo-u1/)).not.toBeInTheDocument();
+      expect(await screen.findByText(/do-u2/)).toBeInTheDocument();
+    });
+
+    it("the same user confirmed again gets their list back", async () => {
+      mockFetchFavorites.mockResolvedValue(page([privateFavorite("A", "minha")]));
+      renderPage();
+      expect(await screen.findByText(/minha/)).toBeInTheDocument();
+
+      act(() => setIdentity(null));
+      act(() => setIdentity("u1:w1"));
+      expect(await screen.findByText(/minha/)).toBeInTheDocument();
+      expect(mockFetchFavorites).toHaveBeenCalledTimes(2);
+    });
   });
 });

@@ -35,6 +35,8 @@ export interface NavDrawer {
    */
   modal: boolean;
   toggle: () => void;
+  /** Opens the drawer: the conversation Back's destination when there is no other (#1124). */
+  show: () => void;
   close: () => void;
 }
 
@@ -70,7 +72,8 @@ export function useNavDrawer(pathname: string, openOnEntry = false): NavDrawer {
   }
 
   const close = useCallback(() => setOpen(false), []);
+  const show = useCallback(() => setOpen(true), []);
   const toggle = useCallback(() => setOpen((current) => !current), []);
 
-  return { open, modal: isDrawer && open, toggle, close };
+  return { open, modal: isDrawer && open, toggle, show, close };
 }
