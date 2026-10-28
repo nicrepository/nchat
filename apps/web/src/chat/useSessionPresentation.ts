@@ -17,7 +17,14 @@ export function useSessionPresentation(
   const previousScope = useRef(scope);
   const abandon = useCallback(() => {
     restore.current = false;
-    saved.current = { top: rootRef.current?.scrollTop ?? 0, focus: null };
+    const root = rootRef.current;
+    const active = document.activeElement;
+    // Ordinary pagination ends recovery, but its control may need focus after refresh.
+    saved.current = {
+      top: root?.scrollTop ?? 0,
+      focus: active instanceof HTMLElement && root?.contains(active)
+        ? active.id || active.dataset.sessionFocus || null : null,
+    };
     onAbandon?.();
   }, [onAbandon, rootRef]);
   useLayoutEffect(() => {
@@ -34,8 +41,7 @@ export function useSessionPresentation(
     if (ready && restore.current && pending) root.scrollTop = 0;
     if (ready && restore.current && saved.current && !pending) {
       const maximum = Math.max(0, root.scrollHeight - root.clientHeight);
-      const focusedOutside = document.activeElement !== document.body && !root.contains(document.activeElement);
-      if (!focusedOutside) root.scrollTop = !unavailable && saved.current.top <= maximum ? saved.current.top : 0;
+      root.scrollTop = !unavailable && saved.current.top <= maximum ? saved.current.top : 0;
       if (document.activeElement === document.body && saved.current.focus) {
         const target = unavailable ? undefined : [...root.querySelectorAll<HTMLElement>("[id], [data-session-focus]")]
           .find((element) => keyOf(element) === saved.current?.focus);
@@ -64,7 +70,6 @@ export function useSessionPresentation(
     const blur = (event: FocusEvent) => {
       if (saved.current && event.relatedTarget instanceof Node && !root.contains(event.relatedTarget)) {
         saved.current.focus = null;
-        if (restore.current && (pending || !ready)) abandon();
       }
     };
     root.addEventListener("scroll", scroll);

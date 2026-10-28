@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { useRef } from "react";
+import { StrictMode, useRef } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import { useSessionPresentation } from "./useSessionPresentation";
@@ -16,7 +16,7 @@ function View({ suspended = false, pending = false, scope = "query:groups", remo
   const cancel = useSessionPresentation(ref, ready, suspended, { pending, scope, onAbandon: abandoned });
   return <div ref={ref} tabIndex={-1} data-testid="reading-root">
     {!suspended && <>
-      {!removed && <button id="reading-control">Controle anterior</button>}
+      {!removed && <button id="reading-control" onClick={cancel}>Controle anterior</button>}
       {pending && <div data-reading-recovery="true"><button onClick={cancel}>Cancelar recuperação</button></div>}
     </>}
   </div>;
@@ -98,4 +98,51 @@ it("removed content uses the beginning and an existing root instead of an invali
   view.rerender(<View removed />);
   expect(root.scrollTop).toBe(0);
   expect(root).toHaveFocus();
+});
+
+it.each([false, true])("manual pagination preserves the focus key across removed controls (StrictMode=%s)", (strict) => {
+  const view = render(<View />, { wrapper: strict ? StrictMode : undefined });
+  reading();
+  fireEvent.click(screen.getByRole("button", { name: "Controle anterior" }));
+  view.rerender(<View suspended />);
+  expect(screen.queryByRole("button", { name: "Controle anterior" })).not.toBeInTheDocument();
+  view.rerender(<View />);
+  expect(screen.getByRole("button", { name: "Controle anterior" })).toHaveFocus();
+  expect(screen.getByTestId("reading-root").scrollTop).toBe(600);
+});
+
+it("external focus during confirmation does not discard the reading offset", () => {
+  const view = render(<><button>Outro controle</button><View /></>);
+  const root = reading();
+  view.rerender(<><button>Outro controle</button><View suspended /></>);
+  root.scrollTop = 0;
+  screen.getByRole("button", { name: "Outro controle" }).focus();
+  view.rerender(<><button>Outro controle</button><View /></>);
+  expect(screen.getByRole("button", { name: "Outro controle" })).toHaveFocus();
+  expect(root.scrollTop).toBe(600);
+});
+
+it("moving focus outside while recovery is incomplete preserves scroll but not the old focus", () => {
+  const view = render(<><button>Outro controle</button><View /></>);
+  const root = reading();
+  view.rerender(<><button>Outro controle</button><View suspended /></>);
+  height = 400;
+  view.rerender(<><button>Outro controle</button><View pending /></>);
+  // Recovery controls may lose focus to the shell without abandoning reading.
+  screen.getByRole("button", { name: "Cancelar recuperação" }).focus();
+  screen.getByRole("button", { name: "Outro controle" }).focus();
+  height = 1200;
+  view.rerender(<><button>Outro controle</button><View /></>);
+  expect(screen.getByRole("button", { name: "Outro controle" })).toHaveFocus();
+  expect(root.scrollTop).toBe(600);
+});
+
+it("unmount and a new mount do not reuse an old focus or reading intention", () => {
+  const view = render(<View />);
+  reading();
+  view.rerender(<View suspended />);
+  view.unmount();
+  render(<View />);
+  expect(screen.getByTestId("reading-root").scrollTop).toBe(0);
+  expect(screen.getByRole("button", { name: "Controle anterior" })).not.toHaveFocus();
 });

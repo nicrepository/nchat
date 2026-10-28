@@ -60,9 +60,12 @@ for (const width of [390, 1440]) {
         }
         const root = page.getByTestId(surface === "search" ? "global-search" : "chat-favorites");
         const more = page.getByRole("button", { name: "Carregar mais", exact: true });
-        await expect(root.getByText("Resultado 0", { exact: true })).toBeVisible();
+        const result = (index: number) => surface === "search"
+          ? root.getByRole("button", { name: `Grupo Resultado ${index} 2 participantes`, exact: true })
+          : root.getByText(`Resultado ${index}`, { exact: true });
+        await expect(result(0)).toBeVisible();
         await more.click();
-        await expect(root.getByText("Resultado 59", { exact: true })).toBeAttached();
+        await expect(result(59)).toBeAttached();
         expire = true;
         await more.click();
         const before = await root.evaluate((element) => element.scrollTop);
@@ -72,7 +75,7 @@ for (const width of [390, 1440]) {
         const outside = width < 1024 ? page.getByTestId("chat-nav-toggle") : page.getByRole("button", { name: "Buscar no NChat", exact: true });
         if (moveFocus) await outside.focus();
         releaseIdentity();
-        await expect(root.getByText("Resultado 59", { exact: true })).toBeAttached();
+        await expect(result(59)).toBeAttached();
         await expect(moveFocus ? outside : more).toBeFocused();
         await expect.poll(() => root.evaluate((element) => element.scrollTop)).toBeCloseTo(before, 0);
         if (surface === "search") {
