@@ -12,7 +12,7 @@ export default function SessionPending({
     return (
       <div className={className} role="alert">
         Não foi possível confirmar sua sessão.{" "}
-        <button type="button" onClick={session.retry}>
+        <button type="button" data-reading-recovery="true" onClick={session.retry}>
           Tentar novamente
         </button>
       </div>

@@ -62,16 +62,17 @@ function Shell({ initial }: { initial: string | null }) {
   return <Outlet context={{ sessionIdentity }} />;
 }
 
-function renderPage(identity: string | null = "u1:w1") {
-  return render(
+function renderPage(identity: string | null = "u1:w1", strict = false) {
+  const content = (
     <MemoryRouter initialEntries={["/chat/favorites"]}>
       <Routes>
         <Route element={<Shell initial={identity} />}>
           <Route path="/chat/favorites" element={<FavoritesPage />} />
         </Route>
       </Routes>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+  return render(strict ? <StrictMode>{content}</StrictMode> : content);
 }
 
 function deferred<T>() {
@@ -96,6 +97,130 @@ beforeEach(() => {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe("FavoritesPage", () => {
+  it("a later authorized snapshot can include a favorite added again after removal", async () => {
+    mockFetchFavorites.mockResolvedValue(page([makeFavorite()]));
+    mockUnfavoriteMessage.mockResolvedValueOnce(undefined);
+    renderPage();
+    await userEvent.click(await screen.findByRole("button", { name: "Remover dos favoritos" }));
+    await screen.findByTestId("chat-favorites-empty");
+    act(() => setIdentity(null));
+    act(() => setIdentity("u1:w1"));
+    expect(await screen.findByTestId("favorite-item")).toBeInTheDocument();
+  });
+
+  it("a removal for U1 completing after U2 loaded cannot remove U2's item with the same ID", async () => {
+    const removed = deferred<void>();
+    mockUnfavoriteMessage.mockReturnValueOnce(removed.promise);
+    mockFetchFavorites.mockResolvedValueOnce(page([makeFavorite()]))
+      .mockResolvedValueOnce(page([privateFavorite("U2", "do-u2", "msg-1")]));
+    renderPage();
+    await userEvent.click(await screen.findByRole("button", { name: "Remover dos favoritos" }));
+    act(() => setIdentity(null));
+    act(() => setIdentity("u2:w1"));
+    await screen.findByText("do-u2");
+    await act(async () => removed.resolve());
+    expect(screen.getByText("do-u2")).toBeInTheDocument();
+  });
+
+  it.each(["before", "after"])("a removal completing %s refresh revalidation stays reconciled for the same owner", async (when) => {
+    const removed = deferred<void>();
+    const revalidated = deferred<ReturnType<typeof page>>();
+    mockFetchFavorites.mockResolvedValueOnce(page([makeFavorite()])).mockReturnValueOnce(revalidated.promise);
+    mockUnfavoriteMessage.mockReturnValueOnce(removed.promise);
+    renderPage();
+    await userEvent.click(await screen.findByRole("button", { name: "Remover dos favoritos" }));
+    act(() => setIdentity(null));
+    act(() => setIdentity("u1:w1"));
+    if (when === "before") await act(async () => removed.resolve());
+    await act(async () => revalidated.resolve(page([makeFavorite()])));
+    if (when === "after") await act(async () => removed.resolve());
+    expect(await screen.findByTestId("chat-favorites-empty")).toBeInTheDocument();
+    expect(screen.queryByTestId("favorite-item")).not.toBeInTheDocument();
+  });
+
+  it("paginates once under StrictMode and revalidates exactly the completed page count", async () => {
+    mockFetchFavorites.mockImplementation((cursor?: string) => Promise.resolve(page([
+      privateFavorite(cursor ? "B" : "A", cursor ? "segunda" : "primeira"),
+    ], cursor ? "" : "c1")));
+    renderPage("u1:w1", true);
+    await userEvent.click(await screen.findByRole("button", { name: /carregar mais/i }));
+    await screen.findByText("segunda");
+    expect(mockFetchFavorites.mock.calls.filter(([cursor]) => cursor === "c1")).toHaveLength(1);
+    mockFetchFavorites.mockClear();
+    act(() => setIdentity(null));
+    act(() => setIdentity("u1:w1"));
+    await screen.findByText("segunda");
+    expect(mockFetchFavorites).toHaveBeenCalledTimes(2);
+  });
+
+  it("restores the load-more focus after revalidation without focusing removed items", async () => {
+    mockFetchFavorites.mockResolvedValue(page([makeFavorite()], "c1"));
+    renderPage();
+    const more = await screen.findByRole("button", { name: /carregar mais/i });
+    more.focus();
+    act(() => setIdentity(null));
+    act(() => setIdentity("u1:w1"));
+    expect(await screen.findByRole("button", { name: /carregar mais/i })).toHaveFocus();
+  });
+
+  it("revalidates the loaded depth after same-owner refresh with fresh cursors and no duplicates", async () => {
+    const first = privateFavorite("A", "primeira");
+    const second = privateFavorite("B", "segunda");
+    mockFetchFavorites
+      .mockResolvedValueOnce(page([first], "old-1"))
+      .mockResolvedValueOnce(page([second], "old-2"))
+      .mockResolvedValueOnce(page([first], "fresh-1"))
+      .mockResolvedValueOnce(page([first, second], "fresh-2"))
+      .mockResolvedValueOnce(page([privateFavorite("C", "terceira")]));
+    renderPage();
+    await userEvent.click(await screen.findByRole("button", { name: /carregar mais/i }));
+    expect(await screen.findByText("segunda")).toBeInTheDocument();
+    act(() => setIdentity(null));
+    expect(screen.queryByText("primeira")).not.toBeInTheDocument();
+    act(() => setIdentity("u1:w1"));
+    expect(await screen.findByText("segunda")).toBeInTheDocument();
+    expect(screen.getAllByTestId("favorite-item")).toHaveLength(2);
+    expect(mockFetchFavorites).toHaveBeenLastCalledWith("fresh-1", expect.any(AbortSignal));
+    await userEvent.click(screen.getByRole("button", { name: /carregar mais/i }));
+    expect(await screen.findByText("terceira")).toBeInTheDocument();
+    expect(mockFetchFavorites).toHaveBeenLastCalledWith("fresh-2", expect.any(AbortSignal));
+  });
+
+  it("does not reuse revoked data while revalidating the same owner", async () => {
+    const fresh = deferred<ReturnType<typeof page>>();
+    mockFetchFavorites.mockResolvedValueOnce(page([privateFavorite("A", "revogada")]))
+      .mockReturnValueOnce(fresh.promise);
+    renderPage();
+    expect(await screen.findByText("revogada")).toBeInTheDocument();
+    act(() => setIdentity(null));
+    act(() => setIdentity("u1:w1"));
+    expect(screen.queryByText("revogada")).not.toBeInTheDocument();
+    await act(async () => fresh.resolve(page([])));
+    expect(await screen.findByTestId("chat-favorites-empty")).toBeInTheDocument();
+    expect(mockFetchFavorites).toHaveBeenCalledTimes(2);
+  });
+
+  it("a failed revalidation has a finite, explicit retry and keeps the loaded depth", async () => {
+    const first = privateFavorite("A", "primeira");
+    const second = privateFavorite("B", "segunda");
+    mockFetchFavorites.mockResolvedValueOnce(page([first], "c1"))
+      .mockResolvedValueOnce(page([second]))
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValueOnce(page([first], "new-1"))
+      .mockResolvedValueOnce(page([second]));
+    renderPage();
+    await userEvent.click(await screen.findByRole("button", { name: /carregar mais/i }));
+    await screen.findByText("segunda");
+    act(() => setIdentity(null));
+    act(() => setIdentity("u1:w1"));
+    await screen.findByRole("alert");
+    expect(mockFetchFavorites).toHaveBeenCalledTimes(3);
+    expect(screen.queryByText("primeira")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /tentar novamente/i }));
+    expect(await screen.findByText("segunda")).toBeInTheDocument();
+    expect(mockFetchFavorites).toHaveBeenCalledTimes(5);
+  });
+
   it("shows loading, then the favorites list", async () => {
     mockFetchFavorites.mockResolvedValue(page([makeFavorite()]));
     renderPage();

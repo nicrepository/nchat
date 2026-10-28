@@ -569,6 +569,8 @@ function identityOf({
  * current one, failure included. Only an answer whose whole flight saw one
  * session generation is handed on; `wanted` false (the caller's session is
  * over) stops asking and lets the caller drop the answer.
+ * One revalidation per operation: a successful refresh followed by another
+ * 401 also changes generation, so following every change could retry forever.
  *
  * The answer is handed to `accept` / `refuse` in the very callback that checked
  * the generation, never returned for a later `.then` to take: between two
@@ -579,10 +581,14 @@ function fetchSidebarForCurrentToken<T>(
   wanted: () => boolean,
   accept: (data: Awaited<ReturnType<typeof fetchSidebarData>>) => T,
   refuse: (error: unknown) => T,
+  revalidationsLeft = 1,
 ): Promise<T> {
   const generation = getSessionGeneration();
   const answered = () => generation === getSessionGeneration() || !wanted();
-  const again = () => fetchSidebarForCurrentToken(wanted, accept, refuse);
+  const again = () =>
+    revalidationsLeft > 0
+      ? fetchSidebarForCurrentToken(wanted, accept, refuse, revalidationsLeft - 1)
+      : refuse(new Error("Não foi possível confirmar a sessão. Tente novamente."));
   return fetchSidebarData().then(
     (data) => (answered() ? accept(data) : again()),
     (error: unknown) => (answered() ? refuse(error) : again()),

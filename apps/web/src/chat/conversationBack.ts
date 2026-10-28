@@ -33,6 +33,8 @@
  *  - anything else — the chat's home, the profile, the sign-in, an entry from
  *    before a reload or a deep link — ends the walk: there is no previous
  *    conversation, and Back opens the conversation list instead.
+ * From search or favourites, the same walk also accepts a known Home entry
+ * and skips consecutive entries of the surface already on screen.
  */
 
 import { useCallback, useEffect, useRef } from "react";
@@ -61,6 +63,10 @@ const RETURN_SURFACES = new Set(["/chat/search", "/chat/favorites"]);
 
 function withoutTrailingSlash(pathname: string): string {
   return pathname.length > 1 ? pathname.replace(/\/+$/, "") : pathname;
+}
+
+export function isReturnSurface(pathname: string): boolean {
+  return RETURN_SURFACES.has(withoutTrailingSlash(pathname));
 }
 
 /** The conversation a path opens, identified the way ChatMessageArea identifies it. */
@@ -116,13 +122,19 @@ function walkBack(
   availability: (conversation: ConversationRef) => Availability,
 ): number | "unknown" | null {
   const start = trail.findIndex((entry) => entry.key === displayedKey);
-  const shown = start < 0 ? null : conversationAt(trail[start].pathname);
-  if (!shown) return null;
+  const shownPath = start < 0 ? "" : withoutTrailingSlash(trail[start].pathname);
+  const shown = conversationAt(shownPath);
+  const fromSurface = isReturnSurface(shownPath);
+  if (!shown && !fromSurface) return null;
   for (let steps = start + 1; steps < trail.length; steps += 1) {
     const { pathname } = trail[steps];
     const conversation = conversationAt(pathname);
-    if (!conversation) return RETURN_SURFACES.has(withoutTrailingSlash(pathname)) ? steps : null;
-    if (conversation.kind === shown.kind && conversation.id === shown.id) continue;
+    if (!conversation) {
+      const path = withoutTrailingSlash(pathname);
+      if (fromSurface && path === shownPath) continue;
+      return isReturnSurface(path) || (fromSurface && path === "/chat") ? steps : null;
+    }
+    if (shown && conversation.kind === shown.kind && conversation.id === shown.id) continue;
     const known = availability(conversation);
     if (known !== "unavailable") return known === "available" ? steps : "unknown";
   }
@@ -214,7 +226,7 @@ export function useBackButton(goBack: (() => boolean) | undefined, destination: 
     if (document.activeElement === document.body) ref.current?.focus();
   }, [destination]);
   const onBack = useCallback(() => {
-    travelled.current = goBack?.() === true;
+    if (goBack?.() === true) travelled.current = true;
   }, [goBack]);
   return { ref, onBack: goBack ? onBack : undefined };
 }

@@ -102,10 +102,39 @@ describe("conversationBackDelta (#1124)", () => {
     expect(conversationBackDelta(trail(C, B, A), "e1", settled, everyone)).toBe(2);
   });
 
-  it("offers nothing when the entry on screen is unknown or not a conversation", () => {
+  it("offers nothing when the entry on screen is unknown or not a supported surface", () => {
     expect(conversationBackDelta(trail(C, B), "elsewhere", settled, everyone)).toBeNull();
-    expect(conversationBackDelta(trail("/chat/search", A), "e0", settled, everyone)).toBeNull();
+    expect(conversationBackDelta(trail("/profile", A), "e0", settled, everyone)).toBeNull();
     expect(conversationBackDelta([], "e0", settled, everyone)).toBeNull();
+  });
+
+  describe("returning from search and favourites", () => {
+    for (const surface of ["/chat/search", "/chat/favorites"]) {
+      it(`${surface} returns to a known conversation or Home, skipping its own repeated entries`, () => {
+        expect(conversationBackDelta(trail(surface, A), "e0", settled, everyone)).toBe(1);
+        expect(
+          conversationBackDelta(trail(surface, `${surface}/`, B), "e0", settled, everyone),
+        ).toBe(2);
+        expect(conversationBackDelta(trail(surface, "/chat/"), "e0", settled, everyone)).toBe(1);
+      });
+
+      it(`${surface} never traverses an external, login or unowned predecessor`, () => {
+        for (const path of ["https://outside.example/", "/login", "/profile"]) {
+          expect(conversationBackDelta(trail(surface, path, A), "e0", settled, everyone)).toBeNull();
+        }
+        expect(
+          conversationBackDelta(trail(surface, A), "e0", { ...settled, pending: true }, everyone),
+        ).toBe("unknown");
+        expect(
+          conversationBackDelta(trail(surface, A), "e0", { ...settled, owner: "u2:ws" }, everyone),
+        ).toBe("unknown");
+        expect(
+          conversationBackDelta(trail(surface, B, A), "e0", settled, ({ id }) =>
+            id === "bbbbbbbb-0000-4000-8000-000000000002" ? "unavailable" : "available",
+          ),
+        ).toBe(2);
+      });
+    }
   });
 
   describe("identity first (CQ-05)", () => {

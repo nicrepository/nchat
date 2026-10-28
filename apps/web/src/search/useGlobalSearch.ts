@@ -24,6 +24,8 @@ export const OVERVIEW_LIMIT = 5;
 export type SearchScope = "overview" | "tabs";
 
 export interface ListState<T> {
+  pages: number;
+  restorePages: number;
   status: "idle" | "loading" | "ready" | "error";
   items: T[];
   cursor: string | null;
@@ -36,6 +38,7 @@ export interface ListState<T> {
 export type SearchLists = { [C in SearchCategory]: ListState<SearchResultByCategory[C]> };
 
 export interface GlobalSearchState {
+  revalidationsLeft: number;
   query: string;
   activeQuery: string;
   activeTab: SearchTab;
@@ -74,12 +77,15 @@ type Action =
   | { type: "COMMIT_QUERY"; query: string }
   | { type: "SET_ACTIVE_TAB"; tab: SearchTab }
   | ({ type: "FETCH_START" | "MORE_START" } & Slot)
-  | ({ type: "FETCH_SUCCESS" | "MORE_SUCCESS"; page: SearchResultPage<{ id: string }> } & Slot)
+  | ({ type: "FETCH_SUCCESS" | "MORE_SUCCESS"; page: SearchResultPage<{ id: string }>; pages?: number } & Slot)
   | ({ type: "FETCH_ERROR" | "MORE_ERROR"; errorKind: SearchErrorKind } & Slot)
-  | { type: "RETRY"; scope: SearchScope; category: SearchCategory };
+  | { type: "RETRY"; scope: SearchScope; category: SearchCategory }
+  | { type: "CANCEL_RECOVERY"; abortAutomatic?: boolean };
 
 function idleList<T>(): ListState<T> {
   return {
+    pages: 0,
+    restorePages: 0,
     status: "idle",
     items: [],
     cursor: null,
@@ -104,6 +110,7 @@ function idleLists(): SearchLists {
 function initialState(restored: RestoredSearch | undefined): GlobalSearchState {
   const query = restored?.query.trim() ?? "";
   return {
+    revalidationsLeft: 1,
     query,
     activeQuery: query,
     activeTab: restored?.tab ?? "all",
@@ -130,10 +137,11 @@ function patchSlot(
 }
 
 /** Appends a page, skipping anything an earlier page already showed. */
-function appendPage(list: AnyList, page: SearchResultPage<{ id: string }>): AnyList {
+function appendPage(list: AnyList, page: SearchResultPage<{ id: string }>, pages = 1): AnyList {
   const seen = new Set(list.items.map((item) => item.id));
   return {
     ...list,
+    pages: list.pages + pages,
     loadingMore: false,
     items: [...list.items, ...page.items.filter((item) => !seen.has(item.id))],
     cursor: page.nextCursor,
@@ -149,40 +157,74 @@ function invalidated(state: GlobalSearchState): GlobalSearchState {
 
 /**
  * The session's identity is in doubt (CQ-10): the query and tab are the
- * reader's and stay; the results came from a session now in doubt, and so does
- * anything still answering for them.
+ * reader's and stay. Only page counts survive for a bounded, authorized rebuild;
+ * old results and cursors, including anything still answering, are discarded.
  */
 function searchReducer(
   state: GlobalSearchState,
   action: Action | { type: "SUSPEND" },
 ): GlobalSearchState {
-  return action.type === "SUSPEND" ? invalidated(state) : reducer(state, action);
+  if (action.type !== "SUSPEND") return reducer(state, action);
+  const next = invalidated(state);
+  next.revalidationsLeft = Math.max(0, state.revalidationsLeft - 1);
+  for (const scope of ["overview", "tabs"] as const) {
+    for (const category of SEARCH_CATEGORIES) {
+      next[scope][category].restorePages = Math.max(
+        state[scope][category].pages,
+        state[scope][category].status === "ready" && !state[scope][category].hasMore
+          ? 0 : state[scope][category].restorePages,
+      );
+      // The HTTP operation may have been aborted before reporting its final
+      // 401. A second interruption must not create another equivalent operation.
+      if (state.revalidationsLeft === 0) {
+        next[scope][category].status = "error";
+        next[scope][category].errorKind = "unknown";
+      }
+    }
+  }
+  return next;
 }
 
 function reducer(state: GlobalSearchState, action: Action): GlobalSearchState {
+  if ("generation" in action && action.generation !== state.generation) return state;
   switch (action.type) {
     case "SET_QUERY": {
       const typing = action.query.trim() !== state.activeQuery;
       // Entering the window invalidates everything the old query produced;
       // staying in it (another keystroke) changes nothing else. Leaving it by
       // typing back to the committed query searches that query again.
-      if (typing === state.typing) return { ...state, query: action.query };
-      return { ...invalidated(state), query: action.query, typing };
+      if (typing === state.typing) return { ...state, revalidationsLeft: 1, query: action.query };
+      return { ...invalidated(state), revalidationsLeft: 1, query: action.query, typing };
     }
     case "COMMIT_QUERY":
       return { ...invalidated(state), activeQuery: action.query, typing: false };
     case "SET_ACTIVE_TAB":
-      return { ...state, activeTab: action.tab };
+      return { ...state, revalidationsLeft: 1, activeTab: action.tab };
+    case "CANCEL_RECOVERY": {
+      let next = state;
+      for (const scope of ["overview", "tabs"] as const) {
+        for (const category of SEARCH_CATEGORIES) {
+          next = patchSlot(next, { scope, category }, (list) => ({
+            ...list, restorePages: 0,
+            status: action.abortAutomatic && list.restorePages > list.pages && list.status === "loading" ? "idle" : list.status,
+            loadingMore: list.restorePages > list.pages ? false : list.loadingMore,
+          }));
+        }
+      }
+      return next;
+    }
     case "FETCH_START":
       return patchSlot(state, action, (list) => ({ ...list, status: "loading", errorKind: null }));
     case "FETCH_SUCCESS":
-      return patchSlot(state, action, (list) => ({
+      return completed(patchSlot(state, action, (list) => ({
         ...list,
         status: "ready",
+        pages: action.pages ?? 1,
+        restorePages: list.restorePages > 2 || list.restorePages > (action.pages ?? 1) ? list.restorePages : 0,
         items: action.page.items,
         cursor: action.page.nextCursor,
         hasMore: action.page.hasMore,
-      }));
+      })));
     case "FETCH_ERROR":
       return patchSlot(state, action, (list) => ({
         ...list,
@@ -190,13 +232,13 @@ function reducer(state: GlobalSearchState, action: Action): GlobalSearchState {
         errorKind: action.errorKind,
       }));
     case "MORE_START":
-      return patchSlot(state, action, (list) => ({
+      return patchSlot({ ...state, revalidationsLeft: 1 }, action, (list) => ({
         ...list,
         loadingMore: true,
         loadMoreError: null,
       }));
     case "MORE_SUCCESS":
-      return patchSlot(state, action, (list) => appendPage(list, action.page));
+      return completed(patchSlot(state, action, (list) => appendPage(list, action.page, action.pages)));
     case "MORE_ERROR":
       // Items and cursor stay: a failed "load more" never erases what is shown.
       return patchSlot(state, action, (list) => ({
@@ -205,7 +247,9 @@ function reducer(state: GlobalSearchState, action: Action): GlobalSearchState {
         loadMoreError: action.errorKind,
       }));
     case "RETRY":
-      return patchSlot(state, action, () => idleList());
+      return patchSlot({ ...state, revalidationsLeft: 1 }, action, (list) => ({
+        ...idleList(), restorePages: Math.max(list.pages, list.restorePages),
+      }));
   }
 }
 
@@ -216,12 +260,23 @@ function slotsInView(tab: SearchTab): Array<[SearchScope, SearchCategory]> {
     : [["tabs", tab]];
 }
 
+/** One healthy category must not renew the budget while another keeps rotating. */
+function completed(state: GlobalSearchState): GlobalSearchState {
+  const ready = slotsInView(state.activeTab).every(([scope, category]) => {
+    const list = state[scope][category];
+    return list.status === "ready" && !list.loadingMore;
+  });
+  return ready ? { ...state, revalidationsLeft: 1 } : state;
+}
+
 export interface UseGlobalSearchResult {
   state: GlobalSearchState;
   setQuery: (query: string) => void;
   setActiveTab: (tab: SearchTab) => void;
   loadMore: (category: SearchCategory) => void;
   retry: (scope: SearchScope, category: SearchCategory) => void;
+  recover: (category: SearchCategory) => void;
+  cancelRecovery: () => void;
 }
 
 /**
@@ -229,13 +284,13 @@ export interface UseGlobalSearchResult {
  * exactly the slots the visible view needs (only once per committed query),
  * abort of superseded requests, and cursor pagination per category.
  *
- * Switching tabs does not abort anything: a request for the same query is
- * still valid and simply fills its slot for when the reader comes back.
+ * Switching tabs keeps ordinary requests for the same query, but cancels an
+ * unfinished session recovery together with its reading intention.
  *
  * Not `enabled` — the session's identity in doubt (CQ-10) — nothing is
  * requested, and turning disabled drops every result and every request in
- * flight: once enabled again, the committed query is searched anew, under the
- * identity just confirmed.
+ * flight: once enabled again, visible slots rebuild at most two pages with
+ * fresh cursors. Explicit recovery adds at most five per action; hidden slots stay lazy.
  */
 export function useGlobalSearch(restored?: RestoredSearch, enabled = true): UseGlobalSearchResult {
   const [state, dispatch] = useReducer(searchReducer, restored, initialState);
@@ -247,38 +302,65 @@ export function useGlobalSearch(restored?: RestoredSearch, enabled = true): UseG
     if (!enabled) dispatch({ type: "SUSPEND" });
   }
   const stateRef = useRef(state);
-  const controllersRef = useRef(new Map<string, AbortController>());
+  const controllersRef = useRef(new Map<string, { controller: AbortController; pending: boolean }>());
 
   useEffect(() => {
     stateRef.current = state;
   });
 
   const abortAll = useCallback(() => {
-    controllersRef.current.forEach((controller) => controller.abort());
+    controllersRef.current.forEach(({ controller }) => controller.abort());
     controllersRef.current.clear();
   }, []);
 
-  const run = useCallback((scope: SearchScope, category: SearchCategory, cursor: string | null) => {
+  const run = useCallback((scope: SearchScope, category: SearchCategory, cursor: string | null, batchSize = 1) => {
     const { activeQuery: query, generation } = stateRef.current;
     const key = `${scope}:${category}`;
-    controllersRef.current.get(key)?.abort();
+    if (cursor !== null && controllersRef.current.get(key)?.pending) return;
+    controllersRef.current.get(key)?.controller.abort();
     const controller = new AbortController();
-    controllersRef.current.set(key, controller);
+    const request = { controller, pending: true };
+    controllersRef.current.set(key, request);
 
     const slot = { scope, category, generation };
     const more = cursor !== null;
     dispatch({ type: more ? "MORE_START" : "FETCH_START", ...slot });
-    searchCategory(category, query, {
-      limit: scope === "overview" ? OVERVIEW_LIMIT : PAGE_LIMIT,
-      cursor: cursor ?? undefined,
-      signal: controller.signal,
-    }).then(
-      (page) => {
+    const fetchPages = async () => {
+      const depth = more ? Math.min(5, batchSize) : Math.min(2, Math.max(1,
+        stateRef.current[scope][category].restorePages,
+      ));
+      const items = new Map<string, { id: string }>();
+      const seen = new Set<string>(cursor ? [cursor] : []);
+      let next = cursor;
+      let pages = 0;
+      let page;
+      do {
+        page = await searchCategory(category, query, {
+          limit: scope === "overview" ? OVERVIEW_LIMIT : PAGE_LIMIT,
+          cursor: next ?? undefined,
+          signal: controller.signal,
+        });
         if (controller.signal.aborted) return;
-        dispatch({ type: more ? "MORE_SUCCESS" : "FETCH_SUCCESS", ...slot, page });
+        for (const item of page.items) items.set(item.id, item);
+        pages += 1;
+        next = page.nextCursor;
+        if (!page.hasMore || !next || seen.has(next)) {
+          page = { ...page, nextCursor: null, hasMore: false };
+          break;
+        }
+        seen.add(next);
+      } while (pages < depth);
+      return { page: { ...page, items: [...items.values()] }, pages };
+    };
+    fetchPages().then(
+      (result) => {
+        if (controller.signal.aborted) return;
+        request.pending = false;
+        if (result) dispatch({ type: more ? "MORE_SUCCESS" : "FETCH_SUCCESS", ...slot, ...result });
       },
       (error: unknown) => {
         if (controller.signal.aborted) return;
+        request.pending = false;
         const errorKind = classifySearchError(error);
         dispatch({ type: more ? "MORE_ERROR" : "FETCH_ERROR", ...slot, errorKind });
       },
@@ -333,10 +415,23 @@ export function useGlobalSearch(restored?: RestoredSearch, enabled = true): UseG
     [abortAll],
   );
 
-  const setActiveTab = useCallback(
-    (tab: SearchTab) => dispatch({ type: "SET_ACTIVE_TAB", tab }),
-    [],
-  );
+  const cancelRecovery = useCallback((abortAutomatic = false) => {
+    for (const scope of ["overview", "tabs"] as const) {
+      for (const category of SEARCH_CATEGORIES) {
+        const list = stateRef.current[scope][category];
+        if (list.restorePages > list.pages && (list.loadingMore || (abortAutomatic && list.status === "loading"))) {
+          const key = `${scope}:${category}`;
+          controllersRef.current.get(key)?.controller.abort();
+          controllersRef.current.delete(key);
+        }
+      }
+    }
+    dispatch({ type: "CANCEL_RECOVERY", abortAutomatic });
+  }, []);
+  const setActiveTab = useCallback((tab: SearchTab) => {
+    if (tab !== stateRef.current.activeTab) cancelRecovery(true);
+    dispatch({ type: "SET_ACTIVE_TAB", tab });
+  }, [cancelRecovery]);
 
   const loadMore = useCallback(
     (category: SearchCategory) => {
@@ -352,5 +447,12 @@ export function useGlobalSearch(restored?: RestoredSearch, enabled = true): UseG
     [],
   );
 
-  return { state, setQuery, setActiveTab, loadMore, retry };
+  const recover = useCallback((category: SearchCategory) => {
+    const list = stateRef.current.tabs[category];
+    if (list.status !== "ready" || !list.hasMore || list.loadingMore || !list.cursor) return;
+    const remaining = list.restorePages - list.pages;
+    if (remaining > 0) run("tabs", category, list.cursor, Math.min(5, remaining));
+  }, [run]);
+
+  return { state, setQuery, setActiveTab, loadMore, retry, recover, cancelRecovery };
 }

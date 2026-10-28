@@ -15,18 +15,22 @@
  * the page says it is confirming the session, and offers a retry if the
  * sidebar failed. While the identity is in doubt again, the search keeps what
  * the reader typed and the tab, shows none of it, drops the results it had and
- * requests nothing; confirmed the same, it searches again; confirmed another,
- * the view starts over.
+ * requests nothing; confirmed the same, it revalidates the loaded page depth;
+ * confirmed another user, workspace or session, the view starts over.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
-import { useLocation, useNavigate, type NavigateOptions } from "react-router";
+import { useLocation, useNavigate, useOutletContext, type NavigateOptions } from "react-router";
 
 import "./GlobalSearchPage.css";
+import "../chat/ChatMessageArea.css";
 
 import AttachmentViewerHost from "../chat/AttachmentViewerHost";
 import SessionPending from "../chat/SessionPending";
 import { useSessionOwner, type SessionOwner } from "../chat/useSessionOwner";
+import type { ChatOutletContext } from "../chat/ChatShell";
+import { BackButton } from "../chat/message-area/ConversationHeader";
+import { useSessionPresentation } from "../chat/useSessionPresentation";
 import SearchOverview from "./SearchOverview";
 import SearchResultList, { SearchSkeleton } from "./SearchResultList";
 import SearchTabs from "./SearchTabs";
@@ -63,21 +67,44 @@ function isLoading(state: GlobalSearchState): boolean {
 
 export default function GlobalSearchPage() {
   const session = useSessionOwner();
-  if (session.owner === null) return <SearchPending session={session} />;
+  const [entrySession] = useState(session.sessionKey);
+  const goBack = useOutletContext<ChatOutletContext | null>()?.goBack;
+  if (session.owner === null) return <SearchPending session={session} goBack={goBack} />;
   // Keyed on its owner: another identity's search is a new mount.
-  return <SearchView key={session.owner} owner={session.owner} session={session} />;
+  return <SearchView
+    key={`${session.sessionKey}:${session.owner}`}
+    owner={session.owner}
+    session={session}
+    restoreAllowed={entrySession === session.sessionKey}
+  />;
 }
 
 /** The page while nobody's search may be on screen. */
-function SearchPending({ session }: { session: SessionOwner }) {
+function SearchPending({ session, goBack }: { session: SessionOwner; goBack?: () => boolean }) {
   return (
-    <main className="global-search" data-testid="global-search" aria-busy="true">
+    <main
+      className="global-search"
+      data-testid="global-search"
+      aria-busy="true"
+      onKeyDown={(event) => closeSearch(event, goBack)}
+    >
       <div className="global-search__inner">
-        <h1 className="global-search__sr-only">Busca global</h1>
+        <header className="global-search__header">
+          {goBack && <BackButton onBack={goBack} />}
+          <h1 className="global-search__sr-only">Busca global</h1>
+        </header>
         <SessionPending session={session} className="global-search__initial" />
       </div>
     </main>
   );
+}
+
+function closeSearch(event: KeyboardEvent<HTMLElement>, goBack: (() => boolean) | undefined) {
+  if (event.key !== "Escape" || event.defaultPrevented) return;
+  // A viewer rendered in a portal owns Escape outside the search's DOM subtree.
+  if (!event.currentTarget.contains(event.target as Node)) return;
+  event.preventDefault();
+  goBack?.();
 }
 
 /**
@@ -85,19 +112,44 @@ function SearchPending({ session }: { session: SessionOwner }) {
  * stays mounted, so the same user's confirmed rotation finds the query and tab
  * as they left them, but shows none of it and searches nothing.
  */
-function SearchView({ owner, session }: { owner: string; session: SessionOwner }) {
+function SearchView({ owner, session, restoreAllowed }: {
+  owner: string;
+  session: SessionOwner;
+  restoreAllowed: boolean;
+}) {
   const { settled } = session;
+  const goBack = useOutletContext<ChatOutletContext | null>()?.goBack;
   const location = useLocation();
   const navigate = useNavigate();
   // Read once: a search the reader left for a result, brought back by Back.
-  const [restored] = useState(() => readRestoredSearch(location.state, owner));
-  const { state, setQuery, setActiveTab, loadMore, retry } = useGlobalSearch(restored, settled);
+  const [restored] = useState(() =>
+    restoreAllowed ? readRestoredSearch(location.state, owner) : undefined,
+  );
+  const { state, setQuery, setActiveTab, loadMore, retry, recover, cancelRecovery } = useGlobalSearch(restored, settled);
   const inputRef = useRef<HTMLInputElement>(null);
+  const rootRef = useRef<HTMLElement>(null);
+  const loading = useMemo(() => isLoading(state), [state]);
+  const scope = state.activeTab === "all" ? "overview" : "tabs";
+  const visible = state.activeTab === "all" ? SEARCH_CATEGORIES : [state.activeTab];
+  const presentationReady = !state.activeQuery || (
+    !state.typing && visible.every((category) => state[scope][category].status === "ready")
+  );
+  const currentList = state.activeTab === "all" ? null : state.tabs[state.activeTab];
+  const recoveryPending = !!currentList && currentList.hasMore && currentList.restorePages > currentList.pages;
+  const abandonReading = useSessionPresentation(rootRef, settled && presentationReady, !settled, {
+    pending: recoveryPending, scope: `${state.activeQuery}:${state.activeTab}`, onAbandon: cancelRecovery,
+    unavailable: !!currentList && !currentList.hasMore && currentList.restorePages > currentList.pages,
+  });
   // The field takes focus on every entry into the search: the first open, and
   // a repeat open while already here — the shell replaces the history entry
   // rather than stacking one (issue #550), which gives it a new key.
   // Shown again after a confirmation, the field is where the reader was.
-  useEffect(() => inputRef.current?.focus(), [location.key, settled]);
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, [location.key]);
+  useEffect(() => {
+    if (settled && presentationReady && !recoveryPending && document.activeElement === document.body) inputRef.current?.focus();
+  }, [settled, presentationReady, recoveryPending]);
 
   // Record this search on its own history entry, then leave for the result.
   const { pathname, search, state: historyState } = location;
@@ -113,29 +165,29 @@ function SearchView({ owner, session }: { owner: string; session: SessionOwner }
     [navigate, pathname, search, historyState, activeQuery, activeTab, owner],
   );
 
-  function closeSearch(event: KeyboardEvent<HTMLElement>) {
-    if (event.key !== "Escape" || event.defaultPrevented) return;
-    event.preventDefault();
-    navigate(-1);
-  }
-
   function clearQuery() {
     setQuery("");
     inputRef.current?.focus();
   }
 
-  const loading = useMemo(() => isLoading(state), [state]);
   const view = panelView(state);
 
-  if (!settled) return <SearchPending session={session} />;
+  if (!settled) return <SearchPending session={session} goBack={goBack} />;
 
   return (
     <SearchNavigationContext.Provider value={openResult}>
       <AttachmentViewerHost onFocusFallback={() => inputRef.current?.focus()}>
-        <main className="global-search" data-testid="global-search" onKeyDown={closeSearch}>
+        <main
+          ref={rootRef}
+          tabIndex={-1}
+          className="global-search"
+          data-testid="global-search"
+          onKeyDown={(event) => closeSearch(event, goBack)}
+        >
           <div className="global-search__inner">
             <header className="global-search__header" data-testid="global-search-header">
               <h1 className="global-search__sr-only">Busca global</h1>
+              {goBack && <BackButton onBack={goBack} />}
               <div className="global-search__field">
                 <span className="material-symbols-outlined" aria-hidden="true">
                   search
@@ -208,7 +260,9 @@ function SearchView({ owner, session }: { owner: string; session: SessionOwner }
                   list={state.tabs[state.activeTab]}
                   query={state.activeQuery}
                   onRetry={() => retry("tabs", state.activeTab as SearchCategory)}
-                  onLoadMore={() => loadMore(state.activeTab as SearchCategory)}
+                  onLoadMore={() => { abandonReading(); loadMore(state.activeTab as SearchCategory); }}
+                  onRecover={() => recover(state.activeTab as SearchCategory)}
+                  onCancelRecovery={abandonReading}
                 />
               )}
             </section>

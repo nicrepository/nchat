@@ -20,12 +20,21 @@
  * under another. Never an access decision: that stays with the server.
  */
 
-import { useState } from "react";
+import { useState, useSyncExternalStore } from "react";
 import { useOutletContext } from "react-router";
 
 import type { ChatOutletContext } from "./ChatShell";
+import { getSessionBoundaryGeneration, onAuthChange } from "../lib/authSession";
+
+function subscribeSession(listener: () => void): () => void {
+  return onAuthChange((change) => {
+    if (change === "session") listener();
+  });
+}
 
 export interface SessionOwner {
+  /** Changes on a session replacement, never on a token rotation. */
+  sessionKey: number;
   /** The identity last confirmed while the screen was on, null before any. */
   owner: string | null;
   /** The owner is the confirmed identity right now: no doubt pending. */
@@ -39,8 +48,10 @@ export function useSessionOwner(): SessionOwner {
   const context = useOutletContext<ChatOutletContext | null>();
   const identity = context?.sessionIdentity ?? null;
   const [owner, setOwner] = useState(identity);
+  const sessionKey = useSyncExternalStore(subscribeSession, getSessionBoundaryGeneration);
   if (identity !== null && identity !== owner) setOwner(identity);
   return {
+    sessionKey,
     owner: identity ?? owner,
     settled: identity !== null,
     // Not loading, and no ready sidebar (ChatShell's stand-in has no user):

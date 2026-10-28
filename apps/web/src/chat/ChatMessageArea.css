@@ -1391,6 +1391,12 @@
   font-weight: 700;
 }
 
+.chat-favorites__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .chat-favorites__sub {
   margin: 2px 0 0;
   font-size: 13px;

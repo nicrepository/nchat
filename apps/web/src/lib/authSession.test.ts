@@ -5,6 +5,8 @@ import {
   clearFreshLogin,
   clearTokens,
   getAccessToken,
+  getSessionBoundaryGeneration,
+  getSessionGeneration,
   isAuthenticated,
   isFreshLogin,
   markFreshLogin,
@@ -22,6 +24,31 @@ afterEach(() => {
 });
 
 describe("authSession", () => {
+  it("the session snapshot follows replacements while the token generation follows every installation", () => {
+    setTokens("session-a");
+    const boundary = getSessionGeneration();
+    expect(getSessionBoundaryGeneration()).toBe(boundary);
+    setTokens("rotation-a", "refresh");
+    expect(getSessionGeneration()).toBe(boundary + 1);
+    expect(getSessionBoundaryGeneration()).toBe(boundary);
+    setTokens("session-b");
+    const replacement = getSessionGeneration();
+    setTokens("rotation-b", "refresh");
+    expect(getSessionBoundaryGeneration()).toBe(replacement);
+  });
+
+  it("logout updates both snapshots before its notification", () => {
+    setTokens("session-a");
+    const before = getSessionGeneration();
+    const snapshots: number[][] = [];
+    const unsubscribe = onAuthChange(() => {
+      snapshots.push([getSessionGeneration(), getSessionBoundaryGeneration()]);
+    });
+    clearTokens();
+    expect(snapshots).toEqual([[before + 1, before + 1]]);
+    unsubscribe();
+  });
+
   it("setTokens stores access token in sessionStorage", () => {
     setTokens("acc_abc");
     expect(getAccessToken()).toBe("acc_abc");

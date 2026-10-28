@@ -80,7 +80,7 @@ const DetailsToggle = forwardRef<HTMLButtonElement, DetailsToggleProps>(function
  * and a Back would be a second way to a list that is already there. A real
  * <button>, so Enter, Space, a click and a tap are the same activation.
  */
-const BackButton = forwardRef<HTMLButtonElement, { onBack: () => void }>(function BackButton(
+export const BackButton = forwardRef<HTMLButtonElement, { onBack: () => void }>(function BackButton(
   { onBack },
   ref,
 ) {

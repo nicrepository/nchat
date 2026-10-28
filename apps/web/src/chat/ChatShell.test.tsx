@@ -2981,8 +2981,10 @@ describe("ChatShell — ponto de entrada da busca global (#550)", () => {
   // The real search page: its autoFocus and its Escape are part of the flow
   // under test. With no query typed it requests nothing.
   function renderShell() {
+    window.history.replaceState(null, "", `/chat/channel/${readingId}`);
+    _resetDocumentEntry();
     return render(
-      <MemoryRouter initialEntries={[`/chat/channel/${readingId}`]}>
+      <DocumentRouter>
         <Routes>
           <Route element={<AppShell />}>
             <Route
@@ -2998,7 +3000,7 @@ describe("ChatShell — ponto de entrada da busca global (#550)", () => {
             </Route>
           </Route>
         </Routes>
-      </MemoryRouter>,
+      </DocumentRouter>,
     );
   }
 

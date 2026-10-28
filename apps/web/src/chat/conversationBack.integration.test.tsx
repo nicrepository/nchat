@@ -16,6 +16,7 @@ import App from "../App";
 import { clearTokens, setTokens } from "../lib/authSession";
 import { _resetDocumentEntry, documentHistory } from "../lib/documentEntry";
 import { withRestoredSearch } from "../search/searchNavigation";
+import { groupResult, resultPage } from "../search/searchFixtures";
 import { _resetChatSocket } from "./chatSocket";
 import { NAV_DRAWER_QUERY } from "./useNavDrawer";
 import type { Message, MessagePage } from "./chatTypes";
@@ -25,7 +26,7 @@ const { api, favoritesGate } = vi.hoisted(() => {
   const promise = new Promise<void>((resolve) => {
     open = resolve;
   });
-  return { favoritesGate: { promise, open: () => open() }, api: makeApi() };
+  return { favoritesGate: { promise, open: () => open(), real: false }, api: makeApi() };
   function makeApi() {
     return {
       fetchSidebarData: vi.fn(),
@@ -36,6 +37,7 @@ const { api, favoritesGate } = vi.hoisted(() => {
       fetchMentionCandidates: vi.fn(),
       fetchChannelDetails: vi.fn(),
       fetchConversationAttachments: vi.fn(),
+      fetchFavorites: vi.fn(),
       searchCategory: vi.fn(),
     };
   }
@@ -50,6 +52,7 @@ vi.mock("./chatApi", async (importOriginal) => ({
   fetchAllowedReactionEmojis: api.fetchAllowedReactionEmojis,
   fetchMentionCandidates: api.fetchMentionCandidates,
   fetchChannelDetails: api.fetchChannelDetails,
+  fetchFavorites: api.fetchFavorites,
 }));
 
 vi.mock("../search/searchApi", async (importOriginal) => ({
@@ -59,12 +62,16 @@ vi.mock("../search/searchApi", async (importOriginal) => ({
 
 // A route whose render suspends until the test lets it through, so a move to it
 // stays a pending transition while the previous screen is still on display.
-vi.mock("./FavoritesPage", () => ({
-  default: function SuspendedFavorites() {
-    use(favoritesGate.promise);
-    return <p>Favoritos prontos</p>;
-  },
-}));
+vi.mock("./FavoritesPage", async (importOriginal) => {
+  const { default: FavoritesPage } = await importOriginal<typeof import("./FavoritesPage")>();
+  return {
+    default: function SuspendedFavorites() {
+      if (favoritesGate.real) return <FavoritesPage />;
+      use(favoritesGate.promise);
+      return <p>Favoritos prontos</p>;
+    },
+  };
+});
 
 vi.mock("./filesApi", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./filesApi")>()),
@@ -171,6 +178,8 @@ function installFakes() {
   clearTokens();
   setTokens("test-token");
   vi.clearAllMocks();
+  favoritesGate.real = false;
+  api.fetchFavorites.mockResolvedValue({ favorites: [], nextCursor: "" });
   window.matchMedia = undefined as unknown as typeof window.matchMedia;
   // A message jump scrolls its target into view; jsdom has no layout to do it with.
   window.Element.prototype.scrollIntoView = vi.fn();
@@ -311,6 +320,202 @@ async function walkThroughThreeConversations() {
   await openFromSidebar(/Grupo Projeto/);
   await expectHeader("Projeto");
 }
+
+describe("retorno seguro das superfícies (#1124)", () => {
+  function compact() {
+    window.matchMedia = vi.fn((query: string) => ({
+      matches: query === NAV_DRAWER_QUERY,
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: () => true,
+    }));
+  }
+
+  it.each(["/outside-before-document", "/login"])(
+    "Escape no deep link da busca não retorna ao predecessor desconhecido %s",
+    async (predecessor) => {
+      compact();
+      // jsdom requires same-origin URLs; the predecessor is unknown to this document's trail.
+      window.history.replaceState(null, "", predecessor);
+      window.history.pushState(null, "", "/chat/search");
+      _resetDocumentEntry();
+      render(<App />);
+      await screen.findByRole("searchbox");
+      const entries = window.history.length;
+      const go = vi.spyOn(window.history, "go");
+      try {
+        await user.keyboard("{Escape}");
+        expect(go).not.toHaveBeenCalled();
+        expect(path()).toBe("/chat/search");
+        expect(window.history.length).toBe(entries);
+        expect(navToggle()).toHaveAttribute("aria-expanded", "true");
+        expect(navToggle()).toHaveFocus();
+      } finally {
+        go.mockRestore();
+      }
+    },
+  );
+
+  it.each(["Escape", "Enter", "Space", "pointer", "touch"])(
+    "busca interna retorna à conversa por %s com URL e foco coerentes",
+    async (press) => {
+      compact();
+      loadAt(CHANNEL);
+      await expectHeader("geral");
+      await user.click(navToggle());
+      await user.click(screen.getByRole("button", { name: "Buscar no NChat" }));
+      await screen.findByRole("searchbox");
+      const popped = nextPopstate();
+      if (press === "Escape") await user.keyboard("{Escape}");
+      else {
+        const control = back();
+        expect(control).toHaveAttribute("type", "button");
+        expect(control).toHaveAttribute("title", "Voltar");
+        if (press === "pointer") await user.click(control);
+        else if (press === "touch") await user.pointer({ keys: "[TouchA]", target: control });
+        else {
+          control.focus();
+          await user.keyboard(press === "Enter" ? "{Enter}" : " ");
+        }
+      }
+      await popped();
+      await expectHeader("geral");
+      expect(path()).toBe(CHANNEL);
+      expect(navToggle()).toHaveFocus();
+    },
+  );
+
+  it("Escape já consumido por outro controle não fecha a busca", async () => {
+    loadAt(CHANNEL);
+    await expectHeader("geral");
+    await push("/chat/search");
+    const field = await screen.findByRole("searchbox");
+    const consumed = (event: Event) => event.preventDefault();
+    field.addEventListener("keydown", consumed);
+    fireEvent.keyDown(field, { key: "Escape" });
+    field.removeEventListener("keydown", consumed);
+    expect(path()).toBe("/chat/search");
+    expect(field).toHaveFocus();
+  });
+
+  it("busca → resultado → busca restaura consulta/aba e mantém o Forward nativo", async () => {
+    api.searchCategory.mockImplementation((category: string) =>
+      Promise.resolve(
+        resultPage(category === "groups" ? [groupResult({ id: groupId, title: "Projeto" })] : []),
+      ),
+    );
+    loadAt(CHANNEL);
+    await expectHeader("geral");
+    await push("/chat/search");
+    const field = await screen.findByRole("searchbox");
+    await user.type(field, "projeto");
+    await user.click(screen.getByRole("tab", { name: "Grupos" }));
+    await user.click(await screen.findByRole("button", { name: /Grupo Projeto/ }));
+    await expectHeader("Projeto");
+    await pressBack();
+    expect(path()).toBe("/chat/search");
+    expect(await screen.findByRole("searchbox")).toHaveValue("projeto");
+    expect(screen.getByRole("tab", { name: "Grupos" })).toHaveAttribute("aria-selected", "true");
+    const popped = nextPopstate();
+    act(() => window.history.forward());
+    await popped();
+    await expectHeader("Projeto");
+    expect(path()).toBe(GROUP);
+  });
+
+  it("favoritos por deep link abre a lista sem inventar predecessor", async () => {
+    compact();
+    favoritesGate.real = true;
+    loadAt("/chat/favorites");
+    await screen.findByText(/Nenhuma mensagem favoritada/);
+    const entries = window.history.length;
+    await user.click(back());
+    expect(path()).toBe("/chat/favorites");
+    expect(window.history.length).toBe(entries);
+    expect(navToggle()).toHaveAttribute("aria-expanded", "true");
+    expect(navToggle()).toHaveFocus();
+  });
+
+  it("favoritos internos retornam à conversa anterior validada", async () => {
+    compact();
+    favoritesGate.real = true;
+    loadAt(CHANNEL);
+    await expectHeader("geral");
+    await push("/chat/favorites");
+    await screen.findByText(/Nenhuma mensagem favoritada/);
+    await pressBack();
+    expect(path()).toBe(CHANNEL);
+    await expectHeader("geral");
+    expect(document.body).not.toHaveFocus();
+  });
+
+  it("favoritos → conversa → favoritos usa o mesmo histórico contextual", async () => {
+    favoritesGate.real = true;
+    api.fetchFavorites.mockResolvedValue({
+      favorites: [{
+        message: message("favorite-1", "Favorito seguro"),
+        channelId,
+        dmConversationId: "",
+        favoritedAt: "2026-01-01",
+      }],
+      nextCursor: "",
+    });
+    loadAt("/chat/favorites");
+    await user.click(await screen.findByRole("link", { name: "Ver no canal" }));
+    await expectHeader("geral");
+    await pressBack();
+    expect(path()).toBe("/chat/favorites");
+    await screen.findByText("Favorito seguro");
+  });
+
+  it.each(["/chat/search", "/chat/favorites"])(
+    "a Home registrada é o retorno de %s, sem confundi-la com o drawer",
+    async (surface) => {
+      compact();
+      favoritesGate.real = true;
+      loadAt("/chat");
+      await screen.findByRole("option", { name: /geral/ });
+      await push(surface);
+      if (surface.endsWith("search")) await screen.findByRole("searchbox");
+      else await screen.findByText(/Nenhuma mensagem favoritada/);
+      await pressBack();
+      expect(path()).toBe("/chat");
+      expect(screen.getByTestId("chat-placeholder")).toBeInTheDocument();
+      expect(navToggle()).toHaveAttribute("aria-expanded", "false");
+      expect(document.body).not.toHaveFocus();
+    },
+  );
+
+  it("conversa aberta da Home mantém o fallback existente para a lista e a seleção", async () => {
+    compact();
+    loadAt("/chat");
+    await openFromSidebar(/Canal geral/);
+    await expectHeader("geral");
+    const entries = window.history.length;
+    await user.click(back());
+    expect(path()).toBe(CHANNEL);
+    expect(window.history.length).toBe(entries);
+    expect(navToggle()).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("option", { name: /Canal geral/ })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("nova sessão impede que Escape reutilize o predecessor da busca", async () => {
+    compact();
+    loadAt(CHANNEL);
+    await expectHeader("geral");
+    await push("/chat/search");
+    await screen.findByRole("searchbox");
+    act(() => setTokens("new-session"));
+    await screen.findByRole("searchbox");
+    await user.keyboard("{Escape}");
+    expect(path()).toBe("/chat/search");
+    expect(navToggle()).toHaveAttribute("aria-expanded", "true");
+  });
+});
 
 describe("Voltar contextual do cabeçalho (#1124)", () => {
   it("sidebar A → B → C: volta a B, depois a A, depois abre a lista sem sair de A", async () => {
@@ -469,6 +674,41 @@ describe("Voltar contextual do cabeçalho (#1124)", () => {
     await expectHeader("Juliane");
     expect(path()).toBe(DM);
   });
+
+  it.each([
+    { presses: 1, strict: false },
+    { presses: 2, strict: false },
+    { presses: 1, strict: true },
+    { presses: 2, strict: true },
+  ])(
+    "foco DM → canal após $presses acionamento(s), StrictMode=$strict",
+    async ({ presses, strict }) => {
+      loadAt(CHANNEL, { strict });
+      await expectHeader("geral");
+      await openFromSidebar(/Mensagem direta com Juliane/);
+      await expectHeader("Juliane");
+      const original = back();
+      original.focus();
+      const go = vi.spyOn(window.history, "go");
+      const popped = nextPopstate();
+      try {
+        // Both activations happen before the browser can deliver the POP.
+        act(() => {
+          for (let press = 0; press < presses; press += 1) fireEvent.click(original);
+        });
+        expect(go).toHaveBeenCalledExactlyOnceWith(-1);
+        await popped();
+
+        await expectHeader("geral");
+        expect(path()).toBe(CHANNEL);
+        expect(original).not.toBeInTheDocument();
+        await waitFor(() => expect(back()).toHaveFocus());
+        expect(go).toHaveBeenCalledTimes(1);
+      } finally {
+        go.mockRestore();
+      }
+    },
+  );
 
   it("uma nova sessão não reaproveita o histórico da anterior", async () => {
     loadAt(CHANNEL);

@@ -75,55 +75,52 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-type ContextOverrides = {
-  status?: "loading" | "error" | "ready";
-  channels?: Channel[];
-  dms?: DMConversation[];
-  retry?: AppShellOutletContext["retry"];
-  setMuted?: AppShellOutletContext["setMuted"];
-  setNotificationMode?: AppShellOutletContext["setNotificationMode"];
-  /**
-   * The issue #136 rollout gate, as the server would have published it.
-   *
-   * Defaulted to `true` here because most of this file is about the granular
-   * control. The production default is `false` — proved where it is decided,
-   * in chat-service's config and service suites, and in chatApi's parsing of
-   * the payload — and the suite at the bottom of this file covers what this
-   * page renders when the gate is shut.
-   */
-  notificationLevelsEnabled?: boolean;
-};
-
-/** The sidebar state a context publishes, in the status the case asks for. */
-function sidebarState(overrides: ContextOverrides): SidebarState {
-  const status = overrides.status ?? "ready";
-  return status === "ready"
-    ? {
-        status: "ready",
-        currentUserId: "user-1",
-        workspaceId: "workspace-1",
-        // `in` rather than `??`, so a case can state an explicitly absent
-        // capability — a payload that never carried the field — and get it.
-        notificationLevelsEnabled:
-          "notificationLevelsEnabled" in overrides ? overrides.notificationLevelsEnabled : true,
-        channels: overrides.channels ?? [],
-        dms: overrides.dms ?? [],
-        categories: [],
-      }
-    : status === "error"
-      ? { status: "error", error: "boom" }
-      : { status: "loading" };
-}
-
 /**
  * The page reads the one sidebar instance through the outlet context AppShell
  * publishes, so every render here supplies one. Ready-and-empty by default:
  * the general-notification suites below are about browser permission and local
  * sound preferences, not about conversations.
  */
-function makeContext(overrides: ContextOverrides = {}): AppShellOutletContext {
+function makeContext(
+  overrides: {
+    status?: "loading" | "error" | "ready";
+    channels?: Channel[];
+    dms?: DMConversation[];
+    retry?: AppShellOutletContext["retry"];
+    setMuted?: AppShellOutletContext["setMuted"];
+    setNotificationMode?: AppShellOutletContext["setNotificationMode"];
+    /**
+     * The issue #136 rollout gate, as the server would have published it.
+     *
+     * Defaulted to `true` here because most of this file is about the granular
+     * control. The production default is `false` — proved where it is decided,
+     * in chat-service's config and service suites, and in chatApi's parsing of
+     * the payload — and the suite at the bottom of this file covers what this
+     * page renders when the gate is shut.
+     */
+    notificationLevelsEnabled?: boolean;
+  } = {},
+): AppShellOutletContext {
+  const status = overrides.status ?? "ready";
+  const state: SidebarState =
+    status === "ready"
+      ? {
+          status: "ready",
+          currentUserId: "user-1",
+          workspaceId: "workspace-1",
+          // `in` rather than `??`, so a case can state an explicitly absent
+          // capability — a payload that never carried the field — and get it.
+          notificationLevelsEnabled:
+            "notificationLevelsEnabled" in overrides ? overrides.notificationLevelsEnabled : true,
+          channels: overrides.channels ?? [],
+          dms: overrides.dms ?? [],
+          categories: [],
+        }
+      : status === "error"
+        ? { status: "error", error: "boom" }
+        : { status: "loading" };
   return {
-    state: sidebarState(overrides),
+    state,
     retry: overrides.retry ?? vi.fn(async () => {}),
     setPinned: vi.fn(async () => {}),
     markRead: vi.fn(),

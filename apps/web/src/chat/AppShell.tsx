@@ -31,7 +31,7 @@ import {
   type DirectMessageCoordinator,
 } from "./directMessage";
 import { useChatSidebar } from "./useChatSidebar";
-import { useConversationBack } from "./conversationBack";
+import { isReturnSurface, useConversationBack } from "./conversationBack";
 import { useConversationDrafts, type ConversationDraftsApi } from "./useConversationDrafts";
 import { clearFreshLogin, isFreshLogin, onAuthChange } from "../lib/authSession";
 import { useDocumentReloadEntry } from "../lib/documentEntry";
@@ -526,12 +526,18 @@ export default function AppShell() {
     showNav();
     navToggleRef.current?.focus();
   }, [showNav]);
-  const goBack = useConversationBack(
+  const contextualBack = useConversationBack(
     state,
     sidebar.identityPending,
     sidebar.confirmingIdentity,
     openNavFromBack,
   );
+  const goBack = useCallback(() => {
+    const travelled = contextualBack();
+    // Surface headers unmount on return, including a return to the empty Home.
+    if (travelled && isReturnSurface(pathname)) navToggleRef.current?.focus();
+    return travelled;
+  }, [contextualBack, pathname]);
   // The row control the panel was opened from, kept so closing can hand focus
   // back to it. A ref rather than state: nothing renders from it, and it must
   // survive the render that closes the panel. Captured here rather than read
