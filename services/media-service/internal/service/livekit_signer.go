@@ -108,11 +108,11 @@ func encodeLiveKitToken(apiKey, apiSecret, identity, displayName, room string, t
 		return SignedToken{}, fmt.Errorf("verify issued LiveKit token")
 	}
 	claims, _, err := verifier.Verify(apiSecret)
-	if err != nil || claims.Expiry == nil {
+	if err != nil || claims.ExpiresAt == nil {
 		return SignedToken{}, fmt.Errorf("verify issued LiveKit token")
 	}
 	return SignedToken{
 		Token:     raw,
-		ExpiresAt: time.Unix(int64(*claims.Expiry), 0).UTC(),
+		ExpiresAt: claims.ExpiresAt.UTC(),
 	}, nil
 }
