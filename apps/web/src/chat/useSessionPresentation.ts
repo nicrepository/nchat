@@ -5,7 +5,12 @@ export function useSessionPresentation(
   rootRef: RefObject<HTMLElement | null>,
   ready: boolean,
   suspended: boolean,
-  { pending = false, unavailable = false, scope = "", onAbandon }: {
+  {
+    pending = false,
+    unavailable = false,
+    scope = "",
+    onAbandon,
+  }: {
     pending?: boolean;
     unavailable?: boolean;
     scope?: string;
@@ -22,8 +27,10 @@ export function useSessionPresentation(
     // Ordinary pagination ends recovery, but its control may need focus after refresh.
     saved.current = {
       top: root?.scrollTop ?? 0,
-      focus: active instanceof HTMLElement && root?.contains(active)
-        ? active.id || active.dataset.sessionFocus || null : null,
+      focus:
+        active instanceof HTMLElement && root?.contains(active)
+          ? active.id || active.dataset.sessionFocus || null
+          : null,
     };
     onAbandon?.();
   }, [onAbandon, rootRef]);
@@ -43,8 +50,11 @@ export function useSessionPresentation(
       const maximum = Math.max(0, root.scrollHeight - root.clientHeight);
       root.scrollTop = !unavailable && saved.current.top <= maximum ? saved.current.top : 0;
       if (document.activeElement === document.body && saved.current.focus) {
-        const target = unavailable ? undefined : [...root.querySelectorAll<HTMLElement>("[id], [data-session-focus]")]
-          .find((element) => keyOf(element) === saved.current?.focus);
+        const target = unavailable
+          ? undefined
+          : [...root.querySelectorAll<HTMLElement>("[id], [data-session-focus]")].find(
+              (element) => keyOf(element) === saved.current?.focus,
+            );
         (target ?? root).focus({ preventScroll: true });
       }
     }
@@ -65,10 +75,17 @@ export function useSessionPresentation(
         return;
       }
       if (restore.current && (pending || !ready)) abandon();
-      saved.current = { top: root.scrollTop, focus: keyOf(event.target) ?? "reading-root-fallback" };
+      saved.current = {
+        top: root.scrollTop,
+        focus: keyOf(event.target) ?? "reading-root-fallback",
+      };
     };
     const blur = (event: FocusEvent) => {
-      if (saved.current && event.relatedTarget instanceof Node && !root.contains(event.relatedTarget)) {
+      if (
+        saved.current &&
+        event.relatedTarget instanceof Node &&
+        !root.contains(event.relatedTarget)
+      ) {
         saved.current.focus = null;
       }
     };

@@ -71,7 +71,10 @@ async function readFavoritePages(cursor: string | undefined, depth: number, sign
     for (const item of page.favorites) items.set(item.message.id, item);
     cursor = page.nextCursor;
     loaded += 1;
-    if (!cursor || seen.has(cursor)) { cursor = ""; break; }
+    if (!cursor || seen.has(cursor)) {
+      cursor = "";
+      break;
+    }
     seen.add(cursor);
   } while (loaded < depth);
   return { favorites: [...items.values()], nextCursor: cursor ?? "", loaded };
@@ -103,7 +106,10 @@ export default function FavoritesPage() {
   );
 }
 
-function FavoritesList({ session, rootRef }: {
+function FavoritesList({
+  session,
+  rootRef,
+}: {
   session: SessionOwner;
   rootRef: RefObject<HTMLDivElement | null>;
 }) {
@@ -125,7 +131,9 @@ function FavoritesList({ session, rootRef }: {
   const removedRef = useRef(new Set<string>());
   useEffect(() => {
     mountedRef.current = true;
-    return () => { mountedRef.current = false; };
+    return () => {
+      mountedRef.current = false;
+    };
   }, []);
   const [suspended, setSuspended] = useState(!session.settled);
   const cancelRecovery = useCallback(() => {
@@ -138,7 +146,9 @@ function FavoritesList({ session, rootRef }: {
     setState((s) => ({ ...s, restorePages: 0, loadingMore: false }));
   }, [state.pages, state.loadingMore, state.restorePages, state.status]);
   const abandonReading = useSessionPresentation(
-    rootRef, session.settled && state.status === "ready", !session.settled,
+    rootRef,
+    session.settled && state.status === "ready",
+    !session.settled,
     {
       pending: state.restorePages > state.pages && !!state.nextCursor,
       unavailable: state.restorePages > state.pages && !state.nextCursor,
@@ -154,7 +164,9 @@ function FavoritesList({ session, rootRef }: {
         ...s,
         status: s.revalidationsLeft > 0 ? "loading" : "error",
         revalidationsLeft: Math.max(0, s.revalidationsLeft - 1),
-        items: [], nextCursor: "", loadingMore: false,
+        items: [],
+        nextCursor: "",
+        loadingMore: false,
       }));
     }
   }
@@ -203,48 +215,58 @@ function FavoritesList({ session, rootRef }: {
     setState((s) => ({ ...s, revalidationsLeft: 1, status: "loading", actionError: null }));
   }, []);
 
-  const loadMore = useCallback((recover = false) => {
-    if (pagingRef.current || state.status !== "ready" || !state.nextCursor) return;
-    // A page belongs to the list it continues: reloading or unmounting the
-    // list aborts it, and an answer arriving after that is dropped.
-    const signal = abortRef.current?.signal;
-    if (!signal || signal.aborted) return;
-    const depth = recover ? Math.min(5, state.restorePages - state.pages) : 1;
-    if (depth <= 0) return;
-    if (!recover) abandonReading();
-    pagingRef.current = true;
-    removedRef.current.clear();
-    setState((current) => ({ ...current, revalidationsLeft: 1, loadingMore: true, actionError: null }));
-    readFavoritePages(state.nextCursor, depth, signal).then(
-      (page) => {
-        if (signal.aborted || !page) return;
-        pagingRef.current = false;
-        pagesRef.current = page.nextCursor
-          ? Math.max(pagesRef.current, state.pages + page.loaded)
-          : state.pages + page.loaded;
-        setState((s) => ({
-          ...s,
-          items: [...new Map(
-            [...s.items, ...page.favorites]
-              .filter((item) => !removedRef.current.has(item.message.id))
-              .map((item) => [item.message.id, item]),
-          ).values()],
-          nextCursor: page.nextCursor,
-          pages: s.pages + page.loaded,
-          loadingMore: false,
-        }));
-      },
-      () => {
-        if (signal.aborted) return;
-        pagingRef.current = false;
-        setState((s) => ({
-          ...s,
-          loadingMore: false,
-          actionError: "Não foi possível carregar mais favoritos.",
-        }));
-      },
-    );
-  }, [state.status, state.nextCursor, state.pages, state.restorePages, abandonReading]);
+  const loadMore = useCallback(
+    (recover = false) => {
+      if (pagingRef.current || state.status !== "ready" || !state.nextCursor) return;
+      // A page belongs to the list it continues: reloading or unmounting the
+      // list aborts it, and an answer arriving after that is dropped.
+      const signal = abortRef.current?.signal;
+      if (!signal || signal.aborted) return;
+      const depth = recover ? Math.min(5, state.restorePages - state.pages) : 1;
+      if (depth <= 0) return;
+      if (!recover) abandonReading();
+      pagingRef.current = true;
+      removedRef.current.clear();
+      setState((current) => ({
+        ...current,
+        revalidationsLeft: 1,
+        loadingMore: true,
+        actionError: null,
+      }));
+      readFavoritePages(state.nextCursor, depth, signal).then(
+        (page) => {
+          if (signal.aborted || !page) return;
+          pagingRef.current = false;
+          pagesRef.current = page.nextCursor
+            ? Math.max(pagesRef.current, state.pages + page.loaded)
+            : state.pages + page.loaded;
+          setState((s) => ({
+            ...s,
+            items: [
+              ...new Map(
+                [...s.items, ...page.favorites]
+                  .filter((item) => !removedRef.current.has(item.message.id))
+                  .map((item) => [item.message.id, item]),
+              ).values(),
+            ],
+            nextCursor: page.nextCursor,
+            pages: s.pages + page.loaded,
+            loadingMore: false,
+          }));
+        },
+        () => {
+          if (signal.aborted) return;
+          pagingRef.current = false;
+          setState((s) => ({
+            ...s,
+            loadingMore: false,
+            actionError: "Não foi possível carregar mais favoritos.",
+          }));
+        },
+      );
+    },
+    [state.status, state.nextCursor, state.pages, state.restorePages, abandonReading],
+  );
 
   const removeFavorite = useCallback((messageId: string) => {
     unfavoriteMessage(messageId).then(
@@ -266,17 +288,20 @@ function FavoritesList({ session, rootRef }: {
     );
   }, []);
 
-  if (!session.settled) return <SessionPending session={session} className="chat-favorites__status" />;
+  if (!session.settled)
+    return <SessionPending session={session} className="chat-favorites__status" />;
 
   return (
     <>
-      {state.status === "ready" && state.restorePages > 0 && <PaginationRecovery
-        remaining={Math.max(0, state.restorePages - state.pages)}
-        hasMore={!!state.nextCursor}
-        busy={state.loadingMore}
-        onRecover={() => loadMore(true)}
-        onCancel={abandonReading}
-      />}
+      {state.status === "ready" && state.restorePages > 0 && (
+        <PaginationRecovery
+          remaining={Math.max(0, state.restorePages - state.pages)}
+          hasMore={!!state.nextCursor}
+          busy={state.loadingMore}
+          onRecover={() => loadMore(true)}
+          onCancel={abandonReading}
+        />
+      )}
       {state.status === "loading" && (
         <div className="chat-favorites__status" role="status">
           Carregando favoritos…
@@ -286,7 +311,12 @@ function FavoritesList({ session, rootRef }: {
       {state.status === "error" && (
         <div className="chat-favorites__status" role="alert">
           Não foi possível carregar seus favoritos.{" "}
-          <button type="button" data-reading-recovery="true" className="chat-favorites__link-btn" onClick={retry}>
+          <button
+            type="button"
+            data-reading-recovery="true"
+            className="chat-favorites__link-btn"
+            onClick={retry}
+          >
             Tentar novamente
           </button>
         </div>

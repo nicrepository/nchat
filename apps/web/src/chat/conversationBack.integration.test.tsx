@@ -456,12 +456,14 @@ describe("retorno seguro das superfícies (#1124)", () => {
   it("favoritos → conversa → favoritos usa o mesmo histórico contextual", async () => {
     favoritesGate.real = true;
     api.fetchFavorites.mockResolvedValue({
-      favorites: [{
-        message: message("favorite-1", "Favorito seguro"),
-        channelId,
-        dmConversationId: "",
-        favoritedAt: "2026-01-01",
-      }],
+      favorites: [
+        {
+          message: message("favorite-1", "Favorito seguro"),
+          channelId,
+          dmConversationId: "",
+          favoritedAt: "2026-01-01",
+        },
+      ],
       nextCursor: "",
     });
     loadAt("/chat/favorites");
@@ -500,7 +502,10 @@ describe("retorno seguro das superfícies (#1124)", () => {
     expect(path()).toBe(CHANNEL);
     expect(window.history.length).toBe(entries);
     expect(navToggle()).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByRole("option", { name: /Canal geral/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("option", { name: /Canal geral/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
   });
 
   it("nova sessão impede que Escape reutilize o predecessor da busca", async () => {

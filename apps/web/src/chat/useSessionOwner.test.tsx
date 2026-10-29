@@ -16,33 +16,51 @@ function OwnedState() {
 
 function Probe() {
   const session = useSessionOwner();
-  useLayoutEffect(() => { renders += 1; });
-  return <>
-    <output data-testid="owner" data-owner={session.owner ?? ""} data-settled={session.settled}>
-      {session.sessionKey}
-    </output>
-    {session.owner !== null && <div hidden={!session.settled}>
-      <OwnedState key={`${session.sessionKey}:${session.owner}`} />
-    </div>}
-  </>;
+  useLayoutEffect(() => {
+    renders += 1;
+  });
+  return (
+    <>
+      <output data-testid="owner" data-owner={session.owner ?? ""} data-settled={session.settled}>
+        {session.sessionKey}
+      </output>
+      {session.owner !== null && (
+        <div hidden={!session.settled}>
+          <OwnedState key={`${session.sessionKey}:${session.owner}`} />
+        </div>
+      )}
+    </>
+  );
 }
 
 function Shell() {
   const [sessionIdentity, set] = useState<string | null>("u1:w1");
-  useLayoutEffect(() => { setIdentity = set; }, []);
+  useLayoutEffect(() => {
+    setIdentity = set;
+  }, []);
   return <Outlet context={{ sessionIdentity }} />;
 }
 
 function LayoutEvent({ children, event }: { children: ReactNode; event?: () => void }) {
   // Descendants have rendered; their passive subscriptions are not installed yet.
-  useLayoutEffect(() => { event?.(); }, [event]);
+  useLayoutEffect(() => {
+    event?.();
+  }, [event]);
   return children;
 }
 
 function mount(event?: () => void, strict = false) {
-  const content = <MemoryRouter><LayoutEvent event={event}><Routes>
-    <Route element={<Shell />}><Route path="/" element={<Probe />} /></Route>
-  </Routes></LayoutEvent></MemoryRouter>;
+  const content = (
+    <MemoryRouter>
+      <LayoutEvent event={event}>
+        <Routes>
+          <Route element={<Shell />}>
+            <Route path="/" element={<Probe />} />
+          </Route>
+        </Routes>
+      </LayoutEvent>
+    </MemoryRouter>
+  );
   return render(strict ? <StrictMode>{content}</StrictMode> : content);
 }
 
@@ -128,7 +146,10 @@ describe("useSessionOwner: render-to-subscription race (R3)", () => {
     vi.spyOn(auth, "onAuthChange").mockImplementation((listener) => {
       const unsubscribe = onAuthChange(listener);
       active += 1;
-      return () => { active -= 1; unsubscribe(); };
+      return () => {
+        active -= 1;
+        unsubscribe();
+      };
     });
     const first = mount(undefined, true);
     expect(active).toBe(1);
@@ -157,7 +178,9 @@ describe("useSessionOwner: render-to-subscription race (R3)", () => {
     });
     const current = key();
     const before = renders;
-    act(() => { notify("session"); });
+    act(() => {
+      notify("session");
+    });
     expect(key()).toBe(current);
     expect(ownedGeneration()).toBe(current);
     expect(screen.getByTestId("owner")).toHaveAttribute("data-owner", "u2:w2");

@@ -38,7 +38,12 @@ export function SearchError({
   return (
     <div className="global-search__status" role="alert">
       <span>{errorMessage(kind)}</span>
-      <button type="button" data-reading-recovery="true" className="global-search__link-btn" onClick={onRetry}>
+      <button
+        type="button"
+        data-reading-recovery="true"
+        className="global-search__link-btn"
+        onClick={onRetry}
+      >
         Tentar novamente
       </button>
     </div>
@@ -82,26 +87,30 @@ export default function SearchResultList<C extends SearchCategory>({
 
   return (
     <>
-      {list.restorePages > 0 && onRecover && onCancelRecovery && <PaginationRecovery
-        remaining={Math.max(0, list.restorePages - list.pages)}
-        hasMore={list.hasMore}
-        busy={list.loadingMore}
-        onRecover={onRecover}
-        onCancel={onCancelRecovery}
-      />}
+      {list.restorePages > 0 && onRecover && onCancelRecovery && (
+        <PaginationRecovery
+          remaining={Math.max(0, list.restorePages - list.pages)}
+          hasMore={list.hasMore}
+          busy={list.loadingMore}
+          onRecover={onRecover}
+          onCancel={onCancelRecovery}
+        />
+      )}
       {list.items.length === 0 && <SearchEmpty query={query} />}
       {list.items.length > 0 && !list.hasMore && (
         <p className="global-search__count">
           {resultCount(list.items.length)} para “{query}”
         </p>
       )}
-      {list.items.length > 0 && <ul className="global-search__list" aria-label={TAB_LABELS[category]}>
-        {list.items.map((item) => (
-          <li key={item.id} className="global-search__item">
-            <SearchResultRow category={category} result={item} query={query} />
-          </li>
-        ))}
-      </ul>}
+      {list.items.length > 0 && (
+        <ul className="global-search__list" aria-label={TAB_LABELS[category]}>
+          {list.items.map((item) => (
+            <li key={item.id} className="global-search__item">
+              <SearchResultRow category={category} result={item} query={query} />
+            </li>
+          ))}
+        </ul>
+      )}
 
       {list.hasMore && (
         <button

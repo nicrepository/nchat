@@ -71,12 +71,14 @@ export default function GlobalSearchPage() {
   const goBack = useOutletContext<ChatOutletContext | null>()?.goBack;
   if (session.owner === null) return <SearchPending session={session} goBack={goBack} />;
   // Keyed on its owner: another identity's search is a new mount.
-  return <SearchView
-    key={`${session.sessionKey}:${session.owner}`}
-    owner={session.owner}
-    session={session}
-    restoreAllowed={entrySession === session.sessionKey}
-  />;
+  return (
+    <SearchView
+      key={`${session.sessionKey}:${session.owner}`}
+      owner={session.owner}
+      session={session}
+      restoreAllowed={entrySession === session.sessionKey}
+    />
+  );
 }
 
 /** The page while nobody's search may be on screen. */
@@ -112,7 +114,11 @@ function closeSearch(event: KeyboardEvent<HTMLElement>, goBack: (() => boolean) 
  * stays mounted, so the same user's confirmed rotation finds the query and tab
  * as they left them, but shows none of it and searches nothing.
  */
-function SearchView({ owner, session, restoreAllowed }: {
+function SearchView({
+  owner,
+  session,
+  restoreAllowed,
+}: {
   owner: string;
   session: SessionOwner;
   restoreAllowed: boolean;
@@ -125,20 +131,25 @@ function SearchView({ owner, session, restoreAllowed }: {
   const [restored] = useState(() =>
     restoreAllowed ? readRestoredSearch(location.state, owner) : undefined,
   );
-  const { state, setQuery, setActiveTab, loadMore, retry, recover, cancelRecovery } = useGlobalSearch(restored, settled);
+  const { state, setQuery, setActiveTab, loadMore, retry, recover, cancelRecovery } =
+    useGlobalSearch(restored, settled);
   const inputRef = useRef<HTMLInputElement>(null);
   const rootRef = useRef<HTMLElement>(null);
   const loading = useMemo(() => isLoading(state), [state]);
   const scope = state.activeTab === "all" ? "overview" : "tabs";
   const visible = state.activeTab === "all" ? SEARCH_CATEGORIES : [state.activeTab];
-  const presentationReady = !state.activeQuery || (
-    !state.typing && visible.every((category) => state[scope][category].status === "ready")
-  );
+  const presentationReady =
+    !state.activeQuery ||
+    (!state.typing && visible.every((category) => state[scope][category].status === "ready"));
   const currentList = state.activeTab === "all" ? null : state.tabs[state.activeTab];
-  const recoveryPending = !!currentList && currentList.hasMore && currentList.restorePages > currentList.pages;
+  const recoveryPending =
+    !!currentList && currentList.hasMore && currentList.restorePages > currentList.pages;
   const abandonReading = useSessionPresentation(rootRef, settled && presentationReady, !settled, {
-    pending: recoveryPending, scope: `${state.activeQuery}:${state.activeTab}`, onAbandon: cancelRecovery,
-    unavailable: !!currentList && !currentList.hasMore && currentList.restorePages > currentList.pages,
+    pending: recoveryPending,
+    scope: `${state.activeQuery}:${state.activeTab}`,
+    onAbandon: cancelRecovery,
+    unavailable:
+      !!currentList && !currentList.hasMore && currentList.restorePages > currentList.pages,
   });
   // The field takes focus on every entry into the search: the first open, and
   // a repeat open while already here — the shell replaces the history entry
@@ -148,7 +159,13 @@ function SearchView({ owner, session, restoreAllowed }: {
     inputRef.current?.focus();
   }, [location.key]);
   useEffect(() => {
-    if (settled && presentationReady && !recoveryPending && document.activeElement === document.body) inputRef.current?.focus();
+    if (
+      settled &&
+      presentationReady &&
+      !recoveryPending &&
+      document.activeElement === document.body
+    )
+      inputRef.current?.focus();
   }, [settled, presentationReady, recoveryPending]);
 
   // Record this search on its own history entry, then leave for the result.
@@ -260,7 +277,10 @@ function SearchView({ owner, session, restoreAllowed }: {
                   list={state.tabs[state.activeTab]}
                   query={state.activeQuery}
                   onRetry={() => retry("tabs", state.activeTab as SearchCategory)}
-                  onLoadMore={() => { abandonReading(); loadMore(state.activeTab as SearchCategory); }}
+                  onLoadMore={() => {
+                    abandonReading();
+                    loadMore(state.activeTab as SearchCategory);
+                  }}
                   onRecover={() => recover(state.activeTab as SearchCategory)}
                   onCancelRecovery={abandonReading}
                 />

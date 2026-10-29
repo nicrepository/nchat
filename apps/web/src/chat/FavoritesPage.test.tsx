@@ -111,7 +111,8 @@ describe("FavoritesPage", () => {
   it("a removal for U1 completing after U2 loaded cannot remove U2's item with the same ID", async () => {
     const removed = deferred<void>();
     mockUnfavoriteMessage.mockReturnValueOnce(removed.promise);
-    mockFetchFavorites.mockResolvedValueOnce(page([makeFavorite()]))
+    mockFetchFavorites
+      .mockResolvedValueOnce(page([makeFavorite()]))
       .mockResolvedValueOnce(page([privateFavorite("U2", "do-u2", "msg-1")]));
     renderPage();
     await userEvent.click(await screen.findByRole("button", { name: "Remover dos favoritos" }));
@@ -122,26 +123,36 @@ describe("FavoritesPage", () => {
     expect(screen.getByText("do-u2")).toBeInTheDocument();
   });
 
-  it.each(["before", "after"])("a removal completing %s refresh revalidation stays reconciled for the same owner", async (when) => {
-    const removed = deferred<void>();
-    const revalidated = deferred<ReturnType<typeof page>>();
-    mockFetchFavorites.mockResolvedValueOnce(page([makeFavorite()])).mockReturnValueOnce(revalidated.promise);
-    mockUnfavoriteMessage.mockReturnValueOnce(removed.promise);
-    renderPage();
-    await userEvent.click(await screen.findByRole("button", { name: "Remover dos favoritos" }));
-    act(() => setIdentity(null));
-    act(() => setIdentity("u1:w1"));
-    if (when === "before") await act(async () => removed.resolve());
-    await act(async () => revalidated.resolve(page([makeFavorite()])));
-    if (when === "after") await act(async () => removed.resolve());
-    expect(await screen.findByTestId("chat-favorites-empty")).toBeInTheDocument();
-    expect(screen.queryByTestId("favorite-item")).not.toBeInTheDocument();
-  });
+  it.each(["before", "after"])(
+    "a removal completing %s refresh revalidation stays reconciled for the same owner",
+    async (when) => {
+      const removed = deferred<void>();
+      const revalidated = deferred<ReturnType<typeof page>>();
+      mockFetchFavorites
+        .mockResolvedValueOnce(page([makeFavorite()]))
+        .mockReturnValueOnce(revalidated.promise);
+      mockUnfavoriteMessage.mockReturnValueOnce(removed.promise);
+      renderPage();
+      await userEvent.click(await screen.findByRole("button", { name: "Remover dos favoritos" }));
+      act(() => setIdentity(null));
+      act(() => setIdentity("u1:w1"));
+      if (when === "before") await act(async () => removed.resolve());
+      await act(async () => revalidated.resolve(page([makeFavorite()])));
+      if (when === "after") await act(async () => removed.resolve());
+      expect(await screen.findByTestId("chat-favorites-empty")).toBeInTheDocument();
+      expect(screen.queryByTestId("favorite-item")).not.toBeInTheDocument();
+    },
+  );
 
   it("paginates once under StrictMode and revalidates exactly the completed page count", async () => {
-    mockFetchFavorites.mockImplementation((cursor?: string) => Promise.resolve(page([
-      privateFavorite(cursor ? "B" : "A", cursor ? "segunda" : "primeira"),
-    ], cursor ? "" : "c1")));
+    mockFetchFavorites.mockImplementation((cursor?: string) =>
+      Promise.resolve(
+        page(
+          [privateFavorite(cursor ? "B" : "A", cursor ? "segunda" : "primeira")],
+          cursor ? "" : "c1",
+        ),
+      ),
+    );
     renderPage("u1:w1", true);
     await userEvent.click(await screen.findByRole("button", { name: /carregar mais/i }));
     await screen.findByText("segunda");
@@ -188,7 +199,8 @@ describe("FavoritesPage", () => {
 
   it("does not reuse revoked data while revalidating the same owner", async () => {
     const fresh = deferred<ReturnType<typeof page>>();
-    mockFetchFavorites.mockResolvedValueOnce(page([privateFavorite("A", "revogada")]))
+    mockFetchFavorites
+      .mockResolvedValueOnce(page([privateFavorite("A", "revogada")]))
       .mockReturnValueOnce(fresh.promise);
     renderPage();
     expect(await screen.findByText("revogada")).toBeInTheDocument();
@@ -203,7 +215,8 @@ describe("FavoritesPage", () => {
   it("a failed revalidation has a finite, explicit retry and keeps the loaded depth", async () => {
     const first = privateFavorite("A", "primeira");
     const second = privateFavorite("B", "segunda");
-    mockFetchFavorites.mockResolvedValueOnce(page([first], "c1"))
+    mockFetchFavorites
+      .mockResolvedValueOnce(page([first], "c1"))
       .mockResolvedValueOnce(page([second]))
       .mockRejectedValueOnce(new Error("offline"))
       .mockResolvedValueOnce(page([first], "new-1"))

@@ -14,16 +14,26 @@ vi.mock("./useChatWebSocket", () => ({ useChatWebSocket: () => ({ toggleReaction
 
 function Shell() {
   const { state, confirmingIdentity, retry } = useChatSidebar();
-  return <Outlet context={{
-    sessionIdentity: state.status === "ready" && !confirmingIdentity ? `${state.currentUserId}:${state.workspaceId}` : null,
-    sidebarLoading: state.status === "loading",
-    currentUserId: state.status === "ready" ? state.currentUserId : "",
-    refreshConversations: retry,
-  }} />;
+  return (
+    <Outlet
+      context={{
+        sessionIdentity:
+          state.status === "ready" && !confirmingIdentity
+            ? `${state.currentUserId}:${state.workspaceId}`
+            : null,
+        sidebarLoading: state.status === "loading",
+        currentUserId: state.status === "ready" ? state.currentUserId : "",
+        refreshConversations: retry,
+      }}
+    />
+  );
 }
 
 function json(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 let user: string;
@@ -36,7 +46,12 @@ let releaseSidebar: (() => void) | undefined;
 let releaseLate: (() => void) | undefined;
 let refreshed: boolean;
 let revoked: boolean;
-let requests: Array<{ path: string; cursor: string | null; token: string | null; signal?: AbortSignal | null }>;
+let requests: Array<{
+  path: string;
+  cursor: string | null;
+  token: string | null;
+  signal?: AbortSignal | null;
+}>;
 
 beforeEach(() => {
   _resetState();
@@ -48,42 +63,77 @@ beforeEach(() => {
   expire = refreshFails = sidebarFails = holdSidebar = refreshed = revoked = false;
   releaseSidebar = releaseLate = undefined;
   requests = [];
-  vi.stubGlobal("fetch", vi.fn(async (input: string, init: RequestInit) => {
-    const url = new URL(input, "http://localhost");
-    const path = url.pathname;
-    const body = init.body ? JSON.parse(String(init.body)) as { cursor?: string } : {};
-    const cursor = url.searchParams.get("before") ?? body.cursor ?? null;
-    requests.push({ path, cursor, token: new Headers(init.headers).get("authorization"), signal: init.signal });
-    if (path === "/api/auth/refresh") {
-      if (refreshFails) return json({}, 503);
-      expire = false;
-      refreshed = true;
-      holdSidebar = true;
-      return json({ access_token: "rotated", token_type: "Bearer", expires_in: 900 });
-    }
-    if (path === "/api/chat/channel-categories") return json({ data: { groups: [] } });
-    if (path === "/api/chat/sidebar") {
-      if (holdSidebar) await new Promise<void>((resolve) => { releaseSidebar = resolve; });
-      return sidebarFails ? json({}, 503) : json({ data: { current_user_id: user, workspace: { id: workspace }, channels: [] } });
-    }
-    if (path === "/api/chat/favorites" || path === "/api/search/groups") {
-      if (expire) return json({ error: { code: "token_expired", message: "Expired" } }, 401);
-      if (refreshed && revoked) return path === "/api/chat/favorites"
-        ? json({ data: { favorites: [], next_cursor: "" } })
-        : json({ error: { code: "forbidden" } }, 403);
-      // The retried old pagination request deliberately ignores abort, and answers last.
-      if (cursor === "old-2") await new Promise<void>((resolve) => { releaseLate = resolve; });
-      const n = cursor ? 2 : 1;
-      const title = `${user}-${n === 1 ? "primeira" : "segunda"}`;
-      const next = `${refreshed ? "new" : "old"}-${n}`;
-      if (path === "/api/chat/favorites") return json({ data: {
-        favorites: [{ message: { id: `${user}-${n}`, sender_id: user, body_text: title, created_at: "2026-01-01T00:00:00Z" }, favorited_at: "2026-01-01T00:00:00Z" }],
-        next_cursor: next,
-      } });
-      return json({ data: { data: [{ id: `${user}-${n}`, title, participant_count: 2 }], pagination: { next_cursor: next, has_more: true } } });
-    }
-    throw new Error(`Unexpected local test request: ${path}`);
-  }));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: string, init: RequestInit) => {
+      const url = new URL(input, "http://localhost");
+      const path = url.pathname;
+      const body = init.body ? (JSON.parse(String(init.body)) as { cursor?: string }) : {};
+      const cursor = url.searchParams.get("before") ?? body.cursor ?? null;
+      requests.push({
+        path,
+        cursor,
+        token: new Headers(init.headers).get("authorization"),
+        signal: init.signal,
+      });
+      if (path === "/api/auth/refresh") {
+        if (refreshFails) return json({}, 503);
+        expire = false;
+        refreshed = true;
+        holdSidebar = true;
+        return json({ access_token: "rotated", token_type: "Bearer", expires_in: 900 });
+      }
+      if (path === "/api/chat/channel-categories") return json({ data: { groups: [] } });
+      if (path === "/api/chat/sidebar") {
+        if (holdSidebar)
+          await new Promise<void>((resolve) => {
+            releaseSidebar = resolve;
+          });
+        return sidebarFails
+          ? json({}, 503)
+          : json({ data: { current_user_id: user, workspace: { id: workspace }, channels: [] } });
+      }
+      if (path === "/api/chat/favorites" || path === "/api/search/groups") {
+        if (expire) return json({ error: { code: "token_expired", message: "Expired" } }, 401);
+        if (refreshed && revoked)
+          return path === "/api/chat/favorites"
+            ? json({ data: { favorites: [], next_cursor: "" } })
+            : json({ error: { code: "forbidden" } }, 403);
+        // The retried old pagination request deliberately ignores abort, and answers last.
+        if (cursor === "old-2")
+          await new Promise<void>((resolve) => {
+            releaseLate = resolve;
+          });
+        const n = cursor ? 2 : 1;
+        const title = `${user}-${n === 1 ? "primeira" : "segunda"}`;
+        const next = `${refreshed ? "new" : "old"}-${n}`;
+        if (path === "/api/chat/favorites")
+          return json({
+            data: {
+              favorites: [
+                {
+                  message: {
+                    id: `${user}-${n}`,
+                    sender_id: user,
+                    body_text: title,
+                    created_at: "2026-01-01T00:00:00Z",
+                  },
+                  favorited_at: "2026-01-01T00:00:00Z",
+                },
+              ],
+              next_cursor: next,
+            },
+          });
+        return json({
+          data: {
+            data: [{ id: `${user}-${n}`, title, participant_count: 2 }],
+            pagination: { next_cursor: next, has_more: true },
+          },
+        });
+      }
+      throw new Error(`Unexpected local test request: ${path}`);
+    }),
+  );
 });
 
 afterEach(async () => {
@@ -98,15 +148,23 @@ afterEach(async () => {
 });
 
 async function open(surface: "favorites" | "search") {
-  const view = render(<MemoryRouter initialEntries={[`/chat/${surface}`]}>
-    <Routes>
-      <Route element={<RequireAuth><Shell /></RequireAuth>}>
-        <Route path="/chat/favorites" element={<FavoritesPage />} />
-        <Route path="/chat/search" element={<GlobalSearchPage />} />
-      </Route>
-      <Route path="/login" element={<div>Login</div>} />
-    </Routes>
-  </MemoryRouter>);
+  const view = render(
+    <MemoryRouter initialEntries={[`/chat/${surface}`]}>
+      <Routes>
+        <Route
+          element={
+            <RequireAuth>
+              <Shell />
+            </RequireAuth>
+          }
+        >
+          <Route path="/chat/favorites" element={<FavoritesPage />} />
+          <Route path="/chat/search" element={<GlobalSearchPage />} />
+        </Route>
+        <Route path="/login" element={<div>Login</div>} />
+      </Routes>
+    </MemoryRouter>,
+  );
   if (surface === "search") {
     await screen.findByRole("searchbox");
     await userEvent.click(screen.getByRole("tab", { name: "Grupos" }));
@@ -128,7 +186,9 @@ async function startRefresh() {
 
 async function confirm() {
   holdSidebar = false;
-  await act(async () => { releaseSidebar?.(); });
+  await act(async () => {
+    releaseSidebar?.();
+  });
 }
 
 describe.each(["favorites", "search"] as const)("%s: real HTTP refresh chain", (surface) => {
@@ -140,7 +200,9 @@ describe.each(["favorites", "search"] as const)("%s: real HTTP refresh chain", (
     if (surface === "favorites") await screen.findByTestId("chat-favorites-empty");
     else await screen.findByText("Você não tem permissão para ver esses resultados.");
     const count = requests.length;
-    await act(async () => { releaseLate?.(); });
+    await act(async () => {
+      releaseLate?.();
+    });
     expect(screen.queryByText("u1-primeira")).not.toBeInTheDocument();
     expect(screen.queryByText("u1-segunda")).not.toBeInTheDocument();
     expect(requests).toHaveLength(count);
@@ -151,30 +213,42 @@ describe.each(["favorites", "search"] as const)("%s: real HTTP refresh chain", (
     await startRefresh();
     await confirm();
     await screen.findByText("u1-segunda");
-    await act(async () => { releaseLate?.(); });
+    await act(async () => {
+      releaseLate?.();
+    });
     expect(screen.getAllByText("u1-segunda")).toHaveLength(1);
-    const fresh = requests.filter((r) => r.token === "Bearer rotated" && r.cursor !== "old-2" && (r.path.endsWith("/favorites") || r.path.endsWith("/groups")));
+    const fresh = requests.filter(
+      (r) =>
+        r.token === "Bearer rotated" &&
+        r.cursor !== "old-2" &&
+        (r.path.endsWith("/favorites") || r.path.endsWith("/groups")),
+    );
     expect(fresh.map((r) => r.cursor)).toEqual([null, "new-1"]);
     expect(requests.filter((r) => r.path === "/api/auth/refresh")).toHaveLength(1);
     expect(requests.find((r) => r.cursor === "old-2")?.signal?.aborted).toBe(true);
   });
 
-  it.each(["user", "workspace"])("does not preserve U1 context when the %s changes", async (change) => {
-    await open(surface);
-    await startRefresh();
-    if (change === "user") user = "u2";
-    else workspace = "w2";
-    await confirm();
-    if (surface === "search") {
-      expect(await screen.findByRole("searchbox")).toHaveValue("");
+  it.each(["user", "workspace"])(
+    "does not preserve U1 context when the %s changes",
+    async (change) => {
+      await open(surface);
+      await startRefresh();
+      if (change === "user") user = "u2";
+      else workspace = "w2";
+      await confirm();
+      if (surface === "search") {
+        expect(await screen.findByRole("searchbox")).toHaveValue("");
+        expect(screen.queryByText("u1-segunda")).not.toBeInTheDocument();
+      } else {
+        await screen.findByText(`${user}-primeira`);
+        expect(screen.queryByText("u1-segunda")).not.toBeInTheDocument();
+      }
+      await act(async () => {
+        releaseLate?.();
+      });
       expect(screen.queryByText("u1-segunda")).not.toBeInTheDocument();
-    } else {
-      await screen.findByText(`${user}-primeira`);
-      expect(screen.queryByText("u1-segunda")).not.toBeInTheDocument();
-    }
-    await act(async () => { releaseLate?.(); });
-    expect(screen.queryByText("u1-segunda")).not.toBeInTheDocument();
-  });
+    },
+  );
 
   it("a new login for the same owner discards pagination and query", async () => {
     await open(surface);
@@ -199,20 +273,27 @@ describe.each(["favorites", "search"] as const)("%s: real HTTP refresh chain", (
     await confirm();
     await screen.findByText(/Não foi possível confirmar sua sessão/);
     const count = requests.length;
-    await act(async () => { releaseLate?.(); });
+    await act(async () => {
+      releaseLate?.();
+    });
     expect(requests).toHaveLength(count);
     expect(screen.queryByText("u1-primeira")).not.toBeInTheDocument();
   });
 
-  it.each(["logout", "unmount"])("%s cancels pending pagination without restarting it", async (end) => {
-    const view = await open(surface);
-    await startRefresh();
-    if (end === "logout") act(() => clearTokens());
-    else view.unmount();
-    const count = requests.length;
-    await confirm();
-    await act(async () => { releaseLate?.(); });
-    expect(requests).toHaveLength(count);
-    expect(screen.queryByText("u1-primeira")).not.toBeInTheDocument();
-  });
+  it.each(["logout", "unmount"])(
+    "%s cancels pending pagination without restarting it",
+    async (end) => {
+      const view = await open(surface);
+      await startRefresh();
+      if (end === "logout") act(() => clearTokens());
+      else view.unmount();
+      const count = requests.length;
+      await confirm();
+      await act(async () => {
+        releaseLate?.();
+      });
+      expect(requests).toHaveLength(count);
+      expect(screen.queryByText("u1-primeira")).not.toBeInTheDocument();
+    },
+  );
 });

@@ -120,7 +120,9 @@ describe("conversationBackDelta (#1124)", () => {
 
       it(`${surface} never traverses an external, login or unowned predecessor`, () => {
         for (const path of ["https://outside.example/", "/login", "/profile"]) {
-          expect(conversationBackDelta(trail(surface, path, A), "e0", settled, everyone)).toBeNull();
+          expect(
+            conversationBackDelta(trail(surface, path, A), "e0", settled, everyone),
+          ).toBeNull();
         }
         expect(
           conversationBackDelta(trail(surface, A), "e0", { ...settled, pending: true }, everyone),

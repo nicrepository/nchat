@@ -113,7 +113,12 @@ afterEach(() => {
 
 describe("GlobalSearchPage", () => {
   it("a new session while mounted does not re-read the previous session's saved search", async () => {
-    renderPage([{ pathname: "/chat/search", state: withRestoredSearch(null, { query: "segredo", tab: "groups" }, "u1:w1") }]);
+    renderPage([
+      {
+        pathname: "/chat/search",
+        state: withRestoredSearch(null, { query: "segredo", tab: "groups" }, "u1:w1"),
+      },
+    ]);
     await flush();
     expect(screen.getByRole("searchbox")).toHaveValue("segredo");
     act(() => setTokens("new-session"));
@@ -123,10 +128,22 @@ describe("GlobalSearchPage", () => {
   });
 
   it("keeps pagination and focus intent across a failed revalidation and explicit retry", async () => {
-    mockSearchCategory.mockImplementation((category: SearchCategory, _query: string, options?: { cursor?: string; limit?: number }) => {
-      if (category !== "groups" || options?.limit === 5) return Promise.resolve(resultPage([]));
-      return Promise.resolve(resultPage([groupResult({ id: options?.cursor ? "g2" : "g1", title: options?.cursor ? "Segunda página" : "Primeira página" })], options?.cursor ? null : "c1"));
-    });
+    mockSearchCategory.mockImplementation(
+      (category: SearchCategory, _query: string, options?: { cursor?: string; limit?: number }) => {
+        if (category !== "groups" || options?.limit === 5) return Promise.resolve(resultPage([]));
+        return Promise.resolve(
+          resultPage(
+            [
+              groupResult({
+                id: options?.cursor ? "g2" : "g1",
+                title: options?.cursor ? "Segunda página" : "Primeira página",
+              }),
+            ],
+            options?.cursor ? null : "c1",
+          ),
+        );
+      },
+    );
     renderPage();
     await search("backup");
     fireEvent.click(screen.getByRole("tab", { name: "Grupos" }));
@@ -172,11 +189,19 @@ describe("GlobalSearchPage", () => {
 
   it("revalidates a paginated tab after confirmation without losing its depth or fresh cursor", async () => {
     let refreshed = false;
-    mockSearchCategory.mockImplementation((category: SearchCategory, _query: string, options?: { cursor?: string; limit?: number }) => {
-      if (category !== "groups" || options?.limit === 5) return Promise.resolve(resultPage([]));
-      if (options?.cursor) return Promise.resolve(resultPage([groupResult({ id: "g2", title: "Segunda página" })], refreshed ? "new-2" : "old-2"));
-      return Promise.resolve(resultPage([groupResult()], refreshed ? "new-1" : "old-1"));
-    });
+    mockSearchCategory.mockImplementation(
+      (category: SearchCategory, _query: string, options?: { cursor?: string; limit?: number }) => {
+        if (category !== "groups" || options?.limit === 5) return Promise.resolve(resultPage([]));
+        if (options?.cursor)
+          return Promise.resolve(
+            resultPage(
+              [groupResult({ id: "g2", title: "Segunda página" })],
+              refreshed ? "new-2" : "old-2",
+            ),
+          );
+        return Promise.resolve(resultPage([groupResult()], refreshed ? "new-1" : "old-1"));
+      },
+    );
     renderPage();
     await search("backup");
     fireEvent.click(screen.getByRole("tab", { name: "Grupos" }));
@@ -194,10 +219,18 @@ describe("GlobalSearchPage", () => {
     expect(screen.getByRole("tab", { name: "Grupos" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("button", { name: /Segunda página/ })).toBeInTheDocument();
     expect(mockSearchCategory).toHaveBeenCalledTimes(2);
-    expect(mockSearchCategory).toHaveBeenLastCalledWith("groups", "backup", expect.objectContaining({ cursor: "new-1" }));
+    expect(mockSearchCategory).toHaveBeenLastCalledWith(
+      "groups",
+      "backup",
+      expect.objectContaining({ cursor: "new-1" }),
+    );
     fireEvent.click(screen.getByRole("button", { name: /carregar mais/i }));
     await flush();
-    expect(mockSearchCategory).toHaveBeenLastCalledWith("groups", "backup", expect.objectContaining({ cursor: "new-2" }));
+    expect(mockSearchCategory).toHaveBeenLastCalledWith(
+      "groups",
+      "backup",
+      expect.objectContaining({ cursor: "new-2" }),
+    );
     expect(screen.getAllByRole("button", { name: /Segunda página/ })).toHaveLength(1);
   });
 

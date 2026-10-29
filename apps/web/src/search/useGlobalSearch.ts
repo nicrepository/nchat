@@ -77,7 +77,11 @@ type Action =
   | { type: "COMMIT_QUERY"; query: string }
   | { type: "SET_ACTIVE_TAB"; tab: SearchTab }
   | ({ type: "FETCH_START" | "MORE_START" } & Slot)
-  | ({ type: "FETCH_SUCCESS" | "MORE_SUCCESS"; page: SearchResultPage<{ id: string }>; pages?: number } & Slot)
+  | ({
+      type: "FETCH_SUCCESS" | "MORE_SUCCESS";
+      page: SearchResultPage<{ id: string }>;
+      pages?: number;
+    } & Slot)
   | ({ type: "FETCH_ERROR" | "MORE_ERROR"; errorKind: SearchErrorKind } & Slot)
   | { type: "RETRY"; scope: SearchScope; category: SearchCategory }
   | { type: "CANCEL_RECOVERY"; abortAutomatic?: boolean };
@@ -172,7 +176,8 @@ function searchReducer(
       next[scope][category].restorePages = Math.max(
         state[scope][category].pages,
         state[scope][category].status === "ready" && !state[scope][category].hasMore
-          ? 0 : state[scope][category].restorePages,
+          ? 0
+          : state[scope][category].restorePages,
       );
       // The HTTP operation may have been aborted before reporting its final
       // 401. A second interruption must not create another equivalent operation.
@@ -205,8 +210,12 @@ function reducer(state: GlobalSearchState, action: Action): GlobalSearchState {
       for (const scope of ["overview", "tabs"] as const) {
         for (const category of SEARCH_CATEGORIES) {
           next = patchSlot(next, { scope, category }, (list) => ({
-            ...list, restorePages: 0,
-            status: action.abortAutomatic && list.restorePages > list.pages && list.status === "loading" ? "idle" : list.status,
+            ...list,
+            restorePages: 0,
+            status:
+              action.abortAutomatic && list.restorePages > list.pages && list.status === "loading"
+                ? "idle"
+                : list.status,
             loadingMore: list.restorePages > list.pages ? false : list.loadingMore,
           }));
         }
@@ -216,15 +225,20 @@ function reducer(state: GlobalSearchState, action: Action): GlobalSearchState {
     case "FETCH_START":
       return patchSlot(state, action, (list) => ({ ...list, status: "loading", errorKind: null }));
     case "FETCH_SUCCESS":
-      return completed(patchSlot(state, action, (list) => ({
-        ...list,
-        status: "ready",
-        pages: action.pages ?? 1,
-        restorePages: list.restorePages > 2 || list.restorePages > (action.pages ?? 1) ? list.restorePages : 0,
-        items: action.page.items,
-        cursor: action.page.nextCursor,
-        hasMore: action.page.hasMore,
-      })));
+      return completed(
+        patchSlot(state, action, (list) => ({
+          ...list,
+          status: "ready",
+          pages: action.pages ?? 1,
+          restorePages:
+            list.restorePages > 2 || list.restorePages > (action.pages ?? 1)
+              ? list.restorePages
+              : 0,
+          items: action.page.items,
+          cursor: action.page.nextCursor,
+          hasMore: action.page.hasMore,
+        })),
+      );
     case "FETCH_ERROR":
       return patchSlot(state, action, (list) => ({
         ...list,
@@ -238,7 +252,9 @@ function reducer(state: GlobalSearchState, action: Action): GlobalSearchState {
         loadMoreError: null,
       }));
     case "MORE_SUCCESS":
-      return completed(patchSlot(state, action, (list) => appendPage(list, action.page, action.pages)));
+      return completed(
+        patchSlot(state, action, (list) => appendPage(list, action.page, action.pages)),
+      );
     case "MORE_ERROR":
       // Items and cursor stay: a failed "load more" never erases what is shown.
       return patchSlot(state, action, (list) => ({
@@ -248,7 +264,8 @@ function reducer(state: GlobalSearchState, action: Action): GlobalSearchState {
       }));
     case "RETRY":
       return patchSlot({ ...state, revalidationsLeft: 1 }, action, (list) => ({
-        ...idleList(), restorePages: Math.max(list.pages, list.restorePages),
+        ...idleList(),
+        restorePages: Math.max(list.pages, list.restorePages),
       }));
   }
 }
@@ -302,7 +319,9 @@ export function useGlobalSearch(restored?: RestoredSearch, enabled = true): UseG
     if (!enabled) dispatch({ type: "SUSPEND" });
   }
   const stateRef = useRef(state);
-  const controllersRef = useRef(new Map<string, { controller: AbortController; pending: boolean }>());
+  const controllersRef = useRef(
+    new Map<string, { controller: AbortController; pending: boolean }>(),
+  );
 
   useEffect(() => {
     stateRef.current = state;
@@ -313,59 +332,63 @@ export function useGlobalSearch(restored?: RestoredSearch, enabled = true): UseG
     controllersRef.current.clear();
   }, []);
 
-  const run = useCallback((scope: SearchScope, category: SearchCategory, cursor: string | null, batchSize = 1) => {
-    const { activeQuery: query, generation } = stateRef.current;
-    const key = `${scope}:${category}`;
-    if (cursor !== null && controllersRef.current.get(key)?.pending) return;
-    controllersRef.current.get(key)?.controller.abort();
-    const controller = new AbortController();
-    const request = { controller, pending: true };
-    controllersRef.current.set(key, request);
+  const run = useCallback(
+    (scope: SearchScope, category: SearchCategory, cursor: string | null, batchSize = 1) => {
+      const { activeQuery: query, generation } = stateRef.current;
+      const key = `${scope}:${category}`;
+      if (cursor !== null && controllersRef.current.get(key)?.pending) return;
+      controllersRef.current.get(key)?.controller.abort();
+      const controller = new AbortController();
+      const request = { controller, pending: true };
+      controllersRef.current.set(key, request);
 
-    const slot = { scope, category, generation };
-    const more = cursor !== null;
-    dispatch({ type: more ? "MORE_START" : "FETCH_START", ...slot });
-    const fetchPages = async () => {
-      const depth = more ? Math.min(5, batchSize) : Math.min(2, Math.max(1,
-        stateRef.current[scope][category].restorePages,
-      ));
-      const items = new Map<string, { id: string }>();
-      const seen = new Set<string>(cursor ? [cursor] : []);
-      let next = cursor;
-      let pages = 0;
-      let page;
-      do {
-        page = await searchCategory(category, query, {
-          limit: scope === "overview" ? OVERVIEW_LIMIT : PAGE_LIMIT,
-          cursor: next ?? undefined,
-          signal: controller.signal,
-        });
-        if (controller.signal.aborted) return;
-        for (const item of page.items) items.set(item.id, item);
-        pages += 1;
-        next = page.nextCursor;
-        if (!page.hasMore || !next || seen.has(next)) {
-          page = { ...page, nextCursor: null, hasMore: false };
-          break;
-        }
-        seen.add(next);
-      } while (pages < depth);
-      return { page: { ...page, items: [...items.values()] }, pages };
-    };
-    fetchPages().then(
-      (result) => {
-        if (controller.signal.aborted) return;
-        request.pending = false;
-        if (result) dispatch({ type: more ? "MORE_SUCCESS" : "FETCH_SUCCESS", ...slot, ...result });
-      },
-      (error: unknown) => {
-        if (controller.signal.aborted) return;
-        request.pending = false;
-        const errorKind = classifySearchError(error);
-        dispatch({ type: more ? "MORE_ERROR" : "FETCH_ERROR", ...slot, errorKind });
-      },
-    );
-  }, []);
+      const slot = { scope, category, generation };
+      const more = cursor !== null;
+      dispatch({ type: more ? "MORE_START" : "FETCH_START", ...slot });
+      const fetchPages = async () => {
+        const depth = more
+          ? Math.min(5, batchSize)
+          : Math.min(2, Math.max(1, stateRef.current[scope][category].restorePages));
+        const items = new Map<string, { id: string }>();
+        const seen = new Set<string>(cursor ? [cursor] : []);
+        let next = cursor;
+        let pages = 0;
+        let page;
+        do {
+          page = await searchCategory(category, query, {
+            limit: scope === "overview" ? OVERVIEW_LIMIT : PAGE_LIMIT,
+            cursor: next ?? undefined,
+            signal: controller.signal,
+          });
+          if (controller.signal.aborted) return;
+          for (const item of page.items) items.set(item.id, item);
+          pages += 1;
+          next = page.nextCursor;
+          if (!page.hasMore || !next || seen.has(next)) {
+            page = { ...page, nextCursor: null, hasMore: false };
+            break;
+          }
+          seen.add(next);
+        } while (pages < depth);
+        return { page: { ...page, items: [...items.values()] }, pages };
+      };
+      fetchPages().then(
+        (result) => {
+          if (controller.signal.aborted) return;
+          request.pending = false;
+          if (result)
+            dispatch({ type: more ? "MORE_SUCCESS" : "FETCH_SUCCESS", ...slot, ...result });
+        },
+        (error: unknown) => {
+          if (controller.signal.aborted) return;
+          request.pending = false;
+          const errorKind = classifySearchError(error);
+          dispatch({ type: more ? "MORE_ERROR" : "FETCH_ERROR", ...slot, errorKind });
+        },
+      );
+    },
+    [],
+  );
 
   // ── Debounce: commit the trimmed query after the user pauses typing ──────────
   useEffect(() => {
@@ -419,7 +442,10 @@ export function useGlobalSearch(restored?: RestoredSearch, enabled = true): UseG
     for (const scope of ["overview", "tabs"] as const) {
       for (const category of SEARCH_CATEGORIES) {
         const list = stateRef.current[scope][category];
-        if (list.restorePages > list.pages && (list.loadingMore || (abortAutomatic && list.status === "loading"))) {
+        if (
+          list.restorePages > list.pages &&
+          (list.loadingMore || (abortAutomatic && list.status === "loading"))
+        ) {
           const key = `${scope}:${category}`;
           controllersRef.current.get(key)?.controller.abort();
           controllersRef.current.delete(key);
@@ -428,10 +454,13 @@ export function useGlobalSearch(restored?: RestoredSearch, enabled = true): UseG
     }
     dispatch({ type: "CANCEL_RECOVERY", abortAutomatic });
   }, []);
-  const setActiveTab = useCallback((tab: SearchTab) => {
-    if (tab !== stateRef.current.activeTab) cancelRecovery(true);
-    dispatch({ type: "SET_ACTIVE_TAB", tab });
-  }, [cancelRecovery]);
+  const setActiveTab = useCallback(
+    (tab: SearchTab) => {
+      if (tab !== stateRef.current.activeTab) cancelRecovery(true);
+      dispatch({ type: "SET_ACTIVE_TAB", tab });
+    },
+    [cancelRecovery],
+  );
 
   const loadMore = useCallback(
     (category: SearchCategory) => {
@@ -447,12 +476,15 @@ export function useGlobalSearch(restored?: RestoredSearch, enabled = true): UseG
     [],
   );
 
-  const recover = useCallback((category: SearchCategory) => {
-    const list = stateRef.current.tabs[category];
-    if (list.status !== "ready" || !list.hasMore || list.loadingMore || !list.cursor) return;
-    const remaining = list.restorePages - list.pages;
-    if (remaining > 0) run("tabs", category, list.cursor, Math.min(5, remaining));
-  }, [run]);
+  const recover = useCallback(
+    (category: SearchCategory) => {
+      const list = stateRef.current.tabs[category];
+      if (list.status !== "ready" || !list.hasMore || list.loadingMore || !list.cursor) return;
+      const remaining = list.restorePages - list.pages;
+      if (remaining > 0) run("tabs", category, list.cursor, Math.min(5, remaining));
+    },
+    [run],
+  );
 
   return { state, setQuery, setActiveTab, loadMore, retry, recover, cancelRecovery };
 }
