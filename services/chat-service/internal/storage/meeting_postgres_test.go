@@ -715,6 +715,7 @@ func TestMeetingMigrationRoundTripPostgreSQL(t *testing.T) {
 	shared := mtSnapshot(t, ctx, pool, sentinel.ID)
 	own := mtDisposableDatabase(t, connectTo)
 
+	mtMigrate(t, own, "000071_meeting_creation_idempotency.down.sql")
 	relations, schema := mtRelations(t, own), mtMeetingSchema(t, own)
 	owned := mtMeetingRelations(t, own)
 	mtMigrate(t, own, "000070_meetings.down.sql")
@@ -730,6 +731,7 @@ func TestMeetingMigrationRoundTripPostgreSQL(t *testing.T) {
 	if !slices.Equal(mtRelations(t, own), relations) || mtMeetingSchema(t, own) != schema {
 		t.Fatal("re-applying the up migration did not restore the same schema")
 	}
+	mtMigrate(t, own, "000071_meeting_creation_idempotency.up.sql")
 	if mtSnapshot(t, ctx, pool, sentinel.ID) != shared || !hasTable(t, own, "chat.meetings") {
 		t.Fatal("the round trip changed the shared meeting or left the tables missing")
 	}

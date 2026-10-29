@@ -66,6 +66,7 @@ type bootstrapServices struct {
 	pin             *service.PinService
 	acknowledgement *service.AcknowledgementService
 	permission      *service.PermissionService
+	meeting         *service.MeetingService
 	channel         *service.ChannelService
 	channelCategory *service.ChannelCategoryService
 	member          *service.MemberService
@@ -95,6 +96,7 @@ type bootstrapHandlers struct {
 	sidebar           *httpapi.SidebarHandler
 	message           *httpapi.MessageHandler
 	directMessages    *httpapi.DMHandler
+	meetings          *httpapi.MeetingHandler
 	channels          *httpapi.ChannelHandler
 	channelCategories *httpapi.ChannelCategoryHandler
 	antiSpam          *httpapi.AntiSpamGuard
@@ -188,6 +190,7 @@ func (b *bootstrap) wireServices(pool storage.Pool) {
 	b.stores.calls = storage.NewPGXCallStore(pool)
 	b.services.call = service.NewCallService(b.stores.calls, time.Duration(cfg.CallRingTimeoutSeconds)*time.Second, nil, nil)
 	b.services.permission = service.NewPermissionService(st.members, st.channels)
+	b.services.meeting = service.NewMeetingService(storage.NewPGXMeetingStore(pool))
 	b.services.channel = service.NewChannelService(st.workspaces, st.channels, st.members)
 	// channelStore is both the category store and the visible-channel read
 	// side, so RF-17 groups channels through the same query the sidebar uses.
@@ -386,6 +389,9 @@ func (b *bootstrap) buildMessageHandler() {
 // rather than exposed. Readiness already fails in that configuration.
 func (b *bootstrap) buildConversationHandlers() {
 	st, limiter := b.stores, b.realtime.reactionLimiter
+	if b.services.meeting != nil && limiter != nil {
+		b.handlers.meetings = httpapi.NewMeetingHandler(st.workspaces, b.services.meeting, limiter)
+	}
 	if b.services.dm != nil {
 		b.handlers.directMessages = httpapi.NewDMHandler(st.workspaces, b.services.dm, limiter).WithOwnership(st.ownership)
 	}
@@ -536,7 +542,7 @@ func (b *bootstrap) app() *App {
 		Config: b.cfg,
 		Logger: b.logger,
 		Handler: httpapi.NewRouter(b.cfg, b.logger, readiness, b.validator, b.stores.sessions, h.sidebar,
-			h.message, rt.wsHandler, h.directMessages, h.channels, h.channelCategories, h.antiSpam, b.metrics),
+			h.message, rt.wsHandler, h.directMessages, h.channels, h.channelCategories, h.meetings, h.antiSpam, b.metrics),
 		TracingShutdown:       b.shutdown,
 		hub:                   rt.hub,
 		presence:              rt.presence,

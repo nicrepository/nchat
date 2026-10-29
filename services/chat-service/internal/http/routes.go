@@ -1,6 +1,9 @@
 package httpapi
 
 const (
+	RouteMeetings          = "/api/chat/meetings"
+	RouteMeeting           = "/api/chat/meetings/{meetingID}"
+	RouteMeetingCancel     = "/api/chat/meetings/{meetingID}/cancel"
 	RouteHealthz           = "/healthz"
 	RouteReadyz            = "/readyz"
 	RouteVersion           = "/version"
