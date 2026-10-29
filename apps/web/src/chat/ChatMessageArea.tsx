@@ -55,6 +55,7 @@ import ChatComposer from "./ChatComposer";
 import { noopConversationDrafts } from "./useConversationDrafts";
 import { senderLabel } from "./messageDisplay";
 import ConversationHeader from "./message-area/ConversationHeader";
+import { useBackButton } from "./conversationBack";
 import ConversationCallBars from "./message-area/ConversationCallBars";
 import ConversationNotices from "./message-area/ConversationNotices";
 import { AccessDeniedState } from "./message-area/ConversationStates";
@@ -226,6 +227,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     resolvedName,
     toggleRef: detailsToggleRef,
   });
+  const back = useBackButton(ctx.goBack, `${kind}:${targetId}`);
   const reloadOpenDetails = details.reload;
   // The rename the panel may offer for the conversation on screen (issue #893).
   // The capability is the server's, read from the canonical sidebar payload,
@@ -614,6 +616,8 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           resourceCall={resourceCall.headerState}
           details={details}
           detailsToggleRef={detailsToggleRef}
+          onBack={back.onBack}
+          backRef={back.ref}
         />
 
         <ConversationCallBars

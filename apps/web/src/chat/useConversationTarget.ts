@@ -28,7 +28,7 @@ const emptyOutletContext: ChatOutletContext = {
   drafts: noopConversationDrafts,
 };
 
-function safeDecodeURIComponent(value: string): string {
+export function safeDecodeURIComponent(value: string): string {
   try {
     return decodeURIComponent(value);
   } catch {

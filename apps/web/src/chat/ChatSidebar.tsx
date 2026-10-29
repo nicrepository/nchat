@@ -7,6 +7,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type RefObject,
 } from "react";
 import { Link, useLocation, useNavigate } from "react-router";
 
@@ -1054,6 +1055,7 @@ interface ChatSidebarProps {
   ) => void;
   /** The shell-owned search action, shared by the sidebar button and shortcut command. */
   onOpenSearch?: () => void;
+  searchButtonRef?: RefObject<HTMLButtonElement | null>;
   /** Publishes this sidebar's visual-row selection flow to the command layer. */
   onNavigateRelativeChange?: (navigate: (direction: -1 | 1) => void) => void;
   /**
@@ -1096,6 +1098,7 @@ export default function ChatSidebar({
   leaveConversation,
   onOpenDetails,
   onOpenSearch,
+  searchButtonRef,
   onNavigateRelativeChange,
   draftSummaries = EMPTY_DRAFT_SUMMARIES,
 }: ChatSidebarProps) {
@@ -1432,6 +1435,7 @@ export default function ChatSidebar({
             type="button"
             className="chat-sidebar__search"
             aria-label="Buscar no NChat"
+            ref={searchButtonRef}
             title="Buscar"
             onClick={onOpenSearch}
           >

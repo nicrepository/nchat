@@ -30,10 +30,16 @@ const listeners = new Set<AuthChangeListener>();
  * where the token is verified.
  */
 let sessionGeneration = 0;
+let sessionBoundaryGeneration = 0;
 
 /** Current session generation. Changes on every setTokens and clearTokens. */
 export function getSessionGeneration(): number {
   return sessionGeneration;
+}
+
+/** Snapshot of the existing generation at the last replacement/logout, not refresh. */
+export function getSessionBoundaryGeneration(): number {
+  return sessionBoundaryGeneration;
 }
 
 function notifyAuthChange(change: AuthChange): void {
@@ -70,6 +76,7 @@ export function setTokens(accessToken: string, change: AuthChange = "session"): 
   // existing token is a replacement, not a no-op, even when the token is
   // identical — sameness of string is not sameness of session.
   sessionGeneration += 1;
+  if (change === "session") sessionBoundaryGeneration = sessionGeneration;
   notifyAuthChange(change);
 }
 
@@ -83,6 +90,7 @@ export function clearTokens(): void {
   // generation too. Without this, logging out and back in as the same user
   // could land on the generation the first session already used.
   sessionGeneration += 1;
+  sessionBoundaryGeneration = sessionGeneration;
   notifyAuthChange("session");
 }
 
