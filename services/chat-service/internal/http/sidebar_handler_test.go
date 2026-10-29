@@ -40,7 +40,7 @@ func (s *stubSidebarProvider) GetSidebar(_ context.Context, _ string) (service.S
 func sidebarRouter(v *httpapi.TokenValidator, svc interface {
 	GetSidebar(context.Context, string) (service.SidebarData, error)
 }) http.Handler {
-	return httpapi.NewRouter(sidebarTestConfig(), nil, httpapi.ReadinessState{}, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(svc), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, nil, nil, nil)
+	return httpapi.NewRouter(sidebarTestConfig(), nil, httpapi.ReadinessState{}, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(svc), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, nil, nil, nil, nil)
 }
 
 type pinningSidebarProvider struct {
@@ -95,7 +95,7 @@ func authSidebarPinRequest(t *testing.T, method, path string) *http.Request {
 
 func TestSidebarHandler_NilService_Returns503(t *testing.T) {
 	v := makeTestValidator(t)
-	router := httpapi.NewRouter(sidebarTestConfig(), nil, httpapi.ReadinessState{}, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(nil), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, nil, nil, nil)
+	router := httpapi.NewRouter(sidebarTestConfig(), nil, httpapi.ReadinessState{}, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(nil), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, nil, nil, nil, nil)
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, authGet(t))
 	if rr.Code != http.StatusServiceUnavailable {

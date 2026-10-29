@@ -321,3 +321,12 @@ func (r *routeSet) registerOwnershipRoutes(prefix string, handler http.HandlerFu
 	r.handle("PATCH "+prefix+"/members/{userID}/role", r.pinAction, handler)
 	r.handle("POST "+prefix+"/ownership/{operation}", r.pinAction, handler)
 }
+
+func (r *routeSet) registerMeetingRoutes(meetings *MeetingHandler) {
+	if meetings == nil {
+		return
+	}
+	r.handle("POST "+RouteMeetings, nil, meetings.Create)
+	r.handle("PATCH "+RouteMeeting, nil, meetings.Update)
+	r.handle("POST "+RouteMeetingCancel, nil, meetings.Cancel)
+}

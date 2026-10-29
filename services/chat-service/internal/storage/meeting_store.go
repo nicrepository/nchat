@@ -65,20 +65,14 @@ type meetingTx struct {
 // CreateMeeting stores m, built by domain.NewMeeting, with its organizer's
 // accepted participant row, atomically.
 func (s *PGXMeetingStore) CreateMeeting(ctx context.Context, m domain.Meeting) (domain.Meeting, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return domain.Meeting{}, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	organizer, _, err := lockMeetingActors(ctx, tx, m, m.OrganizerUserID, "")
-	if err != nil {
-		return domain.Meeting{}, err
-	}
-	if err = domain.AuthorizeMeeting(m, organizer, domain.MeetingCapabilityCreate); err != nil {
-		return domain.Meeting{}, err
-	}
+	result, err := s.createMeeting(ctx, MeetingCreation{Meeting: m})
+	return result.Meeting, err
+}
+
+// insertMeeting persists a new meeting and its accepted organizer on tx.
+func insertMeeting(ctx context.Context, tx pgx.Tx, m domain.Meeting) (domain.Meeting, error) {
 	channelID, dmID := meetingConversationColumns(m.Conversation)
-	err = tx.QueryRow(ctx, `INSERT INTO chat.meetings (id, workspace_id, channel_id, dm_conversation_id,
+	err := tx.QueryRow(ctx, `INSERT INTO chat.meetings (id, workspace_id, channel_id, dm_conversation_id,
  organizer_user_id, title, description, starts_at, ends_at, timezone, status, join_policy, room_key, version)
  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
  RETURNING created_at, updated_at`,
@@ -90,9 +84,6 @@ func (s *PGXMeetingStore) CreateMeeting(ctx context.Context, m domain.Meeting) (
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO chat.meeting_participants (meeting_id, user_id, role, rsvp, invited_at, updated_at)
  VALUES ($1, $2, $3, $4, $5, $5)`, m.ID, m.OrganizerUserID, domain.MeetingRoleOrganizer, domain.MeetingRSVPAccepted, m.CreatedAt); err != nil {
-		return domain.Meeting{}, err
-	}
-	if err = tx.Commit(ctx); err != nil {
 		return domain.Meeting{}, err
 	}
 	m.CreatedAt, m.UpdatedAt = m.CreatedAt.UTC(), m.UpdatedAt.UTC()
@@ -132,19 +123,10 @@ func (s *PGXMeetingStore) AuthorizeMeetingJoin(ctx context.Context, scope Meetin
 
 // UpdateMeeting replaces the meeting's details when expectedVersion is current.
 func (s *PGXMeetingStore) UpdateMeeting(ctx context.Context, scope MeetingScope, expectedVersion int64, details domain.MeetingDetails) (domain.Meeting, error) {
-	var meeting domain.Meeting
-	err := s.withMeeting(ctx, scope, meetingWrite, "", func(st *meetingTx) error {
-		if err := domain.AuthorizeMeetingUpdate(st.meeting, st.actor, details.JoinPolicy); err != nil {
-			return err
-		}
-		next, err := st.meeting.Update(details, expectedVersion)
-		if err != nil {
-			return err
-		}
-		meeting, err = writeMeeting(ctx, st.tx, next)
-		return err
+	return s.PatchMeeting(ctx, scope, expectedVersion, MeetingPatch{
+		Title: &details.Title, Description: &details.Description, StartsAt: &details.StartsAt,
+		EndsAt: &details.EndsAt, Timezone: &details.Timezone, JoinPolicy: &details.JoinPolicy,
 	})
-	return meeting, err
 }
 
 // TransitionMeeting moves the meeting to next. Repeating the transition that
@@ -346,6 +328,16 @@ func lockMeetingActors(ctx context.Context, tx pgx.Tx, m domain.Meeting, actorID
 	if targetID != "" {
 		ids = append(ids, targetID)
 	}
+	a, err := lockMeetingAuthority(ctx, tx, m, ids)
+	if err != nil {
+		return domain.MeetingActor{}, domain.MeetingActor{}, err
+	}
+	return a.actor(actorID), a.actor(targetID), nil
+}
+
+// lockMeetingAuthority locks all users together, table by table in canonical
+// order. Repeating actor-first locks per invitee would invert that order.
+func lockMeetingAuthority(ctx context.Context, tx pgx.Tx, m domain.Meeting, ids []string) (*meetingAuthority, error) {
 	a := meetingAuthority{meeting: m, users: map[string]*meetingFacts{}}
 	batch := &pgx.Batch{}
 	batch.Queue(`SELECT status = 'active' FROM chat.workspaces WHERE id = $1 FOR SHARE`, m.WorkspaceID).
@@ -358,10 +350,10 @@ func lockMeetingActors(ctx context.Context, tx pgx.Tx, m domain.Meeting, actorID
 	a.queuePlaces(batch, ids)
 	batch.Queue(`SELECT meeting_id::text, user_id::text, role, rsvp, invited_at, updated_at
  FROM chat.meeting_participants WHERE meeting_id = $1 AND user_id = ANY($2::uuid[])`, m.ID, ids).Query(a.scanParticipants)
-	if err = tx.SendBatch(ctx, batch).Close(); err != nil {
-		return domain.MeetingActor{}, domain.MeetingActor{}, err
+	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
+		return nil, err
 	}
-	return a.actor(actorID), a.actor(targetID), nil
+	return &a, nil
 }
 
 func (a *meetingAuthority) queueConversation(batch *pgx.Batch) {

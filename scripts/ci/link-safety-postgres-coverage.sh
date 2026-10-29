@@ -239,6 +239,34 @@ case "$MODULE" in
       TestMeetingSuspensionBeforeWritePostgreSQL
       TestMeetingWriteBeforeSuspensionPostgreSQL
       TestMeetingMembershipAfterLockPostgreSQL
+      # Issue #1053: durable create, atomic invitees and lifecycle interleavings.
+      TestMeetingAPICreateRosterAndReplayPostgreSQL
+      TestMeetingAPICreateRefusalsAreAtomicPostgreSQL
+      TestMeetingAPICreationNamespacePostgreSQL
+      TestMeetingAPIClaimRollbackPostgreSQL
+      TestMeetingAPIReplayAfterUnknownCommitPostgreSQL
+      TestMeetingAPIReplayReauthorizesPostgreSQL
+      TestMeetingAPIClaimSchemaPostgreSQL
+      TestMeetingAPIClaimMigrationRoundTripPostgreSQL
+      TestMeetingAPISimultaneousClaimsPostgreSQL
+      TestMeetingAPIClaimWaitsForRollbackPostgreSQL
+      TestMeetingAPIMutationsSerializePostgreSQL
+      TestMeetingAPICreateRevocationFirstPostgreSQL
+      TestMeetingAPICreateBeforeRevocationPostgreSQL
+      TestMeetingAPICreateVersusSuspensionPostgreSQL
+      TestMeetingAPICreateBeforeSuspensionPostgreSQL
+      TestMeetingAPICohostAndCancelAuthorizationPostgreSQL
+      TestMeetingAPIRoleRevocationBeforeUpdatePostgreSQL
+      TestMeetingAPIReplayDuringRevocationPostgreSQL
+      TestMeetingAPIWriteErrorsLeaveNoSuccessPostgreSQL
+      TestMeetingAPIInvalidUpdatesLeaveHistoryPostgreSQL
+      TestMeetingAPIStorageRejectsInvalidInitialRolesPostgreSQL
+      # Q-001: PATCH merges against the same locked version used by CAS.
+      TestMeetingPatchStalePolicyPostgreSQL
+      TestMeetingPatchLockedSnapshotPostgreSQL
+      TestMeetingPatchCohostPartialPostgreSQL
+      TestMeetingPatchAuthorizationPrecedencePostgreSQL
+      TestMeetingPatchConcurrentHTTPPostgreSQL
     )
     ;;
   services/notification-service)
