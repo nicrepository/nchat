@@ -45,6 +45,7 @@ const (
 )
 
 var (
+	ErrBusy      = errors.New("audio conversion busy")
 	ErrBlocked   = errors.New("converter blocked document")
 	ErrPermanent = errors.New("permanent converter failure")
 	ErrTransient = errors.New("transient converter failure")
@@ -178,6 +179,8 @@ func (c *Client) ConvertAudio(ctx context.Context, format AudioFormat, source io
 	limited, _ := io.ReadAll(io.LimitReader(res.Body, 4097))
 	_ = json.Unmarshal(limited, &payload)
 	switch payload.Code {
+	case "busy":
+		return nil, ErrBusy
 	case "blocked":
 		return nil, ErrBlocked
 	case "invalid_audio", "unsupported", "output_too_large":

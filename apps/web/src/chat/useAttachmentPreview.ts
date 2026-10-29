@@ -8,6 +8,7 @@
  * attachments have a preview to load and what to load for them.
  */
 
+import { isDocumentAttachment, isImagePreviewableDocument } from "./attachmentDocumentRules";
 import { useAttachmentGate } from "./lazyAttachment";
 import { useAttachmentBlobUrl } from "./useAttachmentBlobUrl";
 import { fetchAttachmentPreview } from "./filesApi";
@@ -82,7 +83,8 @@ export function useAttachmentPreview(attachment: ChannelAttachment): AttachmentP
   const gate = useAttachmentGate();
   const { url, onLoadError } = useAttachmentBlobUrl(
     attachment.id,
-    canShowPreview(attachment),
+    canShowPreview(attachment) &&
+      (!isDocumentAttachment(attachment) || isImagePreviewableDocument(attachment)),
     fetchAttachmentPreview,
     { priority: gate.priority, active: gate.active },
   );

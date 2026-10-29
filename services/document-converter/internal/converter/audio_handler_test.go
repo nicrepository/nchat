@@ -172,7 +172,7 @@ func TestHandlerRejectsAnOversizedAudioOutput(t *testing.T) {
 // /v1/convert-audio alongside /v1/convert must not change anything about the
 // document route's own behaviour.
 func TestConvertRouteIsUnaffectedByTheAudioRoute(t *testing.T) {
-	body := zipDocument(t, map[string]string{"word/document.xml": "x"})
+	body := zipDocument(t, map[string]string{"word/document.xml": "<document/>"})
 	handler := NewHandler(stubRunner{pdf: []byte("%PDF-1.7\n%%EOF")}, WithAudioConverter(stubAudioConverter{mp3: []byte(validMP3Fixture)}))
 	req := httptest.NewRequest(http.MethodPost, "/v1/convert", bytes.NewReader(body))
 	req.Header.Set("X-Document-Format", "docx")

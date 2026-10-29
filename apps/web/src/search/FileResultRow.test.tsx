@@ -40,6 +40,7 @@ vi.mock("../chat/AttachmentLightbox", () => ({
 }));
 
 import AttachmentViewerHost from "../chat/AttachmentViewerHost";
+import { legacyContainerCase, nativeDocumentCases } from "../chat/attachmentDocumentFixtures";
 import FileResultRow from "./FileResultRow";
 import { fileResult } from "./searchFixtures";
 import type { FileSearchResult } from "./searchTypes";
@@ -142,3 +143,15 @@ describe("FileResultRow", () => {
     expect(screen.getByTestId("landing")).toHaveTextContent("/chat/dm/d1?message=m9");
   });
 });
+
+it.each([...nativeDocumentCases, legacyContainerCase])(
+  "search opens canonical $extension in the shared document viewer",
+  async ({ contentType, extension }) => {
+    renderFile(fileResult({ filename: `costs.${extension}`, contentType }));
+    await userEvent.click(screen.getByRole("button", { name: new RegExp(`costs\\.${extension}`) }));
+    expect(
+      screen.getByRole("dialog", { name: `Documento costs.${extension}` }),
+    ).toBeInTheDocument();
+    expect(mockFetchPreview).not.toHaveBeenCalled();
+  },
+);

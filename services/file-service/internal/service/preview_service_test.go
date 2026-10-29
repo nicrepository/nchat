@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/nicrepository/nchat/services/file-service/internal/crypto"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
+	"github.com/nicrepository/nchat/services/file-service/internal/filepolicy"
 	"github.com/nicrepository/nchat/services/file-service/internal/preview"
 	"github.com/nicrepository/nchat/services/file-service/internal/service"
 )
@@ -1646,7 +1647,7 @@ func TestUploadSchedulesAPreviewWithoutWaitingForOne(t *testing.T) {
 		want    domain.PreviewStatus
 	}{
 		"png": {content: pngBytes(), want: domain.PreviewStatusPending},
-		"pdf": {content: []byte("%PDF-1.4 a document"), want: domain.PreviewStatusPending},
+		"pdf": {content: []byte("%PDF-1.4 a document\n%%EOF"), want: domain.PreviewStatusPending},
 		// A zip-shaped upload is scheduled too now — CSV and XLSX both sniff
 		// as coarse types (text/plain, application/zip respectively; see
 		// domain.previewableMIMEs' own comment), so an office document is no
@@ -1658,7 +1659,7 @@ func TestUploadSchedulesAPreviewWithoutWaitingForOne(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t)
-			view, err := f.upload(context.Background(), bytes.NewReader(tt.content), "file.bin")
+			view, err := f.upload(context.Background(), bytes.NewReader(tt.content), map[string]string{"png": "file.png", "pdf": "file.pdf", "other": "file.mp3"}[name])
 			if err != nil {
 				t.Fatalf("upload: %v", err)
 			}
@@ -2611,5 +2612,37 @@ func TestCleanupResultsNeverReachThePreviewCounter(t *testing.T) {
 	// a preview outcome.
 	if results := previews.observed(); len(results) != 0 {
 		t.Fatalf("cleanup results leaked onto the preview counter: %v", results)
+	}
+}
+
+func TestPreviewWorkerDoesNotRenderClassifiedFormatsWithoutPreview(t *testing.T) {
+	for id, mime := range map[string]string{"txt": "text/plain", "zip": "application/zip", "md": "text/markdown", "odp": "application/vnd.oasis.opendocument.presentation", "unknown": "application/zip"} {
+		t.Run(id, func(t *testing.T) {
+			f := newPreviewFixture(t)
+			job := f.storeAttachment(t, []byte("original"), mime)
+			f.objects.openErr = errors.New("disabled preview must not read storage")
+			job.FormatID = id
+			job.PolicyVersion = filepolicy.Version
+			f.store.enqueue(job)
+			if _, err := f.service.ProcessDue(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			assertUnsupportedPreview(t, f)
+		})
+	}
+}
+
+func assertUnsupportedPreview(t *testing.T, f *previewFixture) {
+	t.Helper()
+
+	if f.renderer.callCount() != 0 {
+		t.Fatal("catalog-disabled file reached renderer")
+	}
+	ready, terminal := f.store.recorded()
+	if len(ready) != 0 || len(terminal) != 1 || terminal[0] != domain.PreviewStatusUnsupported {
+		t.Fatalf("ready=%v terminal=%v", ready, terminal)
+	}
+	if f.objects.openCount() != 0 {
+		t.Fatal("disabled preview opened storage")
 	}
 }

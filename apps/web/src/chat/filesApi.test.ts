@@ -313,6 +313,9 @@ describe("uploadAttachment", () => {
   it("keeps the other rejections distinguishable", async () => {
     const cases: Array<[ApiRequestError, string]> = [
       [new ApiRequestError(415, "unsupported_media_type", "x"), "unsupported"],
+      [new ApiRequestError(415, "file_policy_blocked", "x"), "blocked"],
+      [new ApiRequestError(415, "file_content_unrecognized", "x"), "unrecognized"],
+      [new ApiRequestError(415, "file_inspection_limit", "x"), "inspection_limit"],
       [new ApiRequestError(403, "forbidden", "x"), "forbidden"],
       [new ApiRequestError(404, "not_found", "x"), "forbidden"],
       [new ApiRequestError(503, "service_unavailable", "x"), "unavailable"],

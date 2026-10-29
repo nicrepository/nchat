@@ -87,3 +87,30 @@ func TestInspectDocumentContainerRejectsExcessiveExpansion(t *testing.T) {
 		t.Fatal("expansion bomb accepted")
 	}
 }
+
+func TestSecurityDocumentReferences(t *testing.T) {
+	for _, suffix := range []string{".rels", ".RELS", ".Rels"} {
+		for _, attrs := range []string{
+			`Type="http://schemas.test/attachedTemplate" Target="word/document.xml"`,
+			`Type="http://schemas.test/oleObject" Target="word/document.xml"`,
+			`Type="http://schemas.test/vbaProject" Target="word/document.xml"`,
+			`Type="http://schemas.test/activeX" Target="word/document.xml"`,
+			`Type="http://schemas.test/externalLink" Target="word/document.xml"`,
+			`Type="http://schemas.test/document" Target="https://example.test" TargetMode = 'Ext&#101;rnal'`,
+			`Type="http://schemas.test/document" Target="/etc/passwd"`,
+		} {
+			files := map[string]string{"word/document.xml": "<document/>", "_rels/" + suffix: `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="r1" ` + attrs + `/></Relationships>`}
+			if _, err := InspectDocumentContainer(zipFixture(t, files)); err == nil {
+				t.Fatalf("unsafe relation: %s %s", suffix, attrs)
+			}
+		}
+	}
+	for _, ref := range []string{"/etc/passwd", `C:\Windows\win.ini`, "../secret", "%2e%2e/secret", "file:///secret", "http://example.test", "https://example.test", "//example.test", "Pictures/a.png?q=x", "missing.png", "%252e%252e/secret", "%ZZ", "http&#58;//example.test", "#section", "Pictures/a.png"} {
+		files := map[string]string{"mimetype": "application/vnd.oasis.opendocument.text", "Pictures/a.png": "image", "content.xml": `<document xmlns:r="http://www.w3.org/1999/xlink"><image r:href = '` + ref + `'/></document>`}
+		_, err := InspectDocumentContainer(zipFixture(t, files))
+		valid := ref == "#section" || ref == "Pictures/a.png"
+		if (err == nil) != valid {
+			t.Fatalf("ref %s: %v", ref, err)
+		}
+	}
+}

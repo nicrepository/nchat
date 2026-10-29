@@ -214,6 +214,31 @@ case "$MODULE" in
       TestAWithheldMessageSchedulesNoRemindersPostgreSQL
       TestPublishingAWithheldMessageStartsItsRemindersPostgreSQL
       TestPromotingTwiceDoesNotRestartTheReminderClockPostgreSQL
+      # Issue #1052. The meeting store authorizes and writes inside one
+      # transaction, so its isolation, versioning, roster rules, locking
+      # against concurrent revocation and account suspension and schema
+      # invariants are only observable against a real database. The
+      # migration round trip runs in a database of its own that the test
+      # creates and drops.
+      TestMeetingCreateAndReadRoundTripPostgreSQL
+      TestMeetingCreateRefusalsPostgreSQL
+      TestMeetingSchemaInvariantsPostgreSQL
+      TestMeetingIsolationPostgreSQL
+      TestMeetingJoinPoliciesPostgreSQL
+      TestMeetingLifecyclePostgreSQL
+      TestMeetingCancelIsIdempotentPostgreSQL
+      TestMeetingOptimisticConcurrencyPostgreSQL
+      TestMeetingParticipantsPostgreSQL
+      TestMeetingConcurrentParticipantChangesPostgreSQL
+      TestMeetingRSVPPostgreSQL
+      TestMeetingMigrationRoundTripPostgreSQL
+      TestMeetingDisposableDatabaseCleanupPostgreSQL
+      TestMeetingRevocationBeforeWritePostgreSQL
+      TestMeetingWriteBeforeRevocationPostgreSQL
+      TestMeetingReadIsOneStatePostgreSQL
+      TestMeetingSuspensionBeforeWritePostgreSQL
+      TestMeetingWriteBeforeSuspensionPostgreSQL
+      TestMeetingMembershipAfterLockPostgreSQL
     )
     ;;
   services/notification-service)
