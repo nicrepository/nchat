@@ -300,6 +300,7 @@ function FavoritesList({
           busy={state.loadingMore}
           onRecover={() => loadMore(true)}
           onCancel={abandonReading}
+          focusFallbackRef={rootRef}
         />
       )}
       {state.status === "loading" && (

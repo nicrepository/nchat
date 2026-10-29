@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { StrictMode } from "react";
+import { StrictMode, useRef } from "react";
 import { expect, it, vi } from "vitest";
 
 import PaginationRecovery from "./PaginationRecovery";
@@ -113,4 +113,70 @@ it("leaves final focus to the owner when the recovery button disappears", () => 
   view.rerender(<Recovery remaining={0} />);
   expect(button).not.toBeInTheDocument();
   expect(document.body).toHaveFocus();
+});
+
+function RecoveryWithFallback({
+  busy = false,
+  remaining = 2,
+}: {
+  busy?: boolean;
+  remaining?: number;
+}) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  return (
+    <div ref={rootRef} tabIndex={-1} data-testid="recovery-root">
+      <button>Outro controle</button>
+      <PaginationRecovery
+        remaining={remaining}
+        hasMore
+        busy={busy}
+        onRecover={() => {}}
+        onCancel={() => {}}
+        focusFallbackRef={rootRef}
+      />
+    </div>
+  );
+}
+
+it.each([false, true])(
+  "uses the owner's fallback after the final batch (StrictMode=%s)",
+  (strict) => {
+    const view = render(<RecoveryWithFallback />, { wrapper: strict ? StrictMode : undefined });
+    const button = screen.getByRole("button", { name: "Recuperar contexto de leitura" });
+    button.focus();
+    fireEvent.click(button);
+    view.rerender(<RecoveryWithFallback busy />);
+    nativeDisabledBlur();
+    view.rerender(<RecoveryWithFallback remaining={0} />);
+    expect(button).not.toBeInTheDocument();
+    expect(screen.getByTestId("recovery-root")).toHaveFocus();
+  },
+);
+
+it("does not focus the final fallback without an initiating gesture", () => {
+  render(<RecoveryWithFallback remaining={0} />);
+  expect(screen.getByTestId("recovery-root")).not.toHaveFocus();
+});
+
+it("keeps intentional focus after the last batch", () => {
+  const view = render(<RecoveryWithFallback />);
+  const button = screen.getByRole("button", { name: "Recuperar contexto de leitura" });
+  button.focus();
+  fireEvent.click(button);
+  view.rerender(<RecoveryWithFallback busy />);
+  nativeDisabledBlur();
+  screen.getByRole("button", { name: "Outro controle" }).focus();
+  view.rerender(<RecoveryWithFallback remaining={0} />);
+  expect(screen.getByRole("button", { name: "Outro controle" })).toHaveFocus();
+});
+
+it("discards final fallback intent when the owner is replaced", () => {
+  const view = render(<RecoveryWithFallback key="u1" />);
+  const button = screen.getByRole("button", { name: "Recuperar contexto de leitura" });
+  button.focus();
+  fireEvent.click(button);
+  view.rerender(<RecoveryWithFallback key="u1" busy />);
+  nativeDisabledBlur();
+  view.rerender(<RecoveryWithFallback key="u2" remaining={0} />);
+  expect(screen.getByTestId("recovery-root")).not.toHaveFocus();
 });

@@ -26,6 +26,47 @@ async function focusEvidence(page: Page, step: string) {
   });
 }
 
+test("M-01: profile → Ctrl+K → Escape preserves the internal origin and native Forward", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await installMessagingMocks(
+    page,
+    createScenario({
+      kind: "channel",
+      targetId: "profile-origin",
+      targetName: "Origem",
+      messages: [],
+    }),
+  );
+  await page.goto("/profile");
+  const search = page.getByRole("button", { name: "Buscar no NChat", exact: true });
+  await expect(search).toBeVisible();
+  await search.focus();
+  const initial = await page.evaluate(() => history.length);
+  await page.keyboard.press("Control+k");
+  await expect(page).toHaveURL(/\/chat\/search$/);
+  await expect(page.getByRole("searchbox")).toBeFocused();
+  await page.keyboard.press("Escape");
+  await focusEvidence(page, "profile-first-escape");
+  await expect(page).toHaveURL(/\/profile$/);
+  await expect(page.getByTestId("global-search")).toHaveCount(0);
+  await expect(search).toBeVisible();
+  await expect(search).toBeFocused();
+  expect(await page.evaluate(() => history.length)).toBe(initial + 1);
+  await page.goForward();
+  await expect(page.getByRole("searchbox")).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(page).toHaveURL(/\/profile$/);
+  await expect(search).toBeFocused();
+  await search.click();
+  await expect(page.getByRole("searchbox")).toBeFocused();
+  await page.goBack();
+  await expect(page).toHaveURL(/\/profile$/);
+  await expect(search).toBeFocused();
+  expect(await page.evaluate(() => history.length)).toBe(initial + 1);
+});
+
 test("R4: Home → search → Escape → native Forward → Escape at 1440x900", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await installMessagingMocks(

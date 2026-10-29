@@ -34,7 +34,8 @@
  *    before a reload or a deep link — ends the walk: there is no previous
  *    conversation, and Back opens the conversation list instead.
  * From search or favourites, the same walk also accepts a known Home entry
- * and skips consecutive entries of the surface already on screen.
+ * and skips consecutive entries of the surface already on screen. Search may
+ * also close to a recorded profile settings entry of this same identity.
  */
 
 import { useCallback, useEffect, useRef } from "react";
@@ -60,6 +61,12 @@ export type Availability = "available" | "unavailable" | "unknown";
 
 const CONVERSATION_PATH = /^\/chat\/(channel|dm)\/([^/]+)$/;
 const RETURN_SURFACES = new Set(["/chat/search", "/chat/favorites"]);
+const PROFILE_PATHS = new Set([
+  "/profile",
+  "/profile/notifications",
+  "/profile/security",
+  "/profile/sessions",
+]);
 
 function withoutTrailingSlash(pathname: string): string {
   return pathname.length > 1 ? pathname.replace(/\/+$/, "") : pathname;
@@ -132,6 +139,7 @@ function walkBack(
     if (!conversation) {
       const path = withoutTrailingSlash(pathname);
       if (fromSurface && path === shownPath) continue;
+      if (shownPath === "/chat/search" && PROFILE_PATHS.has(path)) return steps;
       return isReturnSurface(path) || (fromSurface && path === "/chat") ? steps : null;
     }
     if (shown && conversation.kind === shown.kind && conversation.id === shown.id) continue;

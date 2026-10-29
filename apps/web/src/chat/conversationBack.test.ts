@@ -109,6 +109,23 @@ describe("conversationBackDelta (#1124)", () => {
   });
 
   describe("returning from search and favourites", () => {
+    it.each(["/profile", "/profile/notifications", "/profile/security", "/profile/sessions"])(
+      "search returns to the recorded profile origin %s only for its confirmed owner",
+      (profile) => {
+        const entries = trail("/chat/search", profile);
+        expect(conversationBackDelta(entries, "e0", settled, everyone)).toBe(1);
+        expect(conversationBackDelta(entries, "e0", { ...settled, pending: true }, everyone)).toBe(
+          "unknown",
+        );
+        expect(conversationBackDelta(entries, "e0", { ...settled, owner: "u2:ws" }, everyone)).toBe(
+          "unknown",
+        );
+        expect(conversationBackDelta(trail(C, profile), "e0", settled, everyone)).toBeNull();
+        expect(
+          conversationBackDelta(trail("/chat/favorites", profile), "e0", settled, everyone),
+        ).toBeNull();
+      },
+    );
     for (const surface of ["/chat/search", "/chat/favorites"]) {
       it(`${surface} returns to a known conversation or Home, skipping its own repeated entries`, () => {
         expect(conversationBackDelta(trail(surface, A), "e0", settled, everyone)).toBe(1);
@@ -119,7 +136,12 @@ describe("conversationBackDelta (#1124)", () => {
       });
 
       it(`${surface} never traverses an external, login or unowned predecessor`, () => {
-        for (const path of ["https://outside.example/", "/login", "/profile"]) {
+        for (const path of [
+          "https://outside.example/",
+          "/login",
+          "/profile/unknown",
+          "/admin/users",
+        ]) {
           expect(
             conversationBackDelta(trail(surface, path, A), "e0", settled, everyone),
           ).toBeNull();

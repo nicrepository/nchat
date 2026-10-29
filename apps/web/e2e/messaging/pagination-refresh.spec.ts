@@ -164,19 +164,71 @@ async function installPages(page: Page, surface: Surface) {
     ]);
     await expect(rows).toHaveCount(depth * PAGE_SIZE);
   };
-  const rotate = async () => {
+  const rotate = async (preserveExternalFocus = false) => {
     state.expire = true;
     await more.click();
     const top = await root.evaluate((element) => element.scrollTop);
     expect(top).toBeGreaterThan(0);
     expiry.resolve();
     await expect(root.getByText("Confirmando sua sessão…", { exact: true })).toBeVisible();
+    if (preserveExternalFocus) {
+      await page.getByRole("button", { name: "Buscar no NChat", exact: true }).focus();
+    }
     await expect(root.getByText(/Resultado u1-old-/)).toHaveCount(0);
     expect(fresh()).toHaveLength(0);
     identity.resolve();
     return top;
   };
   return { state, calls, fresh, root, rows, more, recover, result, open, rotate, heldPage };
+}
+
+for (const movedFocus of [false, true]) {
+  test(`L-01: favorites final explicit batch, intentional external focus=${movedFocus}`, async ({
+    page,
+  }) => {
+    const fixture = await installPages(page, "favorites");
+    await fixture.open(9);
+    const previousTop = await fixture.rotate(true);
+    await expect(fixture.result("u1-new-2-7")).toBeAttached();
+    // Leave the recovery control for an external control before explicitly resuming.
+    await fixture.recover.focus();
+    await page.getByRole("button", { name: "Buscar no NChat", exact: true }).focus();
+    await expect(page.getByRole("button", { name: "Buscar no NChat", exact: true })).toBeFocused();
+    await fixture.recover.click();
+    await expect(fixture.rows).toHaveCount(7 * PAGE_SIZE);
+    await expect(fixture.recover).toBeFocused();
+    fixture.state.holdAt = 8;
+    await fixture.recover.click();
+    await expect.poll(() => fixture.fresh().length).toBe(8);
+    if (movedFocus)
+      await page.getByRole("button", { name: "Buscar no NChat", exact: true }).focus();
+    fixture.heldPage.resolve();
+    await expect(fixture.rows).toHaveCount(9 * PAGE_SIZE);
+    await expect(fixture.recover).toHaveCount(0);
+    await test.info().attach("final-focus", {
+      body: JSON.stringify(await page.evaluate(() => document.activeElement?.outerHTML)),
+      contentType: "application/json",
+    });
+    if (movedFocus) {
+      await expect(
+        page.getByRole("button", { name: "Buscar no NChat", exact: true }),
+      ).toBeFocused();
+      await expect(fixture.root).not.toBeFocused();
+    } else {
+      await expect(fixture.root).toBeVisible();
+      await expect(fixture.root).toBeFocused();
+    }
+    await expect
+      .poll(() => fixture.root.evaluate((element) => element.scrollTop))
+      .toBeCloseTo(previousTop, 0);
+    expect(fixture.fresh().map((call) => call.cursor)).toEqual([
+      null,
+      ...Array.from({ length: 8 }, (_, i) => `new-${i + 1}`),
+    ]);
+    await fixture.more.click();
+    await expect(fixture.rows).toHaveCount(10 * PAGE_SIZE);
+    expect(fixture.fresh().at(-1)?.cursor).toBe("new-9");
+  });
 }
 
 for (const surface of ["search", "favorites"] as const) {

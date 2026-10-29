@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef, type RefObject } from "react";
 
 /** Presentation only: cursors and results remain in the owning list. */
 export default function PaginationRecovery({
@@ -7,20 +7,29 @@ export default function PaginationRecovery({
   busy,
   onRecover,
   onCancel,
+  focusFallbackRef,
 }: {
   remaining: number;
   hasMore: boolean;
   busy: boolean;
   onRecover: () => void;
   onCancel: () => void;
+  focusFallbackRef?: RefObject<HTMLElement | null>;
 }) {
   const buttonRef = useRef<HTMLButtonElement>(null);
   const restoreFocus = useRef(false);
   useLayoutEffect(() => {
-    if (busy || !restoreFocus.current) return;
+    if (busy || !restoreFocus.current || !buttonRef.current) return;
     restoreFocus.current = false;
     if (document.activeElement === document.body) buttonRef.current?.focus({ preventScroll: true });
   }, [busy]);
+  // The owner restores its reading position in layout effects before this fallback.
+  useEffect(() => {
+    if (busy || !restoreFocus.current) return;
+    restoreFocus.current = false;
+    if (document.activeElement === document.body)
+      focusFallbackRef?.current?.focus({ preventScroll: true });
+  }, [busy, focusFallbackRef]);
   return (
     <div data-reading-recovery="true" aria-live="polite">
       <p>
