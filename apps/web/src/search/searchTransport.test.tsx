@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router";
+import { MemoryRouter, Outlet, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiRequestError } from "../lib/api";
@@ -70,7 +70,10 @@ async function search(text: string) {
   render(
     <MemoryRouter initialEntries={["/chat/search"]}>
       <Routes>
-        <Route path="/chat/search" element={<GlobalSearchPage />} />
+        {/* The shell's confirmed identity: without one the page requests nothing. */}
+        <Route element={<Outlet context={{ sessionIdentity: "u1:w1" }} />}>
+          <Route path="/chat/search" element={<GlobalSearchPage />} />
+        </Route>
       </Routes>
     </MemoryRouter>,
   );

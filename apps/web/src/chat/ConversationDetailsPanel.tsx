@@ -1693,15 +1693,29 @@ export default function ConversationDetailsPanel({
         <h2 id={conversationDetailsTitleId} className="chat-details__title">
           {header.title}
         </h2>
+        {/* Where the navigation is a drawer the panel covers the conversation and
+            its header, Back included (issue #1124): this close is that Back's
+            first step, so there it takes the Back's place and arrow. One control
+            either way — same name, same action, same focus restoration. */}
         <button
           ref={closeButtonRef}
           type="button"
           className="chat-details__close"
           aria-label={header.closeLabel}
           onClick={onClose}
+          data-testid="chat-details-close"
         >
-          <span className="material-symbols-outlined" aria-hidden="true">
+          <span
+            className="material-symbols-outlined chat-details__close-icon--close"
+            aria-hidden="true"
+          >
             close
+          </span>
+          <span
+            className="material-symbols-outlined chat-details__close-icon--back"
+            aria-hidden="true"
+          >
+            arrow_back
           </span>
         </button>
       </div>

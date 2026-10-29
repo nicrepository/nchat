@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { getOrCreateDirectDM } from "../chat/chatApi";
+import { getOrCreateDirectDM, markConversationRead } from "../chat/chatApi";
 import { listSessions } from "../profile/sessionsApi";
+import { ApiRequestError } from "./api";
 import { _resetState, authenticatedFetch } from "./authClient";
 import { getAccessToken, setTokens } from "./authSession";
 
@@ -192,5 +193,65 @@ describe("session listing over the real request stack", () => {
     expect(sentRequest(1).url).toBe("/api/auth/refresh");
     expect(sentRequest(2).url).toBe("/api/auth/me/sessions");
     expect(sentRequest(2).headers.get("authorization")).toBe("Bearer new_at");
+  });
+});
+
+// CQ-17: the client sends a request again after a 401, under the token the
+// refresh installed. A read cursor belongs to the identity that read it, so it
+// is never sent again by the client — whatever the refresh hands back.
+describe("read cursor over the real request stack", () => {
+  const READ_URL = "/api/chat/channels/ch-1/read";
+  const cursor = JSON.stringify({ last_read_message_id: "m-3", read_cursor: "message" });
+
+  it("refreshes after a 401 but never sends the cursor again", async () => {
+    setTokens("session-a");
+    mockFetch
+      .mockResolvedValueOnce(unauthorized())
+      .mockResolvedValueOnce(refreshed("session-b-from-cookie"));
+
+    const write = markConversationRead("channel", "ch-1", "m-3");
+
+    await expect(write).rejects.toBeInstanceOf(ApiRequestError);
+    await expect(write).rejects.toMatchObject({ status: 401, code: "replay_refused" });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(sentRequest(0)).toMatchObject({ url: READ_URL, method: "POST", body: cursor });
+    expect(sentRequest(0).headers.get("authorization")).toBe("Bearer session-a");
+    expect(sentRequest(1).url).toBe("/api/auth/refresh");
+    // The refresh is the session's: its token is installed all the same.
+    expect(getAccessToken()).toBe("session-b-from-cookie");
+  });
+
+  it("never sends the cursor again under a rotation another request committed", async () => {
+    setTokens("session-a");
+    let answerWrite!: (response: Response) => void;
+    mockFetch
+      .mockReturnValueOnce(new Promise<Response>((resolve) => (answerWrite = resolve)))
+      .mockResolvedValueOnce(unauthorized())
+      .mockResolvedValueOnce(refreshed("session-a-rotated"))
+      .mockResolvedValueOnce(sessionsListed());
+
+    const write = markConversationRead("channel", "ch-1", "m-3");
+    // Another request rotates the token while the cursor is in flight, and is
+    // itself sent again with the rotated token.
+    await expect(listSessions()).resolves.toHaveLength(1);
+    expect(sentRequest(3).headers.get("authorization")).toBe("Bearer session-a-rotated");
+
+    answerWrite(unauthorized());
+    await expect(write).rejects.toMatchObject({ status: 401, code: "replay_refused" });
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    expect(mockFetch.mock.calls.filter(([url]) => url === READ_URL)).toHaveLength(1);
+  });
+
+  it("sends a cursor the server accepts exactly once", async () => {
+    setTokens("session-a");
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ data: { unread_count: 0, read_through: null } }),
+    );
+
+    await expect(markConversationRead("channel", "ch-1", "m-3")).resolves.toEqual({
+      unreadCount: 0,
+      readThrough: null,
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 });

@@ -209,6 +209,30 @@
   font-size: 20px;
 }
 
+/*
+ * The header's Back (issue #1124): only where the navigation is a drawer — the
+ * `drawer` band of AppShell.css, the same number as useNavDrawer's
+ * NAV_DRAWER_QUERY. Wider, the sidebar is a column on screen and a Back to it
+ * would be redundant. A 44px target that never shrinks, so a long title or
+ * wrapped actions never cover it, and kept clear of a landscape notch.
+ */
+.chat-msg-area__header-back {
+  display: none;
+}
+
+@media (max-width: 1023.98px) {
+  .chat-msg-area__header {
+    padding-left: max(clamp(12px, 2vw, 24px), env(safe-area-inset-left));
+  }
+
+  .chat-msg-area__header-back {
+    display: inline-flex;
+    flex-shrink: 0;
+    width: 44px;
+    height: 44px;
+  }
+}
+
 /* DM avatar in header */
 .chat-msg-area__header-avatar {
   width: 34px;
@@ -1365,6 +1389,12 @@
   margin: 0;
   font-size: 18px;
   font-weight: 700;
+}
+
+.chat-favorites__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .chat-favorites__sub {

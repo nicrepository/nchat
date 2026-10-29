@@ -31,6 +31,7 @@ import {
   type DirectMessageCoordinator,
 } from "./directMessage";
 import { useChatSidebar } from "./useChatSidebar";
+import { isReturnSurface, useConversationBack } from "./conversationBack";
 import { useConversationDrafts, type ConversationDraftsApi } from "./useConversationDrafts";
 import { clearFreshLogin, isFreshLogin, onAuthChange } from "../lib/authSession";
 import { useDocumentReloadEntry } from "../lib/documentEntry";
@@ -321,6 +322,13 @@ export type AppShellOutletContext = ReturnType<typeof useChatSidebar> & {
    * instead — see `useDirectMessagePending`.
    */
   directMessage: DirectMessageCoordinator;
+  /**
+   * The conversation header's Back (issue #1124): the previous conversation
+   * when there is one, otherwise the conversation list. True when it travels.
+   * Here because the shell owns both halves of the answer — the navigation it
+   * opens and the sidebar that says which conversations are still this user's.
+   */
+  goBack: () => boolean;
 };
 
 /**
@@ -501,9 +509,11 @@ export default function AppShell() {
     open: navOpen,
     modal: navModal,
     toggle: toggleNav,
+    show: showNav,
     close: setNavClosed,
   } = useNavDrawer(pathname, loginEntry || reloadEntry);
   const navToggleRef = useRef<HTMLButtonElement>(null);
+  const searchButtonRef = useRef<HTMLButtonElement>(null);
   // Closing always hands focus back to the control that opened the drawer: it
   // is the one element that is on screen in every drawer state, so a keyboard
   // user never lands nowhere.
@@ -511,6 +521,27 @@ export default function AppShell() {
     setNavClosed();
     navToggleRef.current?.focus();
   }, [setNavClosed]);
+  // Opened by the conversation's Back, focus moves to the drawer's own control —
+  // the conversation behind it is inert now — exactly as when opened on entry.
+  const openNavFromBack = useCallback(() => {
+    showNav();
+    navToggleRef.current?.focus();
+  }, [showNav]);
+  const contextualBack = useConversationBack(
+    state,
+    sidebar.identityPending,
+    sidebar.confirmingIdentity,
+    openNavFromBack,
+  );
+  // Set when Back leaves the search or the favourites, settled once the
+  // destination is on screen (the effect after useSearchOpener below).
+  const surfaceReturnRef = useRef(false);
+  const goBack = useCallback(() => {
+    const travelled = contextualBack();
+    // Surface headers unmount on return, including a return to the empty Home.
+    if (travelled && isReturnSurface(pathname)) surfaceReturnRef.current = true;
+    return travelled;
+  }, [contextualBack, pathname]);
   // The row control the panel was opened from, kept so closing can hand focus
   // back to it. A ref rather than state: nothing renders from it, and it must
   // survive the render that closes the panel. Captured here rather than read
@@ -532,6 +563,18 @@ export default function AppShell() {
     navigate,
     navToggleRef,
   );
+  // A surface left by Back with nothing restoring its opener — entered by the
+  // browser's Forward, say — would drop focus to <body>. Only once the
+  // destination is on screen, and only if nothing took focus: focusing at the
+  // press, still on the surface, makes the arriving composer adopt that control
+  // as its baseline and take focus from it one frame later.
+  useEffect(() => {
+    if (!surfaceReturnRef.current) return;
+    surfaceReturnRef.current = false;
+    if (document.activeElement === document.body) {
+      restoreOpenerFocus(navToggleRef.current, searchButtonRef.current);
+    }
+  }, [pathname]);
   const commandRegistry = useMemo(
     () =>
       createCommandRegistry({
@@ -602,6 +645,7 @@ export default function AppShell() {
         leaveConversation={leaveConversation}
         onOpenDetails={openSidebarDetails}
         onOpenSearch={() => commandRegistry.execute("search.open")}
+        searchButtonRef={searchButtonRef}
         onNavigateRelativeChange={setSidebarNavigation}
         draftSummaries={drafts.summaries}
       />
@@ -620,7 +664,7 @@ export default function AppShell() {
         />
       )}
       <main className="chat-app__main" aria-label={mainAriaLabel(pathname)} inert={navModal}>
-        <Outlet context={{ ...sidebar, drafts, directMessage }} />
+        <Outlet context={{ ...sidebar, drafts, directMessage, goBack }} />
       </main>
       <SidebarDetailsPanel
         target={openDetailsTarget}
