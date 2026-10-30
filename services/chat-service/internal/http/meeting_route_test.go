@@ -21,14 +21,15 @@ const meetingRouteID = "44444444-4444-4444-8444-444444444444"
 const meetingRoutePath = "/api/chat/meetings/" + meetingRouteID
 
 type meetingRouteProvider struct {
-	calls   int
-	create  service.CreateMeetingInput
-	update  service.UpdateMeetingInput
-	scope   storage.MeetingScope
-	version int64
-	m       domain.Meeting
-	replay  bool
-	err     error
+	participantCalls int
+	calls            int
+	create           service.CreateMeetingInput
+	update           service.UpdateMeetingInput
+	scope            storage.MeetingScope
+	version          int64
+	m                domain.Meeting
+	replay           bool
+	err              error
 }
 
 func (p *meetingRouteProvider) CreateMeeting(_ context.Context, in service.CreateMeetingInput) (service.CreateMeetingResult, error) {

@@ -1,17 +1,21 @@
 package httpapi
 
 const (
-	RouteMeetings          = "/api/chat/meetings"
-	RouteMeeting           = "/api/chat/meetings/{meetingID}"
-	RouteMeetingCancel     = "/api/chat/meetings/{meetingID}/cancel"
-	RouteHealthz           = "/healthz"
-	RouteReadyz            = "/readyz"
-	RouteVersion           = "/version"
-	RouteSidebar           = "/api/chat/sidebar"
-	RouteChannelSidebarPin = "/api/chat/channels/{channelID}/sidebar-pin"
-	RouteDMSidebarPin      = "/api/chat/dm/{conversationID}/sidebar-pin"
-	RouteChannelRead       = "/api/chat/channels/{channelID}/read"
-	RouteDMRead            = "/api/chat/dm/{conversationID}/read"
+	RouteMeetingParticipants    = "/api/chat/meetings/{meetingID}/participants"
+	RouteMeetingParticipant     = "/api/chat/meetings/{meetingID}/participants/{userID}"
+	RouteMeetingParticipantsAll = "/api/chat/meetings/{meetingID}/participants/invite-all"
+	RouteMeetingCandidates      = "/api/chat/meeting-candidates/{kind}/{conversationID}"
+	RouteMeetings               = "/api/chat/meetings"
+	RouteMeeting                = "/api/chat/meetings/{meetingID}"
+	RouteMeetingCancel          = "/api/chat/meetings/{meetingID}/cancel"
+	RouteHealthz                = "/healthz"
+	RouteReadyz                 = "/readyz"
+	RouteVersion                = "/version"
+	RouteSidebar                = "/api/chat/sidebar"
+	RouteChannelSidebarPin      = "/api/chat/channels/{channelID}/sidebar-pin"
+	RouteDMSidebarPin           = "/api/chat/dm/{conversationID}/sidebar-pin"
+	RouteChannelRead            = "/api/chat/channels/{channelID}/read"
+	RouteDMRead                 = "/api/chat/dm/{conversationID}/read"
 	// Issue #527 mute. A per-user preference like the sidebar pin above, so it
 	// has the same shape: POST to silence, DELETE to restore, no body at all, and
 	// the workspace resolved from the session. The general channel is refused in

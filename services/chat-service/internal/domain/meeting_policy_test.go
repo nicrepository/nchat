@@ -269,7 +269,7 @@ func TestMeetingInviteeEligibility(t *testing.T) {
 		want    bool
 	}{
 		{"member", plain, member(policyMember, "", false), true},
-		{"guest, explicitly invited", plain, guest, true},
+		{"guest excluded from new invitations (#1054)", plain, guest, false},
 		{"suspended member", plain, policyActor{policyMember, meetingWorkspace, domain.WorkspaceRoleMember, domain.MemberStatusSuspended, "", false}, false},
 		{"other workspace's member", plain, policyActor{policyMember, policyOther, domain.WorkspaceRoleMember, domain.MemberStatusActive, "", false}, false},
 		{"unknown user", plain, policyActor{user: policyMember}, false},
@@ -293,5 +293,30 @@ func TestMeetingTransitionCapability(t *testing.T) {
 		if got := domain.MeetingTransitionCapability(status); got != capability {
 			t.Errorf("%s needs %s, want %s", status, got, capability)
 		}
+	}
+}
+
+func TestMeetingParticipantBulkAuthorization(t *testing.T) {
+	m := policyMeeting(t, domain.MeetingJoinInvitedOnly)
+	organizer := member(m.OrganizerUserID, domain.MeetingRoleOrganizer, true).build(m)
+	if err := domain.AuthorizeMeetingParticipantBulk(m, organizer); err != nil {
+		t.Fatal(err)
+	}
+	organizer.ConversationAccess = false
+	if err := domain.AuthorizeMeetingParticipantBulk(m, organizer); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatal(err)
+	}
+	plain := m
+	plain.Conversation = nil
+	if err := domain.AuthorizeMeetingParticipantBulk(plain, organizer); !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatal(err)
+	}
+	attendee := member(policyAttendee, domain.MeetingRoleAttendee, true).build(m)
+	if err := domain.AuthorizeMeetingParticipantBulk(m, attendee); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatal(err)
+	}
+	m.Status = domain.MeetingStatusEnded
+	if err := domain.AuthorizeMeetingParticipantBulk(m, organizer); !errors.Is(err, domain.ErrMeetingInvalidState) {
+		t.Fatal(err)
 	}
 }

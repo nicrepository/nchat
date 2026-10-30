@@ -97,6 +97,7 @@ func TestMeetingAPICreateRefusalsAreAtomicPostgreSQL(t *testing.T) {
 		want         error
 	}{
 		{"unknown", mtNobody, mtChannelConversation, domain.ErrMeetingParticipantNotEligible},
+		{"guest excluded (#1054)", mtGuest, mtChannelConversation, domain.ErrMeetingParticipantNotEligible},
 		{"foreign", mtForeign, nil, domain.ErrMeetingParticipantNotEligible},
 		{"suspended", mtSuspended, nil, domain.ErrMeetingParticipantNotEligible},
 		{"no channel access", mtMember, mtChannelConversation, domain.ErrMeetingParticipantNotEligible},

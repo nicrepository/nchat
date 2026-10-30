@@ -14,6 +14,12 @@ import (
 )
 
 type meetingStore interface {
+	ListMeetingParticipants(context.Context, storage.MeetingScope, storage.MeetingPageQuery) (storage.MeetingParticipantPage, error)
+	ListMeetingCandidates(context.Context, storage.MeetingCandidateScope, storage.MeetingPageQuery) (storage.MeetingCandidatePage, error)
+	AddMeetingParticipant(context.Context, storage.MeetingScope, string, domain.MeetingRole) (domain.MeetingParticipant, error)
+	ChangeMeetingParticipantRole(context.Context, storage.MeetingScope, string, domain.MeetingRole) (domain.MeetingParticipant, error)
+	RemoveMeetingParticipant(context.Context, storage.MeetingScope, string) error
+	InviteAllMeetingParticipants(context.Context, storage.MeetingScope) (int64, error)
 	CreateMeetingWithParticipants(context.Context, storage.MeetingCreation) (storage.MeetingCreationResult, error)
 	PatchMeeting(context.Context, storage.MeetingScope, int64, storage.MeetingPatch) (domain.Meeting, error)
 	TransitionMeeting(context.Context, storage.MeetingScope, int64, domain.MeetingStatus) (domain.Meeting, error)

@@ -110,12 +110,13 @@ de produto, nao de pipeline, e por isso fora da #931.
 > issues sejam implementadas; a existencia das issues nao deve ser interpretada como
 > cobertura atual.
 
-A família Meeting (#1052/#1053) pertence a **Tests / Go Coverage** e é nomeada
+A família Meeting (#1052/#1053/#1054) pertence a **Tests / Go Coverage** e é nomeada
 explicitamente em `link-safety-postgres-coverage.sh`. Usa o schema completo das
 migrations reais, sem reset de schema: cada caso semeia e limpa somente seus
 workspaces e usuários. A #1053 cobre claims persistentes, roster atômico,
 recuperação de commit desconhecido, CAS, cancel e revogações coordenadas pelo
-grafo de locks do PostgreSQL. Round trips de migrations usam bancos descartáveis
+grafo de locks do PostgreSQL. A #1054 acrescenta seleção contextual, keyset,
+bulk limitado, rollback e contagem constante de statements para 2/322 candidatos. Round trips de migrations usam bancos descartáveis
 próprios, sem tocar o banco compartilhado.
 
 ## Tenho um teste novo que usa PostgreSQL real. Onde ele entra?
