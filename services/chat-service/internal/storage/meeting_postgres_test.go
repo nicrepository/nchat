@@ -606,9 +606,14 @@ func TestMeetingParticipantsPostgreSQL(t *testing.T) {
 	refused("re-role a non-participant", change(organizer, mtGuest, domain.MeetingRoleAttendee), domain.ErrNotFound)
 	refused("remove a non-participant", remove(organizer, mtGuest), domain.ErrNotFound)
 
+	refused("guest excluded from invitations", add(cohost, mtGuest, domain.MeetingRoleAttendee), domain.ErrMeetingParticipantNotEligible)
+	// Continue testing role administration with an internal member.
+	if _, err := pool.Exec(ctx, `UPDATE chat.workspace_members SET role = 'member' WHERE workspace_id = $1 AND user_id = $2`, mtWS, mtGuest); err != nil {
+		t.Fatal(err)
+	}
 	guest, err := store.AddMeetingParticipant(ctx, cohost, mtGuest, domain.MeetingRoleAttendee)
 	if err != nil || guest.Role != domain.MeetingRoleAttendee || guest.RSVP != domain.MeetingRSVPPending || guest.InvitedAt.IsZero() {
-		t.Fatalf("cohost invites the channel guest = %+v, %v", guest, err)
+		t.Fatalf("cohost invites an internal channel member = %+v, %v", guest, err)
 	}
 	promoted, err := store.ChangeMeetingParticipantRole(ctx, organizer, mtGuest, domain.MeetingRoleCohost)
 	if err != nil || promoted.Role != domain.MeetingRoleCohost {
@@ -631,6 +636,10 @@ func TestMeetingParticipantsPostgreSQL(t *testing.T) {
 
 func TestMeetingConcurrentParticipantChangesPostgreSQL(t *testing.T) {
 	pool, ctx := meetingsPostgres(t)
+	// #1054 excludes guests from new invitations; this race exercises internal users.
+	if _, err := pool.Exec(ctx, `UPDATE chat.workspace_members SET role = 'member' WHERE workspace_id = $1 AND user_id = $2`, mtWS, mtGuest); err != nil {
+		t.Fatal(err)
+	}
 	store := storage.NewPGXMeetingStore(pool)
 	m, err := domain.NewMeeting(mtWS, mtOrganizer, nil, mtDetails(""))
 	if err != nil {
@@ -1233,6 +1242,11 @@ type mtMembershipCase struct {
 
 func (c mtMembershipCase) run(t *testing.T) {
 	pool, ctx := meetingsPostgres(t)
+	if c.user == mtGuest && c.want == nil {
+		if _, err := pool.Exec(ctx, `UPDATE chat.workspace_members SET role = 'member' WHERE workspace_id = $1 AND user_id = $2`, mtWS, mtGuest); err != nil {
+			t.Fatal(err)
+		}
+	}
 	m := mtStore(t, ctx, storage.NewPGXMeetingStore(pool), c.conversation, mtDetails(""))
 	var inserted, revoked <-chan error
 	insertWaited, revokeWaited := false, false

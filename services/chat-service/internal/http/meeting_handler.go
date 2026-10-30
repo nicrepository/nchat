@@ -14,6 +14,12 @@ import (
 )
 
 type meetingProvider interface {
+	ListMeetingParticipants(context.Context, storage.MeetingScope, storage.MeetingPageQuery) (storage.MeetingParticipantPage, error)
+	ListMeetingCandidates(context.Context, storage.MeetingCandidateScope, storage.MeetingPageQuery) (storage.MeetingCandidatePage, error)
+	AddMeetingParticipant(context.Context, storage.MeetingScope, string, domain.MeetingRole) (domain.MeetingParticipant, error)
+	ChangeMeetingParticipantRole(context.Context, storage.MeetingScope, string, domain.MeetingRole) (domain.MeetingParticipant, error)
+	RemoveMeetingParticipant(context.Context, storage.MeetingScope, string) error
+	InviteAllMeetingParticipants(context.Context, storage.MeetingScope) (int64, error)
 	CreateMeeting(context.Context, service.CreateMeetingInput) (service.CreateMeetingResult, error)
 	UpdateMeeting(context.Context, service.UpdateMeetingInput) (domain.Meeting, error)
 	CancelMeeting(context.Context, storage.MeetingScope, int64) (domain.Meeting, error)
@@ -119,6 +125,7 @@ func (h *MeetingHandler) admitMutation(w http.ResponseWriter, r *http.Request, a
 }
 
 func (h *MeetingHandler) admit(w http.ResponseWriter, r *http.Request, action string, limit int) (storage.MeetingScope, bool) {
+	w.Header().Set("Cache-Control", "no-store")
 	if h.workspaces == nil || h.meetings == nil || h.limiter == nil {
 		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "meetings not available")
 		return storage.MeetingScope{}, false
@@ -138,7 +145,7 @@ func (h *MeetingHandler) admit(w http.ResponseWriter, r *http.Request, action st
 		httputil.WriteError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
 		return storage.MeetingScope{}, false
 	}
-	if !requireJSONContentType(w, r) {
+	if !meetingContentTypeAllowed(w, r) {
 		return storage.MeetingScope{}, false
 	}
 	workspace, err := h.workspaces.GetDefaultWorkspace(r.Context())
@@ -191,5 +198,14 @@ func writeMeetingError(w http.ResponseWriter, err error) {
 		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid meeting")
 	default:
 		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
+	}
+}
+
+func meetingContentTypeAllowed(w http.ResponseWriter, r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodDelete:
+		return true
+	default:
+		return requireJSONContentType(w, r)
 	}
 }

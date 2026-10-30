@@ -189,6 +189,10 @@ func (s *PGXMeetingStore) ChangeMeetingParticipantRole(ctx context.Context, scop
 		if target.Participant == nil {
 			return domain.ErrNotFound
 		}
+		if target.Participant.Role == role {
+			participant = *target.Participant
+			return nil
+		}
 		var err error
 		participant, err = scanMeetingParticipant(st.tx.QueryRow(ctx, `UPDATE chat.meeting_participants
  SET role = $3, updated_at = now() WHERE meeting_id = $1 AND user_id = $2
@@ -284,7 +288,7 @@ func (sc MeetingScope) canonical() (MeetingScope, error) {
 	workspace, errWorkspace := uuid.Parse(sc.WorkspaceID)
 	actor, errActor := uuid.Parse(sc.ActorID)
 	meeting, errMeeting := uuid.Parse(sc.MeetingID)
-	if errors.Join(errWorkspace, errActor, errMeeting) != nil {
+	if errors.Join(errWorkspace, errActor, errMeeting) != nil || workspace == uuid.Nil || actor == uuid.Nil || meeting == uuid.Nil {
 		return MeetingScope{}, domain.ErrInvalidInput
 	}
 	return MeetingScope{WorkspaceID: workspace.String(), ActorID: actor.String(), MeetingID: meeting.String()}, nil

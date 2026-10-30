@@ -179,7 +179,8 @@ de rede, retry de deadlock ou chamada a outro serviço dentro da transação.
 
 Reutiliza `NewMeeting`, `Meeting.Update`, `Meeting.Transition`,
 `AuthorizeMeeting`, `AuthorizeMeetingUpdate`, `AuthorizeMeetingParticipantChange`,
-`MeetingInviteeEligible` e `PGXMeetingStore`. Não altera as regras da #1052.
+`MeetingInviteeEligible` e `PGXMeetingStore`. A #1054 restringe novos convites a usuários internos não guest; veja
+[Participantes de reuniões](chat-meeting-participants.md).
 
 ## Threat model e observabilidade
 
@@ -204,3 +205,6 @@ de dashboards/eventos/outbox.
 Testes PostgreSQL dessa família pertencem ao gate **Tests / Go Coverage**, junto
 à #1052, explicitamente nomeados em `link-safety-postgres-coverage.sh`.
 Playwright é não aplicável: não há UI ou consumidor web dessas novas rotas.
+
+A seleção contextual, roster paginado e gestão de participantes estão em
+[Participantes de reuniões — #1054](chat-meeting-participants.md).

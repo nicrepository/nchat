@@ -17,9 +17,8 @@ memberships que já pertencem a ele.
 | Schema                         | `migrations/chat/000070_meetings.up.sql` |
 
 O store lê a reunião e os fatos do ator na mesma transação e delega a decisão a
-`domain.AuthorizeMeeting`. Ele não decide regra de negócio. Ainda não existe
-camada de serviço nem endpoint: a #1053 cria a API (idempotência, publicação)
-sobre estes contratos.
+`domain.AuthorizeMeeting`. Ele não decide regra de negócio. A #1053 acrescentou serviço e HTTP para create/update/cancel; a #1054 expõe
+gestão e seleção contextual sobre estes contratos.
 
 ## Modelo
 
@@ -183,3 +182,19 @@ identidade da reunião não muda, então uma série pode referenciá-la), RSVP e
 (nenhum consumidor existe ainda), paginação do roster (#1054), convites no
 create (#1053), transferência de organizer e idempotência do RSVP (#1059: repetir
 a mesma resposta hoje regrava `updated_at`).
+
+## Evolução #1054 — participantes internos
+
+[Contrato HTTP, limites e threat model](../api/chat-meeting-participants.md).
+Seleção contextual e roster usam keyset por UUID, até 100 linhas por página.
+Bulk explícito resolve até 500 candidatos, revalida fatos com
+`lockMeetingAuthority` e insere em um statement atômico. Primeiro trava reunião,
+workspace e conversa; só depois resolve IDs e trava memberships/contas de todos
+os usuários, por tabela e ID, preservando a ordem histórica. Nenhuma mutation
+roster incrementa version. Não há migration nem alteração de join policy.
+
+A #1054 exclui guests de novos convites pela `MeetingInviteeEligible`, inclusive
+no create. Esta restrição deliberada substitui a elegibilidade anterior de guest
+explicitamente convidado; preserva leitura/join de registros históricos.
+Descoberta usa autorização de criação com acesso atual à conversa, sem usar
+policy de join como autorização para enumerar membros. Roster usa meeting:view.

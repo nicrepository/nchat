@@ -261,6 +261,20 @@ case "$MODULE" in
       TestMeetingAPIWriteErrorsLeaveNoSuccessPostgreSQL
       TestMeetingAPIInvalidUpdatesLeaveHistoryPostgreSQL
       TestMeetingAPIStorageRejectsInvalidInitialRolesPostgreSQL
+      # Issue #1054. Contextual selection, bounded roster, bulk and lock ordering.
+      TestMeetingSelectionContextsPostgreSQL
+      TestMeetingSelectionDirectDMPostgreSQL
+      TestMeetingSelectionLargeChannelPostgreSQL
+      TestMeetingSelectionBulkLimitPostgreSQL
+      TestMeetingSelectionBulkSemanticsPostgreSQL
+      TestMeetingSelectionBulkRollbackPostgreSQL
+      TestMeetingSelectionConstantQueriesPostgreSQL
+      TestMeetingSelectionCurrentEligibilityPostgreSQL
+      TestMeetingSelectionBulkConcurrentPostgreSQL
+      TestMeetingSelectionBulkSimultaneousPostgreSQL
+      TestMeetingSelectionBulkRevocationPostgreSQL
+      TestMeetingSelectionBulkLostConversationPostgreSQL
+      TestMeetingSelectionRoleSerializationPostgreSQL
       # Q-001: PATCH merges against the same locked version used by CAS.
       TestMeetingPatchStalePolicyPostgreSQL
       TestMeetingPatchLockedSnapshotPostgreSQL

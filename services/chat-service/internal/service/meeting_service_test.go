@@ -133,16 +133,17 @@ func TestMeetingCreationRejectsInvalidBoundaryInput(t *testing.T) {
 }
 
 type msStore struct {
-	creation storage.MeetingCreation
-	result   storage.MeetingCreationResult
-	err      error
-	creates  int
-	m        domain.Meeting
-	scope    storage.MeetingScope
-	version  int64
-	patch    storage.MeetingPatch
-	updates  int
-	next     domain.MeetingStatus
+	participantCalls int
+	creation         storage.MeetingCreation
+	result           storage.MeetingCreationResult
+	err              error
+	creates          int
+	m                domain.Meeting
+	scope            storage.MeetingScope
+	version          int64
+	patch            storage.MeetingPatch
+	updates          int
+	next             domain.MeetingStatus
 }
 
 func (s *msStore) CreateMeetingWithParticipants(_ context.Context, in storage.MeetingCreation) (storage.MeetingCreationResult, error) {

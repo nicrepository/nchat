@@ -98,11 +98,27 @@ func AuthorizeMeetingParticipantChange(m Meeting, a MeetingActor, target *Meetin
 	return nil
 }
 
+// AuthorizeMeetingParticipantBulk requires roster management and current access
+// to the linked conversation: meeting visibility never grants member discovery.
+func AuthorizeMeetingParticipantBulk(m Meeting, actor MeetingActor) error {
+	if err := AuthorizeMeeting(m, actor, MeetingCapabilityManageParticipants); err != nil {
+		return err
+	}
+	if m.Conversation == nil {
+		return ErrInvalidInput
+	}
+	if !actor.ConversationAccess {
+		return ErrForbidden
+	}
+	return nil
+}
+
 // MeetingInviteeEligible reports whether invitee may be added to m: an
 // eligible member of m's workspace who, when m belongs to a conversation, can
 // read it — an invitation must not reveal a conversation to an outsider.
 func MeetingInviteeEligible(m Meeting, invitee MeetingActor) bool {
-	return eligibleMeetingMember(m, invitee) && (m.Conversation == nil || invitee.ConversationAccess)
+	return eligibleMeetingMember(m, invitee) && CanReachPublicChannels(invitee.Membership) &&
+		(m.Conversation == nil || invitee.ConversationAccess)
 }
 
 // Creating takes a workspace-wide role (guests are excluded, as for channel
