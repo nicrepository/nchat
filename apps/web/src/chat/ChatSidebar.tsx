@@ -11,6 +11,8 @@ import {
 } from "react";
 import { Link, useLocation, useNavigate } from "react-router";
 
+import { useMeetingScheduling } from "../meetings/meetingContext";
+
 import "./ChatSidebar.css";
 import ChannelIcon from "./ChannelIcon";
 import { channelAccessibleName } from "./channelIdentity";
@@ -1355,6 +1357,8 @@ export default function ChatSidebar({
    * the same pair the navigation effect performs, muting is the equivalent for
    * notifications, and rename, details and leave only open something.
    */
+  const openScheduling = useMeetingScheduling();
+
   function handleAction(
     target: ConversationTarget,
     action: ConversationActionId,
@@ -1362,6 +1366,7 @@ export default function ChatSidebar({
   ) {
     const apiTarget = { kind: conversationTargetKind(target.kind), targetId: target.id };
     const effects: Record<ConversationActionId, () => void> = {
+      "schedule-meeting": () => openScheduling?.(apiTarget.kind, target.id, trigger),
       pin: () => handlePin(apiTarget.kind, target.id, false),
       unpin: () => handlePin(apiTarget.kind, target.id, true),
       "mark-read": () => markRead?.(apiTarget),

@@ -15,6 +15,12 @@ export function useShortcutManager(registry: CommandRegistry, scopes: readonly S
       if (event.defaultPrevented || event.repeat) return;
       const command = resolveShortcut(event, scopes);
       if (!command) return;
+      // A scheduling modal owns interaction until closed; navigation must not
+      // hide an in-flight create or leave a second overlay above the form.
+      if (event.target instanceof Element && event.target.closest("dialog[open]")) {
+        event.preventDefault();
+        return;
+      }
       if (shouldIgnoreShortcutTarget(event.target) && !allowsShortcutInEditableTarget(command))
         return;
       event.preventDefault();

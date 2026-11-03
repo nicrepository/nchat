@@ -53,6 +53,32 @@ describe("useShortcutManager", () => {
     expect(escapeEvent.defaultPrevented).toBe(false);
   });
 
+  it("keeps application shortcuts inside a native scheduling modal", () => {
+    const openSearch = vi.fn();
+    const nextConversation = vi.fn();
+    const registry = createCommandRegistry({
+      openSearch,
+      openShortcutHelp: vi.fn(),
+      nextConversation,
+      previousConversation: vi.fn(),
+      historyBack: vi.fn(),
+      historyForward: vi.fn(),
+    });
+    render(
+      <>
+        <ShortcutHarness registry={registry} />
+        <dialog open>
+          <input aria-label="Meeting field" />
+        </dialog>
+      </>,
+    );
+    const input = screen.getByLabelText("Meeting field");
+    fireEvent.keyDown(input, { key: "k", ctrlKey: true });
+    fireEvent.keyDown(input, { key: "ArrowDown", altKey: true });
+    expect(openSearch).not.toHaveBeenCalled();
+    expect(nextConversation).not.toHaveBeenCalled();
+  });
+
   it("lets the overlay own Escape and restores focus without dispatching a global command", () => {
     const previousConversation = vi.fn();
     const nextConversation = vi.fn();

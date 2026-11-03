@@ -161,4 +161,4 @@ __pycache__/
 *.py[cod]
 
 # Agent execution state (F-03 / #1128): local, not project source.
-/.swarm/
+.swarm/
