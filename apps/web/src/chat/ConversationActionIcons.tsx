@@ -32,6 +32,12 @@ function Svg({ className, children }: IconProps & { children: React.ReactNode })
 }
 
 const icons: Record<ConversationActionIcon, (props: IconProps) => React.ReactElement> = {
+  calendar: (props) => (
+    <Svg {...props}>
+      <rect x="3" y="5" width="18" height="16" rx="2" />
+      <path d="M16 3v4M8 3v4M3 11h18M12 14v4M10 16h4" />
+    </Svg>
+  ),
   pin: (props) => (
     <Svg {...props}>
       <path d="M12 17v5M7 3h10l-2 5v4l3 3H6l3-3V8L7 3Z" />

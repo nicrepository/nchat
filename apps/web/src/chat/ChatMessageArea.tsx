@@ -602,6 +602,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       */}
       <div className="chat-msg-area__conversation">
         <ConversationHeader
+          targetId={targetId}
           kind={kind}
           workspaceId={ctx.workspaceId}
           name={resolvedName}

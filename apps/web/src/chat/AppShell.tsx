@@ -19,6 +19,8 @@ import {
 } from "react-router";
 
 import "./AppShell.css";
+import { restoreOpenerFocus } from "./restoreOpenerFocus";
+import MeetingSchedulingProvider from "../meetings/MeetingSchedulingProvider";
 import ChatSidebar, { chatNavigationId } from "./ChatSidebar";
 import InAppMessageAlert, { type InAppAlert } from "./InAppMessageAlert";
 import { useNavDrawer } from "./useNavDrawer";
@@ -115,31 +117,6 @@ function detailsTargetName(
   if (!target) return "";
   const collection = target.kind === "channel" ? ready.channels : ready.dms;
   return collection.find((item) => item.id === target.id)?.name ?? "";
-}
-
-/**
- * Hands focus back to whatever opened a surface the shell owns — the sidebar's
- * details panel (issue #467, code quality review) or the global search
- * (issue #550).
- *
- * The opener is a control inside the sidebar, and whether it can still take
- * focus depends on the composition the surface was closed in:
- *
- *  - a column sidebar: the row is right there and takes it;
- *  - a drawer: the row is still mounted and still connected, but the drawer was
- *    closed when the panel opened, and a hidden element cannot hold focus.
- *
- * Rather than predicting that from the viewport — which would duplicate the
- * responsive policy in JavaScript — this asks the DOM: focus the opener, then
- * see whether it actually took. The fallback is the navigation toggle, the one
- * control that is on screen in every drawer state, so focus never lands on
- * `<body>`. `focus()` on a detached or hidden element is a no-op, never a
- * throw, so neither step needs a guard of its own.
- */
-function restoreOpenerFocus(opener: HTMLElement | null, fallback: HTMLElement | null) {
-  if (opener?.isConnected) opener.focus();
-  if (opener && document.activeElement === opener) return;
-  fallback?.focus();
 }
 
 /**
@@ -514,6 +491,17 @@ export default function AppShell() {
   } = useNavDrawer(pathname, loginEntry || reloadEntry);
   const navToggleRef = useRef<HTMLButtonElement>(null);
   const searchButtonRef = useRef<HTMLButtonElement>(null);
+  const restoreMeetingFocus = useCallback(
+    (opener: HTMLElement | null) => {
+      // A closing drawer remains CSS-visible during its transition. Its state
+      // takes precedence so focus never lands on a control about to disappear.
+      const closedDrawerOpener = !navOpen && opener?.closest(`#${chatNavigationId}`);
+      if (closedDrawerOpener && restoreOpenerFocus(navToggleRef.current, null)) return;
+      if (!restoreOpenerFocus(opener, navToggleRef.current))
+        restoreOpenerFocus(searchButtonRef.current, null);
+    },
+    [navOpen],
+  );
   // Closing always hands focus back to the control that opened the drawer: it
   // is the one element that is on screen in every drawer state, so a keyboard
   // user never lands nowhere.
@@ -622,78 +610,88 @@ export default function AppShell() {
   }
 
   return (
-    <div
-      className="chat-app"
-      data-testid="chat-shell"
-      data-nav-open={dataFlag(navOpen)}
-      data-details-open={dataFlag(openDetailsTarget !== null)}
-      onKeyDown={handleShellKeyDown}
+    <MeetingSchedulingProvider
+      userId={currentUserId}
+      workspaceId={workspaceId}
+      channels={channels}
+      dms={dms}
+      identityPending={sidebar.identityPending}
+      confirmingIdentity={sidebar.confirmingIdentity}
+      restoreFocus={restoreMeetingFocus}
     >
-      {/* The toggle keeps focus through open and close alike, so closing from
+      <div
+        className="chat-app"
+        data-testid="chat-shell"
+        data-nav-open={dataFlag(navOpen)}
+        data-details-open={dataFlag(openDetailsTarget !== null)}
+        onKeyDown={handleShellKeyDown}
+      >
+        {/* The toggle keeps focus through open and close alike, so closing from
           here needs no focus restoration of its own — unlike the backdrop, the
           Escape key and the row menu below, which all hand it back. */}
-      <ChatNavBar open={navOpen} onToggle={toggleNav} toggleRef={navToggleRef} />
-      <ChatSidebar
-        state={state}
-        retry={retry}
-        setPinned={setPinned}
-        markRead={markRead}
-        renameChannel={renameChannel}
-        renameGroup={renameGroup}
-        setGroupAvatar={setGroupAvatar}
-        setMuted={setMuted}
-        leaveConversation={leaveConversation}
-        onOpenDetails={openSidebarDetails}
-        onOpenSearch={() => commandRegistry.execute("search.open")}
-        searchButtonRef={searchButtonRef}
-        onNavigateRelativeChange={setSidebarNavigation}
-        draftSummaries={drafts.summaries}
-      />
-      {/* Pointer half of "the background is not interactive while the drawer is
+        <ChatNavBar open={navOpen} onToggle={toggleNav} toggleRef={navToggleRef} />
+        <ChatSidebar
+          state={state}
+          retry={retry}
+          setPinned={setPinned}
+          markRead={markRead}
+          renameChannel={renameChannel}
+          renameGroup={renameGroup}
+          setGroupAvatar={setGroupAvatar}
+          setMuted={setMuted}
+          leaveConversation={leaveConversation}
+          onOpenDetails={openSidebarDetails}
+          onOpenSearch={() => commandRegistry.execute("search.open")}
+          searchButtonRef={searchButtonRef}
+          onNavigateRelativeChange={setSidebarNavigation}
+          draftSummaries={drafts.summaries}
+        />
+        {/* Pointer half of "the background is not interactive while the drawer is
           open"; `inert` below is the keyboard and assistive-technology half.
           A real named button rather than a decorative overlay: it sits between
           the drawer and the conversation in tab order, so tabbing past the end
           of the drawer reaches an explicit way out instead of nothing. */}
-      {navModal && (
-        <button
-          type="button"
-          className="chat-app__nav-backdrop"
-          aria-label="Fechar a navegação"
-          onClick={closeNav}
-          data-testid="chat-nav-backdrop"
+        {navModal && (
+          <button
+            type="button"
+            className="chat-app__nav-backdrop"
+            aria-label="Fechar a navegação"
+            onClick={closeNav}
+            data-testid="chat-nav-backdrop"
+          />
+        )}
+        <main className="chat-app__main" aria-label={mainAriaLabel(pathname)} inert={navModal}>
+          <Outlet context={{ ...sidebar, drafts, directMessage, goBack }} />
+        </main>
+        <SidebarDetailsPanel
+          target={openDetailsTarget}
+          currentUserId={currentUserId}
+          workspaceId={workspaceId}
+          onRename={renameDetailsTarget}
+          canonicalName={detailsCanonicalName}
+          // The same coordinator the conversation's own surfaces use, so a
+          // recipient already being resolved there is joined rather than
+          // requested again. The panel declares its own lifetime on top of it.
+          coordinator={directMessage}
+          onClose={closeSidebarDetails}
         />
-      )}
-      <main className="chat-app__main" aria-label={mainAriaLabel(pathname)} inert={navModal}>
-        <Outlet context={{ ...sidebar, drafts, directMessage, goBack }} />
-      </main>
-      <SidebarDetailsPanel
-        target={openDetailsTarget}
-        currentUserId={currentUserId}
-        workspaceId={workspaceId}
-        onRename={renameDetailsTarget}
-        canonicalName={detailsCanonicalName}
-        // The same coordinator the conversation's own surfaces use, so a
-        // recipient already being resolved there is joined rather than
-        // requested again. The panel declares its own lifetime on top of it.
-        coordinator={directMessage}
-        onClose={closeSidebarDetails}
-      />
-      <DirectMessageError coordinator={directMessage} />
-      {/* The in-app channel of the delivery plan (issue #744). Whether it is
+        <DirectMessageError coordinator={directMessage} />
+        {/* The in-app channel of the delivery plan (issue #744). Whether it is
           here at all was decided by chat-service for this recipient; this shell
           only renders what the decision allowed. Keyed by the message so a newer
           alert replaces the current one outright rather than inheriting its
           dismissal timer. */}
-      {inAppAlert && (
-        <InAppMessageAlert
-          key={inAppAlert.messageId}
-          alert={inAppAlert}
-          workspaceId={workspaceId}
-          onOpen={openInAppAlert}
-          onDismiss={dismissInAppAlert}
-        />
-      )}
-      {shortcutHelpOpen && <KeyboardShortcutsDialog onClose={() => setShortcutHelpOpen(false)} />}
-    </div>
+        {inAppAlert && (
+          <InAppMessageAlert
+            key={inAppAlert.messageId}
+            alert={inAppAlert}
+            workspaceId={workspaceId}
+            onOpen={openInAppAlert}
+            onDismiss={dismissInAppAlert}
+          />
+        )}
+        {shortcutHelpOpen && <KeyboardShortcutsDialog onClose={() => setShortcutHelpOpen(false)} />}
+      </div>
+    </MeetingSchedulingProvider>
   );
 }

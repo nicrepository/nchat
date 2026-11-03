@@ -198,3 +198,8 @@ no create. Esta restrição deliberada substitui a elegibilidade anterior de gue
 explicitamente convidado; preserva leitura/join de registros históricos.
 Descoberta usa autorização de criação com acesso atual à conversa, sem usar
 policy de join como autorização para enumerar membros. Roster usa meeting:view.
+
+## Evolução #1055 — agendamento contextual
+
+[Arquitetura, threat model e validação da UX](meeting-scheduling.md). O frontend
+consome create, candidatos e invite-all sem alterar o domínio nem iniciar mídia.

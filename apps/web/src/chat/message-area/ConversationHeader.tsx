@@ -11,6 +11,8 @@
 
 import { forwardRef, type RefObject } from "react";
 
+import { useMeetingScheduling } from "../../meetings/meetingContext";
+
 import type { ResourceCallHeaderState } from "../../calls/resourceCallTypes";
 import type { ChatOutletContext } from "../ChatShell";
 import type { DMConversation, DMCounterpart } from "../chatTypes";
@@ -340,6 +342,7 @@ export function HeaderDM({
 }
 
 interface ConversationHeaderProps {
+  targetId?: string;
   kind: "channel" | "dm";
   workspaceId: string;
   name: string;
@@ -359,6 +362,7 @@ interface ConversationHeaderProps {
 
 /** The channel or DM header, and the details control both of them offer. */
 export default function ConversationHeader({
+  targetId,
   kind,
   workspaceId,
   name,
@@ -373,6 +377,21 @@ export default function ConversationHeader({
   onBack,
   backRef,
 }: ConversationHeaderProps) {
+  const openScheduling = useMeetingScheduling();
+  const scheduleAction =
+    openScheduling && targetId ? (
+      <button
+        type="button"
+        className="chat-msg-area__header-btn"
+        aria-label="Agendar reunião"
+        title="Agendar reunião"
+        onClick={(event) => openScheduling(kind, targetId, event.currentTarget)}
+      >
+        <span className="material-symbols-outlined" aria-hidden="true">
+          calendar_add_on
+        </span>
+      </button>
+    ) : null;
   const back = onBack ? <BackButton ref={backRef} onBack={onBack} /> : undefined;
   const detailsToggle = details.supportsDetails ? (
     <DetailsToggle
@@ -389,7 +408,12 @@ export default function ConversationHeader({
         isPrivate={isPrivate}
         resourceCall={resourceCall}
         back={back}
-        detailsToggle={detailsToggle}
+        detailsToggle={
+          <>
+            {scheduleAction}
+            {detailsToggle}
+          </>
+        }
       />
     );
   }
@@ -403,7 +427,12 @@ export default function ConversationHeader({
       onStartCall={onStartCall}
       resourceCall={resourceCall}
       back={back}
-      detailsToggle={detailsToggle}
+      detailsToggle={
+        <>
+          {scheduleAction}
+          {detailsToggle}
+        </>
+      }
     />
   );
 }

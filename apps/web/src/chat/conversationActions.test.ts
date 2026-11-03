@@ -96,6 +96,7 @@ describe("conversationActions", () => {
       "mute",
       "pin",
       "rename",
+      "schedule-meeting",
       "unmute",
       "unpin",
     ]);
@@ -138,6 +139,7 @@ describe("conversationActions — the product matrix", () => {
       "pin",
       "mark-read",
       "mute",
+      "schedule-meeting",
       "rename",
       "details",
       "leave",
@@ -159,6 +161,7 @@ describe("conversationActions — the product matrix", () => {
     expect(ids({ kind: "channel", isGeneral: true, canRename: true, hasUnread: true })).toEqual([
       "pin",
       "mark-read",
+      "schedule-meeting",
       "details",
     ]);
   });
@@ -168,6 +171,7 @@ describe("conversationActions — the product matrix", () => {
       "pin",
       "mark-read",
       "mute",
+      "schedule-meeting",
       "rename",
       "identity",
       "details",
@@ -177,7 +181,13 @@ describe("conversationActions — the product matrix", () => {
 
   // A 1:1 conversation has no membership to leave and no title to rename.
   it("offers neither rename nor leave on a 1:1 conversation", () => {
-    expect(ids({ kind: "dm", hasUnread: true })).toEqual(["pin", "mark-read", "mute", "details"]);
+    expect(ids({ kind: "dm", hasUnread: true })).toEqual([
+      "pin",
+      "mark-read",
+      "mute",
+      "schedule-meeting",
+      "details",
+    ]);
   });
 
   it("toggles the mute item against the persisted preference", () => {
@@ -210,7 +220,15 @@ describe("conversationActions — the product matrix", () => {
     const groups = conversationActions(
       target({ kind: "channel", canRename: true, hasUnread: true }),
     ).map((action) => action.group);
-    expect(groups).toEqual(["frequent", "frequent", "frequent", "manage", "manage", "destructive"]);
+    expect(groups).toEqual([
+      "frequent",
+      "frequent",
+      "frequent",
+      "manage",
+      "manage",
+      "manage",
+      "destructive",
+    ]);
   });
 
   it("gives every action an icon from the shared set", () => {
