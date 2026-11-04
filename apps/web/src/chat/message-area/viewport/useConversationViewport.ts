@@ -23,7 +23,7 @@ import { useCallback } from "react";
 
 import { scrollButtonState, type ScrollButtonState } from "./navigation";
 import { useViewportCore } from "./useViewportCore";
-import { useInstantPositioning, useOpenPositionResolution } from "./useOpenPosition";
+import { isSameRequest, useInstantPositioning, useOpenPositionResolution } from "./useOpenPosition";
 import { usePrependRestoreEffects, useRowResizeAdjustment } from "./usePrependRestore";
 import { useTimelineRows } from "./useTimelineRows";
 import { useNavigator, useUnreadBoundary } from "./useNavigator";
@@ -32,7 +32,13 @@ import type { TimelinePosition } from "../../messages/messageOrder";
 import type { ReadProgress } from "../../readCursor";
 import { useReadCursor } from "../read/useReadCursor";
 import { useMessageJump } from "./useMessageJump";
-import { useAnchorCapture, useInfiniteTop, useListFocusRecovery } from "./useListBoundaries";
+import {
+  useAnchorCapture,
+  useInfiniteTop,
+  useListFocusRecovery,
+  useTargetFocusReturn,
+  type FocusReturn,
+} from "./useListBoundaries";
 
 export interface ConversationViewportInput {
   messages: Message[];
@@ -51,6 +57,8 @@ export interface ConversationViewportInput {
   focusMessageId?: string;
   /** Which request asked for it, so asking again travels again (issue #896). */
   focusRequest?: string;
+  /** #1099: the target focus is to return to, held above this list's lifetime. */
+  focusReturnRef: RefObject<FocusReturn | null>;
   onLoadMore: () => void;
   onCaptureAnchor: (key: string, anchor: ViewportAnchor) => void;
   /** #1082: the server's current read point for this conversation, live. */
@@ -83,6 +91,13 @@ export interface ConversationViewport {
   firstUnreadMessageId: string | null;
   highlightedMessageId: string | null;
   jumpToMessage: (messageId: string) => void;
+  /**
+   * #1099: a message target the bounded search could not reach, and that is
+   * still not loaded — what the reader is told instead of a silent fallback.
+   */
+  targetMissed: boolean;
+  /** #1099: marks a target as followed from inside the list; see useTargetFocusReturn. */
+  armFocusReturn: (messageId: string) => void;
   /** #880: the one floating control — whether it shows, and what it offers. */
   scrollButton: ScrollButtonState;
   /** What pressing that control does, which depends on what it offers. */
@@ -119,6 +134,7 @@ export function useConversationViewport(input: ConversationViewportInput): Conve
     unreadCountAtOpen: input.unreadCountAtOpen,
     initialAnchor: input.initialAnchor,
     focusMessageId: input.focusMessageId,
+    focusRequest: input.focusRequest ?? "",
     onLoadMore: input.onLoadMore,
   });
   const { firstUnreadMessageId, resolved } = resolution;
@@ -166,17 +182,36 @@ export function useConversationViewport(input: ConversationViewportInput): Conve
   // #1088: a link the opening could not reach settled on another destination.
   // That request is spent — a page the reader loads by hand later must not yank
   // them back to it — but asking again for the same message still travels.
+  // #1099: only the very request the opening was decided for — the same
+  // message *and* the same navigation. Anything asked for afterwards, the
+  // missed message included once a later page brought it in, is followed
+  // without reopening the conversation.
+  const focusMissed =
+    resolution.target !== null &&
+    resolution.target !== "MESSAGE_TARGET" &&
+    isSameRequest(resolution.settledFor, input.focusMessageId, input.focusRequest);
   const { highlightedMessageId, jumpToMessage } = useMessageJump(
     core,
     input.messages,
     input.focusMessageId,
     input.focusRequest,
-    resolution.target !== null && resolution.target !== "MESSAGE_TARGET",
+    focusMissed,
   );
+  const targetMissed =
+    focusMissed &&
+    !!input.focusMessageId &&
+    !input.messages.some((message) => message.id === input.focusMessageId);
 
   useInfiniteTop(core, input.hasMore, input.onLoadMore);
   useAnchorCapture(core, input.conversationKey, input.onCaptureAnchor);
   const focusList = useListFocusRecovery(core);
+  const armFocusReturn = useTargetFocusReturn(
+    core,
+    input.focusReturnRef,
+    input.focusMessageId,
+    input.focusRequest,
+    targetMissed,
+  );
 
   // #1082: read state, beside the viewport rather than inside it — it reads
   // the same mounted rows and never moves the scrollport. Last on purpose: its
@@ -226,6 +261,8 @@ export function useConversationViewport(input: ConversationViewportInput): Conve
     firstUnreadMessageId,
     highlightedMessageId,
     jumpToMessage,
+    targetMissed,
+    armFocusReturn,
     scrollButton,
     onScrollButtonClick,
     focusList,

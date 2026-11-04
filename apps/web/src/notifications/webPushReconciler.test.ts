@@ -952,6 +952,41 @@ describe("browser states", () => {
     expect(registerPushSubscription).not.toHaveBeenCalled();
   });
 
+  // Issue #902: no status of the config request is a statement that the
+  // deployment delivers no push. Only an explicit null key is, so a 404 from a
+  // regressed route stays a diagnosable backend error and never reads as
+  // not_configured.
+  it.each([[401], [403], [404], [500], [502], [503]])(
+    "reports a %i from the config request as a backend error, never as not_configured",
+    async (status) => {
+      vi.mocked(fetchPushVapidPublicKey).mockRejectedValue(
+        new ApiRequestError(status, "failed", "failed"),
+      );
+
+      const snapshot = expectAvailable(await reconcileWebPush());
+
+      expect(snapshot).toMatchObject({ health: "error", error: "backend" });
+      expect(createLocalSubscription).not.toHaveBeenCalled();
+      expect(registerPushSubscription).not.toHaveBeenCalled();
+      expect(fetchPushVapidPublicKey).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("converges on the next focus once the config request recovers, without a timer", async () => {
+    vi.mocked(fetchPushVapidPublicKey).mockRejectedValueOnce(
+      new ApiRequestError(503, "unavailable", "down"),
+    );
+    startWebPushLifecycle();
+    expect(expectAvailable(await reconcileWebPush()).health).toBe("error");
+
+    advanceClock(5_000);
+    window.dispatchEvent(new Event("focus"));
+    const snapshot = expectAvailable(await reconcileWebPush());
+
+    expect(snapshot.health).toBe("healthy");
+    expect(fetchPushVapidPublicKey).toHaveBeenCalledTimes(2);
+  });
+
   it("reports a browser error when the key request fails without a response", async () => {
     vi.mocked(fetchPushVapidPublicKey).mockRejectedValue(new TypeError("network down"));
 

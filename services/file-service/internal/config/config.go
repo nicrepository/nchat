@@ -90,6 +90,10 @@ const (
 )
 
 type Config struct {
+	EnterpriseDataEnabled           bool
+	EnterpriseOfficeEnabled         bool
+	EnterpriseArchivesEnabled       bool
+	formatProfilesInvalid           bool
 	ServiceName                     string
 	Env                             string
 	Port                            int
@@ -262,6 +266,9 @@ type Config struct {
 }
 
 func Load() Config {
+	data, dataInvalid := configuredBool("FILE_ENTERPRISE_DATA_ENABLED", false)
+	office, officeInvalid := configuredBool("FILE_ENTERPRISE_OFFICE_ENABLED", false)
+	archives, archivesInvalid := configuredBool("FILE_ENTERPRISE_ARCHIVES_ENABLED", false)
 	uploadsEnabled, uploadsEnabledInvalid := configuredBool("FILE_UPLOADS_ENABLED", false)
 	scanRequired, scanRequiredInvalid := configuredBool("FILE_MALWARE_SCAN_REQUIRED", true)
 	maxUploadBytes, maxUploadBytesInvalid := configuredInt64("FILE_MAX_UPLOAD_BYTES", domain.MaxMaxUploadBytes)
@@ -296,6 +303,10 @@ func Load() Config {
 		EncryptionMasterKey:             platformconfig.GetString("FILE_ENCRYPTION_MASTER_KEY", ""),
 		EncryptionMasterKeyID:           platformconfig.GetString("FILE_ENCRYPTION_MASTER_KEY_ID", ""),
 		EncryptionPreviousKeys:          platformconfig.GetString("FILE_ENCRYPTION_PREVIOUS_KEYS", ""),
+		EnterpriseDataEnabled:           data,
+		EnterpriseOfficeEnabled:         office,
+		EnterpriseArchivesEnabled:       archives,
+		formatProfilesInvalid:           dataInvalid || officeInvalid || archivesInvalid,
 		MalwareScanRequired:             scanRequired,
 		MalwareScannerAddress:           strings.TrimSpace(platformconfig.GetString("FILE_MALWARE_SCANNER_ADDRESS", "")),
 		MalwareScanTimeoutSeconds:       positiveInt("FILE_MALWARE_SCAN_TIMEOUT_SECONDS", defaultMalwareScanTimeoutSeconds),
@@ -341,11 +352,8 @@ func Load() Config {
 // it actually asks — limits, scan policy, dependencies — so each stays readable
 // on its own.
 func (c Config) Validate() error {
-	if c.uploadsEnabledInvalid {
-		return errors.New("FILE_UPLOADS_ENABLED must be a valid boolean")
-	}
-	if c.malwareScanRequiredInvalid {
-		return errors.New("FILE_MALWARE_SCAN_REQUIRED must be a valid boolean")
+	if err := c.validateFeatureFlags(); err != nil {
+		return err
 	}
 	// Link previews are validated before the early return below, because they
 	// are independent of uploads: a deployment may run either, both or neither.
@@ -722,4 +730,20 @@ func positiveInt(key string, fallback int) int {
 		return fallback
 	}
 	return value
+}
+
+func (c Config) validateFeatureFlags() error {
+	if c.uploadsEnabledInvalid {
+		return errors.New("FILE_UPLOADS_ENABLED must be a valid boolean")
+	}
+	if (c.EnterpriseDataEnabled || c.EnterpriseOfficeEnabled || c.EnterpriseArchivesEnabled) && !c.MalwareScanRequired {
+		return errors.New("enterprise format profiles require malware scanning")
+	}
+	if c.formatProfilesInvalid {
+		return errors.New("FILE_ENTERPRISE_*_ENABLED must be valid booleans")
+	}
+	if c.malwareScanRequiredInvalid {
+		return errors.New("FILE_MALWARE_SCAN_REQUIRED must be a valid boolean")
+	}
+	return nil
 }

@@ -70,7 +70,7 @@ func TestLiveKitTokenEncoderUsesOfficialSDKWithRoomBoundMinimalGrant(t *testing.
 	if grants.SIP != nil || grants.Agent != nil || grants.Inference != nil || grants.Observability != nil {
 		t.Fatalf("unexpected non-video grants: %+v", grants)
 	}
-	wantExpiry := time.Unix(int64(*claims.Expiry), 0).UTC()
+	wantExpiry := claims.ExpiresAt.UTC()
 	if !result.ExpiresAt.Equal(wantExpiry) {
 		t.Fatalf("result expiry %v does not match token %v", result.ExpiresAt, wantExpiry)
 	}

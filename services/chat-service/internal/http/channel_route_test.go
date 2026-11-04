@@ -212,7 +212,7 @@ func newChannelRouteEnv(t *testing.T, sessions httpapi.SessionValidator, workspa
 	return channelRouteEnv{
 		router: httpapi.NewRouter(
 			sidebarTestConfig(), nil, httpapi.ReadinessState{}, makeTestValidator(t), sessions,
-			httpapi.NewSidebarHandler(nil), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, handler, nil, nil,
+			httpapi.NewSidebarHandler(nil), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, handler, nil, nil, nil,
 		),
 		created:  channels,
 		members:  members,

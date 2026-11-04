@@ -12,6 +12,7 @@ import type { Channel, DMConversation } from "./chatTypes";
 import type { WorkspaceAttachmentLimits } from "./chatApi";
 import type { ReadProgress } from "./readCursor";
 import type { ReadTarget } from "./readCursorWriter";
+import { confirmedIdentity } from "./conversationBack";
 import type { SidebarState } from "./useChatSidebar";
 import type { ConversationDraftsApi } from "./useConversationDrafts";
 
@@ -187,11 +188,32 @@ export interface ChatOutletContext {
    */
   renameChannel?: (channelId: string, displayName: string) => Promise<void>;
   renameGroup?: (conversationId: string, title: string) => Promise<void>;
+  /**
+   * The header's Back (issue #1124), forwarded from AppShell. Optional like the
+   * callbacks above: absent, the header simply offers no Back.
+   */
+  goBack?: () => boolean;
+  /**
+   * Whose state a screen may show (CQ-07): the user and workspace the sidebar
+   * confirmed — null while it is loading, failed, or a rotated token is being
+   * confirmed. Only which identity a screen's state is still this session's;
+   * every access decision stays with the server.
+   */
+  sessionIdentity?: string | null;
 }
 
 export default function ChatShell() {
-  const { state, retry, reportReadProgress, drafts, renameChannel, renameGroup, directMessage } =
-    useOutletContext<AppShellOutletContext>();
+  const {
+    state,
+    retry,
+    reportReadProgress,
+    drafts,
+    renameChannel,
+    renameGroup,
+    directMessage,
+    goBack,
+    confirmingIdentity,
+  } = useOutletContext<AppShellOutletContext>();
   const ready = readySidebar(state);
   const {
     calls,
@@ -307,6 +329,8 @@ export default function ChatShell() {
     // in-flight map makes a second request for the same recipient impossible
     // (issue #895).
     directMessage,
+    goBack,
+    sessionIdentity: confirmingIdentity ? null : confirmedIdentity(state),
     startCall: resourceCall.active ? undefined : calls.start,
     getResourceCall,
     isParticipatingIn,

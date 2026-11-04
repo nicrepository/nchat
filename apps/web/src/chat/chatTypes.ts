@@ -333,6 +333,17 @@ export function normalizeLinkSafety(raw?: unknown): MessageLinkSafety {
 }
 
 /**
+ * A quote's `author_display_name` (issue #1099), as HTTP and realtime both send
+ * it. Two different absences are kept apart: "" (blank included) is the server
+ * saying the author's account no longer exists; undefined is a field that was
+ * never sent — a pre-#1099 server, or malformed — which says nothing about
+ * the author at all.
+ */
+export function parseQuoteAuthorDisplayName(raw: unknown): string | undefined {
+  return typeof raw === "string" ? raw.trim() : undefined;
+}
+
+/**
  * The one place that decides whether a message's links may be drawn as anchors.
  *
  * An allowlist of exactly two states, and it is exported so the bubble, the tests
@@ -764,6 +775,12 @@ export interface QuotedMessage {
    * lets the quote say why instead of rendering an empty block.
    */
   linkSafetyState: MessageLinkSafety;
+  /**
+   * The quoted author's name as the server projects it (issue #1099), so the
+   * quote can say who wrote it without the original being loaded. Undefined
+   * when the server did not send one.
+   */
+  authorDisplayName?: string;
 }
 
 export type MessageReference =

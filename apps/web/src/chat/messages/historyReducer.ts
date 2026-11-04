@@ -24,12 +24,26 @@ function applyLoaded(state: MessagesState, action: ActionOf<"loaded">): Messages
     realtimeError: null,
     actionError: null,
     pendingReactions: new Map(),
-    replyTo: null,
+    // "loading" already decided whether the reply survives this load.
+    replyTo: state.replyTo,
     linkSafetyCorrections: state.linkSafetyCorrections,
+    pendingEdits: new Map(),
+    syncError: null,
   };
 }
 
+/**
+ * True when an older-page answer still belongs to this timeline: it was asked
+ * for with the cursor the timeline holds now. A replacement (issue #947) moves
+ * the cursor, so an answer requested before it can never splice an old range
+ * into the new list or point the next page back into it.
+ */
+function continuesTimeline(state: MessagesState, cursor: string): boolean {
+  return state.nextCursor === cursor;
+}
+
 function applyPrepended(state: MessagesState, action: ActionOf<"prepended">): MessagesState {
+  if (!continuesTimeline(state, action.cursor)) return state;
   // Prepend older messages; deduplicate by ID to guard against cursor overlaps.
   const existingIds = new Set(state.messages.map((m) => m.id));
   const fresh = action.page.messages
@@ -55,6 +69,9 @@ export function reduceHistory(state: MessagesState, action: Action): MessagesSta
       return {
         ...state,
         status: "loading",
+        // What was owed or pending belonged to the conversation being left.
+        pendingEdits: new Map(),
+        syncError: null,
         sendError: null,
         sending: false,
         loadingMore: false,
@@ -63,7 +80,7 @@ export function reduceHistory(state: MessagesState, action: Action): MessagesSta
         realtimeError: null,
         actionError: null,
         pendingReactions: new Map(),
-        replyTo: null,
+        replyTo: action.keepReply ? state.replyTo : null,
       };
     case "loaded":
       return applyLoaded(state, action);
@@ -76,6 +93,8 @@ export function reduceHistory(state: MessagesState, action: Action): MessagesSta
       return {
         ...state,
         status: "denied",
+        pendingEdits: new Map(),
+        syncError: null,
         messages: [],
         nextCursor: "",
         sendError: null,
@@ -92,6 +111,7 @@ export function reduceHistory(state: MessagesState, action: Action): MessagesSta
     case "prepended":
       return applyPrepended(state, action);
     case "prepend_error":
+      if (!continuesTimeline(state, action.cursor)) return state;
       return {
         ...state,
         loadingMore: false,

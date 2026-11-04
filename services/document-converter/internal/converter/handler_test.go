@@ -78,9 +78,9 @@ func TestHandlerRejectsDisguisedOrActiveDocumentsBeforeRunner(t *testing.T) {
 		body   []byte
 	}{
 		{"arbitrary zip", "docx", zipDocument(t, map[string]string{"payload": "x"})},
-		{"macro docx", "docx", zipDocument(t, map[string]string{"word/document.xml": "x", "word/vbaProject.bin": "x"})},
-		{"wrong subtype", "pptx", zipDocument(t, map[string]string{"word/document.xml": "x"})},
-		{"external relationship", "docx", zipDocument(t, map[string]string{"word/document.xml": "x", "word/_rels/document.xml.rels": `<Relationship TargetMode="External" Target="https://example.test"/>`})},
+		{"macro docx", "docx", zipDocument(t, map[string]string{"word/document.xml": "<document/>", "word/vbaProject.bin": "x"})},
+		{"wrong subtype", "pptx", zipDocument(t, map[string]string{"word/document.xml": "<document/>"})},
+		{"external relationship", "docx", zipDocument(t, map[string]string{"word/document.xml": "<document/>", "word/_rels/document.xml.rels": `<Relationship TargetMode="External" Target="https://example.test"/>`})},
 		{"xml entity", "odt", zipDocument(t, map[string]string{"mimetype": "application/vnd.oasis.opendocument.text", "content.xml": `<!DOCTYPE x [<!ENTITY e SYSTEM "file:///etc/passwd">]>`})},
 		{"odt script", "odt", zipDocument(t, map[string]string{"mimetype": "application/vnd.oasis.opendocument.text", "content.xml": `<office:scripts><office:script>macro</office:script></office:scripts>`})},
 		{"unknown format", "exe", []byte("MZ")},
@@ -103,7 +103,7 @@ func TestHandlerRejectsDisguisedOrActiveDocumentsBeforeRunner(t *testing.T) {
 
 func TestHandlerClassifiesRunnerFailureAndOversizedInput(t *testing.T) {
 	handler := NewHandler(stubRunner{err: ErrTimeout})
-	body := zipDocument(t, map[string]string{"word/document.xml": "x"})
+	body := zipDocument(t, map[string]string{"word/document.xml": "<document/>"})
 	req := httptest.NewRequest(http.MethodPost, "/v1/convert", bytes.NewReader(body))
 	req.Header.Set("X-Document-Format", "docx")
 	res := httptest.NewRecorder()
@@ -180,7 +180,7 @@ func TestHandlerClassifiesEveryRunnerError(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			handler := NewHandler(stubRunner{err: test.runnerErr})
-			body := zipDocument(t, map[string]string{"word/document.xml": "x"})
+			body := zipDocument(t, map[string]string{"word/document.xml": "<document/>"})
 			req := httptest.NewRequest(http.MethodPost, "/v1/convert", bytes.NewReader(body))
 			req.Header.Set("X-Document-Format", "docx")
 			res := httptest.NewRecorder()
@@ -196,7 +196,7 @@ func TestHandlerClassifiesEveryRunnerError(t *testing.T) {
 func TestHandlerRejectsAnOversizedConvertedPDF(t *testing.T) {
 	oversized := append([]byte("%PDF-"), make([]byte, MaxOutputBytes+1)...)
 	handler := NewHandler(stubRunner{pdf: oversized})
-	body := zipDocument(t, map[string]string{"word/document.xml": "x"})
+	body := zipDocument(t, map[string]string{"word/document.xml": "<document/>"})
 	req := httptest.NewRequest(http.MethodPost, "/v1/convert", bytes.NewReader(body))
 	req.Header.Set("X-Document-Format", "docx")
 	res := httptest.NewRecorder()
@@ -209,7 +209,7 @@ func TestHandlerRejectsAnOversizedConvertedPDF(t *testing.T) {
 
 func TestHandlerRejectsNonPDFOutputFromTheRunner(t *testing.T) {
 	handler := NewHandler(stubRunner{pdf: []byte("not a pdf")})
-	body := zipDocument(t, map[string]string{"word/document.xml": "x"})
+	body := zipDocument(t, map[string]string{"word/document.xml": "<document/>"})
 	req := httptest.NewRequest(http.MethodPost, "/v1/convert", bytes.NewReader(body))
 	req.Header.Set("X-Document-Format", "docx")
 	res := httptest.NewRecorder()
@@ -282,7 +282,7 @@ func TestHasNonEmptyScriptsElementBlocksDirectTextContent(t *testing.T) {
 		"mimetype":    "application/vnd.oasis.opendocument.text",
 		"content.xml": `<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"><office:scripts>alert(1)</office:scripts></office:document>`,
 	})
-	if err := validateDocument(FormatODT, body); !errors.Is(err, ErrBlocked) {
+	if err := validateDocument(context.Background(), FormatODT, body); !errors.Is(err, ErrBlocked) {
 		t.Fatalf("error = %v, want ErrBlocked", err)
 	}
 }
@@ -292,7 +292,7 @@ func TestHasNonEmptyScriptsElementBlocksMalformedXMLContainingScripts(t *testing
 		"mimetype":    "application/vnd.oasis.opendocument.text",
 		"content.xml": `<office:document><office:scripts><unterminated`,
 	})
-	if err := validateDocument(FormatODT, body); !errors.Is(err, ErrBlocked) {
+	if err := validateDocument(context.Background(), FormatODT, body); !errors.Is(err, ErrBlocked) {
 		t.Fatalf("error = %v, want ErrBlocked", err)
 	}
 }
@@ -310,14 +310,13 @@ func TestExternalReferenceBlocksEverySchemeAndQuoteStyle(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			// No TargetMode="External" here on purpose: that condition is
-			// checked earlier in validateDocument's OR chain and would
-			// short-circuit before externalReference ever runs.
+			// No relationship marker: the namespace-aware href guard itself
+			// must reject the decoded URI before invoking the runner.
 			body := zipDocument(t, map[string]string{
 				"mimetype":    "application/vnd.oasis.opendocument.text",
-				"content.xml": `<office:document ` + test.href + `></office:document>`,
+				"content.xml": `<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:xlink="http://www.w3.org/1999/xlink" ` + test.href + `></office:document>`,
 			})
-			if err := validateDocument(FormatODT, body); !errors.Is(err, ErrBlocked) {
+			if err := validateDocument(context.Background(), FormatODT, body); !errors.Is(err, ErrBlocked) {
 				t.Fatalf("error = %v, want ErrBlocked", err)
 			}
 		})
@@ -329,7 +328,7 @@ func TestValidateDocumentRejectsAnEmptyZip(t *testing.T) {
 	if err := zip.NewWriter(&output).Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateDocument(FormatDOCX, output.Bytes()); !errors.Is(err, ErrBlocked) {
+	if err := validateDocument(context.Background(), FormatDOCX, output.Bytes()); !errors.Is(err, ErrBlocked) {
 		t.Fatalf("error = %v, want ErrBlocked", err)
 	}
 }
@@ -344,8 +343,8 @@ func TestValidateDocumentRejectsPathTraversalAndAbsoluteEntryNames(t *testing.T)
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			body := zipDocument(t, map[string]string{test.entry: "x", "word/document.xml": "x"})
-			if err := validateDocument(FormatDOCX, body); !errors.Is(err, ErrBlocked) {
+			body := zipDocument(t, map[string]string{test.entry: "x", "word/document.xml": "<document/>"})
+			if err := validateDocument(context.Background(), FormatDOCX, body); !errors.Is(err, ErrBlocked) {
 				t.Fatalf("error = %v, want ErrBlocked", err)
 			}
 		})
@@ -354,21 +353,21 @@ func TestValidateDocumentRejectsPathTraversalAndAbsoluteEntryNames(t *testing.T)
 
 func TestValidateDocumentRejectsAFileOverThePerFileSizeCap(t *testing.T) {
 	huge := map[string]string{
-		"word/document.xml": "x",
+		"word/document.xml": "<document/>",
 		// Highly compressible so the test zip itself stays small; the cap
 		// checks the declared uncompressed size, which archive/zip computes
 		// accurately regardless of how well the content compresses.
 		"word/media/huge.bin": strings.Repeat("A", (8<<20)+1),
 	}
 	body := zipDocument(t, huge)
-	if err := validateDocument(FormatDOCX, body); !errors.Is(err, ErrBlocked) {
+	if err := validateDocument(context.Background(), FormatDOCX, body); !errors.Is(err, ErrBlocked) {
 		t.Fatalf("error = %v, want ErrBlocked", err)
 	}
 }
 
 func TestValidateDocumentAcceptsAWellFormedPPTX(t *testing.T) {
 	body := zipDocument(t, map[string]string{"ppt/presentation.xml": `<p:presentation/>`})
-	if err := validateDocument(FormatPPTX, body); err != nil {
+	if err := validateDocument(context.Background(), FormatPPTX, body); err != nil {
 		t.Fatalf("validateDocument = %v, want nil", err)
 	}
 }
@@ -383,5 +382,47 @@ func assertErrorCode(t *testing.T, res *httptest.ResponseRecorder, want string) 
 	}
 	if payload.Code != want {
 		t.Fatalf("code = %q, want %q", payload.Code, want)
+	}
+}
+
+type countingDocumentRunner struct{ calls int }
+
+func (r *countingDocumentRunner) Convert(context.Context, Format, []byte) ([]byte, error) {
+	r.calls++
+	return []byte("%PDF-1.7\n%%EOF"), nil
+}
+
+func TestSecurityReferencesNeverReachRunner(t *testing.T) {
+	for _, ref := range []string{"/etc/passwd", `C:\Windows\win.ini`, "../secret", "%2e%2e/secret", "file:///secret", "http://example.test", "https://example.test", "//example.test", "Pictures/a.png?q=x", "missing.png", "%252e%252e/secret", "%ZZ", "http&#58;//example.test", "#section", "Pictures/a.png"} {
+		t.Run(ref, func(t *testing.T) {
+			files := map[string]string{"mimetype": "application/vnd.oasis.opendocument.text", "Pictures/a.png": "image", "content.xml": `<document xmlns:r="http://www.w3.org/1999/xlink"><image r:href = '` + ref + `'/></document>`}
+			runner := &countingDocumentRunner{}
+			handler := NewHandler(runner)
+			req := httptest.NewRequest(http.MethodPost, "/v1/convert", bytes.NewReader(zipDocument(t, files)))
+			req.Header.Set("X-Document-Format", "odt")
+			res := httptest.NewRecorder()
+			handler.ServeHTTP(res, req)
+			valid := ref == "#section" || ref == "Pictures/a.png"
+			if valid {
+				if res.Code != 200 || runner.calls != 1 {
+					t.Fatalf("valid: %d/%d", res.Code, runner.calls)
+				}
+			} else if res.Code != 422 || runner.calls != 0 {
+				t.Fatalf("unsafe reached conversion: %d/%d", res.Code, runner.calls)
+			}
+		})
+	}
+	for _, suffix := range []string{".rels", ".RELS", ".Rels"} {
+		for _, typ := range []string{"attachedTemplate", "vbaProject", "oleObject", "activeX", "externalLink", "package"} {
+			files := map[string]string{"word/document.xml": "<document/>", "_rels/" + suffix: `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="r1" Type="http://schemas.test/` + typ + `" Target = 'word/document.xml'/></Relationships>`}
+			runner := &countingDocumentRunner{}
+			req := httptest.NewRequest(http.MethodPost, "/v1/convert", bytes.NewReader(zipDocument(t, files)))
+			req.Header.Set("X-Document-Format", "docx")
+			res := httptest.NewRecorder()
+			NewHandler(runner).ServeHTTP(res, req)
+			if res.Code != 422 || runner.calls != 0 {
+				t.Fatalf("unsafe %s/%s reached conversion: %d/%d", suffix, typ, res.Code, runner.calls)
+			}
+		}
 	}
 }

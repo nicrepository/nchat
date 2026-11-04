@@ -762,8 +762,8 @@ func TestMessageService_CreateChannelMessage_PublishDoesNotBlockRequestGoroutine
 		}
 	case <-time.After(100 * time.Millisecond):
 		close(pub.release)
-		<-done
-		t.Fatal("CreateChannelMessage blocked waiting for PublishMessageCreated")
+		err := <-done
+		t.Fatalf("CreateChannelMessage blocked waiting for PublishMessageCreated (returned %v after release)", err)
 	}
 
 	close(pub.release)

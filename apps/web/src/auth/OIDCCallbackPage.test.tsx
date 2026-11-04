@@ -18,8 +18,10 @@ const mockOIDCExchange = vi.fn();
 vi.mock("./authApi", () => ({ oidcExchange: (...args: unknown[]) => mockOIDCExchange(...args) }));
 
 const mockSetTokens = vi.fn();
+const mockMarkFreshLogin = vi.fn();
 vi.mock("../lib/authSession", () => ({
   setTokens: (...args: unknown[]) => mockSetTokens(...args),
+  markFreshLogin: (...args: unknown[]) => mockMarkFreshLogin(...args),
 }));
 
 function renderCallback(initialEntry: string) {
@@ -58,6 +60,13 @@ describe("OIDCCallbackPage", () => {
     });
     expect(mockOIDCExchange).toHaveBeenCalledTimes(1);
     expect(replaceSpy).toHaveBeenCalledWith({}, "", "/oidc-callback");
+    // Issue #1123: SSO is a sign-in exactly like the form. It has no destination
+    // of its own, so it is always the chat's home; marked after the session.
+    expect(mockMarkFreshLogin).toHaveBeenCalledTimes(1);
+    expect(mockMarkFreshLogin).toHaveBeenCalledWith("/");
+    expect(mockSetTokens.mock.invocationCallOrder[0]).toBeLessThan(
+      mockMarkFreshLogin.mock.invocationCallOrder[0],
+    );
   });
 
   it("removes code from URL before calling oidcExchange", async () => {
@@ -124,5 +133,6 @@ describe("OIDCCallbackPage", () => {
       /não foi possível concluir o login com sso/i,
     );
     expect(screen.getByRole("alert").textContent).not.toMatch(/raw backend detail|bad-code/i);
+    expect(mockMarkFreshLogin).not.toHaveBeenCalled();
   });
 });

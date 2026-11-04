@@ -30,10 +30,16 @@ const listeners = new Set<AuthChangeListener>();
  * where the token is verified.
  */
 let sessionGeneration = 0;
+let sessionBoundaryGeneration = 0;
 
 /** Current session generation. Changes on every setTokens and clearTokens. */
 export function getSessionGeneration(): number {
   return sessionGeneration;
+}
+
+/** Snapshot of the existing generation at the last replacement/logout, not refresh. */
+export function getSessionBoundaryGeneration(): number {
+  return sessionBoundaryGeneration;
 }
 
 function notifyAuthChange(change: AuthChange): void {
@@ -70,6 +76,7 @@ export function setTokens(accessToken: string, change: AuthChange = "session"): 
   // existing token is a replacement, not a no-op, even when the token is
   // identical — sameness of string is not sameness of session.
   sessionGeneration += 1;
+  if (change === "session") sessionBoundaryGeneration = sessionGeneration;
   notifyAuthChange(change);
 }
 
@@ -83,9 +90,51 @@ export function clearTokens(): void {
   // generation too. Without this, logging out and back in as the same user
   // could land on the generation the first session already used.
   sessionGeneration += 1;
+  sessionBoundaryGeneration = sessionGeneration;
   notifyAuthChange("session");
 }
 
 export function isAuthenticated(): boolean {
   return sessionStorage.getItem(ACCESS_TOKEN_KEY) !== null;
+}
+
+/**
+ * Where a sign-in without a destination of its own lands: "/" redirects to
+ * "/chat", the chat's home (issue #1123). Any other destination — a
+ * conversation, the search, a call, the admin pages — is one the user asked for.
+ */
+const CHAT_HOME_DESTINATIONS = new Set(["/", "/chat", "/chat/"]);
+
+/**
+ * The session generation an interactive sign-in into the chat's home started,
+ * or null (issue #1123).
+ *
+ * Bound to the generation, not a boolean, so it belongs to that one session:
+ * any later setTokens or clearTokens — logout, a different sign-in, a silent
+ * recovery, a rotation — advances the generation and the mark no longer
+ * matches. Nothing has to remember to clear it.
+ *
+ * Module memory on purpose, never Web Storage or history state: a reload and a
+ * new tab start without it, which is exactly what makes them "not a fresh
+ * login". It is a one-shot UI hint, holds no identity and grants nothing.
+ */
+let freshLoginGeneration: number | null = null;
+
+/**
+ * Called by the sign-in flows right after setTokens installed the new session,
+ * with the destination they navigate to. Only the chat's home is marked, so a
+ * sign-in that goes elsewhere leaves no intention behind for a later entry.
+ */
+export function markFreshLogin(destination: string): void {
+  freshLoginGeneration = CHAT_HOME_DESTINATIONS.has(destination) ? sessionGeneration : null;
+}
+
+/** True only while the session the sign-in installed is still the current one. */
+export function isFreshLogin(): boolean {
+  return freshLoginGeneration === sessionGeneration;
+}
+
+/** Spent by the first chat entry after the sign-in, whatever it decided. */
+export function clearFreshLogin(): void {
+  freshLoginGeneration = null;
 }

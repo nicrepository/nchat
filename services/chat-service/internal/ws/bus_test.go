@@ -110,6 +110,7 @@ func newBusTestHub(auth SubscriptionAuthorizer, bus BroadcastBus) *Hub {
 		assertionLocks:          newAssertionSequencer(),
 		presenceInstanceID:      "runtime-instance-A",
 		reconcileSignal:         make(chan struct{}, 1),
+		syncSignal:              make(chan struct{}, 1),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h.busCancel = cancel

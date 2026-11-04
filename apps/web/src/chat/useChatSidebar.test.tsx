@@ -1,5 +1,5 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
-import type { PropsWithChildren } from "react";
+import { StrictMode, type PropsWithChildren } from "react";
 import { MemoryRouter, useLocation, useNavigate } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -8,7 +8,8 @@ import type {
   ShowBrowserMessageNotificationResult,
 } from "./browserNotification";
 import { ApiRequestError } from "../lib/api";
-import { clearTokens, setTokens } from "../lib/authSession";
+import { _resetState as resetAuthClient } from "../lib/authClient";
+import { clearTokens, getAccessToken, setTokens } from "../lib/authSession";
 import { REALTIME_LEDGER_CAPACITY, retainedRealtimeIdCount } from "./realtimeMessageLedger";
 import { SOUND_COOLDOWN_MS } from "./notificationBurst";
 import { parseInstant } from "./instant";
@@ -5138,15 +5139,884 @@ describe("useChatSidebar — read cursor (#1082)", () => {
       expect(rowB(result.current.state).readThrough).toBeUndefined();
     });
 
-    it("asks nothing extra for a refresh before anything was loaded", async () => {
-      const first = deferredValue<ReturnType<typeof sidebar>>();
-      mockFetchSidebarData.mockReturnValueOnce(first.promise);
-      const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
-      act(() => setTokens("session-a-rotated", "refresh"));
-      await act(async () => first.resolve(sidebar(readState(5, 0))));
+    // #1124 CQ-13: an answer speaks for the token that asked, never the one
+    // installed when it lands.
+    describe("an answer that outlived the token it was asked with", () => {
+      /** Every user the sidebar was ready for, render by render. */
+      function renderSeeing(seen: (string | null)[], wrap = wrapper("/chat")) {
+        return renderHook(
+          () => {
+            const sidebar = useChatSidebar();
+            const { state } = sidebar;
+            seen.push(
+              state.status === "ready" ? `${state.currentUserId}:${state.workspaceId}` : null,
+            );
+            return sidebar;
+          },
+          { wrapper: wrap },
+        );
+      }
 
-      await waitFor(() => expect(result.current.state.status).toBe("ready"));
-      expect(mockFetchSidebarData).toHaveBeenCalledTimes(1);
+      it("never loads A's first answer once B's token is installed, and loads B's", async () => {
+        const first = deferredValue<ReturnType<typeof sidebar>>();
+        mockFetchSidebarData.mockReturnValueOnce(first.promise);
+        mockFetchSidebarData.mockResolvedValue(sidebar(readState(7, 1), {}, "user-b"));
+        const seen: (string | null)[] = [];
+        const { result } = renderSeeing(seen);
+
+        act(() => setTokens("session-b-via-cookie", "refresh"));
+        await act(async () => first.resolve(sidebar(readState(5, 0))));
+        await waitFor(() =>
+          expect(result.current.state).toMatchObject({ currentUserId: "user-b" }),
+        );
+
+        expect(seen).not.toContain(`${currentUserId}:workspace-1`);
+        expect(mockFetchSidebarData).toHaveBeenCalledTimes(2);
+        expect(rowB(result.current.state).unreadCount).toBe(7);
+      });
+
+      it("asks again even for the same user: the session generation decides, not the user id", async () => {
+        const first = deferredValue<ReturnType<typeof sidebar>>();
+        const again = deferredValue<ReturnType<typeof sidebar>>();
+        mockFetchSidebarData.mockReturnValueOnce(first.promise).mockReturnValueOnce(again.promise);
+        const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+
+        act(() => setTokens("session-a-rotated", "refresh"));
+        await act(async () => first.resolve(sidebar(readState(5, 0))));
+        expect(result.current.state.status).toBe("loading");
+
+        await act(async () => again.resolve(sidebar(readState(3, 2))));
+        expect(result.current.state).toMatchObject({ status: "ready", currentUserId });
+        expect(rowB(result.current.state).unreadCount).toBe(3);
+      });
+
+      it("takes a first failure under the previous token for no error: it asks again", async () => {
+        const first = deferredValue<ReturnType<typeof sidebar>>();
+        mockFetchSidebarData.mockReturnValueOnce(first.promise);
+        const statuses: string[] = [];
+        const { result } = renderHook(
+          () => {
+            const sidebar = useChatSidebar();
+            statuses.push(sidebar.state.status);
+            return sidebar;
+          },
+          { wrapper: wrapper("/chat") },
+        );
+
+        act(() => setTokens("session-a-rotated", "refresh"));
+        await act(async () => first.reject(new Error("401 for the old token")));
+
+        await waitFor(() => expect(result.current.state.status).toBe("ready"));
+        expect(statuses).not.toContain("error");
+        expect(mockFetchSidebarData).toHaveBeenCalledTimes(2);
+      });
+
+      it("lets A's first answer load nothing after a logout and B's login", async () => {
+        const first = deferredValue<ReturnType<typeof sidebar>>();
+        mockFetchSidebarData.mockReturnValueOnce(first.promise);
+        const seen: (string | null)[] = [];
+        const { result } = renderSeeing(seen);
+
+        act(() => clearTokens());
+        mockFetchSidebarData.mockResolvedValue(sidebar(readState(7, 1), {}, "user-b"));
+        act(() => setTokens("session-b"));
+        await waitFor(() =>
+          expect(result.current.state).toMatchObject({ currentUserId: "user-b" }),
+        );
+        await act(async () => first.resolve(sidebar(readState(5, 0))));
+
+        expect(seen).not.toContain(`${currentUserId}:workspace-1`);
+        expect(result.current.state).toMatchObject({ currentUserId: "user-b" });
+        // A's load (dropped, not asked again: its session is over), B's load.
+        expect(mockFetchSidebarData).toHaveBeenCalledTimes(2);
+      });
+
+      it("never lets A's check settle B's token, whichever answer lands first", async () => {
+        const { result } = await ready();
+        const stale = deferredValue<ReturnType<typeof sidebar>>();
+        const current = deferredValue<ReturnType<typeof sidebar>>();
+        mockFetchSidebarData
+          .mockReturnValueOnce(stale.promise)
+          .mockReturnValueOnce(current.promise);
+        mockFetchSidebarData.mockResolvedValue(sidebar(readState(7, 1), {}, "user-b"));
+        vi.useFakeTimers();
+        try {
+          act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+          act(() => setTokens("session-a-rotated", "refresh"));
+          act(() => setTokens("session-b-via-cookie", "refresh"));
+          // The check asked with A's rotated token answers A: not this token's answer.
+          await act(async () => stale.resolve(sidebar(readState(5, 0))));
+          expect(result.current.confirmingIdentity).toBe(true);
+          await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+          expect(mockMarkConversationRead).not.toHaveBeenCalled();
+
+          await act(async () => current.resolve(sidebar(readState(7, 1), {}, "user-b")));
+        } finally {
+          vi.useRealTimers();
+        }
+        await waitFor(() =>
+          expect(result.current.state).toMatchObject({ currentUserId: "user-b" }),
+        );
+        expect(mockMarkConversationRead).not.toHaveBeenCalled();
+        // The first load, the stale check, its asking again, B's load.
+        expect(mockFetchSidebarData).toHaveBeenCalledTimes(4);
+      });
+
+      it("lets a check's failure under a rotated-away token undo nothing it confirms after", async () => {
+        const { result } = await ready();
+        const stale = deferredValue<ReturnType<typeof sidebar>>();
+        mockFetchSidebarData.mockReturnValueOnce(stale.promise);
+        vi.useFakeTimers();
+        try {
+          act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+          act(() => setTokens("session-a-rotated", "refresh"));
+          act(() => setTokens("session-a-rotated-again", "refresh"));
+          await act(async () => stale.reject(new Error("401 for the old token")));
+          await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+        } finally {
+          vi.useRealTimers();
+        }
+
+        expect(result.current.confirmingIdentity).toBe(false);
+        expect(mockMarkConversationRead).toHaveBeenCalledTimes(1);
+        expect(rowB(result.current.state).readThrough).toEqual(position(3));
+        // The first load, the failed check, its asking again — no reload, no loop.
+        expect(mockFetchSidebarData).toHaveBeenCalledTimes(3);
+      });
+
+      it("asks a refetch out across a rotation again rather than landing it", async () => {
+        const { result } = await ready();
+        const late = heldRefetch();
+        mockFetchSidebarData.mockResolvedValue(sidebar(readState(2, 3)));
+
+        act(() => setTokens("session-a-rotated", "refresh"));
+        await waitFor(() => expect(result.current.confirmingIdentity).toBe(false));
+        await act(async () => late.resolve(sidebar(readState(9, 0))));
+
+        await waitFor(() => expect(rowB(result.current.state).unreadCount).toBe(2));
+        // The first load, the refetch, the check, the refetch asked again.
+        expect(mockFetchSidebarData).toHaveBeenCalledTimes(4);
+      });
+
+      it("takes the same user in another workspace for another identity", async () => {
+        const { result } = await ready();
+        mockFetchSidebarData.mockResolvedValue({
+          ...sidebar(readState(4, 2)),
+          workspaceId: "workspace-2",
+        });
+        vi.useFakeTimers();
+        try {
+          act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+          act(() => setTokens("session-a-rotated", "refresh"));
+          await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+        } finally {
+          vi.useRealTimers();
+        }
+        await waitFor(() =>
+          expect(result.current.state).toMatchObject({ workspaceId: "workspace-2" }),
+        );
+
+        expect(mockMarkConversationRead).not.toHaveBeenCalled();
+        expect(rowB(result.current.state).readThrough).toBeUndefined();
+      });
+
+      it("holds under StrictMode's second mount too", async () => {
+        const first = deferredValue<ReturnType<typeof sidebar>>();
+        mockFetchSidebarData.mockReturnValueOnce(first.promise);
+        mockFetchSidebarData.mockResolvedValue(sidebar(readState(7, 1), {}, "user-b"));
+        const seen: (string | null)[] = [];
+        const Router = wrapper("/chat");
+        const { result } = renderSeeing(seen, ({ children }: PropsWithChildren) => (
+          <StrictMode>
+            <Router>{children}</Router>
+          </StrictMode>
+        ));
+
+        act(() => setTokens("session-b-via-cookie", "refresh"));
+        await act(async () => first.resolve(sidebar(readState(5, 0))));
+        await waitFor(() =>
+          expect(result.current.state).toMatchObject({ currentUserId: "user-b" }),
+        );
+
+        expect(seen).not.toContain(`${currentUserId}:workspace-1`);
+      });
+
+      it("asks nothing once unmounted, and stops listening", async () => {
+        const first = deferredValue<ReturnType<typeof sidebar>>();
+        mockFetchSidebarData.mockReturnValueOnce(first.promise);
+        const { unmount } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+
+        unmount();
+        act(() => setTokens("session-b-via-cookie", "refresh"));
+        await act(async () => first.resolve(sidebar(readState(5, 0))));
+        act(() => setTokens("session-c"));
+        await act(async () => {});
+
+        expect(mockFetchSidebarData).toHaveBeenCalledTimes(1);
+      });
+
+      // R6: the answer was checked for one token and taken one microtask later,
+      // after another token's refresh had run in between.
+      describe("a rotation landing between an answer's check and its taking", () => {
+        /** The identity the sidebar vouches for, render by render — none while a check is out. */
+        function renderVouching(vouched: (string | null)[]) {
+          return renderHook(
+            () => {
+              const sidebar = useChatSidebar();
+              const { state, confirmingIdentity } = sidebar;
+              vouched.push(
+                state.status === "ready" && !confirmingIdentity
+                  ? `${state.currentUserId}:${state.workspaceId}`
+                  : null,
+              );
+              return sidebar;
+            },
+            { wrapper: wrapper("/chat") },
+          );
+        }
+
+        it("never vouches for A's first answer under B's token, and asks B's", async () => {
+          const first = deferredValue<ReturnType<typeof sidebar>>();
+          const check = deferredValue<ReturnType<typeof sidebar>>();
+          mockFetchSidebarData
+            .mockReturnValueOnce(first.promise)
+            .mockReturnValueOnce(check.promise);
+          mockFetchSidebarData.mockResolvedValue(sidebar(readState(7, 1), {}, "user-b"));
+          const vouched: (string | null)[] = [];
+          const { result } = renderVouching(vouched);
+
+          await act(async () => {
+            first.resolve(sidebar(readState(5, 0)));
+            queueMicrotask(() => setTokens("session-b-via-cookie", "refresh"));
+          });
+          expect(result.current.confirmingIdentity).toBe(true);
+          // The current token was asked whose it is.
+          expect(mockFetchSidebarData).toHaveBeenCalledTimes(2);
+
+          await act(async () => check.resolve(sidebar(readState(7, 1), {}, "user-b")));
+          await waitFor(() =>
+            expect(result.current.state).toMatchObject({ currentUserId: "user-b" }),
+          );
+          expect(vouched).not.toContain(`${currentUserId}:workspace-1`);
+          expect(vouched.at(-1)).toBe("user-b:workspace-1");
+        });
+
+        it("vouches again for the same user once the current token says so", async () => {
+          const first = deferredValue<ReturnType<typeof sidebar>>();
+          const check = deferredValue<ReturnType<typeof sidebar>>();
+          mockFetchSidebarData
+            .mockReturnValueOnce(first.promise)
+            .mockReturnValueOnce(check.promise);
+          const vouched: (string | null)[] = [];
+          const { result } = renderVouching(vouched);
+
+          await act(async () => {
+            first.resolve(sidebar(readState(5, 0)));
+            queueMicrotask(() => setTokens("session-a-rotated", "refresh"));
+          });
+          expect(vouched).not.toContain(`${currentUserId}:workspace-1`);
+
+          await act(async () => check.resolve(sidebar(readState(5, 0))));
+          expect(result.current.confirmingIdentity).toBe(false);
+          expect(vouched.at(-1)).toBe(`${currentUserId}:workspace-1`);
+          expect(rowB(result.current.state).unreadCount).toBe(5);
+          expect(mockFetchSidebarData).toHaveBeenCalledTimes(2);
+        });
+
+        it("lets a check settled for one token settle no rotation after it", async () => {
+          const { result } = await ready();
+          const check = deferredValue<ReturnType<typeof sidebar>>();
+          const next = deferredValue<ReturnType<typeof sidebar>>();
+          mockFetchSidebarData.mockReturnValueOnce(check.promise).mockReturnValueOnce(next.promise);
+          act(() => setTokens("session-a-rotated", "refresh"));
+
+          await act(async () => {
+            check.resolve(sidebar(readState(5, 0)));
+            queueMicrotask(() => setTokens("session-b-via-cookie", "refresh"));
+          });
+          // The second token is asked for itself, not answered by the first one's check.
+          expect(result.current.confirmingIdentity).toBe(true);
+          expect(mockFetchSidebarData).toHaveBeenCalledTimes(3);
+
+          mockFetchSidebarData.mockResolvedValue(sidebar(readState(7, 1), {}, "user-b"));
+          await act(async () => next.resolve(sidebar(readState(7, 1), {}, "user-b")));
+          await waitFor(() =>
+            expect(result.current.state).toMatchObject({ currentUserId: "user-b" }),
+          );
+        });
+
+        it("sends no write waiting on a check that settled for a rotated-away token", async () => {
+          const { result } = await ready();
+          const check = deferredValue<ReturnType<typeof sidebar>>();
+          const next = deferredValue<ReturnType<typeof sidebar>>();
+          mockFetchSidebarData.mockReturnValueOnce(check.promise).mockReturnValueOnce(next.promise);
+          mockFetchSidebarData.mockResolvedValue(sidebar(readState(7, 1), {}, "user-b"));
+          vi.useFakeTimers();
+          try {
+            act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+            act(() => setTokens("session-a-rotated", "refresh"));
+            // The debounce fires: the write is handed over and waits on the check.
+            await elapse(READ_CURSOR_DEBOUNCE_MS * 2);
+            await act(async () => {
+              check.resolve(sidebar(readState(5, 0)));
+              queueMicrotask(() => setTokens("session-b-via-cookie", "refresh"));
+            });
+            expect(mockMarkConversationRead).not.toHaveBeenCalled();
+            await act(async () => next.resolve(sidebar(readState(7, 1), {}, "user-b")));
+            await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+          } finally {
+            vi.useRealTimers();
+          }
+          await waitFor(() =>
+            expect(result.current.state).toMatchObject({ currentUserId: "user-b" }),
+          );
+          expect(mockMarkConversationRead).not.toHaveBeenCalled();
+        });
+
+        it("lets a check's failure answered before the rotation ask the current token again", async () => {
+          const { result } = await ready();
+          const check = deferredValue<ReturnType<typeof sidebar>>();
+          mockFetchSidebarData.mockReturnValueOnce(check.promise);
+          mockFetchSidebarData.mockResolvedValue(sidebar(readState(7, 1), {}, "user-b"));
+          act(() => setTokens("session-a-rotated", "refresh"));
+
+          await act(async () => {
+            check.reject(new Error("offline"));
+            queueMicrotask(() => setTokens("session-b-via-cookie", "refresh"));
+          });
+          await waitFor(() =>
+            expect(result.current.state).toMatchObject({ currentUserId: "user-b" }),
+          );
+          expect(result.current.confirmingIdentity).toBe(false);
+          expect(mockMarkConversationRead).not.toHaveBeenCalled();
+        });
+      });
+    });
+
+    // CQ-16: a write handed over before the session ended, still waiting on a
+    // check, is never sent once its session is gone — whatever the check says.
+    // The real chatApi and auth client, only `fetch` replaced: what is asserted
+    // is the request that would have reached the network, and its bearer.
+    describe("a write waiting on a check when its session ends", () => {
+      interface Sent {
+        url: string;
+        authorization: string | null;
+        body: unknown;
+      }
+
+      /** The real read transport, down to `fetch`; `answer` decides each response. */
+      async function realTransport(
+        answer: (url: string) => Promise<Response> = () =>
+          Promise.resolve(new Response(null, { status: 204 })),
+      ) {
+        const actual = await vi.importActual<typeof import("./chatApi")>("./chatApi");
+        const sent: Sent[] = [];
+        vi.stubGlobal(
+          "fetch",
+          vi.fn((url: string, init: RequestInit) => {
+            sent.push({
+              url,
+              authorization: new Headers(init.headers).get("Authorization"),
+              body: init.body,
+            });
+            return answer(url);
+          }),
+        );
+        mockMarkConversationRead.mockImplementation(actual.markConversationRead);
+        return sent;
+      }
+
+      const cursor = (id: string) =>
+        JSON.stringify({ last_read_message_id: id, read_cursor: "message" });
+
+      /** A write of m-3 handed over under A's rotated token, waiting on its check. */
+      async function writeWaitingOnCheck(result: { current: ReturnType<typeof useChatSidebar> }) {
+        const check = deferredValue<ReturnType<typeof sidebar>>();
+        mockFetchSidebarData.mockReturnValueOnce(check.promise);
+        act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+        act(() => setTokens("session-a-rotated", "refresh"));
+        await elapse(READ_CURSOR_DEBOUNCE_MS * 2);
+        expect(result.current.confirmingIdentity).toBe(true);
+        return check;
+      }
+
+      const ends = [
+        {
+          name: "a logout and another user's login",
+          next: sidebar(readState(7, 1), {}, "user-b"),
+          end: () => {
+            clearTokens();
+            setTokens("session-b");
+          },
+          token: "session-b",
+        },
+        {
+          name: "a logout and the same user's login",
+          next: sidebar(readState(5, 0)),
+          end: () => {
+            clearTokens();
+            setTokens("session-a-again");
+          },
+          token: "session-a-again",
+        },
+        {
+          name: "A → B → A, each a new session",
+          next: sidebar(readState(5, 0)),
+          end: () => {
+            clearTokens();
+            setTokens("session-b");
+            clearTokens();
+            setTokens("session-a-third");
+          },
+          token: "session-a-third",
+        },
+        {
+          name: "a login into another workspace",
+          next: { ...sidebar(readState(5, 0)), workspaceId: "workspace-2" },
+          end: () => setTokens("session-a-workspace-2"),
+          token: "session-a-workspace-2",
+        },
+      ];
+
+      describe.each(["before", "after"] as const)(
+        "the check settling %s the session ends",
+        (when) => {
+          it.each(ends)(
+            "sends nothing of A's under $name, and the new session's own reads",
+            async ({ next, end, token }) => {
+              const { result } = await ready();
+              const sent = await realTransport();
+              vi.useFakeTimers();
+              try {
+                const check = await writeWaitingOnCheck(result);
+                mockFetchSidebarData.mockResolvedValue(next);
+                await act(async () => {
+                  if (when === "before") end();
+                  check.resolve(sidebar(readState(5, 0)));
+                  if (when === "after") queueMicrotask(end);
+                });
+                await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+                expect(sent).toEqual([]);
+
+                // The new session's own reading goes out, once, with its own token.
+                expect(result.current.state).toMatchObject({
+                  status: "ready",
+                  workspaceId: next.workspaceId,
+                });
+                act(() => result.current.reportReadProgress(channelBTarget, progress(4)));
+                await elapse(READ_CURSOR_DEBOUNCE_MS * 2);
+              } finally {
+                vi.useRealTimers();
+                vi.unstubAllGlobals();
+              }
+              expect(sent).toEqual([
+                {
+                  url: `/api/chat/channels/${channelB}/read`,
+                  authorization: `Bearer ${token}`,
+                  body: cursor("m-4"),
+                },
+              ]);
+            },
+          );
+
+          it("sends nothing once unmounted", async () => {
+            const { result, unmount } = await ready();
+            const sent = await realTransport();
+            vi.useFakeTimers();
+            try {
+              const check = await writeWaitingOnCheck(result);
+              await act(async () => {
+                if (when === "before") unmount();
+                check.resolve(sidebar(readState(5, 0)));
+                if (when === "after") queueMicrotask(unmount);
+              });
+              await vi.advanceTimersByTimeAsync(READ_CURSOR_DEBOUNCE_MS * 3);
+            } finally {
+              vi.useRealTimers();
+              vi.unstubAllGlobals();
+            }
+            expect(sent).toEqual([]);
+          });
+        },
+      );
+
+      it("holds under StrictMode's second mount too", async () => {
+        const Router = wrapper(`/chat/channel/${channelB}`);
+        const { result } = renderHook(() => useChatSidebar(), {
+          wrapper: ({ children }: PropsWithChildren) => (
+            <StrictMode>
+              <Router>{children}</Router>
+            </StrictMode>
+          ),
+        });
+        await waitFor(() => expect(result.current.state.status).toBe("ready"));
+        const sent = await realTransport();
+        vi.useFakeTimers();
+        try {
+          const check = await writeWaitingOnCheck(result);
+          mockFetchSidebarData.mockResolvedValue(sidebar(readState(7, 1), {}, "user-b"));
+          await act(async () => {
+            check.resolve(sidebar(readState(5, 0)));
+            queueMicrotask(() => {
+              clearTokens();
+              setTokens("session-b");
+            });
+          });
+          await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+        } finally {
+          vi.useRealTimers();
+          vi.unstubAllGlobals();
+        }
+        expect(sent).toEqual([]);
+      });
+
+      it("sends A's write once, with A's rotated token, when the check says it is still A", async () => {
+        const { result } = await ready();
+        const sent = await realTransport();
+        vi.useFakeTimers();
+        try {
+          const check = await writeWaitingOnCheck(result);
+          // Nothing leaves while the rotated token is unconfirmed.
+          expect(sent).toEqual([]);
+          await act(async () => check.resolve(sidebar(readState(5, 0))));
+          act(() => result.current.reportReadProgress(channelBTarget, progress(4)));
+          await elapse(READ_CURSOR_DEBOUNCE_MS * 2);
+        } finally {
+          vi.useRealTimers();
+          vi.unstubAllGlobals();
+        }
+        expect(sent.map(({ authorization, body }) => [authorization, body])).toEqual([
+          ["Bearer session-a-rotated", cursor("m-3")],
+          ["Bearer session-a-rotated", cursor("m-4")],
+        ]);
+      });
+
+      it("sends nothing on a failed check, and the session it reloads reads again", async () => {
+        const { result } = await ready();
+        const sent = await realTransport();
+        vi.useFakeTimers();
+        try {
+          const check = await writeWaitingOnCheck(result);
+          await act(async () => check.reject(new Error("offline")));
+          await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+          expect(sent).toEqual([]);
+
+          expect(result.current.state.status).toBe("ready");
+          act(() => result.current.reportReadProgress(channelBTarget, progress(4)));
+          await elapse(READ_CURSOR_DEBOUNCE_MS * 2);
+        } finally {
+          vi.useRealTimers();
+          vi.unstubAllGlobals();
+        }
+        expect(sent.map(({ authorization, body }) => [authorization, body])).toEqual([
+          ["Bearer session-a-rotated", cursor("m-4")],
+        ]);
+      });
+
+      it("lets a write already sent before the logout settle nothing in the next session", async () => {
+        const response = deferredValue<Response>();
+        const { result } = await ready();
+        const sent = await realTransport(() => response.promise);
+        vi.useFakeTimers();
+        try {
+          act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+          await elapse(READ_CURSOR_DEBOUNCE_MS * 2);
+          // Already on the network, with A's token: not something to take back.
+          expect(sent.map(({ authorization }) => authorization)).toEqual(["Bearer session-a"]);
+
+          mockFetchSidebarData.mockResolvedValue(sidebar(readState(7, 1), {}, "user-b"));
+          act(() => {
+            clearTokens();
+            setTokens("session-b");
+          });
+          await act(async () => {});
+          const before = rowB(result.current.state);
+          const calls = mockFetchSidebarData.mock.calls.length;
+          // Refused as a server without the cursor would: under A's session this
+          // asks the sidebar again; under B's it asks nothing, settles nothing.
+          await act(async () => response.resolve(new Response(null, { status: 400 })));
+          await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+
+          expect(rowB(result.current.state)).toBe(before);
+          expect(mockFetchSidebarData).toHaveBeenCalledTimes(calls);
+        } finally {
+          vi.useRealTimers();
+          vi.unstubAllGlobals();
+        }
+        expect(result.current.state).toMatchObject({ currentUserId: "user-b" });
+        expect(sent).toHaveLength(1);
+      });
+
+      // CQ-17: a 401 makes the client refresh and send the request again, under
+      // whatever token the refresh installed and whether or not its writer is
+      // still alive. A cursor is never sent again by the client; the writer
+      // asks again, once, through the same confirmation as any other write.
+      describe("a write refused 401, whose refresh would send it again", () => {
+        const unauthorized = () => new Response(null, { status: 401 });
+        const refreshed = (token: string) =>
+          new Response(
+            JSON.stringify({ access_token: token, token_type: "Bearer", expires_in: 900 }),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            },
+          );
+
+        /** The first write is refused 401, the refresh answers `refresh`, later writes land. */
+        function expiring(refresh: Promise<Response>) {
+          let writes = 0;
+          return (url: string) => {
+            if (url.endsWith("/auth/refresh")) return refresh;
+            writes += 1;
+            return Promise.resolve(
+              writes === 1 ? unauthorized() : new Response(null, { status: 204 }),
+            );
+          };
+        }
+
+        const writes = (sent: Sent[]) =>
+          sent
+            .filter(({ url }) => url.endsWith("/read"))
+            .map(({ url, authorization, body }) => [url, authorization, body]);
+        const read = `/api/chat/channels/${channelB}/read`;
+
+        /** m-3 written under A's token and refused 401: the refresh is now out. */
+        async function refusedWrite(result: { current: ReturnType<typeof useChatSidebar> }) {
+          act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+          await elapse(READ_CURSOR_DEBOUNCE_MS * 2);
+        }
+
+        beforeEach(() => {
+          resetAuthClient();
+        });
+
+        it("never sends A's cursor again under the other account's token the refresh installs", async () => {
+          const { result } = await ready();
+          const sent = await realTransport(
+            expiring(Promise.resolve(refreshed("session-b-from-cookie"))),
+          );
+          const check = deferredValue<ReturnType<typeof sidebar>>();
+          mockFetchSidebarData
+            .mockReturnValueOnce(check.promise)
+            .mockResolvedValue(sidebar(readState(7, 1), {}, "user-b"));
+          vi.useFakeTimers();
+          try {
+            await refusedWrite(result);
+            // The cookie's token is installed and unconfirmed: nothing goes again.
+            expect(result.current.identityPending()).toBe(true);
+            expect(writes(sent)).toHaveLength(1);
+            await act(async () => check.resolve(sidebar(readState(7, 1), {}, "user-b")));
+            await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+            expect(result.current.state).toMatchObject({
+              status: "ready",
+              currentUserId: "user-b",
+            });
+
+            // B's own reading goes out, with B's token.
+            act(() => result.current.reportReadProgress(channelBTarget, progress(4)));
+            await elapse(READ_CURSOR_DEBOUNCE_MS * 2);
+          } finally {
+            vi.useRealTimers();
+            vi.unstubAllGlobals();
+          }
+          expect(sent.map(({ url }) => url)).toEqual([read, "/api/auth/refresh", read]);
+          expect(writes(sent)).toEqual([
+            [read, "Bearer session-a", cursor("m-3")],
+            [read, "Bearer session-b-from-cookie", cursor("m-4")],
+          ]);
+        });
+
+        it("sends A's cursor again once, with A's rotated token, when the check says it is still A", async () => {
+          const { result } = await ready();
+          const sent = await realTransport(
+            expiring(Promise.resolve(refreshed("session-a-rotated"))),
+          );
+          const check = deferredValue<ReturnType<typeof sidebar>>();
+          mockFetchSidebarData.mockReturnValueOnce(check.promise);
+          vi.useFakeTimers();
+          try {
+            await refusedWrite(result);
+            expect(writes(sent)).toHaveLength(1);
+            await act(async () => check.resolve(sidebar(readState(5, 0))));
+            await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+
+            act(() => result.current.reportReadProgress(channelBTarget, progress(4)));
+            await elapse(READ_CURSOR_DEBOUNCE_MS * 2);
+          } finally {
+            vi.useRealTimers();
+            vi.unstubAllGlobals();
+          }
+          expect(writes(sent)).toEqual([
+            [read, "Bearer session-a", cursor("m-3")],
+            [read, "Bearer session-a-rotated", cursor("m-3")],
+            [read, "Bearer session-a-rotated", cursor("m-4")],
+          ]);
+        });
+
+        it("asks again at most once: a second 401 ends the write", async () => {
+          const { result } = await ready();
+          let refreshes = 0;
+          const sent = await realTransport((url) =>
+            Promise.resolve(
+              url.endsWith("/auth/refresh")
+                ? refreshed(`session-a-rotated-${(refreshes += 1)}`)
+                : unauthorized(),
+            ),
+          );
+          vi.useFakeTimers();
+          try {
+            await refusedWrite(result);
+            await elapse(READ_CURSOR_DEBOUNCE_MS * 10);
+          } finally {
+            vi.useRealTimers();
+            vi.unstubAllGlobals();
+          }
+          expect(writes(sent)).toEqual([
+            [read, "Bearer session-a", cursor("m-3")],
+            [read, "Bearer session-a-rotated-1", cursor("m-3")],
+          ]);
+          expect(result.current.state).toMatchObject({ status: "ready" });
+        });
+
+        it.each(ends)(
+          "sends nothing of A's when its refresh lands after $name, and the new session reads",
+          async ({ next, end, token }) => {
+            const { result } = await ready();
+            const refresh = deferredValue<Response>();
+            const sent = await realTransport(expiring(refresh.promise));
+            vi.useFakeTimers();
+            try {
+              await refusedWrite(result);
+              mockFetchSidebarData.mockResolvedValue(next);
+              act(end);
+              await act(async () => refresh.resolve(refreshed("session-a-rotated")));
+              await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+              // The refresh answered for a session that is gone: it installs nothing.
+              expect(getAccessToken()).toBe(token);
+              expect(writes(sent)).toHaveLength(1);
+
+              act(() => result.current.reportReadProgress(channelBTarget, progress(4)));
+              await elapse(READ_CURSOR_DEBOUNCE_MS * 2);
+            } finally {
+              vi.useRealTimers();
+              vi.unstubAllGlobals();
+            }
+            expect(writes(sent)).toEqual([
+              [read, "Bearer session-a", cursor("m-3")],
+              [read, `Bearer ${token}`, cursor("m-4")],
+            ]);
+          },
+        );
+
+        it("sends nothing once unmounted, whatever token the refresh then installs", async () => {
+          const { result, unmount } = await ready();
+          const refresh = deferredValue<Response>();
+          const sent = await realTransport(expiring(refresh.promise));
+          vi.useFakeTimers();
+          try {
+            await refusedWrite(result);
+            unmount();
+            await act(async () => refresh.resolve(refreshed("session-b-after-unmount")));
+            await vi.advanceTimersByTimeAsync(READ_CURSOR_DEBOUNCE_MS * 3);
+          } finally {
+            vi.useRealTimers();
+            vi.unstubAllGlobals();
+          }
+          // The refresh is the session's, not the write's: it still renews the token.
+          expect(getAccessToken()).toBe("session-b-after-unmount");
+          expect(writes(sent)).toEqual([[read, "Bearer session-a", cursor("m-3")]]);
+        });
+
+        it("sends nothing when the 401 answers after the logout, and asks no refresh", async () => {
+          const response = deferredValue<Response>();
+          const { result } = await ready();
+          const sent = await realTransport((url) =>
+            url.endsWith("/read") ? response.promise : Promise.reject(new Error(url)),
+          );
+          vi.useFakeTimers();
+          try {
+            act(() => result.current.reportReadProgress(channelBTarget, progress(3)));
+            await elapse(READ_CURSOR_DEBOUNCE_MS * 2);
+            mockFetchSidebarData.mockResolvedValue(sidebar(readState(7, 1), {}, "user-b"));
+            act(() => {
+              clearTokens();
+              setTokens("session-b");
+            });
+            await act(async () => response.resolve(unauthorized()));
+            await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+          } finally {
+            vi.useRealTimers();
+            vi.unstubAllGlobals();
+          }
+          expect(getAccessToken()).toBe("session-b");
+          expect(sent.map(({ url }) => url)).toEqual([read]);
+          expect(result.current.state).toMatchObject({ currentUserId: "user-b" });
+        });
+
+        it("ends the session on a failed refresh, sending nothing again", async () => {
+          const { result } = await ready();
+          const sent = await realTransport(expiring(Promise.resolve(unauthorized())));
+          vi.useFakeTimers();
+          try {
+            await refusedWrite(result);
+            await elapse(READ_CURSOR_DEBOUNCE_MS * 10);
+          } finally {
+            vi.useRealTimers();
+            vi.unstubAllGlobals();
+          }
+          expect(getAccessToken()).toBeNull();
+          expect(sent.map(({ url }) => url)).toEqual([read, "/api/auth/refresh"]);
+        });
+
+        it("lets a refresh failing after another login leave that session alone", async () => {
+          const { result } = await ready();
+          const refresh = deferredValue<Response>();
+          const sent = await realTransport(expiring(refresh.promise));
+          mockFetchSidebarData.mockResolvedValue(sidebar(readState(7, 1), {}, "user-b"));
+          vi.useFakeTimers();
+          try {
+            await refusedWrite(result);
+            act(() => {
+              clearTokens();
+              setTokens("session-b");
+            });
+            await act(async () => refresh.resolve(new Response(null, { status: 500 })));
+            await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+          } finally {
+            vi.useRealTimers();
+            vi.unstubAllGlobals();
+          }
+          expect(getAccessToken()).toBe("session-b");
+          expect(result.current.state).toMatchObject({ status: "ready", currentUserId: "user-b" });
+          expect(writes(sent)).toHaveLength(1);
+        });
+
+        it("holds under StrictMode's second mount too", async () => {
+          const Router = wrapper(`/chat/channel/${channelB}`);
+          const { result } = renderHook(() => useChatSidebar(), {
+            wrapper: ({ children }: PropsWithChildren) => (
+              <StrictMode>
+                <Router>{children}</Router>
+              </StrictMode>
+            ),
+          });
+          await waitFor(() => expect(result.current.state.status).toBe("ready"));
+          const sent = await realTransport(
+            expiring(Promise.resolve(refreshed("session-b-from-cookie"))),
+          );
+          mockFetchSidebarData.mockResolvedValue(sidebar(readState(7, 1), {}, "user-b"));
+          vi.useFakeTimers();
+          try {
+            await refusedWrite(result);
+            await elapse(READ_CURSOR_DEBOUNCE_MS * 3);
+          } finally {
+            vi.useRealTimers();
+            vi.unstubAllGlobals();
+          }
+          expect(result.current.state).toMatchObject({ currentUserId: "user-b" });
+          expect(writes(sent)).toEqual([[read, "Bearer session-a", cursor("m-3")]]);
+        });
+      });
     });
   });
 

@@ -692,7 +692,9 @@ esta neste repositorio, e os testes geram o par que usam. Procedimento:
 ### A chave publica no browser (#862)
 
 O browser nao recebe a chave pelo build. `GET /api/notifications/push/config`,
-autenticada e montada junto com as rotas de subscription, devolve
+autenticada e montada junto com as rotas de subscription (sempre registradas;
+sem banco ou segredo de assinatura utilizavel o `Authenticate` responde **503**
+`service_unavailable`, nunca o 404 do catch-all — #902), devolve
 `{"vapid_public_key": "<base64url sem padding>"}` — ou `null` quando o worker
 esta desligado ou `NotificationWorkerReady` reprova. Dois motivos:
 

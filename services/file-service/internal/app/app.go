@@ -16,6 +16,7 @@ import (
 	"github.com/nicrepository/nchat/services/file-service/internal/converter"
 	"github.com/nicrepository/nchat/services/file-service/internal/crypto"
 	"github.com/nicrepository/nchat/services/file-service/internal/events"
+	"github.com/nicrepository/nchat/services/file-service/internal/filepolicy"
 	httpapi "github.com/nicrepository/nchat/services/file-service/internal/http"
 	"github.com/nicrepository/nchat/services/file-service/internal/linkpreview"
 	"github.com/nicrepository/nchat/services/file-service/internal/preview"
@@ -310,6 +311,7 @@ func (a *App) wireAttachments(
 		attachmentMetrics,
 		logger,
 	)
+	attachmentService.SetFormatProfiles(filepolicy.Profiles{Data: cfg.EnterpriseDataEnabled, Office: cfg.EnterpriseOfficeEnabled, Archives: cfg.EnterpriseArchivesEnabled})
 	routerDeps.Attachments = attachmentService
 	routerDeps.Admission = admission
 	routerDeps.RateLimiter = limiter
@@ -445,6 +447,7 @@ func (a *App) startMalwareScanWorker(
 		time.Duration(cfg.MalwareScanTimeoutSeconds)*time.Second,
 		logger,
 	)
+	scans.SetFormatProfiles(filepolicy.Profiles{Data: cfg.EnterpriseDataEnabled, Office: cfg.EnterpriseOfficeEnabled, Archives: cfg.EnterpriseArchivesEnabled})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {

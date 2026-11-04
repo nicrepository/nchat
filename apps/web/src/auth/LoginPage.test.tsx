@@ -24,10 +24,12 @@ vi.mock("./authApi", () => ({
 const mockClearTokens = vi.fn();
 const mockSetTokens = vi.fn();
 const mockIsAuthenticated = vi.fn(() => false);
+const mockMarkFreshLogin = vi.fn();
 vi.mock("../lib/authSession", () => ({
   clearTokens: (...args: unknown[]) => mockClearTokens(...args),
   setTokens: (...args: unknown[]) => mockSetTokens(...args),
   isAuthenticated: () => mockIsAuthenticated(),
+  markFreshLogin: (...args: unknown[]) => mockMarkFreshLogin(...args),
 }));
 
 function renderLogin(
@@ -101,6 +103,32 @@ describe("LoginPage", () => {
       expect(mockSetTokens).toHaveBeenCalledWith("at");
       expect(mockNavigate).toHaveBeenCalledWith("/", { replace: true });
     });
+    // Issue #1123: the chat it lands in learns this was an interactive sign-in —
+    // for the destination it navigates to, after the session is installed (the
+    // mark is bound to that session and would not match if set before it).
+    expect(mockMarkFreshLogin).toHaveBeenCalledTimes(1);
+    expect(mockMarkFreshLogin).toHaveBeenCalledWith("/");
+    expect(mockSetTokens.mock.invocationCallOrder[0]).toBeLessThan(
+      mockMarkFreshLogin.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("marks the sign-in with the protected destination it returns to", async () => {
+    mockLogin.mockResolvedValue({
+      accessToken: "at",
+      refreshToken: "rt",
+      tokenType: "Bearer",
+      expiresIn: 900,
+      user: { id: "u1", email: "a@b.com", displayName: "Alice", mustChangePassword: false },
+    });
+    renderLogin([{ pathname: "/login", state: { from: "/call/call-1123" } }]);
+    await userEvent.type(screen.getByLabelText(/e-mail corporativo/i), "a@b.com");
+    await userEvent.type(screen.getByLabelText(/senha/i), "pass");
+    await userEvent.click(screen.getByRole("button", { name: /entrar$/i }));
+    await waitFor(() => {
+      expect(mockNavigate).toHaveBeenCalledWith("/call/call-1123", { replace: true });
+    });
+    expect(mockMarkFreshLogin).toHaveBeenCalledWith("/call/call-1123");
   });
 
   it("blocks app navigation when password change is required", async () => {
@@ -120,6 +148,7 @@ describe("LoginPage", () => {
     });
     expect(mockClearTokens).toHaveBeenCalled();
     expect(mockSetTokens).not.toHaveBeenCalled();
+    expect(mockMarkFreshLogin).not.toHaveBeenCalled();
     expect(mockNavigate).not.toHaveBeenCalledWith("/", expect.anything());
   });
 

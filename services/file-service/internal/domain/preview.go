@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/nicrepository/nchat/services/file-service/internal/filepolicy"
 )
 
 // ErrPreviewUnavailable is returned for an attachment the caller may read but
@@ -237,7 +238,7 @@ func NormalizeDetectedMIME(detected string) string {
 // client declared and never an extension: a .png that is really a zip is
 // already recorded as application/zip and is refused here.
 func PreviewSupported(detectedMIME string) bool {
-	_, ok := previewableMIMEs[NormalizeDetectedMIME(detectedMIME)]
+	_, ok := previewableMIMEs[filepolicy.PreviewMIME(NormalizeDetectedMIME(detectedMIME))]
 	return ok
 }
 
@@ -249,6 +250,16 @@ func InitialPreviewStatus(detectedMIME string, size int64) PreviewStatus {
 		return PreviewStatusUnsupported
 	}
 	return PreviewStatusPending
+}
+
+// InitialPolicyPreviewStatus uses catalog metadata for classified attachments;
+// version zero retains the historical MIME-based renderer contract.
+func InitialPolicyPreviewStatus(detectedMIME string, size int64, formatID filepolicy.FormatID, version int) PreviewStatus {
+	rendererMIME := filepolicy.PolicyPreviewMIME(NormalizeDetectedMIME(detectedMIME), formatID, version)
+	if rendererMIME == "" {
+		return PreviewStatusUnsupported
+	}
+	return InitialPreviewStatus(rendererMIME, size)
 }
 
 // InitialDocumentPreviewStatus additionally admits a legacy PowerPoint only

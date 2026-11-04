@@ -3,8 +3,9 @@
 
 infra/k8s/bootstrap/nchat-prod is applied by a cluster administrator, never by
 a release. These checks render it the way it is applied and hold the Role to
-the production baseline plus exactly one rule: get/patch/update on the one
-ConfigMap named nchat-release-state.
+the production baseline plus exactly two named rules: get/patch/update on the
+one ConfigMap named nchat-release-state (#1000), and get/patch/update on the
+scale subresource of the Blue/Green application Deployments (#1108).
 
 Two independent checks, because each catches what the other cannot:
 
@@ -40,6 +41,12 @@ SERVICES = [
     "file-service", "media-service", "nchat-admin-web", "nchat-web",
     "notification-service", "search-service",
 ]
+SLOTS = ["blue", "green"]
+# kubectl scale reads the Deployment, then PATCHes deployments/<name>/scale; with
+# --current-replicas or --resource-version it GETs and PUTs the subresource
+# instead. drain-old.sh scales exactly these names, and RBAC authorizes the
+# subresource separately from the deployments grant (#1108).
+SCALED = [f"{service}-{slot}" for service in SERVICES for slot in SLOTS]
 # Role/nchat-prod-deployer as it exists in production before #1000, as the
 # operator read it from the cluster. Not inferred from the scripts: this is the
 # grant set the change must preserve exactly.
@@ -59,6 +66,10 @@ STATE_RULE = {
     "apiGroups": [""], "resources": ["configmaps"],
     "resourceNames": [STATE], "verbs": ["get", "patch", "update"],
 }
+SCALE_RULE = {
+    "apiGroups": ["apps"], "resources": ["deployments/scale"],
+    "resourceNames": SCALED, "verbs": ["get", "patch", "update"],
+}
 # (verb, name, allowed) on core/configmaps. name None is a request without a
 # resource name: create, list, watch of the collection.
 CONFIGMAP_MATRIX = [
@@ -69,6 +80,22 @@ CONFIGMAP_MATRIX = [
     ("patch", "nchat-config", False), ("update", "nchat-config", False),
     ("patch", "any-other", False), ("update", "any-other", False),
     ("get", "nchat-config", True), ("list", None, True),
+]
+# (group, resource, verb, name) scale requests that must be refused: no
+# collection or create/delete access, no unsuffixed or shared Deployment, and
+# no other workload kind -- the stateful services are never scaled by CD.
+SCALE_REFUSED = [
+    ("apps", "deployments/scale", verb, name)
+    for verb in ["create", "delete", "list", "watch", "patch", "update"]
+    for name in [None, "nchat-web", "clamav", "upload-guard", "any-other"]
+] + [
+    ("apps", "deployments/scale", verb, SCALED[0])
+    for verb in ["create", "delete", "deletecollection"]
+] + [
+    ("apps", resource, verb, name)
+    for resource in ["statefulsets/scale", "replicasets/scale"]
+    for verb in ["get", "patch", "update"]
+    for name in [None, "postgres", "valkey", "seaweedfs", SCALED[0]]
 ]
 
 
@@ -89,14 +116,16 @@ def expected_rules():
         if names:
             rule["resourceNames"] = names
         rules.append(rule)
-    return rules + [STATE_RULE]
+    return rules + [STATE_RULE, SCALE_RULE]
 
 
 def rule_matches(rule, group, resource, verb, name):
     """One PolicyRule against one request, as the RBAC authorizer decides it."""
     if not {group, "*"} & set(rule.get("apiGroups", [])):
         return False
-    if not {resource, "*"} & set(rule.get("resources", [])):
+    resources = set(rule.get("resources", []))
+    subresource = resource.partition("/")[2]
+    if not ({resource, "*"} & resources or (subresource and f"*/{subresource}" in resources)):
         return False
     if not {verb, "*"} & set(rule.get("verbs", [])):
         return False
@@ -132,11 +161,18 @@ def validate_identity(by_kind):
 
 def validate_rules(role):
     require(sorted(map(normalized, role["rules"])) == sorted(map(normalized, expected_rules())),
-            "only the named lifecycle rule may differ from the production baseline")
+            "only the named lifecycle and scale rules may differ from the production baseline")
     for verb, name, allowed in CONFIGMAP_MATRIX:
         require(allows(role, "", "configmaps", verb, name) is allowed,
                 f"configmaps {verb} {name or '(collection)'} must be "
                 f"{'allowed' if allowed else 'refused'}")
+    for name in SCALED:
+        for verb in ["get", "patch", "update"]:
+            require(allows(role, "apps", "deployments/scale", verb, name),
+                    f"drain-old.sh must be able to {verb} deployments/{name}/scale")
+    for group, resource, verb, name in SCALE_REFUSED:
+        require(not allows(role, group, resource, verb, name),
+                f"{resource} {verb} {name or '(collection)'} must be refused")
     for resource in ["secrets", "nodes", "namespaces", "roles", "rolebindings"]:
         for verb in READ + ["create", "patch", "update", "delete", "escalate", "bind"]:
             require(not allows(role, "", resource, verb) and
@@ -182,6 +218,15 @@ class BootstrapRBAC(unittest.TestCase):
                 values.reverse()
         validate(objects)
 
+    def test_scale_names_are_exactly_the_rendered_slot_deployments(self):
+        # A service added to a slot without its scale grant would fail the
+        # next drain in production; one granted without existing is dead scope.
+        rendered = sorted(obj["metadata"]["name"]
+                          for slot in SLOTS
+                          for obj in render(ROOT / "infra/k8s/overlays/k3s-prod/slots" / slot)
+                          if obj["kind"] == "Deployment")
+        self.assertEqual(rendered, sorted(SCALED))
+
     def test_rejects_any_additional_grant(self):
         forbidden = [
             ("", "configmaps", ["create"], []),
@@ -196,6 +241,11 @@ class BootstrapRBAC(unittest.TestCase):
             ("", "*", READ, []),
             ("*", "*", ["*"], []),
             ("rbac.authorization.k8s.io", "roles", ["escalate", "bind"], []),
+            ("apps", "deployments/scale", ["patch"], []),
+            ("apps", "deployments/scale", ["patch"], ["clamav"]),
+            ("apps", "deployments/scale", ["delete"], [SCALED[0]]),
+            ("apps", "statefulsets/scale", ["patch", "update"], ["postgres"]),
+            ("apps", "*/scale", ["patch"], []),
         ]
         for group, resource, verbs, names in forbidden:
             with self.subTest(group=group, resource=resource, verbs=verbs, names=names):
@@ -204,6 +254,22 @@ class BootstrapRBAC(unittest.TestCase):
                 if names:
                     rule["resourceNames"] = names
                 role_of(objects)["rules"].append(rule)
+                with self.assertRaises(AssertionError):
+                    validate(objects)
+
+    def test_rejects_widening_the_scale_rule_in_place(self):
+        for field, value in [("verbs", ["get", "patch", "update", "create"]),
+                             ("verbs", ["get", "patch", "update", "delete"]),
+                             ("verbs", ["*"]),
+                             ("resources", ["deployments/scale", "statefulsets/scale"]),
+                             ("resources", ["*/scale"]),
+                             ("resourceNames", SCALED + ["clamav"]),
+                             ("resourceNames", [])]:
+            with self.subTest(field=field, value=value):
+                objects = copy.deepcopy(self.objects)
+                rule = next(r for r in role_of(objects)["rules"]
+                            if r.get("resources") == ["deployments/scale"])
+                rule[field] = value
                 with self.assertRaises(AssertionError):
                     validate(objects)
 

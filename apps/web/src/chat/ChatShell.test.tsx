@@ -1,13 +1,34 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { StrictMode, use, useEffect } from "react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, Route, Routes, useOutletContext } from "react-router";
+import {
+  MemoryRouter,
+  Navigate,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+  useNavigationType,
+  useOutletContext,
+} from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { clearTokens, setTokens } from "../lib/authSession";
+import {
+  clearFreshLogin,
+  clearTokens,
+  isFreshLogin,
+  markFreshLogin,
+  setTokens,
+} from "../lib/authSession";
+import { _resetDocumentEntry } from "../lib/documentEntry";
+import { DocumentRouter } from "../lib/DocumentRouter";
+import { refresh, type TokenResponse } from "../auth/authApi";
+import RequireAuth from "../auth/RequireAuth";
 import { issueCallToken, issueResourceCallToken } from "./callApi";
 import { fetchSidebarData, leaveConversation, markConversationRead } from "./chatApi";
 import AppShell, { ROOT_LOCK_CLASS } from "./AppShell";
 import ChatShell, { type ChatOutletContext } from "./ChatShell";
+import type { useChatSidebar } from "./useChatSidebar";
 import CallSessionProvider from "../calls/CallSessionProvider";
 import { _resetChatSocket } from "./chatSocket";
 import { requestMediaPermission, type MediaPermissionResult } from "./mediaPermission";
@@ -29,6 +50,11 @@ vi.mock("./chatApi", async () => {
 vi.mock("./SidebarDetailsPanel", () => ({
   default: ({ target }: { target: { kind: string; id: string } | null }) =>
     target ? <div data-testid="sidebar-details">{`${target.kind}:${target.id}`}</div> : null,
+}));
+// Only RequireAuth's silent recovery (#1130 suite) reaches it.
+vi.mock("../auth/authApi", async () => ({
+  ...(await vi.importActual<typeof import("../auth/authApi")>("../auth/authApi")),
+  refresh: vi.fn(),
 }));
 vi.mock("./callApi", () => ({ issueCallToken: vi.fn(), issueResourceCallToken: vi.fn() }));
 vi.mock("./useChatWebSocket", () => ({ useChatWebSocket: vi.fn() }));
@@ -108,6 +134,43 @@ function deferredValue<T>() {
 
 const currentUserId = "00000000-0000-4000-8000-000000000401";
 const callerId = "00000000-0000-4000-8000-000000000402";
+
+type ChatSidebarApi = ReturnType<typeof useChatSidebar>;
+
+/**
+ * useChatSidebar's whole answer, typed against the hook so a stand-in cannot
+ * fall behind its contract unnoticed: the shell reads `identityPending` and
+ * `confirmingIdentity` (#1124), and a partial stand-in without them failed in
+ * AppShell, not here. By default a sidebar loaded for currentUserId and
+ * confirmed for it — no identity check out, none being confirmed.
+ */
+function sidebarStub(overrides: Partial<ChatSidebarApi> = {}): ChatSidebarApi {
+  return {
+    state: {
+      status: "ready",
+      currentUserId,
+      workspaceId: "workspace-1",
+      channels: [],
+      dms: [],
+      categories: [],
+    },
+    retry: vi.fn(),
+    setPinned: vi.fn(),
+    markRead: vi.fn(),
+    reportReadProgress: vi.fn(),
+    renameChannel: vi.fn(),
+    renameGroup: vi.fn(),
+    setGroupAvatar: vi.fn(),
+    setMuted: vi.fn(),
+    setNotificationMode: vi.fn(),
+    leaveConversation: vi.fn(),
+    inAppAlert: null,
+    dismissInAppAlert: vi.fn(),
+    identityPending: () => false,
+    confirmingIdentity: false,
+    ...overrides,
+  };
+}
 const call = {
   call_id: "00000000-0000-4000-8000-000000000403",
   request_id: "00000000-0000-4000-8000-000000000404",
@@ -1190,15 +1253,10 @@ describe("ChatShell — #642 review, blocker 5 (leave rejection)", () => {
         resourcePresentationCall,
       }),
     }));
-    vi.doMock("./useChatSidebar", () => ({
-      useChatSidebar: () => ({
-        state: { status: "ready", currentUserId, channels: [], dms: [] },
-        retry: vi.fn(),
-        setPinned: vi.fn(),
-        markRead: vi.fn(),
-        renameChannel: vi.fn(),
-      }),
-    }));
+    vi.doMock("./useChatSidebar", () => {
+      const sidebar = sidebarStub();
+      return { useChatSidebar: () => sidebar };
+    });
     // Partial: only the component is stubbed out. ChatSidebar also exports
     // chatNavigationId, which the shell's navigation toggle points
     // `aria-controls` at (issue #467) — replacing the whole module would take
@@ -1287,15 +1345,10 @@ describe("ChatShell — #642 review, blocker 5 (leave rejection)", () => {
         resourcePresentationCall,
       }),
     }));
-    vi.doMock("./useChatSidebar", () => ({
-      useChatSidebar: () => ({
-        state: { status: "ready", currentUserId, channels: [], dms: [] },
-        retry: vi.fn(),
-        setPinned: vi.fn(),
-        markRead: vi.fn(),
-        renameChannel: vi.fn(),
-      }),
-    }));
+    vi.doMock("./useChatSidebar", () => {
+      const sidebar = sidebarStub();
+      return { useChatSidebar: () => sidebar };
+    });
     vi.doMock("./ChatSidebar", async () => {
       const actual = await vi.importActual<typeof import("./ChatSidebar")>("./ChatSidebar");
       return { ...actual, default: () => null };
@@ -1352,7 +1405,7 @@ describe("ChatShell — #673 directCallSession derivation", () => {
     vi.resetModules();
   });
 
-  function mockUseCallSession(overrides: Record<string, unknown> = {}) {
+  function mockUseCallSession(overrides: Record<string, unknown> = {}, sidebar = sidebarStub()) {
     vi.doMock("../calls/CallSessionProvider", () => ({
       useCallSession: () => ({
         calls: { call: null, start: vi.fn(), end: vi.fn() },
@@ -1376,15 +1429,7 @@ describe("ChatShell — #673 directCallSession derivation", () => {
         ...overrides,
       }),
     }));
-    vi.doMock("./useChatSidebar", () => ({
-      useChatSidebar: () => ({
-        state: { status: "ready", currentUserId, channels: [], dms: [] },
-        retry: vi.fn(),
-        setPinned: vi.fn(),
-        markRead: vi.fn(),
-        renameChannel: vi.fn(),
-      }),
-    }));
+    vi.doMock("./useChatSidebar", () => ({ useChatSidebar: () => sidebar }));
     vi.doMock("./ChatSidebar", async () => {
       const actual = await vi.importActual<typeof import("./ChatSidebar")>("./ChatSidebar");
       return { ...actual, default: () => null };
@@ -1550,6 +1595,62 @@ describe("ChatShell — #673 directCallSession derivation", () => {
     await user.click(await screen.findByRole("button", { name: "Alternar microfone" }));
     expect(toggleMicrophone).toHaveBeenCalledOnce();
   });
+
+  // #1124 (CQ-13): the routes are handed an identity only once the sidebar is
+  // confirmed for it. While a rotated token is being confirmed, the sidebar
+  // still shows the previous token's user — and that is not an identity yet.
+  describe("the session identity handed to the routes", () => {
+    function SessionIdentityProbe() {
+      const ctx = useOutletContext<ChatOutletContext>();
+      return <span data-testid="session-identity">{String(ctx.sessionIdentity)}</span>;
+    }
+
+    const pendingCheck = { identityPending: () => true, confirmingIdentity: true };
+
+    it.each([
+      { name: "confirmed", sidebar: {}, identity: `${currentUserId}:workspace-1` },
+      { name: "being confirmed after a rotation", sidebar: pendingCheck, identity: "null" },
+      {
+        name: "changed to another user",
+        sidebar: {
+          state: {
+            status: "ready",
+            currentUserId: "user-b",
+            workspaceId: "workspace-1",
+            channels: [],
+            dms: [],
+            categories: [],
+          },
+        },
+        identity: "user-b:workspace-1",
+      },
+      {
+        name: "unavailable while loading",
+        sidebar: { state: { status: "loading" } },
+        identity: "null",
+      },
+    ] satisfies { name: string; sidebar: Partial<ChatSidebarApi>; identity: string }[])(
+      "is $identity when the sidebar is $name",
+      async ({ sidebar, identity }) => {
+        vi.resetModules();
+        mockUseCallSession({}, sidebarStub(sidebar));
+        const { default: ChatShellFresh } = await import("./ChatShell");
+        const { default: AppShellFresh } = await import("./AppShell");
+        render(
+          <MemoryRouter initialEntries={["/chat"]}>
+            <Routes>
+              <Route element={<AppShellFresh />}>
+                <Route path="/chat" element={<ChatShellFresh />}>
+                  <Route index element={<SessionIdentityProbe />} />
+                </Route>
+              </Route>
+            </Routes>
+          </MemoryRouter>,
+        );
+        expect(await screen.findByTestId("session-identity")).toHaveTextContent(identity);
+      },
+    );
+  });
 });
 
 /**
@@ -1560,31 +1661,50 @@ describe("ChatShell — #673 directCallSession derivation", () => {
  * subject. Both are derived from the canonical list, so both must stop pointing
  * at a conversation this user is no longer in.
  */
+/**
+ * The shared shell with the chat's own child routes stubbed: the shell is what
+ * these suites drive, so each route only has to say which one rendered.
+ */
+function renderShellAt(path: string) {
+  return render(
+    <MemoryRouter initialEntries={[path]}>
+      <Routes>
+        <Route element={<AppShell />}>
+          <Route
+            path="/chat"
+            element={
+              <CallSessionProvider>
+                <ChatShell />
+              </CallSessionProvider>
+            }
+          >
+            <Route index element={<div>vazio</div>} />
+            <Route path="channel/:channelId" element={<div>mensagens</div>} />
+            <Route path="search" element={<div>busca</div>} />
+          </Route>
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+/** "Plataforma" (readingId) and "Infra" (otherId), both writable public channels. */
+function twoChannelSidebar(readingId: string, otherId: string) {
+  return {
+    currentUserId,
+    workspaceId: "workspace-1",
+    channels: [
+      { id: readingId, name: "Plataforma", type: "public" as const, canWrite: true },
+      { id: otherId, name: "Infra", type: "public" as const, canWrite: true },
+    ],
+    dms: [],
+    categories: [],
+  };
+}
+
 describe("ChatShell — leaving the conversation on screen", () => {
   const readingId = "00000000-0000-4000-8000-0000000005a1";
   const otherId = "00000000-0000-4000-8000-0000000005a2";
-
-  function renderShellAt(path: string) {
-    return render(
-      <MemoryRouter initialEntries={[path]}>
-        <Routes>
-          <Route element={<AppShell />}>
-            <Route
-              path="/chat"
-              element={
-                <CallSessionProvider>
-                  <ChatShell />
-                </CallSessionProvider>
-              }
-            >
-              <Route index element={<div>vazio</div>} />
-              <Route path="channel/:channelId" element={<div>mensagens</div>} />
-            </Route>
-          </Route>
-        </Routes>
-      </MemoryRouter>,
-    );
-  }
 
   function sidebarWith(channels: { id: string; name: string }[]) {
     return {
@@ -1892,46 +2012,11 @@ describe("ChatShell — navegação responsiva", () => {
   const readingId = "00000000-0000-4000-8000-0000000005b1";
   const otherId = "00000000-0000-4000-8000-0000000005b2";
 
-  function renderShellAt(path: string) {
-    return render(
-      <MemoryRouter initialEntries={[path]}>
-        <Routes>
-          <Route element={<AppShell />}>
-            <Route
-              path="/chat"
-              element={
-                <CallSessionProvider>
-                  <ChatShell />
-                </CallSessionProvider>
-              }
-            >
-              <Route index element={<div>vazio</div>} />
-              <Route path="channel/:channelId" element={<div>mensagens</div>} />
-            </Route>
-          </Route>
-        </Routes>
-      </MemoryRouter>,
-    );
-  }
-
-  function sidebarWithTwoChannels() {
-    return {
-      currentUserId,
-      workspaceId: "workspace-1",
-      channels: [
-        { id: readingId, name: "Plataforma", type: "public" as const, canWrite: true },
-        { id: otherId, name: "Infra", type: "public" as const, canWrite: true },
-      ],
-      dms: [],
-      categories: [],
-    };
-  }
-
   const toggle = () => screen.getByRole("button", { name: "Conversas" });
   const main = () => screen.getByRole("main");
 
   beforeEach(() => {
-    vi.mocked(fetchSidebarData).mockResolvedValue(sidebarWithTwoChannels());
+    vi.mocked(fetchSidebarData).mockResolvedValue(twoChannelSidebar(readingId, otherId));
   });
 
   afterEach(() => {
@@ -2077,6 +2162,818 @@ describe("ChatShell — navegação responsiva", () => {
   });
 });
 
+/**
+ * Issue #1123: entering the chat straight after a sign-in, with no destination
+ * of its own, starts with the conversation list on screen. Only the mark the
+ * sign-in flows leave decides it — a reload, a silent session recovery and a
+ * deep link all start without it or away from /chat. A reload opens the
+ * navigation for a reason of its own since #1130 (see the suite below); jsdom
+ * records no navigation entry, so none of these is a reload.
+ */
+describe("ChatShell — navegação de entrada após login (#1123)", () => {
+  const readingId = "00000000-0000-4000-8000-000000001123";
+  const otherId = "00000000-0000-4000-8000-000000001124";
+
+  const shell = () => screen.getByTestId("chat-shell");
+  const main = () => screen.getByRole("main");
+
+  beforeEach(() => {
+    vi.mocked(fetchSidebarData).mockResolvedValue(twoChannelSidebar(readingId, otherId));
+  });
+
+  afterEach(() => {
+    clearFreshLogin();
+    sessionStorage.removeItem("nchat_at");
+    // @ts-expect-error -- jsdom does not define this by default; restore that.
+    delete window.matchMedia;
+  });
+
+  it("abre a navegação no primeiro acesso após login e fecha ao escolher a conversa", async () => {
+    stubViewport(true);
+    markFreshLogin("/");
+    const user = userEvent.setup();
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).toHaveAttribute("data-nav-open", "true");
+    expect(main()).toHaveAttribute("inert");
+    expect(screen.getByRole("button", { name: "Fechar conversas" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(isFreshLogin()).toBe(false);
+
+    await user.click(screen.getByRole("option", { name: /Infra/ }));
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+    expect(screen.getByText("mensagens")).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Infra/ })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("a navegação de entrada fecha com Escape e devolve o foco ao acionador", async () => {
+    stubViewport(true);
+    markFreshLogin("/");
+    const user = userEvent.setup();
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    // The sign-in form that had focus is gone; focus starts on the toggle, so
+    // the very first keystroke already reaches the drawer.
+    expect(screen.getByRole("button", { name: "Fechar conversas" })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByTestId("chat-sidebar")).toContainElement(
+      document.activeElement as HTMLElement,
+    );
+
+    await user.keyboard("{Escape}");
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(screen.getByRole("button", { name: "Conversas" })).toHaveFocus();
+  });
+
+  // Regression (code quality review): "/chat/" renders the same index route, so
+  // it is the same entry — a literal comparison with "/chat" missed it.
+  it("/chat/ após login é a mesma entrada que /chat", async () => {
+    stubViewport(true);
+    markFreshLogin("/");
+    renderShellAt("/chat/");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(screen.getByText("vazio")).toBeInTheDocument();
+    expect(shell()).toHaveAttribute("data-nav-open", "true");
+    expect(main()).toHaveAttribute("inert");
+  });
+
+  it("outra superfície do chat após login mantém o destino explícito", async () => {
+    stubViewport(true);
+    markFreshLogin("/");
+    renderShellAt("/chat/search");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(screen.getByText("busca")).toBeInTheDocument();
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(isFreshLogin()).toBe(false);
+  });
+
+  it("deep link após login abre o destino, não a navegação", async () => {
+    stubViewport(true);
+    markFreshLogin("/");
+    renderShellAt(`/chat/channel/${readingId}`);
+    await screen.findByRole("option", { name: /Plataforma/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+    expect(screen.getByText("mensagens")).toBeInTheDocument();
+    // Spent by this entry, so it cannot surface on a later one.
+    expect(isFreshLogin()).toBe(false);
+  });
+
+  it("recuperação silenciosa ou nova aba, sem login nem reload, não abre a navegação", async () => {
+    stubViewport(true);
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+  });
+
+  // Regression (second code quality review): the mark belongs to the session
+  // the sign-in installed. Each case is the order the app really runs them in.
+  it("login interativo: a sessão instalada e só então a intenção abrem a navegação", async () => {
+    stubViewport(true);
+    setTokens("at-a");
+    markFreshLogin("/");
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).toHaveAttribute("data-nav-open", "true");
+  });
+
+  it("login → logout → recuperação silenciosa de outra sessão não herda a intenção", async () => {
+    stubViewport(true);
+    setTokens("at-a");
+    markFreshLogin("/");
+    clearTokens();
+    setTokens("at-b");
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+  });
+
+  it("login → substituição da sessão não herda a intenção", async () => {
+    stubViewport(true);
+    setTokens("at-a");
+    markFreshLogin("/");
+    setTokens("at-b");
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+  });
+
+  for (const destination of ["/call/call-1123", "/admin/users", "/profile"]) {
+    it(`login para ${destination} não deixa intenção para uma ida posterior a /chat`, async () => {
+      stubViewport(true);
+      setTokens("at-a");
+      markFreshLogin(destination);
+      renderShellAt("/chat");
+      await screen.findByRole("option", { name: /Infra/ });
+
+      expect(shell()).not.toHaveAttribute("data-nav-open");
+    });
+  }
+
+  it("só a primeira entrada após o login abre a navegação", async () => {
+    stubViewport(true);
+    markFreshLogin("/");
+    const first = renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+    expect(shell()).toHaveAttribute("data-nav-open", "true");
+    first.unmount();
+
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+  });
+
+  it("em coluna o login não abre camada modal, e o resize nunca reabre a navegação", async () => {
+    const viewport = stubViewport(false);
+    markFreshLogin("/");
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(screen.queryByTestId("chat-nav-backdrop")).not.toBeInTheDocument();
+
+    viewport.resizeTo(true);
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+  });
+
+  it("sair e voltar à largura de drawer fecha a navegação de entrada sem recriar a conexão", async () => {
+    const viewport = stubViewport(true);
+    markFreshLogin("/");
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+    expect(shell()).toHaveAttribute("data-nav-open", "true");
+    const sockets = FakeWebSocket.instances.length;
+    const sidebarFetches = vi.mocked(fetchSidebarData).mock.calls.length;
+
+    viewport.resizeTo(false);
+    viewport.resizeTo(true);
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+    expect(FakeWebSocket.instances).toHaveLength(sockets);
+    expect(vi.mocked(fetchSidebarData).mock.calls).toHaveLength(sidebarFetches);
+  });
+});
+
+/**
+ * Issue #1130: reloading the page at drawer widths starts with the navigation
+ * open too — over whatever route was reloaded, which stays mounted behind it.
+ * Only a real reload of the document counts (the browser's Navigation Timing
+ * entry, stubbed here); a direct deep link, a navigation inside the app, a
+ * remount, a token rotation or a resize never opens it.
+ */
+describe("ChatShell — navegação de entrada após reload (#1130)", () => {
+  const readingId = "00000000-0000-4000-8000-000000001130";
+  const otherId = "00000000-0000-4000-8000-000000001131";
+  const dmId = "00000000-0000-4000-8000-000000001132";
+
+  const shell = () => screen.getByTestId("chat-shell");
+  const main = () => screen.getByRole("main");
+  const location = () => screen.getByTestId("location").textContent;
+  const recoveredSession: TokenResponse = {
+    accessToken: "at-recovered",
+    tokenType: "Bearer",
+    expiresIn: 900,
+  };
+
+  /** Every location the router committed, in order, and how it got there. */
+  let committed: string[] = [];
+  function LocationProbe() {
+    const { pathname } = useLocation();
+    const navigationType = useNavigationType();
+    useEffect(() => {
+      committed.push(pathname);
+    }, [pathname]);
+    return (
+      <>
+        <output data-testid="location">{pathname}</output>
+        <output data-testid="navigation-type">{navigationType}</output>
+      </>
+    );
+  }
+
+  function stubDocumentEntry(type: NavigationTimingType) {
+    vi.spyOn(performance, "getEntriesByType").mockReturnValue([
+      { type } as PerformanceNavigationTiming,
+    ]);
+  }
+
+  /** A route whose code never arrives: navigating to it suspends for good. */
+  const neverLoads = new Promise<never>(() => {});
+  let suspendedRenders = 0;
+  function NeverLoads() {
+    suspendedRenders += 1;
+    return use(neverLoads);
+  }
+
+  /** In-app navigation, the way a link or the browser's Back drives the router. */
+  function Controls() {
+    const navigate = useNavigate();
+    return (
+      <nav aria-label="controles do teste">
+        <button type="button" onClick={() => void navigate("/call/demo")}>
+          ir para a chamada
+        </button>
+        <button type="button" onClick={() => void navigate("/call/lenta")}>
+          ir para a chamada lenta
+        </button>
+        <button type="button" onClick={() => void navigate("/chat")}>
+          ir para o chat
+        </button>
+        <button type="button" onClick={() => void navigate(`/chat/channel/${readingId}`)}>
+          abrir o canal
+        </button>
+        <button type="button" onClick={() => void navigate(`/chat/dm/${dmId}`, { replace: true })}>
+          trocar pela conversa direta
+        </button>
+        <button type="button" onClick={() => void navigate(-1)}>
+          voltar
+        </button>
+      </nav>
+    );
+  }
+
+  function HeldBack() {
+    return null;
+  }
+
+  /**
+   * The document's router and the routes, composed as App.tsx composes them,
+   * over jsdom's real session history: the location is whatever the document's
+   * URL is when the tree mounts (see renderAt).
+   *
+   * `shellMounted: false` holds the shell back, so the router can move before
+   * the shell's first mount; rerendering keeps the router and its history.
+   * `requireAuth` puts the real session gate in front of the shell.
+   */
+  function shellTree({ shellMounted = true, requireAuth = false } = {}) {
+    const appShell = requireAuth ? (
+      <RequireAuth>
+        <AppShell />
+      </RequireAuth>
+    ) : (
+      <AppShell />
+    );
+    return (
+      <DocumentRouter>
+        <LocationProbe />
+        <Controls />
+        <Routes>
+          <Route path="/entrar" element={<Navigate to="/chat" />} />
+          <Route path="/call/demo" element={<div>chamada</div>} />
+          <Route path="/call/lenta" element={<NeverLoads />} />
+          {/* A null element would render the outlet; this renders nothing. */}
+          <Route element={shellMounted ? appShell : <HeldBack />}>
+            <Route
+              path="/chat"
+              element={
+                <CallSessionProvider>
+                  <ChatShell />
+                </CallSessionProvider>
+              }
+            >
+              <Route index element={<div>vazio</div>} />
+              <Route path="channel/:channelId" element={<div>mensagens</div>} />
+              <Route path="dm/:dmId" element={<div>conversa direta</div>} />
+            </Route>
+          </Route>
+        </Routes>
+      </DocumentRouter>
+    );
+  }
+
+  /** The document is (re)loaded at `path`: the URL the router starts from. */
+  function loadDocumentAt(path: string) {
+    window.history.replaceState(null, "", path);
+  }
+
+  function renderAt(path: string, options?: Parameters<typeof shellTree>[0]) {
+    loadDocumentAt(path);
+    return render(shellTree(options));
+  }
+
+  /** The browser's Back: the router hears it as a POP, asynchronously. */
+  function nextPopState() {
+    return new Promise((resolve) => window.addEventListener("popstate", resolve, { once: true }));
+  }
+
+  async function goBack(user: ReturnType<typeof userEvent.setup>) {
+    const popped = nextPopState();
+    await user.click(screen.getByRole("button", { name: "voltar" }));
+    await act(() => popped);
+  }
+
+  /** No token, so RequireAuth recovers the session — and waits for `recover`. */
+  function holdSessionRecovery() {
+    let recover: (value: TokenResponse) => void = () => {};
+    vi.mocked(refresh).mockReturnValue(
+      new Promise((resolve) => {
+        recover = resolve;
+      }),
+    );
+    sessionStorage.removeItem("nchat_at");
+    return async () => {
+      await act(async () => {
+        recover(recoveredSession);
+      });
+      await screen.findByRole("option", { name: /Infra/ });
+    };
+  }
+
+  beforeEach(() => {
+    // Every earlier shell mount in this file spent the document's one entry,
+    // and every earlier navigation left it: each test is a fresh document.
+    _resetDocumentEntry();
+    committed = [];
+    suspendedRenders = 0;
+    vi.mocked(fetchSidebarData).mockResolvedValue(twoChannelSidebar(readingId, otherId));
+  });
+
+  afterEach(() => {
+    clearFreshLogin();
+    // Only spies (vitest 4): the Navigation Timing stub, never the module mocks.
+    vi.restoreAllMocks();
+    sessionStorage.removeItem("nchat_at");
+    // @ts-expect-error -- jsdom does not define this by default; restore that.
+    delete window.matchMedia;
+    loadDocumentAt("/");
+  });
+
+  // Regression (first Code Quality Review #1130): Navigation Timing still says
+  // "reload", the path is the reloaded one again and the router reports POP —
+  // yet the app moved in between, so this is not the reload's entry.
+  it("navegar antes da primeira montagem do shell e voltar com POP não abre a navegação", async () => {
+    stubViewport(true);
+    stubDocumentEntry("reload");
+    const user = userEvent.setup();
+    const view = renderAt("/chat", { shellMounted: false });
+
+    await user.click(screen.getByRole("button", { name: "ir para a chamada" }));
+    expect(location()).toBe("/call/demo");
+    await goBack(user);
+    expect(location()).toBe("/chat");
+
+    view.rerender(shellTree());
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+  });
+
+  // Regression (second Code Quality Review #1130), scenario A: the navigation
+  // away suspends, the POP back supersedes it, and the render that saw the app
+  // leave the entry is thrown away without ever committing. Leaving is still
+  // final, because it is recorded when the history moves, not when React renders.
+  it("transição suspensa e descartada antes da primeira montagem não devolve a elegibilidade", async () => {
+    stubViewport(true);
+    stubDocumentEntry("reload");
+    const recover = holdSessionRecovery();
+    const user = userEvent.setup();
+    renderAt("/chat", { requireAuth: true });
+    expect(screen.queryByTestId("chat-shell")).not.toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "ir para a chamada lenta" }));
+    });
+    // The URL moved and the router rendered towards it, but that render
+    // suspended: nothing was committed, the app still shows the reloaded entry.
+    expect(window.location.pathname).toBe("/call/lenta");
+    expect(suspendedRenders).toBeGreaterThan(0);
+    expect(location()).toBe("/chat");
+
+    await goBack(user);
+    expect(window.location.pathname).toBe("/chat");
+    await recover();
+
+    expect(committed).toEqual(["/chat"]);
+    expect(screen.getByTestId("navigation-type")).toHaveTextContent("POP");
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+  });
+
+  // Scenario B: away and back before React renders anything in between.
+  it("sair e voltar antes de o React renderizar não devolve a elegibilidade", async () => {
+    stubViewport(true);
+    stubDocumentEntry("reload");
+    const recover = holdSessionRecovery();
+    renderAt("/chat", { requireAuth: true });
+
+    await act(async () => {
+      const popped = nextPopState();
+      fireEvent.click(screen.getByRole("button", { name: "ir para a chamada" }));
+      fireEvent.click(screen.getByRole("button", { name: "voltar" }));
+      await popped;
+    });
+    await recover();
+
+    // React only ever rendered the reloaded entry: the trip was batched away.
+    expect(committed).toEqual(["/chat"]);
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+  });
+
+  // Scenario C: each history operation, alone, before the shell's first mount.
+  for (const [action, operate] of [
+    [
+      "PUSH",
+      (user: ReturnType<typeof userEvent.setup>) =>
+        user.click(screen.getByRole("button", { name: "abrir o canal" })),
+    ],
+    [
+      "REPLACE",
+      (user: ReturnType<typeof userEvent.setup>) =>
+        user.click(screen.getByRole("button", { name: "trocar pela conversa direta" })),
+    ],
+    ["POP", goBack],
+  ] as const) {
+    it(`${action} sozinho antes da primeira montagem do shell não abre a navegação`, async () => {
+      stubViewport(true);
+      stubDocumentEntry("reload");
+      const recover = holdSessionRecovery();
+      const user = userEvent.setup();
+      // The reloaded entry has an earlier one behind it, for the POP to reach.
+      loadDocumentAt(`/chat/channel/${otherId}`);
+      window.history.pushState(null, "", "/chat");
+      render(shellTree({ requireAuth: true }));
+      const entries = window.history.length;
+
+      await operate(user);
+      await recover();
+
+      expect(screen.getByTestId("navigation-type")).toHaveTextContent(action);
+      expect(window.history.length).toBe(action === "PUSH" ? entries + 1 : entries);
+      expect(location()).not.toBe("/chat");
+      expect(shell()).not.toHaveAttribute("data-nav-open");
+      expect(main()).not.toHaveAttribute("inert");
+    });
+  }
+
+  for (const path of ["/chat", "/chat/"]) {
+    it(`reload autenticado em ${path} abre a navegação com o foco no acionador`, async () => {
+      stubViewport(true);
+      stubDocumentEntry("reload");
+      renderAt(path);
+      await screen.findByRole("option", { name: /Infra/ });
+
+      expect(screen.getByText("vazio")).toBeInTheDocument();
+      expect(shell()).toHaveAttribute("data-nav-open", "true");
+      expect(main()).toHaveAttribute("inert");
+      expect(screen.getByTestId("chat-nav-backdrop")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Fechar conversas" })).toHaveFocus();
+    });
+  }
+
+  for (const [path, content] of [
+    [`/chat/channel/${readingId}`, "mensagens"],
+    [`/chat/dm/${dmId}`, "conversa direta"],
+  ] as const) {
+    it(`reload em ${path} abre a navegação sobre a conversa, sem mudar a rota`, async () => {
+      stubViewport(true);
+      stubDocumentEntry("reload");
+      const user = userEvent.setup();
+      renderAt(path);
+      await screen.findByRole("option", { name: /Infra/ });
+
+      expect(shell()).toHaveAttribute("data-nav-open", "true");
+      expect(screen.getByText(content)).toBeInTheDocument();
+      expect(location()).toBe(path);
+      const sockets = FakeWebSocket.instances.length;
+      const sidebarFetches = vi.mocked(fetchSidebarData).mock.calls.length;
+
+      await user.click(screen.getByRole("button", { name: "Fechar conversas" }));
+
+      expect(shell()).not.toHaveAttribute("data-nav-open");
+      expect(main()).not.toHaveAttribute("inert");
+      expect(screen.getByText(content)).toBeInTheDocument();
+      expect(location()).toBe(path);
+      expect(screen.getByRole("button", { name: "Conversas" })).toHaveFocus();
+      // Closing touches neither the connection nor the sidebar's data.
+      expect(FakeWebSocket.instances).toHaveLength(sockets);
+      expect(vi.mocked(fetchSidebarData).mock.calls).toHaveLength(sidebarFetches);
+    });
+  }
+
+  it("reload com o canal aberto mantém a seleção; Escape fecha", async () => {
+    stubViewport(true);
+    stubDocumentEntry("reload");
+    const user = userEvent.setup();
+    renderAt(`/chat/channel/${readingId}`);
+    await screen.findByRole("option", { name: /Plataforma/ });
+
+    expect(screen.getByRole("option", { name: /Plataforma/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    await user.keyboard("{Escape}");
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(screen.getByText("mensagens")).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Plataforma/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
+  it("após o reload, escolher conversa fecha e a navegação interna não reabre", async () => {
+    stubViewport(true);
+    stubDocumentEntry("reload");
+    const user = userEvent.setup();
+    renderAt(`/chat/channel/${readingId}`);
+    await screen.findByRole("option", { name: /Infra/ });
+
+    await user.click(screen.getByRole("option", { name: /Infra/ }));
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(location()).toBe(`/chat/channel/${otherId}`);
+
+    // Opening and picking again: each route change closes, none reopens.
+    await user.click(screen.getByRole("button", { name: "Conversas" }));
+    await user.click(screen.getByRole("option", { name: /Plataforma/ }));
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+    expect(location()).toBe(`/chat/channel/${readingId}`);
+  });
+
+  it("deep link aberto diretamente, sem reload, mostra o destino", async () => {
+    stubViewport(true);
+    stubDocumentEntry("navigate");
+    renderAt(`/chat/channel/${readingId}`);
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+    expect(screen.getByText("mensagens")).toBeInTheDocument();
+  });
+
+  it("voltar/avançar do histórico do navegador não é reload", async () => {
+    stubViewport(true);
+    stubDocumentEntry("back_forward");
+    renderAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+  });
+
+  it("chegar ao shell vindo de outra página do documento recarregado não abre", async () => {
+    stubViewport(true);
+    stubDocumentEntry("reload");
+    const user = userEvent.setup();
+    renderAt("/call/demo");
+    expect(screen.getByText("chamada")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "ir para o chat" }));
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(location()).toBe("/chat");
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+  });
+
+  it("/chat → /call/demo → /chat: a volta não reabre a navegação", async () => {
+    stubViewport(true);
+    stubDocumentEntry("reload");
+    const user = userEvent.setup();
+    renderAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+    expect(shell()).toHaveAttribute("data-nav-open", "true");
+
+    await user.click(screen.getByRole("button", { name: "ir para a chamada" }));
+    expect(screen.queryByTestId("chat-shell")).not.toBeInTheDocument();
+    await goBack(user);
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(location()).toBe("/chat");
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+  });
+
+  it("A → B → A pelo histórico, de volta à URL recarregada, não reabre", async () => {
+    stubViewport(true);
+    stubDocumentEntry("reload");
+    const user = userEvent.setup();
+    renderAt(`/chat/channel/${readingId}`);
+    await screen.findByRole("option", { name: /Infra/ });
+
+    await user.click(screen.getByRole("option", { name: /Infra/ }));
+    expect(location()).toBe(`/chat/channel/${otherId}`);
+    await goBack(user);
+
+    expect(location()).toBe(`/chat/channel/${readingId}`);
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+  });
+
+  it("recuperação silenciosa da sessão após o reload abre a navegação", async () => {
+    stubViewport(true);
+    stubDocumentEntry("reload");
+    vi.mocked(refresh).mockResolvedValue(recoveredSession);
+    // No token, the way a session is recovered: RequireAuth asks for one.
+    sessionStorage.removeItem("nchat_at");
+    renderAt("/chat", { requireAuth: true });
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(refresh).toHaveBeenCalled();
+    expect(shell()).toHaveAttribute("data-nav-open", "true");
+    expect(main()).toHaveAttribute("inert");
+  });
+
+  it("navegar e voltar enquanto a sessão é recuperada após o reload não abre", async () => {
+    stubViewport(true);
+    stubDocumentEntry("reload");
+    const recover = holdSessionRecovery();
+    const user = userEvent.setup();
+    renderAt("/chat", { requireAuth: true });
+    expect(screen.queryByTestId("chat-shell")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "ir para a chamada" }));
+    await goBack(user);
+    expect(location()).toBe("/chat");
+    await recover();
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+  });
+
+  it("StrictMode: o reload abre uma vez, e o retorno por POP continua fechado", async () => {
+    stubViewport(true);
+    stubDocumentEntry("reload");
+    const user = userEvent.setup();
+    loadDocumentAt("/chat");
+    const reloaded = render(<StrictMode>{shellTree()}</StrictMode>);
+    await screen.findByRole("option", { name: /Infra/ });
+    expect(shell()).toHaveAttribute("data-nav-open", "true");
+    reloaded.unmount();
+
+    _resetDocumentEntry();
+    loadDocumentAt("/chat");
+    const view = render(<StrictMode>{shellTree({ shellMounted: false })}</StrictMode>);
+    await user.click(screen.getByRole("button", { name: "ir para a chamada" }));
+    await goBack(user);
+    view.rerender(<StrictMode>{shellTree()}</StrictMode>);
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+  });
+
+  it("sem a API Navigation Timing, a resposta previsível é não abrir", async () => {
+    stubViewport(true);
+    const original = performance.getEntriesByType.bind(performance);
+    Object.defineProperty(performance, "getEntriesByType", {
+      value: undefined,
+      configurable: true,
+    });
+    try {
+      renderAt("/chat");
+      await screen.findByRole("option", { name: /Infra/ });
+
+      expect(shell()).not.toHaveAttribute("data-nav-open");
+    } finally {
+      Object.defineProperty(performance, "getEntriesByType", {
+        value: original,
+        configurable: true,
+      });
+    }
+  });
+
+  it("fora do roteador do documento, nenhuma montagem é tomada pelo reload", async () => {
+    stubViewport(true);
+    stubDocumentEntry("reload");
+    renderShellAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+  });
+
+  it("entrar no shell por navegação da app, mesmo num documento recarregado, não abre", async () => {
+    stubViewport(true);
+    stubDocumentEntry("reload");
+    renderAt("/entrar");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(location()).toBe("/chat");
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+  });
+
+  it("só a primeira entrada do documento recarregado abre a navegação", async () => {
+    stubViewport(true);
+    stubDocumentEntry("reload");
+    const first = renderAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+    expect(shell()).toHaveAttribute("data-nav-open", "true");
+    first.unmount();
+
+    renderAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+  });
+
+  it("fechada após o reload, rotação de token e resize não a reabrem", async () => {
+    const viewport = stubViewport(true);
+    stubDocumentEntry("reload");
+    const user = userEvent.setup();
+    renderAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+    await user.click(screen.getByRole("button", { name: "Fechar conversas" }));
+
+    act(() => setTokens("at-rotated", "refresh"));
+    viewport.resizeTo(false);
+    viewport.resizeTo(true);
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+  });
+
+  it("em coluna o reload não abre camada modal, e o resize nunca a abre", async () => {
+    const viewport = stubViewport(false);
+    stubDocumentEntry("reload");
+    renderAt("/chat");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(screen.queryByTestId("chat-nav-backdrop")).not.toBeInTheDocument();
+    expect(main()).not.toHaveAttribute("inert");
+
+    viewport.resizeTo(true);
+
+    expect(shell()).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+  });
+
+  // The sign-in navigates to the shell, so the reload's entry is gone and the
+  // login entry (#1123) is what opens it — the same as in any other document.
+  it("login na Home de um documento recarregado continua abrindo a navegação", async () => {
+    stubViewport(true);
+    stubDocumentEntry("reload");
+    markFreshLogin("/");
+    renderAt("/entrar");
+    await screen.findByRole("option", { name: /Infra/ });
+
+    expect(location()).toBe("/chat");
+    expect(shell()).toHaveAttribute("data-nav-open", "true");
+  });
+});
+
 describe("ChatShell — ponto de entrada da busca global (#550)", () => {
   const readingId = "00000000-0000-4000-8000-000000000551";
   const otherId = "00000000-0000-4000-8000-000000000552";
@@ -2084,8 +2981,10 @@ describe("ChatShell — ponto de entrada da busca global (#550)", () => {
   // The real search page: its autoFocus and its Escape are part of the flow
   // under test. With no query typed it requests nothing.
   function renderShell() {
+    window.history.replaceState(null, "", `/chat/channel/${readingId}`);
+    _resetDocumentEntry();
     return render(
-      <MemoryRouter initialEntries={[`/chat/channel/${readingId}`]}>
+      <DocumentRouter>
         <Routes>
           <Route element={<AppShell />}>
             <Route
@@ -2101,7 +3000,7 @@ describe("ChatShell — ponto de entrada da busca global (#550)", () => {
             </Route>
           </Route>
         </Routes>
-      </MemoryRouter>,
+      </DocumentRouter>,
     );
   }
 

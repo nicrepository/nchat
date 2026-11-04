@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/nicrepository/nchat/services/file-service/internal/crypto"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
+	"github.com/nicrepository/nchat/services/file-service/internal/filepolicy"
 	"github.com/nicrepository/nchat/services/file-service/internal/preview"
 )
 
@@ -91,6 +92,8 @@ const (
 // the service itself finalised, never on behalf of a caller, and it never
 // serves what it reads.
 type PreviewJob struct {
+	PolicyVersion    int
+	FormatID         string
 	AttachmentID     string
 	WorkspaceID      string
 	DetectedMIME     string
@@ -479,6 +482,10 @@ func (s *PreviewService) render(
 			err = s.renderPanicked(ctx, job, recovered)
 		}
 	}()
+
+	if job.PolicyVersion != 0 && domain.InitialPolicyPreviewStatus(job.DetectedMIME, job.Size, filepolicy.FormatID(job.FormatID), job.PolicyVersion) != domain.PreviewStatusPending {
+		return nil, "", fmt.Errorf("%w: catalog has no preview renderer", preview.ErrUnsupported)
+	}
 
 	content, err := openEncryptedObject(ctx, s.keys, s.objects, s.logger, encryptedObject{
 		objectID:        job.AttachmentID,

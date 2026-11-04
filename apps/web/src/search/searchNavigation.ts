@@ -44,20 +44,42 @@ const STATE_KEY = "globalSearch";
 const MAX_RESTORED_QUERY = 512;
 const TABS: readonly string[] = ["all", ...SEARCH_CATEGORIES];
 
+/**
+ * Records `search` on a history state, owned by `owner` — the identity the
+ * session had confirmed when it was left (CQ-07). The identity, user and
+ * workspace ids, is what the sidebar already holds: no token, no credential,
+ * and like the query it never reaches the URL.
+ */
 export function withRestoredSearch(
   state: unknown,
   search: RestoredSearch,
+  owner: string | null,
 ): Record<string, unknown> {
   const base = typeof state === "object" && state !== null ? state : {};
-  return { ...base, [STATE_KEY]: search };
+  return { ...base, [STATE_KEY]: { ...search, owner } };
 }
 
-/** Reads a search back from history state, accepting only well-formed values. */
-export function readRestoredSearch(state: unknown): RestoredSearch | undefined {
+function savedSearch(state: unknown): Record<string, unknown> | undefined {
   if (typeof state !== "object" || state === null) return undefined;
   const saved = (state as Record<string, unknown>)[STATE_KEY];
-  if (typeof saved !== "object" || saved === null) return undefined;
-  const { query, tab } = saved as Record<string, unknown>;
+  return typeof saved === "object" && saved !== null
+    ? (saved as Record<string, unknown>)
+    : undefined;
+}
+
+/**
+ * Reads a search back from history state for `owner`, accepting only
+ * well-formed values. A search is only ever restored for the identity that
+ * left it: one saved under another identity, under none confirmed, or before
+ * searches had owners is nobody's to restore (CQ-07).
+ */
+export function readRestoredSearch(
+  state: unknown,
+  owner: string | null,
+): RestoredSearch | undefined {
+  const saved = savedSearch(state);
+  if (!saved || owner === null || saved.owner !== owner) return undefined;
+  const { query, tab } = saved;
   if (typeof query !== "string" || query.length > MAX_RESTORED_QUERY) return undefined;
   if (typeof tab !== "string" || !TABS.includes(tab)) return undefined;
   return { query, tab: tab as SearchTab };

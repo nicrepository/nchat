@@ -46,6 +46,24 @@ describe("fetchPushVapidPublicKey", () => {
   });
 });
 
+describe("fetchPushVapidPublicKey failures (issue #902)", () => {
+  it.each([[401], [403], [404], [503]])("propagates a %i as the error it is", async (status) => {
+    vi.mocked(authenticatedFetch).mockRejectedValueOnce(
+      new ApiRequestError(status, "failed", "failed"),
+    );
+
+    await expect(fetchPushVapidPublicKey()).rejects.toMatchObject({ status });
+  });
+
+  it("never reads a body without the envelope as a usable key", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({});
+
+    // The contract is only that it rejects: a malformed body must never resolve
+    // to a key (or to null, which the reconciler reads as "not configured").
+    await expect(fetchPushVapidPublicKey()).rejects.toThrow();
+  });
+});
+
 describe("listPushSubscriptions", () => {
   it("maps the envelope, keeping non-active rows a client has to react to", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({

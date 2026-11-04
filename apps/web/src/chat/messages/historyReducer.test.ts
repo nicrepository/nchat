@@ -23,6 +23,7 @@ describe("olderPagesSettled", () => {
   it("starts from zero on every load", () => {
     const paged = reducer(loaded(message("m2")), {
       type: "prepended",
+      cursor: "c1",
       page: { messages: [message("m1")], nextCursor: "c2" },
     });
     expect(paged.olderPagesSettled).toBe(1);
@@ -36,6 +37,7 @@ describe("olderPagesSettled", () => {
     const before = loaded(message("m1"), message("m2"));
     const after = reducer(before, {
       type: "prepended",
+      cursor: "c1",
       page: { messages: [message("m1")], nextCursor: "c2" },
     });
 
@@ -46,13 +48,14 @@ describe("olderPagesSettled", () => {
   it("counts an empty page, and one that left the cursor where it was", () => {
     const after = reducer(loaded(message("m2")), {
       type: "prepended",
+      cursor: "c1",
       page: { messages: [], nextCursor: "c1" },
     });
     expect(after).toMatchObject({ nextCursor: "c1", olderPagesSettled: 1 });
   });
 
   it("counts a page that failed, so nothing waits on it forever", () => {
-    const after = reducer(loaded(message("m2")), { type: "prepend_error" });
+    const after = reducer(loaded(message("m2")), { type: "prepend_error", cursor: "c1" });
     expect(after).toMatchObject({ loadingMore: false, olderPagesSettled: 1 });
   });
 
@@ -61,5 +64,30 @@ describe("olderPagesSettled", () => {
       loadingMore: true,
       olderPagesSettled: 0,
     });
+  });
+});
+
+// Issue #1099: following a quote reloads the same conversation toward its
+// original; the reply being composed is the reader's, and only leaving the
+// conversation discards it.
+describe("the reply across a reload", () => {
+  const replying = (): MessagesState => ({ ...loaded(message("m1")), replyTo: message("m1") });
+
+  it("survives a reload of the same conversation", () => {
+    const reloading = reducer(replying(), { type: "loading", keepReply: true });
+    expect(reloading.replyTo?.id).toBe("m1");
+    const reloaded = reducer(reloading, {
+      type: "loaded",
+      page: { messages: [message("m9")], nextCursor: "" },
+    });
+    expect(reloaded.replyTo?.id).toBe("m1");
+  });
+
+  it("is discarded when another conversation loads", () => {
+    const reloading = reducer(replying(), { type: "loading" });
+    expect(reloading.replyTo).toBeNull();
+    expect(
+      reducer(reloading, { type: "loaded", page: { messages: [], nextCursor: "" } }).replyTo,
+    ).toBeNull();
   });
 });

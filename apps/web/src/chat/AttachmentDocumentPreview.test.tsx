@@ -13,6 +13,7 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { nativeDocumentCases } from "./attachmentDocumentFixtures";
 import AttachmentDocumentPreview from "./AttachmentDocumentPreview";
 import {
   AttachmentHydrationContext,
@@ -356,3 +357,20 @@ describe("a document carried through the prefetch region by the real gate", () =
     expect(mockRegenerate).toHaveBeenCalledTimes(1);
   });
 });
+
+it.each(nativeDocumentCases.filter(({ kind }) => kind === "pages"))(
+  "canonical $extension uses a raster page",
+  async ({ contentType, extension }) => {
+    renderAt(VISIBLE, { filename: `costs.${extension}`, contentType });
+    await waitFor(() => expect(mockPage).toHaveBeenCalledWith("doc-1", 1, expect.any(AbortSignal)));
+    expect(await screen.findByTestId("chat-message-attachment-document-doc-1")).toBeInTheDocument();
+  },
+);
+it.each(nativeDocumentCases.filter(({ kind }) => kind === "sheets"))(
+  "$extension is not a raster preview",
+  ({ contentType, extension }) => {
+    const { container } = renderAt(VISIBLE, { filename: `costs.${extension}`, contentType });
+    expect(mockPage).not.toHaveBeenCalled();
+    expect(container.querySelector("img")).toBeNull();
+  },
+);

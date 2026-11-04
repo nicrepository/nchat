@@ -48,6 +48,7 @@ export interface ConversationTarget {
 }
 
 export type ConversationActionId =
+  | "schedule-meeting"
   | "pin"
   | "unpin"
   | "mark-read"
@@ -64,6 +65,7 @@ export type ConversationActionId =
  * the name here is what lets the list stay a plain data structure.
  */
 export type ConversationActionIcon =
+  | "calendar"
   | "pin"
   | "check"
   | "bell"
@@ -194,7 +196,9 @@ function frequentActions(target: ConversationTarget): ConversationAction[] {
 
 /** The management and navigation group. Details is offered for every target. */
 function manageActions(target: ConversationTarget): ConversationAction[] {
-  const actions: ConversationAction[] = [];
+  const actions: ConversationAction[] = [
+    { id: "schedule-meeting", label: "Agendar reunião", icon: "calendar", group: "manage" },
+  ];
   if (canRenameConversation(target)) {
     actions.push({
       id: "rename",

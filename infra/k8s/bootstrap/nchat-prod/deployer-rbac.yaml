@@ -3,7 +3,8 @@
 # Applied by a cluster administrator (`kubectl apply -k`), never by CD and never
 # by a release overlay: the identity cannot be allowed to rewrite its own grants.
 # Until issue #1000 this existed only in the cluster; the rules below are that
-# production Role unchanged, plus the one lifecycle rule at the end.
+# production Role unchanged, plus the two named rules at the end: the lifecycle
+# record (#1000) and the Blue/Green scale subresource (#1108).
 # scripts/ci/test_prod_bootstrap_rbac.py holds the rendered result to exactly
 # that, so any other grant fails CI.
 apiVersion: v1
@@ -73,6 +74,34 @@ rules:
   - apiGroups: [""]
     resources: [configmaps]
     resourceNames: [nchat-release-state]
+    verbs: [get, patch, update]
+  # drain-old.sh retires a slot with `kubectl scale --replicas=0`, which writes
+  # deployments/<name>/scale (PATCH; GET+PUT with preconditions), a subresource
+  # the deployments grant above does not cover. Only the Blue/Green application
+  # Deployments: never the shared ones, never a StatefulSet.
+  - apiGroups: [apps]
+    resources: [deployments/scale]
+    resourceNames:
+      - admin-service-blue
+      - admin-service-green
+      - auth-service-blue
+      - auth-service-green
+      - chat-service-blue
+      - chat-service-green
+      - document-converter-blue
+      - document-converter-green
+      - file-service-blue
+      - file-service-green
+      - media-service-blue
+      - media-service-green
+      - nchat-admin-web-blue
+      - nchat-admin-web-green
+      - nchat-web-blue
+      - nchat-web-green
+      - notification-service-blue
+      - notification-service-green
+      - search-service-blue
+      - search-service-green
     verbs: [get, patch, update]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

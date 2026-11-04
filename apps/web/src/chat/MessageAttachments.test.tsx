@@ -36,6 +36,7 @@ vi.mock("./filesApi", () => ({
   regenerateDocumentPreview: (...args: unknown[]) => mockRegenerate(...args),
 }));
 
+import { legacyContainerCase, nativeDocumentCases } from "./attachmentDocumentFixtures";
 import MessageAttachments from "./MessageAttachments";
 import type { ChannelAttachment } from "./chatTypes";
 
@@ -86,12 +87,84 @@ describe("message attachments — document viewer", () => {
 
   afterEach(() => vi.unstubAllGlobals());
 
+  it.each([...nativeDocumentCases, legacyContainerCase])(
+    "opens canonical $extension in the document viewer",
+    async ({ contentType, extension, kind }) => {
+      mockDocumentManifest.mockResolvedValue({
+        attachmentId: "att-1",
+        kind,
+        pageCount: 1,
+        labels: ["Preview"],
+      });
+      render(
+        <MessageAttachments
+          attachments={[
+            attachment({
+              filename: `costs.${extension}`,
+              contentType,
+              status: "clean",
+              previewStatus: "ready",
+            }),
+          ]}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: `Visualizar costs.${extension}` }));
+      expect(await screen.findByRole("dialog", { name: `costs.${extension}` })).toBeInTheDocument();
+      expect(mockContent).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(nativeDocumentCases.filter(({ kind }) => kind === "sheets"))(
+    "never assigns a $extension JSON preview to an image",
+    async ({ contentType, extension }) => {
+      mockDocumentManifest.mockResolvedValue({
+        attachmentId: "att-1",
+        kind: "sheets",
+        pageCount: 1,
+        labels: ["Sheet"],
+      });
+      mockPreview.mockResolvedValue(
+        new Blob(['{"rows":[]}'], { type: "application/vnd.nchat.preview-sheet+json" }),
+      );
+      const { container } = render(
+        <MessageAttachments
+          attachments={[
+            attachment({
+              filename: `costs.${extension}`,
+              contentType,
+              status: "clean",
+              previewStatus: "ready",
+            }),
+          ]}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: `Visualizar costs.${extension}` }));
+      expect(await screen.findByRole("cell", { name: "1" })).toBeInTheDocument();
+      expect(container.querySelector("img")).toBeNull();
+      expect(mockPreview).not.toHaveBeenCalled();
+      expect(downloadButton()).toBeInTheDocument();
+    },
+  );
+
+  it.each(["application/vnd.oasis.opendocument.presentation", "application/vnd.untrusted.export"])(
+    "keeps original download without a renderer for %s",
+    (contentType) => {
+      render(
+        <MessageAttachments
+          attachments={[attachment({ contentType, status: "clean", previewStatus: "unsupported" })]}
+        />,
+      );
+      expect(downloadButton()).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /Visualizar/ })).toBeNull();
+      expect(mockPreview).not.toHaveBeenCalled();
+    },
+  );
+
   it("opens an approved document preview without downloading and navigates its raster pages", async () => {
     const user = userEvent.setup();
     mockPreview.mockResolvedValue(new Blob(["thumbnail"]));
     render(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[attachment({ status: "clean", previewStatus: "ready" })]}
       />,
     );
@@ -116,7 +189,6 @@ describe("message attachments — document viewer", () => {
     mockPreview.mockResolvedValue(new Blob(["thumbnail"]));
     render(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[attachment({ status: "clean", previewStatus: "ready" })]}
       />,
     );
@@ -147,7 +219,6 @@ describe("message attachments — document viewer", () => {
     });
     render(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[
           attachment({
             filename: "planilha.csv",
@@ -186,14 +257,12 @@ afterEach(() => {
 
 describe("message attachments", () => {
   it("renders nothing when the message carries none", () => {
-    const { container } = render(
-      <MessageAttachments sentAt="2026-07-15T12:00:00.000Z" attachments={undefined} />,
-    );
+    const { container } = render(<MessageAttachments attachments={undefined} />);
     expect(container).toBeEmptyDOMElement();
   });
 
   it("shows a file still being scanned without any way to obtain it", () => {
-    render(<MessageAttachments sentAt="2026-07-15T12:00:00.000Z" attachments={[attachment()]} />);
+    render(<MessageAttachments attachments={[attachment()]} />);
 
     expect(screen.getByText("relatorio.pdf")).toBeInTheDocument();
     expect(screen.getByTestId("chat-message-attachment-status-att-1")).toHaveTextContent(
@@ -212,12 +281,7 @@ describe("message attachments", () => {
     const revokeObjectURL = vi.fn();
     vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL });
 
-    render(
-      <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
-        attachments={[attachment({ status: "clean" })]}
-      />,
-    );
+    render(<MessageAttachments attachments={[attachment({ status: "clean" })]} />);
 
     const button = downloadButton();
     expect(button).toBeInTheDocument();
@@ -229,11 +293,9 @@ describe("message attachments", () => {
     vi.unstubAllGlobals();
   });
 
-  it("saves an ordinary (non-voice) audio file's download as .mp3, matching what file-service always serves", async () => {
-    // Nic-Gravador compatibility task: file-service re-encodes every audio
-    // download to real MP3 regardless of the stored container, so the name
-    // the browser is offered must match — an .ogg file must not still be
-    // suggested as "clip.ogg" once the bytes it receives are genuinely MP3.
+  it("preserves the native audio original filename", async () => {
+    // Original downloads preserve bytes, native container and filename.
+    // MP3 conversion is a separate, explicitly requested derivative.
     const user = userEvent.setup();
     const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
     vi.stubGlobal("URL", {
@@ -244,7 +306,6 @@ describe("message attachments", () => {
 
     render(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[
           attachment({ filename: "clip.ogg", contentType: "audio/ogg", status: "clean" }),
         ]}
@@ -255,7 +316,7 @@ describe("message attachments", () => {
 
     await waitFor(() => expect(mockContent).toHaveBeenCalledWith("att-1"));
     const anchor = click.mock.instances[0] as HTMLAnchorElement;
-    expect(anchor.download).toBe("clip.mp3");
+    expect(anchor.download).toBe("clip.ogg");
     vi.unstubAllGlobals();
   });
 
@@ -264,12 +325,7 @@ describe("message attachments", () => {
     mockContent.mockRejectedValue(new Error("403"));
     vi.stubGlobal("URL", { ...URL, createObjectURL: vi.fn(), revokeObjectURL: vi.fn() });
 
-    render(
-      <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
-        attachments={[attachment({ status: "clean" })]}
-      />,
-    );
+    render(<MessageAttachments attachments={[attachment({ status: "clean" })]} />);
 
     await user.click(downloadButton() as HTMLElement);
 
@@ -283,12 +339,7 @@ describe("message attachments", () => {
   });
 
   it("says a rejected file is blocked and offers nothing", () => {
-    render(
-      <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
-        attachments={[attachment({ status: "rejected" })]}
-      />,
-    );
+    render(<MessageAttachments attachments={[attachment({ status: "rejected" })]} />);
 
     expect(screen.getByTestId("chat-message-attachment-status-att-1")).toHaveTextContent(
       "Bloqueado",
@@ -308,7 +359,6 @@ describe("message attachments", () => {
   it("shows a loading placeholder for a pdf whose preview is still being generated, never an error", () => {
     render(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[attachment({ status: "clean", previewStatus: "pending" })]}
       />,
     );
@@ -325,7 +375,6 @@ describe("message attachments", () => {
   it("offers retry when a pdf preview failed", () => {
     render(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[attachment({ status: "clean", previewStatus: "failed" })]}
       />,
     );
@@ -340,7 +389,6 @@ describe("message attachments", () => {
   it("regenerates an expired preview exactly once while keeping the skeleton", async () => {
     const { rerender } = render(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[attachment({ status: "clean", previewStatus: "expired" })]}
       />,
     );
@@ -350,7 +398,6 @@ describe("message attachments", () => {
     ).toBeInTheDocument();
     rerender(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[attachment({ status: "clean", previewStatus: "expired" })]}
       />,
     );
@@ -360,7 +407,6 @@ describe("message attachments", () => {
   it("shows the pdf's first-page preview, filename, size and both actions once ready", async () => {
     render(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[attachment({ status: "clean", previewStatus: "ready" })]}
       />,
     );
@@ -383,7 +429,6 @@ describe("message attachments", () => {
   ])("shows the raster preview generated for %s", async (filename, contentType) => {
     render(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[
           attachment({ filename, contentType, status: "clean", previewStatus: "available" }),
         ]}
@@ -400,7 +445,6 @@ describe("message attachments", () => {
   it("keeps a ready CSV/XLSX attachment on the plain icon row, with no large preview box", async () => {
     render(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[
           attachment({
             filename: "planilha.csv",
@@ -435,36 +479,26 @@ describe("message attachments", () => {
     const audio = (overrides: Partial<ChannelAttachment> = {}) =>
       attachment({ filename: "audio.mp3", contentType: "audio/mpeg", ...overrides });
     const { rerender } = render(
-      <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
-        attachments={[audio({ previewStatus: "ready" })]}
-      />,
+      <MessageAttachments attachments={[audio({ previewStatus: "ready" })]} />,
     );
     // pending_scan + ready preview: still nothing, because the scan decides.
     expect(mockPreview).not.toHaveBeenCalled();
 
     rerender(
-      <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
-        attachments={[audio({ status: "clean", previewStatus: "ready" })]}
-      />,
+      <MessageAttachments attachments={[audio({ status: "clean", previewStatus: "ready" })]} />,
     );
     expect(mockPreview).toHaveBeenCalledWith("att-1", expect.anything());
   });
 
   it("requests a PDF's first-page preview only once it is approved and ready", () => {
     const { rerender } = render(
-      <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
-        attachments={[attachment({ previewStatus: "ready" })]}
-      />,
+      <MessageAttachments attachments={[attachment({ previewStatus: "ready" })]} />,
     );
     // pending_scan + ready preview: still nothing, because the scan decides.
     expect(mockDocumentPage).not.toHaveBeenCalled();
 
     rerender(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[attachment({ status: "clean", previewStatus: "ready" })]}
       />,
     );
@@ -474,7 +508,6 @@ describe("message attachments", () => {
   it("never plays a video the scan has not cleared", () => {
     render(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[attachment({ id: "att-1", filename: "clipe.mp4", contentType: "video/mp4" })]}
       />,
     );
@@ -486,7 +519,6 @@ describe("message attachments", () => {
   it("does not turn a ready video preview into a document viewer", () => {
     render(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[
           attachment({
             filename: "clip.mp4",
@@ -535,9 +567,7 @@ describe("message attachments — image preview and lightbox", () => {
   });
 
   it("shows the large preview instead of the 32px thumbnail", async () => {
-    render(
-      <MessageAttachments sentAt="2026-07-15T12:00:00.000Z" attachments={[imageAttachment()]} />,
-    );
+    render(<MessageAttachments attachments={[imageAttachment()]} />);
 
     expect(await screen.findByTestId("chat-message-attachment-image-img-1")).toBeInTheDocument();
     expect(screen.queryByTestId("chat-details-file-thumb")).not.toBeInTheDocument();
@@ -545,9 +575,7 @@ describe("message attachments — image preview and lightbox", () => {
 
   it("opens the lightbox on click without downloading, and returns focus to the trigger on close", async () => {
     const user = userEvent.setup();
-    render(
-      <MessageAttachments sentAt="2026-07-15T12:00:00.000Z" attachments={[imageAttachment()]} />,
-    );
+    render(<MessageAttachments attachments={[imageAttachment()]} />);
 
     const trigger = await screen.findByRole("button", { name: "Ampliar foto.png" });
     await user.click(trigger);
@@ -570,7 +598,6 @@ describe("message attachments — image preview and lightbox", () => {
   it("wires a GIF attachment through to the animated inline preview", async () => {
     render(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[
           imageAttachment({ id: "gif-1", filename: "reacao.gif", contentType: "image/gif" }),
         ]}
@@ -585,7 +612,6 @@ describe("message attachments — image preview and lightbox", () => {
   it("leaves a WebP as a shell in the timeline — it has no derived preview, and the card is not worth an original", async () => {
     render(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[
           imageAttachment({
             id: "webp-1",
@@ -612,7 +638,6 @@ describe("message attachments — image preview and lightbox", () => {
     );
     render(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[...images, attachment({ id: "doc-1", filename: "fim.pdf" })]}
       />,
     );
@@ -647,7 +672,6 @@ describe("message attachments — image preview and lightbox", () => {
 
     render(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[
           imageAttachment({ id: "gif-2", filename: "reacao.gif", contentType: "image/gif" }),
         ]}
@@ -706,7 +730,7 @@ describe("message attachments — voice message download", () => {
   });
 
   it("offers the download inside the player, with no filename row beside it", () => {
-    render(<MessageAttachments sentAt="2026-07-15T12:00:00.000Z" attachments={[voice()]} />);
+    render(<MessageAttachments attachments={[voice()]} />);
 
     expect(screen.getByRole("button", { name: "Baixar mensagem de voz" })).toBeInTheDocument();
     // The ordinary row action is not what a voice message gets.
@@ -719,7 +743,6 @@ describe("message attachments — voice message download", () => {
   it("renders a timeline of recordings without requesting a single byte", () => {
     render(
       <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
         attachments={[voice(), voice({ id: "voice-2" }), voice({ id: "voice-3" })]}
       />,
     );
@@ -732,27 +755,21 @@ describe("message attachments — voice message download", () => {
   it("fetches only the clicked recording, and saves it under a readable name", async () => {
     const user = userEvent.setup();
     const click = clickSpy();
-    render(
-      <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
-        attachments={[voice(), voice({ id: "voice-2" })]}
-      />,
-    );
+    render(<MessageAttachments attachments={[voice(), voice({ id: "voice-2" })]} />);
 
     await user.click(screen.getAllByRole("button", { name: "Baixar mensagem de voz" })[1]);
 
     await waitFor(() => expect(mockContent).toHaveBeenCalledTimes(1));
     expect(mockContent).toHaveBeenCalledWith("voice-2");
     const anchor = click.mock.instances[0] as HTMLAnchorElement;
-    // file-service always re-encodes voice-message downloads to real MP3
-    // (Nic-Gravador compatibility task), regardless of the recorded container.
-    expect(anchor.download).toMatch(/^mensagem-de-voz-[\d-]+\.mp3$/);
+    // Saving the original preserves the recorded container and extension.
+    expect(anchor.download).toBe("voice-message.webm");
   });
 
   it("does not start playback, and keeps the recording playable afterwards", async () => {
     const user = userEvent.setup();
     clickSpy();
-    render(<MessageAttachments sentAt="2026-07-15T12:00:00.000Z" attachments={[voice()]} />);
+    render(<MessageAttachments attachments={[voice()]} />);
 
     await user.click(screen.getByRole("button", { name: "Baixar mensagem de voz" }));
     await waitFor(() => expect(mockContent).toHaveBeenCalledTimes(1));
@@ -767,7 +784,7 @@ describe("message attachments — voice message download", () => {
   it("says a download failed without taking the player away", async () => {
     const user = userEvent.setup();
     mockContent.mockRejectedValue(new Error("403"));
-    render(<MessageAttachments sentAt="2026-07-15T12:00:00.000Z" attachments={[voice()]} />);
+    render(<MessageAttachments attachments={[voice()]} />);
 
     await user.click(screen.getByRole("button", { name: "Baixar mensagem de voz" }));
 
@@ -779,12 +796,7 @@ describe("message attachments — voice message download", () => {
   });
 
   it("offers nothing at all for a recording the scan has not approved", () => {
-    render(
-      <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
-        attachments={[voice({ status: "pending_scan" })]}
-      />,
-    );
+    render(<MessageAttachments attachments={[voice({ status: "pending_scan" })]} />);
 
     expect(
       screen.queryByRole("button", { name: "Baixar mensagem de voz" }),
@@ -793,12 +805,7 @@ describe("message attachments — voice message download", () => {
   });
 
   it("offers nothing at all for a rejected recording", () => {
-    render(
-      <MessageAttachments
-        sentAt="2026-07-15T12:00:00.000Z"
-        attachments={[voice({ status: "rejected" })]}
-      />,
-    );
+    render(<MessageAttachments attachments={[voice({ status: "rejected" })]} />);
 
     expect(
       screen.queryByRole("button", { name: "Baixar mensagem de voz" }),

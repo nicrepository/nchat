@@ -35,12 +35,22 @@ export interface NavDrawer {
    */
   modal: boolean;
   toggle: () => void;
+  /** Opens the drawer: the conversation Back's destination when there is no other (#1124). */
+  show: () => void;
   close: () => void;
 }
 
-export function useNavDrawer(pathname: string): NavDrawer {
+/**
+ * `openOnEntry` is read once, on mount (issue #1123): the shell asks for the
+ * navigation to be the first thing on screen when it is entered straight after
+ * a sign-in, or by reloading the page (issue #1130). It only takes effect at
+ * drawer widths — a column is already on screen — and nothing later re-reads
+ * it, so a rerender, a resize or a route change can never reopen the drawer on
+ * its own.
+ */
+export function useNavDrawer(pathname: string, openOnEntry = false): NavDrawer {
   const isDrawer = useMediaQuery(NAV_DRAWER_QUERY);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(() => openOnEntry && isDrawer);
 
   // Two structural reasons to close, both handled the way React documents an
   // adjustment to a changing input — during render, guarded, never in an effect
@@ -62,7 +72,8 @@ export function useNavDrawer(pathname: string): NavDrawer {
   }
 
   const close = useCallback(() => setOpen(false), []);
+  const show = useCallback(() => setOpen(true), []);
   const toggle = useCallback(() => setOpen((current) => !current), []);
 
-  return { open, modal: isDrawer && open, toggle, close };
+  return { open, modal: isDrawer && open, toggle, show, close };
 }

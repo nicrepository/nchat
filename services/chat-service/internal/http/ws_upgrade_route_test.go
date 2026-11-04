@@ -51,7 +51,7 @@ func newUpgradeRouter(t *testing.T) http.Handler {
 	return NewRouter(
 		testConfig(), logger, ReadinessState{}, validator, allowRouterSessionValidator{},
 		NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), wsHandler,
-		nil, nil, nil, nil,
+		nil, nil, nil, nil, nil,
 	)
 }
 

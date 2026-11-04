@@ -1208,12 +1208,17 @@ describe("fetchSidebarData", () => {
     mockAuthFetch.mockResolvedValue(undefined);
     await markConversationRead("dm", "dm-1", "m-9", { keepalive: true });
 
-    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/dm-1/read", {
-      method: "POST",
-      keepalive: true,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ last_read_message_id: "m-9", read_cursor: "message" }),
-    });
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/dm/dm-1/read",
+      {
+        method: "POST",
+        keepalive: true,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ last_read_message_id: "m-9", read_cursor: "message" }),
+      },
+      undefined,
+      expect.any(Function),
+    );
   });
 
   // R1 (#1082 review): a cursor declares itself, so a server without the cursor
@@ -1223,14 +1228,26 @@ describe("fetchSidebarData", () => {
     await markConversationRead("channel", "ch 1");
     await markConversationRead("dm", "dm 1", "message-1");
 
-    expect(mockAuthFetch).toHaveBeenNthCalledWith(1, "/api/chat/channels/ch%201/read", {
-      method: "POST",
-    });
-    expect(mockAuthFetch).toHaveBeenNthCalledWith(2, "/api/chat/dm/dm%201/read", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ last_read_message_id: "message-1", read_cursor: "message" }),
-    });
+    expect(mockAuthFetch).toHaveBeenNthCalledWith(
+      1,
+      "/api/chat/channels/ch%201/read",
+      {
+        method: "POST",
+      },
+      undefined,
+      expect.any(Function),
+    );
+    expect(mockAuthFetch).toHaveBeenNthCalledWith(
+      2,
+      "/api/chat/dm/dm%201/read",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ last_read_message_id: "message-1", read_cursor: "message" }),
+      },
+      undefined,
+      expect.any(Function),
+    );
   });
 
   // ISSUE #414 — the two ordering keys travel on the items the sidebar already
@@ -1600,6 +1617,36 @@ describe("fetchChannelMessages", () => {
     await fetchChannelMessages("geral", "cursor==abc");
     const [url] = mockAuthFetch.mock.calls[0] as [string];
     expect(url).toContain("?before=cursor%3D%3Dabc");
+  });
+
+  // Issue #1099: the quote names its author from the server's projection,
+  // parsed strictly. "" — blank included — is the server saying the author no
+  // longer exists; a pre-#1099 payload without the field, or a malformed
+  // value, says nothing and maps to undefined.
+  it.each([
+    ["a projected name", "Ana Antiga", "Ana Antiga"],
+    ["a pre-#1099 payload", undefined, undefined],
+    ["an author that no longer exists", "", ""],
+    ["a blank name", "   ", ""],
+    ["a malformed name", { name: "Ana" }, undefined],
+    ["a number", 42, undefined],
+  ])("maps a quote's author_display_name from %s", async (_case, raw, expected) => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({
+          quoted: {
+            id: "parent",
+            author_id: "user-parent",
+            body: "Salve",
+            created_at: "2024-01-15T09:00:00Z",
+            ...(raw === undefined ? {} : { author_display_name: raw }),
+          },
+        }),
+      ]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].quoted?.authorDisplayName).toBe(expected);
+    expect(page.messages[0].quoted?.bodyText).toBe("Salve");
   });
 
   it("does not append before param when cursor is absent", async () => {

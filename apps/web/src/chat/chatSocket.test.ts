@@ -463,16 +463,63 @@ describe("chatSocket connection", () => {
     expect(FakeWebSocket.instances).toHaveLength(3);
   });
 
-  it("stops retrying after a bounded run of handshakes that never open", () => {
-    acquireChatSocket({});
-
-    for (let i = 0; i < MAX_CONSECUTIVE_FAILURES + 4; i += 1) {
+  /** Fails every quick retry; stops right after the give-up, before any probe. */
+  function exhaustQuickRetries() {
+    for (let i = 0; i < MAX_CONSECUTIVE_FAILURES; i += 1) {
       latest().close();
-      vi.advanceTimersByTime(RECONNECT_MAX_DELAY_MS);
+      if (i < MAX_CONSECUTIVE_FAILURES - 1) vi.advanceTimersByTime(RECONNECT_MAX_DELAY_MS / 2);
     }
+  }
+
+  // The quick retries are bounded (#449); what follows them is not a stop but a
+  // single slow probe (#947).
+  it("spends only a bounded run of quick retries on handshakes that never open", () => {
+    acquireChatSocket({});
+    exhaustQuickRetries();
 
     expect(FakeWebSocket.instances).toHaveLength(MAX_CONSECUTIVE_FAILURES);
     expect(getChatSocketStatus()).toBe("failed");
+    expect(vi.getTimerCount()).toBe(1);
+  });
+
+  // Issue #947 (I9). Running out of quick retries is not a verdict: the
+  // failures were all retryable, so the connection keeps probing at the backoff
+  // ceiling instead of leaving the tab stale until somebody reloads it.
+  it("keeps probing at the ceiling after the bounded run of quick retries", () => {
+    acquireChatSocket({});
+    exhaustQuickRetries();
+
+    vi.advanceTimersByTime(RECONNECT_MAX_DELAY_MS / 2);
+
+    expect(FakeWebSocket.instances).toHaveLength(MAX_CONSECUTIVE_FAILURES + 1);
+    latest().open();
+    expect(getChatSocketStatus()).toBe("connected");
+  });
+
+  it("probes at most once per ceiling window while the outage lasts", () => {
+    acquireChatSocket({});
+    exhaustQuickRetries();
+
+    for (let probe = 1; probe <= 10; probe += 1) {
+      vi.advanceTimersByTime(RECONNECT_MAX_DELAY_MS / 2 - 1);
+      expect(FakeWebSocket.instances).toHaveLength(MAX_CONSECUTIVE_FAILURES + probe - 1);
+      vi.advanceTimersByTime(1);
+      expect(FakeWebSocket.instances).toHaveLength(MAX_CONSECUTIVE_FAILURES + probe);
+      latest().close();
+      expect(getChatSocketStatus()).toBe("failed");
+      expect(vi.getTimerCount()).toBe(1);
+    }
+  });
+
+  it("revives a retryable give-up as soon as the browser is back online", () => {
+    vi.spyOn(navigator, "onLine", "get").mockReturnValue(true);
+    acquireChatSocket({});
+    exhaustQuickRetries();
+    expect(getChatSocketStatus()).toBe("failed");
+
+    window.dispatchEvent(new Event("online"));
+
+    expect(FakeWebSocket.instances).toHaveLength(MAX_CONSECUTIVE_FAILURES + 1);
     expect(vi.getTimerCount()).toBe(0);
   });
 

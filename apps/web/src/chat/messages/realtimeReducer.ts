@@ -6,7 +6,7 @@
  * an attachment verdict patches the one attachment it names.
  */
 
-import { insertMessageChronologically } from "./messageOrder";
+import { compareTimelinePositions, insertMessageChronologically } from "./messageOrder";
 import type { Message } from "../chatTypes";
 import { applyLinkSafetyCorrections, dropSupersededCorrection } from "./linkSafetyCorrections";
 import type { Action, ActionOf, MessagesState } from "./types";
@@ -86,6 +86,85 @@ function applySnapshotToTimeline(message: Message, snapshot: Message, removed: b
   };
 }
 
+/** A server copy prepared for the timeline: withdrawn content stripped, corrections applied. */
+interface PreparedSnapshot {
+  snapshot: Message;
+  removed: boolean;
+}
+
+function prepareSnapshot(
+  message: Message,
+  corrections: MessagesState["linkSafetyCorrections"],
+): PreparedSnapshot {
+  const removed = message.isRemoved || message.status === "deleted";
+  const raw = removed ? { ...message, bodyText: "", quoted: undefined, reactions: [] } : message;
+  return { snapshot: applyLinkSafetyCorrections(raw, corrections), removed };
+}
+
+/** The result of applying a batch of server copies to the timeline. */
+export interface SnapshotBatch {
+  messages: Message[];
+  linkSafetyCorrections: MessagesState["linkSafetyCorrections"];
+  /** True when a copy the timeline did not hold landed after its last message. */
+  appended: boolean;
+}
+
+/**
+ * Authoritative server copies, applied to the timeline in one pass.
+ *
+ * Every copy replaces its message in place, a withdrawn one also blanks the
+ * quotes of it, and — with `insertIfMissing` — the ones the timeline did not
+ * hold are merged in chronological order. Linear in the timeline plus the batch:
+ * an index by id instead of a scan per copy, one rewrite of the list, and a sort
+ * that only has to merge two runs that are already ordered.
+ */
+export function applyMessageSnapshots(
+  state: MessagesState,
+  messages: Message[],
+  insertIfMissing: boolean,
+): SnapshotBatch {
+  let linkSafetyCorrections = state.linkSafetyCorrections;
+  const byId = new Map<string, PreparedSnapshot>();
+  for (const message of messages) {
+    byId.set(message.id, prepareSnapshot(message, state.linkSafetyCorrections));
+    if (linkSafetyCorrections.has(message.id)) {
+      linkSafetyCorrections = dropSupersededCorrection(
+        linkSafetyCorrections,
+        message.id,
+        message.updatedAt,
+      );
+    }
+  }
+  const rewritten = state.messages.map((message) => {
+    const own = byId.get(message.id);
+    const current = own ? applySnapshotToTimeline(message, own.snapshot, own.removed) : message;
+    const quoted = current.quoted ? byId.get(current.quoted.id) : undefined;
+    return quoted ? applySnapshotToTimeline(current, quoted.snapshot, quoted.removed) : current;
+  });
+  const held = new Set(state.messages.map(({ id }) => id));
+  const missing = insertIfMissing
+    ? [...byId.values()].map(({ snapshot }) => snapshot).filter(({ id }) => !held.has(id))
+    : [];
+  return mergeChronologically(rewritten, missing, linkSafetyCorrections);
+}
+
+function mergeChronologically(
+  messages: Message[],
+  missing: Message[],
+  linkSafetyCorrections: MessagesState["linkSafetyCorrections"],
+): SnapshotBatch {
+  if (missing.length === 0) return { messages, linkSafetyCorrections, appended: false };
+  const last = messages.at(-1);
+  const appended = missing.some(
+    (message) => last === undefined || compareTimelinePositions(message, last) > 0,
+  );
+  return {
+    messages: [...messages, ...missing].sort(compareTimelinePositions),
+    linkSafetyCorrections,
+    appended,
+  };
+}
+
 /**
  * An authoritative single-message read, applied to the timeline.
  *
@@ -96,31 +175,15 @@ function applyMessageSnapshot(
   state: MessagesState,
   action: ActionOf<"message_snapshot">,
 ): MessagesState {
+  const batch = applyMessageSnapshots(state, [action.message], action.insertIfMissing);
   const removed = action.message.isRemoved || action.message.status === "deleted";
-  const rawSnapshot = removed
-    ? { ...action.message, bodyText: "", quoted: undefined, reactions: [] }
-    : action.message;
-  const snapshot = applyLinkSafetyCorrections(rawSnapshot, state.linkSafetyCorrections);
-  const linkSafetyCorrections = dropSupersededCorrection(
-    state.linkSafetyCorrections,
-    rawSnapshot.id,
-    rawSnapshot.updatedAt,
-  );
-  const alreadyPresent = state.messages.some((message) => message.id === snapshot.id);
-  const rewritten = state.messages.map((message) =>
-    applySnapshotToTimeline(message, snapshot, removed),
-  );
-  const insertion =
-    !alreadyPresent && action.insertIfMissing
-      ? insertMessageChronologically(rewritten, snapshot)
-      : { messages: rewritten, isNewer: false };
   return {
     ...state,
-    messages: insertion.messages,
-    replyTo: removed && state.replyTo?.id === snapshot.id ? null : state.replyTo,
-    lastMutation: insertion.isNewer ? "ws_append" : "none",
+    messages: batch.messages,
+    replyTo: removed && state.replyTo?.id === action.message.id ? null : state.replyTo,
+    lastMutation: batch.appended ? "ws_append" : "none",
     realtimeError: null,
-    linkSafetyCorrections,
+    linkSafetyCorrections: batch.linkSafetyCorrections,
   };
 }
 

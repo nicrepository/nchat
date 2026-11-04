@@ -87,8 +87,10 @@ type fakeStore struct {
 
 	markFailedCalls int
 
-	authorized    service.StoredAttachment
-	authorizedErr error
+	authorized      service.StoredAttachment
+	authorizedErr   error
+	authorizedCalls int
+	authorizedByID  map[string]service.StoredAttachment
 
 	listed     []service.ListedAttachment
 	listNext   *domain.AttachmentListCursor
@@ -165,12 +167,20 @@ func (s *fakeStore) MarkFailed(_ context.Context, attachmentID, failureCode stri
 }
 
 func (s *fakeStore) GetAuthorized(
-	_ context.Context, _ service.AttachmentAuthInput,
+	_ context.Context, input service.AttachmentAuthInput,
 ) (service.StoredAttachment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.authorizedCalls++
 	if s.authorizedErr != nil {
 		return service.StoredAttachment{}, s.authorizedErr
+	}
+	if s.authorizedByID != nil {
+		record, ok := s.authorizedByID[input.AttachmentID]
+		if !ok {
+			return service.StoredAttachment{}, domain.ErrNotFound
+		}
+		return record, nil
 	}
 	return s.authorized, nil
 }

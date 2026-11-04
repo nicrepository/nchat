@@ -346,6 +346,10 @@ type quoteJSON struct {
 	// Body above is already empty and this is what tells the client to say so
 	// rather than draw a blank quote (issue #135, CQ-002).
 	LinkSafetyState string `json:"link_safety_state,omitempty"`
+	// Issue #1099. Always sent: "" is the server saying the author's account
+	// no longer exists, which a client tells apart from a pre-#1099 payload
+	// that has no field at all.
+	AuthorDisplayName string `json:"author_display_name"`
 }
 
 type referenceJSON struct {
@@ -790,7 +794,8 @@ func mapQuoteJSON(q *domain.QuotedMessage) *quoteJSON {
 		CreatedAt:  q.CreatedAt,
 		UpdatedAt:  q.UpdatedAt,
 
-		LinkSafetyState: string(q.LinkSafety),
+		LinkSafetyState:   string(q.LinkSafety),
+		AuthorDisplayName: q.AuthorDisplayName,
 	}
 	if !j.IsRemoved {
 		j.Body = q.BodyText

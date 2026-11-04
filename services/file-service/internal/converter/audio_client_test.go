@@ -97,6 +97,7 @@ func TestClientConvertAudioClassifiesResponses(t *testing.T) {
 		// usually looks like) rather than a bare frame sync word — the other
 		// half of validMP3Response's check.
 		{"success with ID3 tag", http.StatusOK, append([]byte("ID3"), []byte("\x04\x00\x00\x00\x00\x00\x00payload")...), nil},
+		{"busy", http.StatusServiceUnavailable, []byte(`{"code":"busy"}`), ErrBusy},
 		{"blocked", http.StatusUnprocessableEntity, []byte(`{"code":"blocked"}`), ErrBlocked},
 		{"invalid", http.StatusUnprocessableEntity, []byte(`{"code":"invalid_audio"}`), ErrPermanent},
 		{"timeout", http.StatusGatewayTimeout, []byte(`{"code":"timeout"}`), ErrTransient},

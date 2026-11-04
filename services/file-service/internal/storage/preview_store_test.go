@@ -41,6 +41,7 @@ func claimedPreviewRow() []any {
 		testKEKKeyID,
 		pgtype.Int2{Int16: 2, Valid: true},
 		pgtype.Int2{Int16: 1, Valid: true},
+		1, "png",
 	}
 }
 
@@ -76,6 +77,9 @@ func TestClaimDuePreviewsLeasesRowsWithoutBlockingOtherWorkers(t *testing.T) {
 		if !strings.Contains(pool.lastSQL, fragment) {
 			t.Fatalf("claim query is missing %q:\n%s", fragment, pool.lastSQL)
 		}
+	}
+	if len(jobs) != 1 || jobs[0].PolicyVersion != 1 || jobs[0].FormatID != "png" {
+		t.Fatalf("policy metadata missing from claim: %+v", jobs)
 	}
 	// The containment control: only an attachment the scan has approved is ever
 	// decrypted and handed to a parser, and the condition lives in the atomic

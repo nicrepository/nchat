@@ -361,7 +361,9 @@ func TestACancelledRequestDoesNotAbortTheSharedCollection(t *testing.T) {
 	<-started
 	time.Sleep(20 * time.Millisecond)
 	cancel()
-	<-done
+	if err := <-done; err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
 
 	// The collection the cancelled caller started still completes, so the next
 	// request is served from its result rather than starting a second one.

@@ -55,6 +55,7 @@ import ChatComposer from "./ChatComposer";
 import { noopConversationDrafts } from "./useConversationDrafts";
 import { senderLabel } from "./messageDisplay";
 import ConversationHeader from "./message-area/ConversationHeader";
+import { useBackButton } from "./conversationBack";
 import ConversationCallBars from "./message-area/ConversationCallBars";
 import ConversationNotices from "./message-area/ConversationNotices";
 import { AccessDeniedState } from "./message-area/ConversationStates";
@@ -190,11 +191,13 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   // One list, one instance: the bar shows its latest pin, the details panel the
   // whole collection (issue #896), so a pin/unpin updates both at once.
   const latestPin = useMemo(() => selectLatestPin(pins), [pins]);
-  // A pinned row opens its message through the RF-09 deep link — the same
-  // `?message=` the timeline already follows, loading history when needed —
-  // on this conversation's own path, keeping any other query and the state.
-  // Marked as a jump request, so opening the same pin again travels again.
-  const openPinnedMessage = useCallback(
+  // A pinned row — and, since #1099, a quote whose original is not loaded —
+  // opens its message through the RF-09 deep link: the same `?message=` the
+  // timeline already follows, loading history when needed, on this
+  // conversation's own path, keeping any other query and the state (so a
+  // pending reference survives). Marked as a jump request, so asking for the
+  // same message again travels again.
+  const openMessageTarget = useCallback(
     (messageId: string) => {
       const search = new URLSearchParams(location.search);
       search.set("message", messageId);
@@ -209,11 +212,11 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       conversationKey: `${kind}:${targetId}`,
       collection: pinCollection,
       pendingIds: pendingPinIds,
-      onNavigate: openPinnedMessage,
+      onNavigate: openMessageTarget,
       onUnpin: (messageId: string) => togglePin(messageId, false),
       onRetry: reloadPins,
     }),
-    [kind, targetId, pinCollection, pendingPinIds, openPinnedMessage, togglePin, reloadPins],
+    [kind, targetId, pinCollection, pendingPinIds, openMessageTarget, togglePin, reloadPins],
   );
 
   const detailsToggleRef = useRef<HTMLButtonElement>(null);
@@ -224,6 +227,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     resolvedName,
     toggleRef: detailsToggleRef,
   });
+  const back = useBackButton(ctx.goBack, `${kind}:${targetId}`);
   const reloadOpenDetails = details.reload;
   // The rename the panel may offer for the conversation on screen (issue #893).
   // The capability is the server's, read from the canonical sidebar payload,
@@ -277,6 +281,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     bodyFormat: target.bodyFormat,
     currentUserId: ctx.currentUserId,
     focusMessageId,
+    focusRequest: target.focusRequest,
     onOwnReactionConfirmed: rememberReaction,
     onPinUpdated: reloadPins,
     // A pin.updated missed while disconnected is recovered here (issue #896).
@@ -550,6 +555,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     onReferenceMessage: dialogs.openReference,
     onForwardMessage: dialogs.openForward,
     onReferenceJump: jumpToReference,
+    onOpenMessageTarget: openMessageTarget,
     onOpenAuthorDM: authorDMAction(ctx.currentUserId, kind, activeDM, openAuthorDM),
     onMentionClick: handleMentionClick,
     onToggleFavorite: toggleFavorite,
@@ -596,6 +602,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       */}
       <div className="chat-msg-area__conversation">
         <ConversationHeader
+          targetId={targetId}
           kind={kind}
           workspaceId={ctx.workspaceId}
           name={resolvedName}
@@ -610,6 +617,8 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           resourceCall={resourceCall.headerState}
           details={details}
           detailsToggleRef={detailsToggleRef}
+          onBack={back.onBack}
+          backRef={back.ref}
         />
 
         <ConversationCallBars
@@ -653,6 +662,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         <ConversationNotices
           sendError={state.sendError}
           realtimeError={state.realtimeError}
+          syncError={state.syncError}
           actionError={state.actionError}
           pinError={pinError}
           acknowledgeError={acknowledgeError}

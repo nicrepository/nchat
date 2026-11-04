@@ -452,19 +452,19 @@ func (a *App) launchWorker(
 	return handle
 }
 
-// pushSubscriptionOptions mounts the Web Push subscription routes, or mounts
+// pushSubscriptionOptions wires the Web Push subscription routes, or wires
 // nothing and says why (issue #745).
 //
 // Both dependencies are hard requirements rather than degraded modes. Without a
 // database there is no session to validate a caller against and no table to
 // write; without a usable signing secret every token would be unverifiable. In
-// either case this returns no option at all, so the router never registers the
-// routes and a request for them is answered by the catch-all: 404. A surface
-// that answered anything else would be one authorising writes it could not
-// attribute to anybody.
+// either case this returns no option at all, so the router's routes have nothing
+// to authenticate with and answer 503 (issue #902), never a 404 that reads as a
+// missing route. A surface that answered anything else would be one authorising
+// writes it could not attribute to anybody.
 //
-// The refusal is in the log, not in the status code. An operator sees the reason
-// here; a client sees a route this build does not serve.
+// The reason is in the log, not in the status code: an operator sees it here; a
+// client sees only that the service is not ready.
 func pushSubscriptionOptions(cfg config.Config, pool storage.Pool, logger *slog.Logger) []httpapi.Option {
 	if pool == nil {
 		logger.Warn("push subscription api disabled", "reason", "database_not_configured")

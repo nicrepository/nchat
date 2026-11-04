@@ -12,15 +12,14 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mockFetchContent, mockFetchManifest } = vi.hoisted(() => ({
+const { mockFetchPreview, mockFetchContent, mockFetchManifest } = vi.hoisted(() => ({
+  mockFetchPreview: vi.fn(),
   mockFetchContent: vi.fn(),
   mockFetchManifest: vi.fn(),
 }));
 
 vi.mock("./filesApi", () => ({
-  // No fixture below has a preview, so a thumbnail is never requested; the
-  // export simply has to exist.
-  fetchAttachmentPreview: () => Promise.reject(new Error("not used")),
+  fetchAttachmentPreview: mockFetchPreview,
   fetchAttachmentContent: mockFetchContent,
   fetchDocumentPreviewManifest: mockFetchManifest,
   fetchDocumentPreviewPage: () => Promise.reject(new Error("not used")),
@@ -35,6 +34,7 @@ vi.mock("./chatApi", () => ({
   addGroupParticipants: vi.fn(),
 }));
 
+import { legacyContainerCase, nativeDocumentCases } from "./attachmentDocumentFixtures";
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
 import type { ChannelAttachment, ChannelDetails } from "./chatTypes";
 import type {
@@ -136,6 +136,7 @@ const createObjectURL = vi.fn(() => "blob:saved");
 const revokeObjectURL = vi.fn();
 
 beforeEach(() => {
+  mockFetchPreview.mockReset().mockRejectedValue(new Error("not used"));
   vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL });
   vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
 });
@@ -609,4 +610,40 @@ describe("recent files — scan state and action", () => {
     expect(within(fileList()).queryAllByRole("button")).toHaveLength(0);
     expect(within(fileList()).queryAllByRole("link")).toHaveLength(0);
   });
+});
+
+it.each([...nativeDocumentCases, legacyContainerCase])(
+  "recent files opens canonical $extension as document",
+  async ({ contentType, extension }) => {
+    mockFetchManifest.mockReturnValue(new Promise(() => {}));
+    renderFiles({
+      status: "ready",
+      data: [file(1, { filename: `costs.${extension}`, contentType, previewStatus: "ready" })],
+    });
+    await userEvent.click(screen.getByRole("button", { name: `Visualizar costs.${extension}` }));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(mockFetchManifest).toHaveBeenCalledWith("a-1", expect.any(AbortSignal));
+    expect(mockFetchContent).not.toHaveBeenCalled();
+  },
+);
+
+it("recent sheets never assign the JSON preview to a thumbnail image", async () => {
+  mockFetchPreview.mockResolvedValue(
+    new Blob(['{"rows":[]}'], { type: "application/vnd.nchat.preview-sheet+json" }),
+  );
+  mockFetchManifest.mockReturnValue(new Promise(() => {}));
+  renderFiles({
+    status: "ready",
+    data: [
+      file(1, {
+        filename: "costs.xlsx",
+        contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        previewStatus: "ready",
+      }),
+    ],
+  });
+  await userEvent.click(screen.getByRole("button", { name: "Visualizar costs.xlsx" }));
+  await waitFor(() => expect(mockFetchManifest).toHaveBeenCalled());
+  expect(within(screen.getByTestId("chat-details-file-a-1")).queryByRole("img")).toBeNull();
+  expect(mockFetchPreview).not.toHaveBeenCalled();
 });

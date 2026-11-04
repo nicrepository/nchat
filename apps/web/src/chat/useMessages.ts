@@ -35,6 +35,7 @@ import { messagesGateway } from "./messages/messagesGateway";
 import { reducer } from "./messages/reducer";
 import { initialState } from "./messages/types";
 import { useAuthoritativeReads } from "./messages/useAuthoritativeReads";
+import { useCatchUpJournal } from "./messages/catchUpJournal";
 import { useConversationScope } from "./messages/useConversationScope";
 import { useLatestRef } from "./messages/useLatestRef";
 import { useMessageLoading } from "./messages/useMessageLoading";
@@ -48,6 +49,7 @@ import { useReferenceRevalidation } from "./messages/useReferenceRevalidation";
 import { useRequestRegistry } from "./messages/useRequestRegistry";
 import { useAcknowledgements } from "./messages/useAcknowledgements";
 import { useSecurityReconciliation } from "./messages/useSecurityReconciliation";
+import { useTimelineCatchUp } from "./messages/useTimelineCatchUp";
 import type {
   WSAttachmentStatusEvent,
   WSConversationEventMessage,
@@ -69,8 +71,10 @@ interface UseMessagesOptions {
   targetId: string;
   bodyFormat?: "v2" | "v3";
   currentUserId: string;
-  /** Direct-navigation target resolved through the authorized single-message GET. */
+  /** A `?message=` target, reached by paging back through history (#1088). */
   focusMessageId?: string;
+  /** Which request asked for focusMessageId (issue #896); asking again may reload (#1099). */
+  focusRequest?: string;
   onOwnReactionConfirmed?: (emoji: string) => void;
   /** RF-05: called on a pin.updated event for the active target (refetch pins). */
   onPinUpdated?: (event: WSPinUpdatedEvent) => void;
@@ -185,6 +189,7 @@ export function useMessages({
   bodyFormat = kind === "channel" ? "v3" : "v2",
   currentUserId,
   focusMessageId,
+  focusRequest,
   onOwnReactionConfirmed,
   onPinUpdated,
   onMembersAdded,
@@ -195,7 +200,12 @@ export function useMessages({
   onSubscriptionReady,
   onMessageRemoved,
 }: UseMessagesOptions): UseMessagesResult {
-  const [state, dispatch] = useReducer(reducer, initialState);
+  const [state, reduce] = useReducer(reducer, initialState);
+  // Every action reaches the reducer through the catch-up journal, which
+  // records the server facts a reconciliation read must be rebased under
+  // (issue #947). Nothing else about dispatching changes.
+  const journal = useCatchUpJournal(reduce);
+  const { dispatch } = journal;
 
   // The action banner is transient by contract: it reports a refusal the reader
   // can do nothing about, so it clears itself rather than accumulating.
@@ -206,7 +216,7 @@ export function useMessages({
       actionErrorTimeoutMs,
     );
     return () => window.clearTimeout(timer);
-  }, [state.actionError]);
+  }, [dispatch, state.actionError]);
 
   const target = { kind, targetId };
   const scope = useConversationScope(target, state);
@@ -253,8 +263,18 @@ export function useMessages({
     nextCursor: state.nextCursor,
     loadingMore: state.loadingMore,
     focusMessageId,
+    focusRequest,
+    focusLoaded: !!focusMessageId && state.messages.some((m) => m.id === focusMessageId),
   });
   useReferenceRevalidation({ scope, gateway, dispatch, messages: state.messages });
+  const catchUpTimeline = useTimelineCatchUp({
+    scope,
+    gateway,
+    journal,
+    fallbacks,
+    status: state.status,
+    notifyRemoved,
+  });
 
   const { sendMessage, editMessageLocal, deleteMessageLocal, toggleFavorite } = useMessageMutations(
     {
@@ -287,6 +307,7 @@ export function useMessages({
     reconciliation,
     reconcileAcknowledgements: acknowledgements.reconcile,
     reconcileAcknowledgement: acknowledgements.reconcileOne,
+    catchUpTimeline,
     notifyRemoved,
     listeners: {
       onPinUpdated,
@@ -307,12 +328,15 @@ export function useMessages({
     sendToggle: sendReactionToggle,
   });
 
-  const selectReply = useCallback((message: Message) => {
-    dispatch({ type: "reply_set", message });
-  }, []);
+  const selectReply = useCallback(
+    (message: Message) => {
+      dispatch({ type: "reply_set", message });
+    },
+    [dispatch],
+  );
   const cancelReply = useCallback(() => {
     dispatch({ type: "reply_clear" });
-  }, []);
+  }, [dispatch]);
 
   return {
     state,

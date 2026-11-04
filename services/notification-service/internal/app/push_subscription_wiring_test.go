@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -23,11 +24,10 @@ import (
 // can be verified. A build that mounted the routes anyway would be authorising
 // writes it could not attribute to anybody.
 //
-// When either is missing the routes are not registered, so the catch-all answers
-// and the status is 404 — this build does not serve them. That is the contract
-// these tests pin down; the 503 an unconfigured Authenticate returns belongs to a
-// partial wiring the production path cannot produce, and is covered in the http
-// package instead.
+// When either is missing the routes stay registered and Authenticate refuses
+// every request with 503 (issue #902): the catch-all's 404 would read as a route
+// that does not exist, and a client probing push/config on every focus would be
+// told so for as long as the process lives.
 
 func pushConfig(databaseURL string) config.Config {
 	return config.Config{
@@ -62,13 +62,29 @@ func captureLogger() (*slog.Logger, *bytes.Buffer) {
 	return slog.New(slog.NewJSONHandler(buffer, nil)), buffer
 }
 
-// statusFor drives the real router the App built.
-func statusFor(app *App, target string) int {
+// responseFor drives the real router the App built.
+func responseFor(app *App, target string) *httptest.ResponseRecorder {
 	request := httptest.NewRequest(http.MethodGet, target, nil)
 	request.Header.Set("Authorization", "Bearer token")
 	response := httptest.NewRecorder()
 	app.Handler.ServeHTTP(response, request)
-	return response.Code
+	return response
+}
+
+func statusFor(app *App, target string) int { return responseFor(app, target).Code }
+
+// errorCodeOf is the contract of an error envelope; the message is prose.
+func errorCodeOf(t *testing.T, response *httptest.ResponseRecorder) string {
+	t.Helper()
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode error envelope: %v (%s)", err, response.Body.String())
+	}
+	return envelope.Error.Code
 }
 
 func TestPushSubscriptionRoutesAreMountedWithADatabaseAndASecret(t *testing.T) {
@@ -83,25 +99,37 @@ func TestPushSubscriptionRoutesAreMountedWithADatabaseAndASecret(t *testing.T) {
 	}
 }
 
-func TestPushSubscriptionRoutesAreAbsentWithoutADatabase(t *testing.T) {
-	restorePushFactories(t)
+// Without a database or a usable secret the routes still exist, so a client can
+// tell "this build is not ready to serve you" (503) from "no such route" (404,
+// issue #902). Every one of them, config included, is refused by Authenticate.
+func TestPushRoutesAnswer503WhenSubscriptionsCannotBeServed(t *testing.T) {
+	cases := map[string]func(*config.Config){
+		"without a database":      func(c *config.Config) { c.DatabaseURL = "" },
+		"without a usable secret": func(c *config.Config) { c.AuthJWTHMACSecret = "too-short" },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			restorePushFactories(t)
+			openDB = func(context.Context, string, int) (storage.Pool, error) { return fakePool{}, nil }
+			cfg := pushConfig("postgres://user@127.0.0.1:1/nchat?sslmode=disable")
+			mutate(&cfg)
 
-	app := New(pushConfig(""))
-	if status := statusFor(app, httpapi.RoutePushSubscriptions); status != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", status)
+			app := New(cfg)
+			assertPushRoutesUnavailable(t, app)
+		})
 	}
 }
 
-func TestPushSubscriptionRoutesAreAbsentWithoutAUsableSecret(t *testing.T) {
-	restorePushFactories(t)
-	openDB = func(context.Context, string, int) (storage.Pool, error) { return fakePool{}, nil }
-
-	cfg := pushConfig("postgres://user@127.0.0.1:1/nchat?sslmode=disable")
-	cfg.AuthJWTHMACSecret = "too-short"
-
-	app := New(cfg)
-	if status := statusFor(app, httpapi.RoutePushSubscriptions); status != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", status)
+func assertPushRoutesUnavailable(t *testing.T, app *App) {
+	t.Helper()
+	for _, route := range []string{httpapi.RoutePushConfig, httpapi.RoutePushSubscriptions} {
+		response := responseFor(app, route)
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s: status = %d, want 503", route, response.Code)
+		}
+		if code := errorCodeOf(t, response); code != "service_unavailable" {
+			t.Fatalf("%s: code = %q, want service_unavailable", route, code)
+		}
 	}
 }
 

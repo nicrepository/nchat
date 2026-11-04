@@ -5,13 +5,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"path"
 	"strings"
+
+	"github.com/nicrepository/nchat/libs/go/platform/documentguard"
 
 	"github.com/richardlehane/mscfb"
 )
@@ -31,6 +31,7 @@ const (
 )
 
 var (
+	ErrBusy             = errors.New("audio converter busy")
 	ErrBlocked          = errors.New("blocked")
 	ErrInvalidDocument  = errors.New("invalid document")
 	ErrTimeout          = errors.New("conversion timeout")
@@ -53,6 +54,7 @@ type AudioConverter interface {
 type Handler struct {
 	runner      Runner
 	audioRunner AudioConverter
+	audioSlots  chan struct{}
 }
 
 // HandlerOption configures an optional dependency on NewHandler without
@@ -65,7 +67,7 @@ func WithAudioConverter(audio AudioConverter) HandlerOption {
 }
 
 func NewHandler(runner Runner, opts ...HandlerOption) http.Handler {
-	h := &Handler{runner: runner}
+	h := &Handler{runner: runner, audioSlots: make(chan struct{}, maxConcurrentAudioConversions)}
 	for _, opt := range opts {
 		opt(h)
 	}
@@ -99,7 +101,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, "output_too_large")
 		return
 	}
-	if err := validateDocument(format, body); err != nil {
+	if err := validateDocument(r.Context(), format, body); err != nil {
 		writeError(w, http.StatusUnprocessableEntity, "blocked")
 		return
 	}
@@ -153,6 +155,10 @@ func (h *Handler) serveConvertAudio(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "blocked")
 		return
 	}
+	if !h.admitAudio(w, r) {
+		return
+	}
+	defer func() { <-h.audioSlots }()
 	body, err := io.ReadAll(io.LimitReader(r.Body, MaxAudioInputBytes+1))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_audio")
@@ -168,15 +174,7 @@ func (h *Handler) serveConvertAudio(w http.ResponseWriter, r *http.Request) {
 	}
 	mp3, err := h.audioRunner.ConvertAudio(r.Context(), format, body)
 	if err != nil {
-		status, code := http.StatusInternalServerError, "conversion_failed"
-		switch {
-		case errors.Is(err, ErrTimeout), errors.Is(err, context.DeadlineExceeded):
-			status, code = http.StatusGatewayTimeout, "timeout"
-		case errors.Is(err, ErrOutputTooLarge):
-			status, code = http.StatusUnprocessableEntity, "output_too_large"
-		case errors.Is(err, ErrBlocked):
-			status, code = http.StatusUnprocessableEntity, "blocked"
-		}
+		status, code := audioErrorStatus(err)
 		writeError(w, status, code)
 		return
 	}
@@ -240,7 +238,7 @@ func (f Format) valid() bool {
 	return f == FormatDOCX || f == FormatODT || f == FormatPPT || f == FormatPPTX
 }
 
-func validateDocument(format Format, data []byte) error {
+func validateDocument(ctx context.Context, format Format, data []byte) error {
 	if format == FormatPPT {
 		return validatePPT(data)
 	}
@@ -248,109 +246,25 @@ func validateDocument(format Format, data []byte) error {
 	if err != nil || len(zr.File) == 0 || len(zr.File) > 2048 {
 		return ErrBlocked
 	}
-	names := make(map[string]bool, len(zr.File))
-	var odfMIME string
-	var expanded uint64
-	for _, file := range zr.File {
-		name := strings.ReplaceAll(file.Name, "\\", "/")
-		clean, lower := path.Clean(name), strings.ToLower(path.Clean(name))
-		if clean == "." || strings.HasPrefix(clean, "../") || strings.HasPrefix(name, "/") {
-			return ErrBlocked
-		}
-		expanded += file.UncompressedSize64
-		if expanded > 32<<20 || file.UncompressedSize64 > 8<<20 || (file.CompressedSize64 > 0 && file.UncompressedSize64/file.CompressedSize64 > 100) {
-			return ErrBlocked
-		}
-		if strings.Contains(lower, "vbaproject") || strings.Contains(lower, "/activex/") || strings.Contains(lower, "/embeddings/") || strings.Contains(lower, "/externallinks/") || strings.HasPrefix(lower, "object ") || strings.HasPrefix(lower, "scripts/") || strings.HasPrefix(lower, "basic/") {
-			return ErrBlocked
-		}
-		names[lower] = true
-		if strings.HasSuffix(lower, ".xml") || strings.HasSuffix(lower, ".rels") {
-			reader, openErr := file.Open()
-			if openErr != nil {
-				return ErrBlocked
-			}
-			body, readErr := io.ReadAll(io.LimitReader(reader, (8<<20)+1))
-			_ = reader.Close()
-			if readErr != nil || len(body) > 8<<20 {
-				return ErrBlocked
-			}
-			folded := strings.ToLower(string(body))
-			if strings.Contains(folded, "<!doctype") || strings.Contains(folded, "<!entity") || strings.Contains(folded, `targetmode="external"`) || strings.Contains(folded, "targetmode='external'") || hasNonEmptyScriptsElement(body) || strings.Contains(folded, "<script:") || strings.Contains(folded, "<draw:object") || strings.Contains(folded, "<draw:plugin") || externalReference(folded) {
-				return ErrBlocked
-			}
-		}
-		if lower == "mimetype" {
-			reader, openErr := file.Open()
-			if openErr != nil {
-				return ErrBlocked
-			}
-			value, readErr := io.ReadAll(io.LimitReader(reader, 257))
-			_ = reader.Close()
-			if readErr != nil || len(value) > 256 {
-				return ErrBlocked
-			}
-			odfMIME = strings.TrimSpace(string(value))
-		}
+	index, err := documentguard.ArchiveXML(ctx, zr)
+	if err != nil {
+		return ErrBlocked
 	}
-	switch format {
-	case FormatDOCX:
-		if names["word/document.xml"] {
-			return nil
-		}
-	case FormatPPTX:
-		if names["ppt/presentation.xml"] {
-			return nil
-		}
-	case FormatODT:
-		if names["content.xml"] && odfMIME == "application/vnd.oasis.opendocument.text" {
-			return nil
-		}
+
+	if validPackageFormat(index, format) {
+		return nil
 	}
 	return ErrBlocked
 }
 
-func hasNonEmptyScriptsElement(body []byte) bool {
-	if !bytes.Contains(bytes.ToLower(body), []byte("scripts")) {
-		return false
-	}
-	decoder := xml.NewDecoder(bytes.NewReader(body))
-	inScripts := false
-	for {
-		token, err := decoder.Token()
-		if err == io.EOF {
-			return false
-		}
-		if err != nil {
-			return true
-		}
-		switch value := token.(type) {
-		case xml.StartElement:
-			if inScripts {
-				return true
-			}
-			if strings.EqualFold(value.Name.Local, "scripts") {
-				inScripts = true
-			}
-		case xml.EndElement:
-			if inScripts && strings.EqualFold(value.Name.Local, "scripts") {
-				inScripts = false
-			}
-		case xml.CharData:
-			if inScripts && strings.TrimSpace(string(value)) != "" {
-				return true
-			}
-		}
-	}
-}
-
-func externalReference(xml string) bool {
-	for _, quote := range []string{`xlink:href="`, "xlink:href='"} {
-		for _, scheme := range []string{"http:", "https:", "file:", "ftp:"} {
-			if strings.Contains(xml, quote+scheme) {
-				return true
-			}
-		}
+func validPackageFormat(index documentguard.Archive, format Format) bool {
+	switch format {
+	case FormatDOCX:
+		return index.Has("word/document.xml")
+	case FormatPPTX:
+		return index.Has("ppt/presentation.xml")
+	case FormatODT:
+		return index.Has("content.xml") && index.MIME == "application/vnd.oasis.opendocument.text"
 	}
 	return false
 }
@@ -392,4 +306,33 @@ func writeError(w http.ResponseWriter, status int, code string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"code": code})
+}
+
+func audioErrorStatus(err error) (int, string) {
+	status, code := http.StatusInternalServerError, "conversion_failed"
+	switch {
+	case errors.Is(err, ErrBusy):
+		status, code = http.StatusServiceUnavailable, "busy"
+	case errors.Is(err, ErrTimeout), errors.Is(err, context.DeadlineExceeded):
+		status, code = http.StatusGatewayTimeout, "timeout"
+	case errors.Is(err, ErrOutputTooLarge):
+		status, code = http.StatusUnprocessableEntity, "output_too_large"
+	case errors.Is(err, ErrBlocked):
+		status, code = http.StatusUnprocessableEntity, "blocked"
+	}
+	return status, code
+}
+
+func (h *Handler) admitAudio(w http.ResponseWriter, r *http.Request) bool {
+	if r.Context().Err() != nil {
+		writeError(w, http.StatusRequestTimeout, "timeout")
+		return false
+	}
+	select {
+	case h.audioSlots <- struct{}{}:
+		return true
+	default:
+		writeError(w, http.StatusServiceUnavailable, "busy")
+		return false
+	}
 }

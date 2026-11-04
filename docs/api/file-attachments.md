@@ -3,6 +3,16 @@
 Upload, consulta e download autenticados de arquivos e imagens em canais e DMs.
 O conteudo e cifrado com envelope encryption antes de chegar ao SeaweedFS.
 
+**Política v1 (#1128):** o backend identifica formato/estrutura antes de finalizar
+o upload e revalida a política no worker AV. O catálogo, as restrições por família
+e os perfis desligados por padrão estão em
+[supported-file-types.md](supported-file-types.md); arquitetura, ameaças,
+integridade e rollout estão em
+[enterprise-attachment-policy.md](../architecture/enterprise-attachment-policy.md).
+As descrições históricas de MIME coarse abaixo não são a autoridade da admissão.
+`/content` sempre retorna o original, inclusive áudio. MP3 convertido é uma
+representação explicitamente solicitada em `/attachments/{id}/audio.mp3`.
+
 Fora de escopo nesta fase: politica de retencao (RF-34), URLs publicas, upload
 resumivel, deduplicacao e criptografia E2E MLS de anexos. O worker assincrono de
 antimalware (RF-22) esta implementado -- ver "Scan assincrono de malware". O RF-31 implementado aqui cobre **thumbnail de imagem, primeira pagina
@@ -25,15 +35,40 @@ Prefixo publico `/api/files`, removido pelo gateway antes de chegar ao servico
 (`strip-files-prefix` em `infra/traefik/local/dynamic.yml`). Todas as rotas
 exigem `Authorization: Bearer <access-token>`.
 
-| Metodo | Rota publica                                    | Descricao                   |
-| ------ | ----------------------------------------------- | --------------------------- |
-| POST   | `/api/files/channels/{channelID}/attachments`   | upload em canal             |
-| POST   | `/api/files/dm/{conversationID}/attachments`    | upload em DM                |
-| GET    | `/api/files/channels/{channelID}/attachments`   | anexos recentes do canal    |
-| GET    | `/api/files/dm/{conversationID}/attachments`    | anexos recentes da conversa |
-| GET    | `/api/files/attachments/{attachmentID}`         | metadados                   |
-| GET    | `/api/files/attachments/{attachmentID}/content` | download do conteudo        |
-| GET    | `/api/files/attachments/{attachmentID}/preview` | preview inline (RF-31)      |
+| Metodo | Rota publica                                      | Descricao                                         |
+| ------ | ------------------------------------------------- | ------------------------------------------------- |
+| POST   | `/api/files/channels/{channelID}/attachments`     | upload em canal                                   |
+| POST   | `/api/files/dm/{conversationID}/attachments`      | upload em DM                                      |
+| GET    | `/api/files/channels/{channelID}/attachments`     | anexos recentes do canal                          |
+| GET    | `/api/files/dm/{conversationID}/attachments`      | anexos recentes da conversa                       |
+| GET    | `/api/files/attachments/{attachmentID}`           | metadados                                         |
+| GET    | `/api/files/attachments/{attachmentID}/content`   | download original exato                           |
+| GET    | `/api/files/attachments/{attachmentID}/audio.mp3` | derivado MP3 explícito, sem substituir o original |
+| GET    | `/api/files/attachments/{attachmentID}/preview`   | preview inline (RF-31)                            |
+
+O endpoint `/content` conserva bytes, tamanho, nome e extensão do original.
+`/audio.mp3` exige a mesma autenticação, autorização atual e aprovação antimalware;
+retorna `audio/mpeg`, `Content-Disposition: attachment` e nome terminado em `.mp3`.
+Áudio já MP3 é aberto sem conversão nem consulta redundante. Nos demais formatos
+compatíveis, o derivado é convertido explicitamente, com nova checagem de acesso
+antes da entrega. Falhas de conversão retornam `502 audio_transcode_failed`;
+erros de acesso/storage seguem os contratos de download. O derivado nunca
+substitui o objeto original nem é usado silenciosamente por `/content`.
+
+O derivado MP3 e o `POST /attachments/{attachmentID}/document-preview/regenerate`
+compartilham o limitador existente de 20 requisições por minuto, por usuário e
+instância, com uploads/cancelamento (`429`, `Retry-After`). Leituras de páginas e
+thumbnails não consomem esse orçamento. Saturação da transcodificação retorna
+`503 service_unavailable`; cada file-service admite uma conversão/entrega MP3,
+e cada conversor admite um áudio antes de ler o corpo. Mesmo um Range pequeno
+pode exigir gerar o derivado completo, sempre sob esses limites; não há cache
+persistente nem deduplicação de conversões. O original permanece independente.
+
+Após falha de preview, uma nova rodada de até três tentativas só pode ser
+agendada 24 horas após a última atualização do attachment. A verificação e o
+reset são atômicos no PostgreSQL, sem novos campos; enquanto isso a rota retorna
+`409 preview_unavailable`. Repetir um pedido já pendente não cria outro job.
+Expiração normal de preview continua regenerável sem esse cooldown adicional.
 
 O destino vem da rota, nunca do corpo. Nao existe forma de request que nomeie
 canal e DM ao mesmo tempo, e o workspace nunca e aceito do cliente: ele e
@@ -76,15 +111,18 @@ nem qualquer detalhe de topologia.
 
 ### Erros de upload
 
-| Status | Codigo                   | Quando                                                                                            |
-| ------ | ------------------------ | ------------------------------------------------------------------------------------------------- |
-| 400    | `bad_request`            | destino invalido, parte ausente, arquivo vazio, mais de um arquivo, campo extra, request truncada |
-| 401    | `unauthorized`           | token ausente/invalido ou sessao inativa                                                          |
-| 404    | `not_found`              | destino inexistente ou fora do alcance do usuario                                                 |
-| 413    | `payload_too_large`      | conteudo acima do limite efetivo do workspace (ver "Limite de tamanho")                           |
-| 415    | `unsupported_media_type` | corpo nao multipart ou multipart sem boundary                                                     |
-| 429    | `rate_limited`           | limite de uploads por usuario                                                                     |
-| 503    | `service_unavailable`    | uploads desabilitados ou dependencia indisponivel                                                 |
+| Status | Codigo                      | Quando                                                                                            |
+| ------ | --------------------------- | ------------------------------------------------------------------------------------------------- |
+| 400    | `bad_request`               | destino invalido, parte ausente, arquivo vazio, mais de um arquivo, campo extra, request truncada |
+| 401    | `unauthorized`              | token ausente/invalido ou sessao inativa                                                          |
+| 404    | `not_found`                 | destino inexistente ou fora do alcance do usuario                                                 |
+| 413    | `payload_too_large`         | conteudo acima do limite efetivo do workspace (ver "Limite de tamanho")                           |
+| 415    | `unsupported_media_type`    | corpo nao multipart ou multipart sem boundary                                                     |
+| 415    | `file_policy_blocked`       | família/perfil, conteúdo ativo ou opaco bloqueado                                                 |
+| 415    | `file_content_unrecognized` | assinatura, estrutura ou MIME específico incompatível                                             |
+| 415    | `file_inspection_limit`     | inspeção não pode terminar dentro dos budgets de formato                                          |
+| 429    | `rate_limited`              | limite de uploads por usuario                                                                     |
+| 503    | `service_unavailable`       | uploads desabilitados ou dependencia indisponivel                                                 |
 
 Destino inexistente e destino inacessivel retornam o mesmo `404`, sem indicar a
 existencia do UUID.
@@ -611,6 +649,14 @@ adicionaria o header e deixaria o `<video>` falar `Range` diretamente com o
 servico. O suporte a `Range` documentado acima ja esta pronto para isso.
 
 ## Preview inline (RF-31, issue #464)
+
+Para anexos classificados pela política v1, `Format.Preview` do catálogo é a
+fonte de suporte: TXT, ZIP, MD e ODP sem renderer terminam como `unsupported`,
+sem trabalho de preview. O lifecycle interno correspondente é `blocked`, conforme
+a migration 000018. Os MIMEs genéricos `text/plain` e `application/zip` continuam
+válidos no caminho legado (versão zero), sem autorizar novos previews v1 por
+fallback. A ausência de preview não impede o download de um original `clean`
+e autorizado. O worker também aplica a política persistida antes de abrir o objeto.
 
 Thumbnail de imagem e **primeira pagina** de PDF, gerados de forma assincrona e
 armazenados como objeto proprio, cifrado do mesmo jeito que o anexo original.

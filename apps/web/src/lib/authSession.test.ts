@@ -2,9 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   _resetListeners,
+  clearFreshLogin,
   clearTokens,
   getAccessToken,
+  getSessionBoundaryGeneration,
+  getSessionGeneration,
   isAuthenticated,
+  isFreshLogin,
+  markFreshLogin,
   onAuthChange,
   setTokens,
 } from "./authSession";
@@ -19,6 +24,31 @@ afterEach(() => {
 });
 
 describe("authSession", () => {
+  it("the session snapshot follows replacements while the token generation follows every installation", () => {
+    setTokens("session-a");
+    const boundary = getSessionGeneration();
+    expect(getSessionBoundaryGeneration()).toBe(boundary);
+    setTokens("rotation-a", "refresh");
+    expect(getSessionGeneration()).toBe(boundary + 1);
+    expect(getSessionBoundaryGeneration()).toBe(boundary);
+    setTokens("session-b");
+    const replacement = getSessionGeneration();
+    setTokens("rotation-b", "refresh");
+    expect(getSessionBoundaryGeneration()).toBe(replacement);
+  });
+
+  it("logout updates both snapshots before its notification", () => {
+    setTokens("session-a");
+    const before = getSessionGeneration();
+    const snapshots: number[][] = [];
+    const unsubscribe = onAuthChange(() => {
+      snapshots.push([getSessionGeneration(), getSessionBoundaryGeneration()]);
+    });
+    clearTokens();
+    expect(snapshots).toEqual([[before + 1, before + 1]]);
+    unsubscribe();
+  });
+
   it("setTokens stores access token in sessionStorage", () => {
     setTokens("acc_abc");
     expect(getAccessToken()).toBe("acc_abc");
@@ -101,5 +131,67 @@ describe("onAuthChange", () => {
     clearTokens();
     expect(listener.mock.calls).toEqual([["session"], ["refresh"], ["session"]]);
     unsub();
+  });
+});
+
+/** Issue #1123: the entry intention lives exactly as long as the session that set it. */
+describe("markFreshLogin", () => {
+  afterEach(() => {
+    clearFreshLogin();
+  });
+
+  it.each(["/", "/chat", "/chat/"])("sign-in into the chat's home (%s) is a fresh login", (to) => {
+    setTokens("at-a");
+    markFreshLogin(to);
+    expect(isFreshLogin()).toBe(true);
+  });
+
+  it.each([
+    "/call/c-1",
+    "/admin/users",
+    "/profile",
+    "/chat/dm/d-1",
+    "/chat/channel/c-1",
+    "/chat/search",
+  ])("sign-in with an explicit destination (%s) leaves no intention", (to) => {
+    setTokens("at-a");
+    markFreshLogin(to);
+    expect(isFreshLogin()).toBe(false);
+  });
+
+  it("logout and a silent recovery of another session do not inherit it", () => {
+    setTokens("at-a");
+    markFreshLogin("/");
+    clearTokens();
+    expect(isFreshLogin()).toBe(false);
+    setTokens("at-b");
+    expect(isFreshLogin()).toBe(false);
+  });
+
+  it("a session installed over it does not inherit it", () => {
+    setTokens("at-a");
+    markFreshLogin("/");
+    setTokens("at-b");
+    expect(isFreshLogin()).toBe(false);
+  });
+
+  it("a token rotation spends it too", () => {
+    setTokens("at-a");
+    markFreshLogin("/");
+    setTokens("at-a2", "refresh");
+    expect(isFreshLogin()).toBe(false);
+  });
+
+  it("marked before the session is installed, it never takes effect", () => {
+    markFreshLogin("/");
+    setTokens("at-a");
+    expect(isFreshLogin()).toBe(false);
+  });
+
+  it("is spent once", () => {
+    setTokens("at-a");
+    markFreshLogin("/");
+    clearFreshLogin();
+    expect(isFreshLogin()).toBe(false);
   });
 });

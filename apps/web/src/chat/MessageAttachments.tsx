@@ -46,14 +46,14 @@ import { useAttachmentViewer } from "./attachmentViewer";
 import { AttachmentHydrationContext, useLazyAttachment } from "./lazyAttachment";
 import { isImageAttachment } from "./attachmentImageRules";
 import { isVoiceMessage } from "./attachmentAudioRules";
-import { isDocumentAttachment } from "./attachmentDocumentRules";
+import { canOpenDocumentPreview, isDocumentAttachment } from "./attachmentDocumentRules";
 import {
+  attachmentDownloadFilename,
   saveAttachmentToDisk,
   useAttachmentDownload,
-  voiceMessageFilename,
 } from "./attachmentDownload";
 import { formatFileSize } from "./conversationDetailsDisplay";
-import { isPreviewAvailable, type ChannelAttachment } from "./chatTypes";
+import { type ChannelAttachment } from "./chatTypes";
 
 /** Same mapping the details panel uses, kept local so neither owns the other. */
 function fileIconFor(contentType: string): string {
@@ -106,8 +106,6 @@ function AttachmentDownloadButton({ attachment }: { attachment: ChannelAttachmen
 
 interface MessageAttachmentProps {
   attachment: ChannelAttachment;
-  /** The owning message's ISO timestamp — see VoiceMessageAttachment. */
-  sentAt: string;
   onOpenImage: (attachment: ChannelAttachment, payload: AttachmentImageOpenPayload) => void;
   onOpenDocument: (attachment: ChannelAttachment, trigger: HTMLButtonElement) => void;
 }
@@ -135,17 +133,10 @@ interface AttachmentBodyProps extends MessageAttachmentProps {
  */
 function VoiceMessageAttachment({
   attachment,
-  sentAt,
   rowRef,
 }: {
   attachment: ChannelAttachment;
   rowRef: Ref<HTMLLIElement>;
-  /**
-   * When the message was sent. It is what dates the saved file: an attachment
-   * of a message has no createdAt of its own — chat-service dates it by the
-   * message — so the name would otherwise be the same for every recording.
-   */
-  sentAt: string;
 }) {
   // Built from ids and metadata the message already carries, so constructing
   // it costs no request: a timeline of recordings still fetches nothing until
@@ -153,7 +144,7 @@ function VoiceMessageAttachment({
   const download = {
     label: "Baixar mensagem de voz",
     title: "Baixar áudio",
-    start: () => saveAttachmentToDisk(attachment.id, voiceMessageFilename(sentAt)),
+    start: () => saveAttachmentToDisk(attachment.id, attachmentDownloadFilename(attachment)),
   };
 
   return (
@@ -199,15 +190,9 @@ function MessageAttachment(props: MessageAttachmentProps) {
   );
 }
 
-function AttachmentBody({
-  attachment,
-  sentAt,
-  onOpenImage,
-  onOpenDocument,
-  rowRef,
-}: AttachmentBodyProps) {
+function AttachmentBody({ attachment, onOpenImage, onOpenDocument, rowRef }: AttachmentBodyProps) {
   if (isVoiceMessage(attachment)) {
-    return <VoiceMessageAttachment attachment={attachment} sentAt={sentAt} rowRef={rowRef} />;
+    return <VoiceMessageAttachment attachment={attachment} rowRef={rowRef} />;
   }
   const icon = (
     <span className="chat-msg-area__attachment-icon" aria-hidden="true">
@@ -259,8 +244,7 @@ function AttachmentBody({
     );
   }
 
-  // Documents (PDF today; other office formats once a later phase renders
-  // them) get the large WhatsApp-style card: a big first-page preview above
+  // Documents use their compatible renderer and the existing card: a big first-page preview above
   // the row, an explicit Visualizar action beside Baixar. A file still being
   // scanned or rejected keeps the plain icon row below unchanged — the same
   // split AttachmentImagePreview draws for raster types, applied to
@@ -284,7 +268,7 @@ function AttachmentBody({
         </div>
         {attachment.status === "clean" && (
           <div className="chat-msg-area__attachment-actions">
-            {isPreviewAvailable(attachment.previewStatus) && (
+            {canOpenDocumentPreview(attachment) && (
               <button
                 type="button"
                 className="chat-msg-area__attachment-action"
@@ -327,8 +311,6 @@ function AttachmentBody({
 
 export default function MessageAttachments(props: {
   attachments: ChannelAttachment[] | undefined;
-  /** The owning message's ISO timestamp. See VoiceMessageAttachment. */
-  sentAt: string;
 }) {
   // The host steps aside when the timeline already provides one above the list,
   // which is what keeps an open viewer alive after virtualization unmounts this
@@ -340,13 +322,7 @@ export default function MessageAttachments(props: {
   );
 }
 
-function MessageAttachmentList({
-  attachments,
-  sentAt,
-}: {
-  attachments: ChannelAttachment[] | undefined;
-  sentAt: string;
-}) {
+function MessageAttachmentList({ attachments }: { attachments: ChannelAttachment[] | undefined }) {
   const viewer = useAttachmentViewer();
   const [expandedRuns, setExpandedRuns] = useState<Set<number>>(() => new Set());
 
@@ -380,7 +356,6 @@ function MessageAttachmentList({
               <MessageAttachment
                 key={segment.attachment.id}
                 attachment={segment.attachment}
-                sentAt={sentAt}
                 onOpenImage={openImage}
                 onOpenDocument={openDocument}
               />
@@ -401,7 +376,6 @@ function MessageAttachmentList({
                   <MessageAttachment
                     key={attachment.id}
                     attachment={attachment}
-                    sentAt={sentAt}
                     onOpenImage={openImage}
                     onOpenDocument={openDocument}
                   />

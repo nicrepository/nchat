@@ -321,3 +321,18 @@ func (r *routeSet) registerOwnershipRoutes(prefix string, handler http.HandlerFu
 	r.handle("PATCH "+prefix+"/members/{userID}/role", r.pinAction, handler)
 	r.handle("POST "+prefix+"/ownership/{operation}", r.pinAction, handler)
 }
+
+func (r *routeSet) registerMeetingRoutes(meetings *MeetingHandler) {
+	if meetings == nil {
+		return
+	}
+	r.handle("GET "+RouteMeetingParticipants, nil, meetings.Participants)
+	r.handle("POST "+RouteMeetingParticipants, nil, meetings.AddParticipant)
+	r.handle("PATCH "+RouteMeetingParticipant, nil, meetings.ChangeParticipantRole)
+	r.handle("DELETE "+RouteMeetingParticipant, nil, meetings.RemoveParticipant)
+	r.handle("POST "+RouteMeetingParticipantsAll, nil, meetings.InviteAllParticipants)
+	r.handle("GET "+RouteMeetingCandidates, nil, meetings.Candidates)
+	r.handle("POST "+RouteMeetings, nil, meetings.Create)
+	r.handle("PATCH "+RouteMeeting, nil, meetings.Update)
+	r.handle("POST "+RouteMeetingCancel, nil, meetings.Cancel)
+}

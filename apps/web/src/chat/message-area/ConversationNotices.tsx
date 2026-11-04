@@ -9,6 +9,11 @@ import { IconWarning } from "./icons";
  * The strip between the timeline and the composer: a failed send, an unstable
  * connection, a refused action, and who is typing.
  *
+ * The connection notice stands for two states with different lifetimes: a
+ * realtime failure, which the next healthy event clears, and a reconciliation
+ * still owed (issue #947), which only an applied catch-up clears. Either one
+ * shows it, so a reconnect never hides a timeline that is not yet current.
+ *
  * The refusals share one line because only one of them can usefully be read at
  * a time, and the order is the order they matter in.
  *
@@ -21,6 +26,7 @@ import { IconWarning } from "./icons";
 export default function ConversationNotices({
   sendError,
   realtimeError,
+  syncError,
   actionError,
   pinError,
   acknowledgeError,
@@ -28,6 +34,8 @@ export default function ConversationNotices({
 }: {
   sendError: string | null;
   realtimeError: string | null;
+  /** Issue #947: a reconciliation the timeline still owes. */
+  syncError: string | null;
   actionError: string | null;
   pinError: string | null;
   /** Issue #824: a confirmation that could not be recorded. */
@@ -35,6 +43,7 @@ export default function ConversationNotices({
   typingLabel: string | null;
 }) {
   const refusal = actionError ?? pinError ?? acknowledgeError ?? null;
+  const unstable = realtimeError ?? syncError;
   return (
     <>
       {sendError && (
@@ -43,7 +52,7 @@ export default function ConversationNotices({
           {sendError}
         </div>
       )}
-      {realtimeError && (
+      {unstable && (
         <div
           className="chat-msg-area__realtime-error"
           role="status"

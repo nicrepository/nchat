@@ -7,8 +7,11 @@ import {
   useMemo,
   useRef,
   useState,
+  type RefObject,
 } from "react";
 import { Link, useLocation, useNavigate } from "react-router";
+
+import { useMeetingScheduling } from "../meetings/meetingContext";
 
 import "./ChatSidebar.css";
 import ChannelIcon from "./ChannelIcon";
@@ -1054,6 +1057,7 @@ interface ChatSidebarProps {
   ) => void;
   /** The shell-owned search action, shared by the sidebar button and shortcut command. */
   onOpenSearch?: () => void;
+  searchButtonRef?: RefObject<HTMLButtonElement | null>;
   /** Publishes this sidebar's visual-row selection flow to the command layer. */
   onNavigateRelativeChange?: (navigate: (direction: -1 | 1) => void) => void;
   /**
@@ -1096,6 +1100,7 @@ export default function ChatSidebar({
   leaveConversation,
   onOpenDetails,
   onOpenSearch,
+  searchButtonRef,
   onNavigateRelativeChange,
   draftSummaries = EMPTY_DRAFT_SUMMARIES,
 }: ChatSidebarProps) {
@@ -1352,6 +1357,8 @@ export default function ChatSidebar({
    * the same pair the navigation effect performs, muting is the equivalent for
    * notifications, and rename, details and leave only open something.
    */
+  const openScheduling = useMeetingScheduling();
+
   function handleAction(
     target: ConversationTarget,
     action: ConversationActionId,
@@ -1359,6 +1366,7 @@ export default function ChatSidebar({
   ) {
     const apiTarget = { kind: conversationTargetKind(target.kind), targetId: target.id };
     const effects: Record<ConversationActionId, () => void> = {
+      "schedule-meeting": () => openScheduling?.(apiTarget.kind, target.id, trigger),
       pin: () => handlePin(apiTarget.kind, target.id, false),
       unpin: () => handlePin(apiTarget.kind, target.id, true),
       "mark-read": () => markRead?.(apiTarget),
@@ -1432,6 +1440,7 @@ export default function ChatSidebar({
             type="button"
             className="chat-sidebar__search"
             aria-label="Buscar no NChat"
+            ref={searchButtonRef}
             title="Buscar"
             onClick={onOpenSearch}
           >

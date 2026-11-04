@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import type { MessagePage } from "../chatTypes";
 import { ApiRequestError } from "../../lib/api";
@@ -51,6 +51,40 @@ interface Options {
    * the timeline prepends to, so the reader would land beside it, not on it.
    */
   focusMessageId?: string;
+  /** Which request asked for focusMessageId (issue #896); "" when unmarked. */
+  focusRequest?: string;
+  /** Whether focusMessageId is among the messages already loaded. */
+  focusLoaded?: boolean;
+}
+
+/** The message target the current load was made for (#1088, #1099). */
+export interface FocusLoad {
+  messageId: string;
+  request: string;
+  /** Bumped whenever the target owes the conversation a fresh load. */
+  generation: number;
+}
+
+/**
+ * Whether a change of message target owes a fresh load (issue #1099).
+ *
+ * Only a target that is not loaded does: the search for it starts from the
+ * newest page. A new one always reloads; asking explicitly again for the
+ * *same* one is the reader's retry after a search that ended without reaching
+ * it (the cap, a failed page), and an unmarked repeat ("") never reloads. A
+ * loaded target — new or not — is a jump the timeline makes on its own, and
+ * it replaces whatever target was still being searched for.
+ */
+export function nextFocusLoad(
+  previous: FocusLoad,
+  messageId: string,
+  request: string,
+  loaded: boolean,
+): FocusLoad {
+  if (previous.messageId === messageId && previous.request === request) return previous;
+  const reload = !loaded && (previous.messageId !== messageId || request !== "");
+  const generation = previous.generation + (reload ? 1 : 0);
+  return { messageId, request, generation };
 }
 
 export function useMessageLoading({
@@ -61,10 +95,25 @@ export function useMessageLoading({
   reactionTimers,
   nextCursor,
   loadingMore,
-  focusMessageId,
+  focusMessageId = "",
+  focusRequest = "",
+  focusLoaded = false,
 }: Options): MessageLoading {
   const pageAbort = useRef<AbortController | null>(null);
   const olderPageAbort = useRef<AbortController | null>(null);
+  // The conversation the last load was for: reloading the same one (a new
+  // message target) keeps the reply being composed, another one never does.
+  const lastLoadKey = useRef("");
+
+  // Adjusted during render, React's documented pattern for state derived from
+  // a prop change (react-hooks/set-state-in-effect forbids the effect form).
+  const [focusLoad, setFocusLoad] = useState<FocusLoad>({
+    messageId: focusMessageId,
+    request: focusRequest,
+    generation: 0,
+  });
+  const nextLoad = nextFocusLoad(focusLoad, focusMessageId, focusRequest, focusLoaded);
+  if (nextLoad !== focusLoad) setFocusLoad(nextLoad);
 
   /**
    * Pagination as the newest committed render left it.
@@ -95,15 +144,19 @@ export function useMessageLoading({
     olderPageAbort.current?.abort();
     fallbacks.abortAll();
     scope.retarget(loadKey);
+    scope.markLoaded(null);
+    const keepReply = lastLoadKey.current === loadKey;
+    lastLoadKey.current = loadKey;
 
     const controller = new AbortController();
     pageAbort.current = controller;
-    dispatch({ type: "loading" });
+    dispatch({ type: "loading", keepReply });
 
     gateway.fetchPage(undefined, controller.signal).then(
       (page) => {
         if (!scope.isCurrent(loadKey)) return;
         dispatch({ type: "loaded", page: sanitizePage(page) });
+        scope.markLoaded(loadKey);
       },
       (error: unknown) => {
         if (!scope.isCurrent(loadKey)) return;
@@ -123,7 +176,7 @@ export function useMessageLoading({
   useEffect(() => {
     if (!scope.targetId) return;
     return load();
-  }, [load, scope.targetId, focusMessageId]);
+  }, [load, scope.targetId, focusLoad.generation]);
 
   const retry = useCallback(() => {
     if (scope.targetId) load();
@@ -144,17 +197,18 @@ export function useMessageLoading({
 
     dispatch({ type: "prepending" });
 
+    // The cursor travels with the answer: the reducer applies it only while the
+    // timeline still continues from that cursor (issue #947).
+    const settle = () => {
+      if (olderPageAbort.current === controller) paging.current.loadingMore = false;
+      return scope.isCurrent(loadKey);
+    };
     gateway.fetchPage(cursor, controller.signal).then(
       (page) => {
-        paging.current.loadingMore = false;
-        if (!scope.isCurrent(loadKey)) return;
-        dispatch({ type: "prepended", page: sanitizePage(page) });
+        if (settle()) dispatch({ type: "prepended", page: sanitizePage(page), cursor });
       },
       (error: unknown) => {
-        paging.current.loadingMore = false;
-        if (!scope.isCurrent(loadKey)) return;
-        if (isAbortError(error)) return;
-        dispatch({ type: "prepend_error" });
+        if (settle() && !isAbortError(error)) dispatch({ type: "prepend_error", cursor });
       },
     );
   }, [dispatch, gateway, sanitizePage, scope]);

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Owner of `Tests / Go Integration`: the Go suites that need a real PostgreSQL
-# and can be run as a whole package without colliding with each other.
+# Owner of `Tests / Go Integration`: the Go suites that need real infrastructure
+# — PostgreSQL, and for the WebSocket multi-replica family a real Valkey — and
+# can be run as a whole package without colliding with each other.
 #
 # Pure unit tests must never wait for a database, so these live here rather than
 # in `go-test.sh`, which exports no DSN and therefore skips every opt-in suite.
@@ -25,6 +26,7 @@
 #     need SeaweedFS. See docs/testing/taxonomy.md; fixing them is its own issue.
 #
 # Local run (Docker):
+#   docker run -d --name nchat-int-valkey -p 56379:6379 valkey/valkey:8.1.3-alpine
 #   docker run -d --name nchat-int-pg -e POSTGRES_USER=nchat \
 #     -e POSTGRES_PASSWORD=REPLACE_ME -e POSTGRES_DB=nchat_test -p 55432:5432 postgres:16
 #   for db in admin_test auth_test media_test search_test channel_creation_test; do
@@ -37,13 +39,14 @@
 #   MEDIA_TEST_DATABASE_URL="$base/media_test?sslmode=disable" \
 #   SEARCH_TEST_DATABASE_URL="$base/search_test?sslmode=disable" \
 #   CHANNEL_CREATION_TEST_DATABASE_URL="$base/channel_creation_test?sslmode=disable" \
+#   CHAT_TEST_VALKEY_URL="redis://127.0.0.1:56379" \
 #     make test-integration-go
-#   docker rm -f nchat-int-pg
+#   docker rm -f nchat-int-pg nchat-int-valkey
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
-# module | DSN variable | package | extra `go test` flags
+# module | infrastructure variable | package | extra `go test` flags
 #
 # chat-service entries are restricted to named families: the rest of its
 # PostgreSQL suites belong to Go Coverage or have no owner yet (see above).
@@ -61,6 +64,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 # family on its own instead of passing while the other still matches.
 # media-service carries a `//go:build integration` tag, so without `-tags` its
 # suite is not even compiled.
+# The chat-service WebSocket family (issue #947) runs two hubs — two replicas —
+# over a real Valkey: cross-replica delivery, a failed re-check on the receiving
+# replica, recovery without a new broadcast, unsubscribe and reconnect during
+# recovery, goroutine cleanup. Each case uses its own workspace, so its own bus
+# channel, and the hubs are shut down by the tests themselves.
 SUITES=(
   "services/chat-service|CHAT_TEST_DATABASE_URL|./internal/storage|-run ^(TestChannelMembershipContractPostgreSQL_|TestPresenceStorePostgreSQL_|TestCallPresencePG_|TestGroupIdentityPostgreSQL_|TestConversationReadStatePostgreSQL_)"
   "services/chat-service|CHANNEL_CREATION_TEST_DATABASE_URL|./internal/storage|-run ^TestChannelCreationPostgreSQL_"
@@ -69,13 +77,14 @@ SUITES=(
   "services/media-service|MEDIA_TEST_DATABASE_URL|./internal/storage|-tags integration"
   "services/search-service|SEARCH_TEST_DATABASE_URL|./internal/storage|-run ^TestSearchAuthorizationPostgreSQL$"
   "services/search-service|SEARCH_TEST_DATABASE_URL|./internal/storage|-run ^TestSearchLinksPostgreSQL$"
+  "services/chat-service|CHAT_TEST_VALKEY_URL|./internal/ws|-race -run ^TestSyncRecoveryValkey_"
 )
 
 for suite in "${SUITES[@]}"; do
   IFS='|' read -r module dsn_variable package flags <<<"$suite"
 
   if [ -z "${!dsn_variable:-}" ]; then
-    echo "$dsn_variable is required: $module has no database to run against." >&2
+    echo "$dsn_variable is required: $module has no infrastructure to run against." >&2
     exit 1
   fi
 

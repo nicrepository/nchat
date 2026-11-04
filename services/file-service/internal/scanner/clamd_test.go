@@ -229,6 +229,8 @@ func TestScanNeverReportsCleanForAnythingButOK(t *testing.T) {
 		"empty":             "\x00",
 		"truncated verdict": "stream: O\x00",
 		"no terminator":     "stream: OK",
+		"unexpected source": "other: OK\x00",
+		"empty prefix":      " OK\x00",
 	} {
 		t.Run(name, func(t *testing.T) {
 			daemon := startFakeDaemon(t, &fakeDaemon{reply: reply})

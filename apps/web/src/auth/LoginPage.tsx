@@ -1,7 +1,7 @@
 import { type FormEvent, useState } from "react";
 import { Link, Navigate, useLocation, useNavigate } from "react-router";
 
-import { clearTokens, isAuthenticated, setTokens } from "../lib/authSession";
+import { clearTokens, isAuthenticated, markFreshLogin, setTokens } from "../lib/authSession";
 import { safeFrom } from "../lib/safeRedirect";
 import "../tokens.css";
 import "./auth.css";
@@ -42,6 +42,7 @@ export default function LoginPage() {
         return;
       }
       setTokens(result.accessToken);
+      markFreshLogin(dest);
       navigate(dest, { replace: true });
     } catch {
       setError(LOGIN_ERROR);

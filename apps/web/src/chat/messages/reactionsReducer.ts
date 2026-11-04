@@ -8,7 +8,7 @@
  * order they arrive in.
  */
 
-import { parseReactionUsers } from "../chatTypes";
+import { parseReactionUsers, type Message } from "../chatTypes";
 import type { WSReactionUpdatedEvent } from "../useChatWebSocket";
 import {
   applyPendingReactions,
@@ -18,6 +18,31 @@ import {
   withPending,
 } from "./pendingReactions";
 import type { Action, ActionOf, MessagesState } from "./types";
+
+/**
+ * The server's absolute list after a reaction event, with this reader's own
+ * flag carried over. It is the event's fact, independent of any intent the
+ * reader still has pending — which is what lets a catch-up rebase replay it
+ * (issue #947) without touching those intents.
+ */
+export function confirmedReactions(
+  previous: Message["reactions"],
+  reaction: NonNullable<WSReactionUpdatedEvent["reaction"]>,
+  actorIsMe: boolean,
+): Message["reactions"] {
+  const wasReacted = new Map(previous.map((item) => [item.emoji, item.reactedByMe]));
+  return reaction.reactions.map((item) => ({
+    emoji: item.emoji,
+    count: item.count,
+    // The names travel with the event, so a tooltip is correct the instant the
+    // count changes — no refetch, and no request when it is hovered.
+    users: parseReactionUsers(item.users),
+    reactedByMe:
+      actorIsMe && item.emoji === reaction.emoji
+        ? reaction.added
+        : (wasReacted.get(item.emoji) ?? false),
+  }));
+}
 
 /**
  * Applies a reaction.updated event to the message it names (issue #496).
@@ -47,18 +72,7 @@ function applyReactionEvent(
   if (index < 0) return state;
   const message = state.messages[index];
   const previous = pendingFor(state.pendingReactions, reaction.message_id, message.reactions);
-  const wasReacted = new Map(previous.confirmed.map((item) => [item.emoji, item.reactedByMe]));
-  const confirmed = reaction.reactions.map((item) => ({
-    emoji: item.emoji,
-    count: item.count,
-    // The names travel with the event, so a tooltip is correct the instant the
-    // count changes — no refetch, and no request when it is hovered.
-    users: parseReactionUsers(item.users),
-    reactedByMe:
-      actorIsMe && item.emoji === reaction.emoji
-        ? reaction.added
-        : (wasReacted.get(item.emoji) ?? false),
-  }));
+  const confirmed = confirmedReactions(previous.confirmed, reaction, actorIsMe);
   const confirmation = confirmReactionIntent(state.pendingReactions, reaction, actorIsMe);
   const pending = {
     confirmed,

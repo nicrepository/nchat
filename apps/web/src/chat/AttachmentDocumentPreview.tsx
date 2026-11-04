@@ -48,6 +48,7 @@
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
+import { isImagePreviewableDocument } from "./attachmentDocumentRules";
 import { useAttachmentGate } from "./lazyAttachment";
 import { useAttachmentBlobUrl } from "./useAttachmentBlobUrl";
 import { fetchDocumentPreviewPage, regenerateDocumentPreview } from "./filesApi";
@@ -81,26 +82,6 @@ function requestPreviewRegeneration(attachmentId: string): Promise<unknown> {
   });
   regenerationsInFlight.set(attachmentId, started);
   return started;
-}
-
-/**
- * Whether this attachment's first page, once ready, is a JPEG this component
- * may fetch and show.
- *
- * An allowlist rather than a denylist, and deliberately narrow: the detected
- * type file-service reports is the coarse net/http.DetectContentType sniff
- * (see MessageAttachments' isDocumentAttachment for the full reasoning), so
- * `text/plain` and `application/zip` cover CSV/XLSX *and* every other
- * document type this build does not render as an image. The filename is used
- * only to select the already-authorized presentation path; the server still
- * identifies and validates the container before ever publishing AVAILABLE.
- */
-function isImagePreviewableDocument(attachment: ChannelAttachment): boolean {
-  const type = attachment.contentType.split(";")[0].trim().toLowerCase();
-  if (type === "application/pdf") return true;
-  if (type !== "application/zip" && type !== "application/octet-stream") return false;
-  const extension = attachment.filename.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1];
-  return extension === "docx" || extension === "odt" || extension === "ppt" || extension === "pptx";
 }
 
 interface AttachmentDocumentPreviewProps {

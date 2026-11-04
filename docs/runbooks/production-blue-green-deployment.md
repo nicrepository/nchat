@@ -1420,8 +1420,8 @@ transition that finds no record refuses and names the administrative command.
 The deployer's ServiceAccount, Role and RoleBinding live in
 `infra/k8s/bootstrap/nchat-prod`. Nothing a release renders includes them or
 the record (`make prod-bootstrap-rbac-test` checks both, and that the Role is
-the production baseline plus the one rule above). They are applied by a cluster
-administrator, never by CD.
+the production baseline plus the rule above and the scale rule below). They are
+applied by a cluster administrator, never by CD.
 
 **Order, for a new namespace.** Steps 1 and 2 are the administrator's; only
 then does anything run as the deployer:
@@ -1452,6 +1452,37 @@ kubectl auth can-i patch  configmap/nchat-config        -n nchat-prod --as=$SA  
 ```
 
 The `kubectl diff` in step 1 must show one added rule and nothing else.
+
+#### Retiring a slot needs the scale subresource (issue #1108)
+
+`drain-old.sh` — run by hand, or by `prepare-slot.sh` when CD retires an
+expired rollback reservation — scales the slot with `kubectl scale
+--replicas=0`. That request does not write the Deployment: kubectl reads it and
+then sends `PATCH deployments/<name>/scale`, or `GET` + `PUT` on the same
+subresource when a precondition such as `--current-replicas` is given. RBAC
+authorizes `deployments/scale` separately from `deployments`, so the deployer
+holds `get`, `patch` and `update` on it for the twenty Blue/Green application
+Deployments by name, and nothing else:
+
+| Request                                                          | `nchat-prod-deployer` |
+| ---------------------------------------------------------------- | --------------------- |
+| `get`/`patch`/`update` `deployments/scale` of `<service>-<slot>` | yes                   |
+| the same on `clamav`, `upload-guard` or any other Deployment     | **no**                |
+| `create`/`delete`/`list` `deployments/scale`                     | **no**                |
+| `statefulsets/scale` (PostgreSQL, Valkey, SeaweedFS)             | **no**                |
+
+`make prod-bootstrap-rbac-test` holds the names to exactly the Deployments the
+slot overlays render, so a service added to a slot without this grant fails CI
+instead of the next drain. After the administrator applies step 1:
+
+```bash
+SA=system:serviceaccount:nchat-prod:nchat-prod-deployer
+kubectl auth can-i patch  deployment/nchat-web-green --subresource=scale -n nchat-prod --as=$SA  # yes
+kubectl auth can-i update deployment/nchat-web-blue  --subresource=scale -n nchat-prod --as=$SA  # yes
+kubectl auth can-i patch  deployment/clamav          --subresource=scale -n nchat-prod --as=$SA  # no
+kubectl auth can-i patch  statefulset/postgres       --subresource=scale -n nchat-prod --as=$SA  # no
+kubectl auth can-i create deployments                --subresource=scale -n nchat-prod --as=$SA  # no
+```
 
 The cluster stays the source of truth for **where production is**. The active
 slot is always `resolve_active_slot(collect_service_slots())`, never

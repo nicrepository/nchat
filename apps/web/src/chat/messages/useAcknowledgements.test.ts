@@ -82,6 +82,8 @@ function scopeFor(messages: Message[], key = "channel:ch-1"): ConversationScope 
     sanitize: (message: Message) => message,
     rememberDeleted: () => undefined,
     retarget: () => undefined,
+    isLoaded: (candidate: string) => candidate === key,
+    markLoaded: () => undefined,
   };
 }
 

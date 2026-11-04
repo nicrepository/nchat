@@ -25,7 +25,7 @@ func discardLogger() *slog.Logger {
 
 func TestUploadToChannelStoresEncryptedContentAndPendingScanMetadata(t *testing.T) {
 	f := newFixture(t)
-	payload := []byte("%PDF-1.7 quarterly report body")
+	payload := []byte("%PDF-1.7 quarterly report body\n%%EOF")
 
 	view, err := f.upload(context.Background(), bytes.NewReader(payload), "report.pdf")
 	if err != nil {
@@ -72,6 +72,22 @@ func TestUploadToChannelStoresEncryptedContentAndPendingScanMetadata(t *testing.
 	if uploaded[0].Size != int64(len(payload)) {
 		t.Fatalf("expected plaintext size %d, got %d", len(payload), uploaded[0].Size)
 	}
+}
+
+func TestUploadReauthorizesBeforeFinalizing(t *testing.T) {
+	f := newFixture(t)
+	target, err := f.service.AuthorizeUpload(context.Background(), service.AuthorizeUploadInput{
+		Destination: domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID}, UserID: testUserID, SessionID: testSessionID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.authorizer.err = domain.ErrNotFound
+	_, err = f.service.Upload(context.Background(), service.UploadInput{Target: target, Filename: "notes.txt", DeclaredMIME: "text/plain", Content: strings.NewReader("synthetic content")})
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("revoked membership upload: %v", err)
+	}
+	assertCompensated(t, f)
 }
 
 func TestUploadToConversationRecordsTheDMDestination(t *testing.T) {
@@ -230,11 +246,11 @@ func TestUploadRejectsActiveMarkupBeyondTheDetectionWindowAndCleansThePartialObj
 
 func TestUploadNormalisesTheFilenameBeforePersisting(t *testing.T) {
 	f := newFixture(t)
-	view, err := f.upload(context.Background(), strings.NewReader("data"), "../../etc/pass\x00wd")
+	view, err := f.upload(context.Background(), strings.NewReader("data"), "../../etc/pass\x00wd.txt")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if view.Filename != "passwd" {
+	if view.Filename != "passwd.txt" {
 		t.Fatalf("expected a normalised filename, got %q", view.Filename)
 	}
 	created, _, _ := f.store.snapshot()
@@ -660,7 +676,7 @@ func TestNewAttachmentServiceToleratesANilLogger(t *testing.T) {
 // storedAttachment uploads real content and returns the row a reader would see.
 func storedAttachment(t *testing.T, f *fixture, payload []byte, status domain.Status) service.StoredAttachment {
 	t.Helper()
-	view, err := f.upload(context.Background(), bytes.NewReader(payload), "report.pdf")
+	view, err := f.upload(context.Background(), bytes.NewReader(payload), "report.txt")
 	if err != nil {
 		t.Fatalf("seed upload: %v", err)
 	}
@@ -711,7 +727,7 @@ func TestDownloadReturnsTheOriginalPlaintext(t *testing.T) {
 	if download.Size != int64(len(payload)) {
 		t.Fatalf("expected size %d, got %d", len(payload), download.Size)
 	}
-	if download.Filename != "report.pdf" {
+	if download.Filename != "report.txt" {
 		t.Fatalf("unexpected filename %q", download.Filename)
 	}
 }
@@ -877,7 +893,7 @@ func TestMetadataReturnsTheClientProjection(t *testing.T) {
 	if view.ID != f.store.authorized.ID || view.Status != string(domain.StatusPendingScan) {
 		t.Fatalf("unexpected view: %+v", view)
 	}
-	if view.Filename != "report.pdf" {
+	if view.Filename != "report.txt" {
 		t.Fatalf("unexpected filename %q", view.Filename)
 	}
 }
@@ -950,7 +966,7 @@ func assertCompensated(t *testing.T, f *fixture) {
 // would have to guess.
 func TestUploadPersistsTheActiveKeyID(t *testing.T) {
 	f := newFixture(t)
-	if _, err := f.upload(context.Background(), bytes.NewReader([]byte("payload")), "report.pdf"); err != nil {
+	if _, err := f.upload(context.Background(), bytes.NewReader([]byte("payload")), "report.txt"); err != nil {
 		t.Fatalf("upload: %v", err)
 	}
 	created, uploaded, _ := f.store.snapshot()
@@ -1068,6 +1084,9 @@ func TestDownloadRejectsATamperedSize(t *testing.T) {
 			f := newFixture(t)
 			f.store.authorized = storedAttachment(t, f, payload, domain.StatusClean)
 			f.store.authorized.Size = size
+			f.objects.mu.Lock()
+			f.objects.opens = 0
+			f.objects.mu.Unlock()
 
 			_, err := f.service.Download(context.Background(), downloadInput(f.store.authorized.ID))
 			if !errors.Is(err, crypto.ErrCiphertext) {
@@ -1136,7 +1155,7 @@ func TestPendingRowCarriesNoKeyMaterialUntilFinalisation(t *testing.T) {
 	f.store.uploadErr = errors.New("update failed")
 
 	if _, err := f.upload(context.Background(),
-		bytes.NewReader([]byte("payload")), "report.pdf"); err == nil {
+		bytes.NewReader([]byte("payload")), "report.txt"); err == nil {
 		t.Fatal("expected the upload to fail")
 	}
 	created, uploaded, _ := f.store.snapshot()
@@ -1162,7 +1181,7 @@ func TestFinalizedSizeCountsTheBytesActuallyRead(t *testing.T) {
 
 	if _, err := f.uploadTo(context.Background(),
 		domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID},
-		&lyingReader{Reader: bytes.NewReader(payload)}, "report.pdf", "application/octet-stream",
+		&lyingReader{Reader: bytes.NewReader(payload)}, "report.txt", "application/octet-stream",
 	); err != nil {
 		t.Fatalf("upload: %v", err)
 	}
@@ -1194,7 +1213,7 @@ func TestUploadCompensatesWhenTheStoredEnvelopeSizeIsWrong(t *testing.T) {
 	f.objects.shortPutBy = 1
 
 	if _, err := f.upload(context.Background(),
-		bytes.NewReader([]byte("payload")), "report.pdf"); err == nil {
+		bytes.NewReader([]byte("payload")), "report.txt"); err == nil {
 		t.Fatal("expected the upload to fail")
 	}
 	_, uploaded, _ := f.store.snapshot()

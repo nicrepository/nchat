@@ -65,6 +65,37 @@
   font-size: 20px;
 }
 
+.chat-details__close-icon--back {
+  display: none;
+}
+
+/*
+ * Where the navigation is a drawer — the band of AppShell.css and useNavDrawer's
+ * NAV_DRAWER_QUERY, the one where the header shows its Back (issue #1124) — the
+ * panel covers the header, so its close stands where that Back stood: first in
+ * the strip, the same arrow, the same 44px target.
+ */
+@media (max-width: 1023.98px) {
+  .chat-details__head {
+    justify-content: flex-start;
+    padding-left: max(clamp(12px, 2vw, 24px), env(safe-area-inset-left));
+  }
+
+  .chat-details__close {
+    order: -1;
+    width: 44px;
+    height: 44px;
+  }
+
+  .chat-details__close-icon--close {
+    display: none;
+  }
+
+  .chat-details__close-icon--back {
+    display: inline;
+  }
+}
+
 .chat-details__body {
   flex: 1;
   min-height: 0;

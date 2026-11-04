@@ -598,6 +598,27 @@ func TestDomainMessageToWSPayloadMapsDeletedQuotePlaceholder(t *testing.T) {
 	}
 }
 
+// Issue #1099: realtime carries the same quoted-author projection as HTTP,
+// including the "" that says the author no longer exists.
+func TestDomainMessageToWSPayloadCarriesQuoteAuthorDisplayName(t *testing.T) {
+	quote := &domain.QuotedMessage{
+		ID: "parent-1", AuthorID: "user-2", BodyText: "Salve", AuthorDisplayName: "Ana Souza",
+		BodyFormat: domain.MessageBodyFormatV1, Status: domain.MessageStatusActive, CreatedAt: time.Now().UTC(),
+	}
+	got := domainMessageToWSPayload(domain.Message{ID: "message-1", Quoted: quote})
+	if got.Quoted == nil || got.Quoted.AuthorDisplayName != "Ana Souza" {
+		t.Fatalf("quoted author name not carried: %+v", got.Quoted)
+	}
+	quote.AuthorDisplayName = ""
+	encoded, err := json.Marshal(domainQuoteToWSPayload(quote))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"author_display_name":""`) {
+		t.Fatalf("an unknown author must be sent as \"\", got %s", encoded)
+	}
+}
+
 func TestDomainMessageToWSPayloadCarriesMaliciousQuoteState(t *testing.T) {
 	got := domainMessageToWSPayload(domain.Message{
 		ID: "message-1", WorkspaceID: "workspace-1", ChannelID: "channel-1",

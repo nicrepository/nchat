@@ -1,9 +1,11 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router";
+import { useEffect, useState } from "react";
+import { MemoryRouter, Outlet, Route, Routes, useLocation, useNavigate } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiRequestError } from "../lib/api";
+import { setTokens } from "../lib/authSession";
 
 const { mockSearchCategory } = vi.hoisted(() => ({ mockSearchCategory: vi.fn() }));
 
@@ -21,6 +23,7 @@ import {
   resultPage,
   userResult,
 } from "./searchFixtures";
+import { withRestoredSearch } from "./searchNavigation";
 import type { SearchCategory } from "./searchTypes";
 
 const FIELD = "Buscar mensagens, pessoas, canais, grupos e arquivos";
@@ -44,12 +47,34 @@ function Elsewhere() {
   );
 }
 
-function renderPage() {
+/** The confirmed identity the chat shell hands its routes, as the test sets it. */
+let setIdentity: (identity: string | null) => void = () => {};
+
+/** The rest of the shell's context a test sets: a failed sidebar, its retry. */
+let shellContext: Record<string, unknown> = {};
+
+function Shell({ initial }: { initial: string | null }) {
+  const [sessionIdentity, set] = useState(initial);
+  useEffect(() => {
+    setIdentity = set;
+  }, []);
+  return <Outlet context={{ ...shellContext, sessionIdentity }} />;
+}
+
+function renderPage(
+  entries: { pathname: string; state?: unknown }[] = [
+    { pathname: "/chat/channel/geral" },
+    { pathname: "/chat/search" },
+  ],
+  identity: string | null = "u1:w1",
+) {
   return render(
-    <MemoryRouter initialEntries={["/chat/channel/geral", "/chat/search"]} initialIndex={1}>
+    <MemoryRouter initialEntries={entries} initialIndex={entries.length - 1}>
       <Routes>
-        <Route path="/chat/search" element={<GlobalSearchPage />} />
-        <Route path="/chat/:kind/:id" element={<Elsewhere />} />
+        <Route element={<Shell initial={identity} />}>
+          <Route path="/chat/search" element={<GlobalSearchPage />} />
+          <Route path="/chat/:kind/:id" element={<Elsewhere />} />
+        </Route>
       </Routes>
     </MemoryRouter>,
   );
@@ -72,16 +97,156 @@ async function search(text: string) {
 
 beforeEach(() => {
   vi.useFakeTimers();
+  // JSDOM has no layout; model a scrollable reading area for the offset assertions.
+  vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(1000);
+  vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(300);
+  shellContext = {};
   mockSearchCategory
     .mockReset()
     .mockImplementation((category: SearchCategory) => Promise.resolve(results[category]));
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
 describe("GlobalSearchPage", () => {
+  it("a new session while mounted does not re-read the previous session's saved search", async () => {
+    renderPage([
+      {
+        pathname: "/chat/search",
+        state: withRestoredSearch(null, { query: "segredo", tab: "groups" }, "u1:w1"),
+      },
+    ]);
+    await flush();
+    expect(screen.getByRole("searchbox")).toHaveValue("segredo");
+    act(() => setTokens("new-session"));
+    await flush();
+    expect(screen.getByRole("searchbox")).toHaveValue("");
+    expect(screen.getByRole("tab", { name: "Tudo" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("keeps pagination and focus intent across a failed revalidation and explicit retry", async () => {
+    mockSearchCategory.mockImplementation(
+      (category: SearchCategory, _query: string, options?: { cursor?: string; limit?: number }) => {
+        if (category !== "groups" || options?.limit === 5) return Promise.resolve(resultPage([]));
+        return Promise.resolve(
+          resultPage(
+            [
+              groupResult({
+                id: options?.cursor ? "g2" : "g1",
+                title: options?.cursor ? "Segunda página" : "Primeira página",
+              }),
+            ],
+            options?.cursor ? null : "c1",
+          ),
+        );
+      },
+    );
+    renderPage();
+    await search("backup");
+    fireEvent.click(screen.getByRole("tab", { name: "Grupos" }));
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: /carregar mais/i }));
+    await flush();
+    screen.getByRole("tab", { name: "Grupos" }).focus();
+    const root = screen.getByTestId("global-search");
+    root.scrollTop = 180;
+    fireEvent.scroll(root);
+    act(() => setIdentity(null));
+    const fetchPage = mockSearchCategory.getMockImplementation()!;
+    mockSearchCategory.mockRejectedValueOnce(new Error("offline"));
+    act(() => setIdentity("u1:w1"));
+    await flush();
+    expect(screen.queryByRole("button", { name: /Segunda página/ })).not.toBeInTheDocument();
+    // Model the browser clamping a scrollport whose results were replaced by an error.
+    screen.getByTestId("global-search").scrollTop = 0;
+    fireEvent.scroll(screen.getByTestId("global-search"));
+    mockSearchCategory.mockImplementation(fetchPage);
+    fireEvent.click(screen.getByRole("button", { name: /tentar novamente/i }));
+    await flush();
+    expect(screen.getByRole("button", { name: /Segunda página/ })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Grupos" })).toHaveFocus();
+    expect(screen.getByTestId("global-search").scrollTop).toBe(180);
+  });
+
+  it("restores the selected tab focus and reading scroll after same-owner revalidation", async () => {
+    renderPage();
+    await search("backup");
+    fireEvent.click(screen.getByRole("tab", { name: "Grupos" }));
+    await flush();
+    screen.getByRole("tab", { name: "Grupos" }).focus();
+    const root = screen.getByTestId("global-search");
+    root.scrollTop = 180;
+    fireEvent.scroll(root);
+    act(() => setIdentity(null));
+    act(() => setIdentity("u1:w1"));
+    await flush();
+    expect(screen.getByRole("tab", { name: "Grupos" })).toHaveFocus();
+    expect(screen.getByTestId("global-search").scrollTop).toBe(180);
+  });
+
+  it("revalidates a paginated tab after confirmation without losing its depth or fresh cursor", async () => {
+    let refreshed = false;
+    mockSearchCategory.mockImplementation(
+      (category: SearchCategory, _query: string, options?: { cursor?: string; limit?: number }) => {
+        if (category !== "groups" || options?.limit === 5) return Promise.resolve(resultPage([]));
+        if (options?.cursor)
+          return Promise.resolve(
+            resultPage(
+              [groupResult({ id: "g2", title: "Segunda página" })],
+              refreshed ? "new-2" : "old-2",
+            ),
+          );
+        return Promise.resolve(resultPage([groupResult()], refreshed ? "new-1" : "old-1"));
+      },
+    );
+    renderPage();
+    await search("backup");
+    fireEvent.click(screen.getByRole("tab", { name: "Grupos" }));
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: /carregar mais/i }));
+    await flush();
+    expect(screen.getByRole("button", { name: /Segunda página/ })).toBeInTheDocument();
+    refreshed = true;
+    mockSearchCategory.mockClear();
+    act(() => setIdentity(null));
+    expect(screen.queryByRole("button", { name: /Segunda página/ })).not.toBeInTheDocument();
+    act(() => setIdentity("u1:w1"));
+    await flush();
+    expect(screen.getByRole("searchbox")).toHaveValue("backup");
+    expect(screen.getByRole("tab", { name: "Grupos" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("button", { name: /Segunda página/ })).toBeInTheDocument();
+    expect(mockSearchCategory).toHaveBeenCalledTimes(2);
+    expect(mockSearchCategory).toHaveBeenLastCalledWith(
+      "groups",
+      "backup",
+      expect.objectContaining({ cursor: "new-1" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /carregar mais/i }));
+    await flush();
+    expect(mockSearchCategory).toHaveBeenLastCalledWith(
+      "groups",
+      "backup",
+      expect.objectContaining({ cursor: "new-2" }),
+    );
+    expect(screen.getAllByRole("button", { name: /Segunda página/ })).toHaveLength(1);
+  });
+
+  it("does not steal focus moved outside the search during same-owner confirmation", async () => {
+    renderPage();
+    await search("backup");
+    act(() => setIdentity(null));
+    const external = document.createElement("button");
+    document.body.append(external);
+    external.focus();
+    act(() => setIdentity("u1:w1"));
+    await flush();
+    expect(external).toHaveFocus();
+    external.remove();
+  });
+
   it("opens on Tudo with seven tabs, a focused labelled field and no request", () => {
     renderPage();
     const tabs = screen.getAllByRole("tab");
@@ -311,12 +476,13 @@ describe("GlobalSearchPage", () => {
     expect(screen.getAllByRole("listitem")).toHaveLength(1);
   });
 
-  it("closes with Escape", () => {
+  it("delegates Escape to the shell's safe contextual return", () => {
+    const goBack = vi.fn(() => false);
+    shellContext = { goBack };
     renderPage();
     fireEvent.keyDown(screen.getByRole("searchbox", { name: FIELD }), { key: "Escape" });
-    expect(
-      screen.getByRole("button", { name: "voltar de /chat/channel/geral" }),
-    ).toBeInTheDocument();
+    expect(goBack).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("searchbox", { name: FIELD })).toBeInTheDocument();
   });
 
   it("comes back from a result with the same query, tab and results", async () => {
@@ -395,5 +561,207 @@ describe("GlobalSearchPage", () => {
     expect(
       within(screen.getByRole("region", { name: "Links" })).getByText("1 resultado"),
     ).toBeInTheDocument();
+  });
+
+  describe("whose search it is (CQ-07)", () => {
+    const savedBy = (owner: string | null) => [
+      { pathname: "/chat/channel/geral" },
+      {
+        pathname: "/chat/search",
+        state: withRestoredSearch(null, { query: "segredo", tab: "groups" }, owner),
+      },
+    ];
+    const field = () => screen.queryByRole("searchbox", { name: FIELD });
+    const confirming = () => screen.queryByText("Confirmando sua sessão…");
+
+    it("brings a search back for the identity that left it, and for nobody else", async () => {
+      renderPage(savedBy("u1:w1"), "u1:w1");
+      await flush();
+      expect(field()).toHaveValue("segredo");
+    });
+
+    it.each([
+      ["another user", "u2:w1"],
+      ["another workspace", "u1:w2"],
+    ])("never brings back a search left by %s", async (_, identity) => {
+      renderPage(savedBy("u1:w1"), identity);
+      await flush();
+      expect(field()).toHaveValue("");
+      expect(screen.getByRole("tab", { name: "Tudo" })).toHaveAttribute("aria-selected", "true");
+      expect(mockSearchCategory).not.toHaveBeenCalled();
+    });
+
+    it("never brings back a search nobody confirmed left, nor one without an owner", async () => {
+      const first = renderPage(savedBy(null), "u1:w1");
+      await flush();
+      expect(field()).toHaveValue("");
+      first.unmount();
+
+      renderPage(
+        [{ pathname: "/chat/search", state: { globalSearch: { query: "x", tab: "all" } } }],
+        "u1:w1",
+      );
+      await flush();
+      expect(field()).toHaveValue("");
+    });
+
+    it("landing while the identity is in doubt: no field to type into, then the owner's search", async () => {
+      renderPage(savedBy("u1:w1"), null);
+      expect(field()).not.toBeInTheDocument();
+      expect(screen.getByRole("status")).toHaveTextContent("Confirmando sua sessão…");
+      expect(screen.getByTestId("global-search")).toHaveAttribute("aria-busy", "true");
+      expect(mockSearchCategory).not.toHaveBeenCalled();
+
+      act(() => setIdentity("u1:w1"));
+      await flush();
+      expect(field()).toHaveValue("segredo");
+      expect(field()).toHaveFocus();
+      expect(screen.getByRole("tab", { name: "Grupos" })).toHaveAttribute("aria-selected", "true");
+    });
+
+    it("landing while the identity is in doubt, confirmed as another: never restored", async () => {
+      renderPage(savedBy("u1:w1"), null);
+      act(() => setIdentity("u2:w1"));
+      await flush();
+      expect(field()).toHaveValue("");
+      expect(mockSearchCategory).not.toHaveBeenCalled();
+    });
+
+    it("a mounted search hides while confirming, keeps query and tab, and searches again once confirmed", async () => {
+      renderPage();
+      await search("backup");
+      fireEvent.click(screen.getByRole("tab", { name: "Grupos" }));
+      await flush();
+      mockSearchCategory.mockClear();
+
+      act(() => setIdentity(null));
+      expect(field()).not.toBeInTheDocument();
+      expect(screen.queryByText("backup")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /Backup Squad/ })).not.toBeInTheDocument();
+      expect(screen.getByRole("status")).toHaveTextContent("Confirmando sua sessão…");
+      await flush();
+      expect(mockSearchCategory).not.toHaveBeenCalled();
+
+      act(() => setIdentity("u1:w1"));
+      expect(confirming()).not.toBeInTheDocument();
+      expect(field()).toHaveValue("backup");
+      await flush();
+      expect(field()).toHaveFocus();
+      expect(screen.getByRole("tab", { name: "Grupos" })).toHaveAttribute("aria-selected", "true");
+      await flush();
+      // The results are asked for again, under the identity just confirmed.
+      expect(mockSearchCategory).toHaveBeenCalledWith("groups", "backup", expect.anything());
+      expect(screen.getByRole("button", { name: /Backup Squad/ })).toBeInTheDocument();
+    });
+
+    it("an answer requested before the doubt is dropped, even when the same user is confirmed (CQ-10)", async () => {
+      renderPage();
+      let answerLate!: (page: ReturnType<typeof resultPage>) => void;
+      mockSearchCategory.mockImplementation((category: SearchCategory) =>
+        category === "groups"
+          ? new Promise((resolve) => (answerLate = resolve))
+          : Promise.resolve(resultPage([])),
+      );
+      await search("backup");
+
+      act(() => setIdentity(null));
+      await act(async () => answerLate(results.groups));
+      mockSearchCategory.mockImplementation(() => Promise.resolve(resultPage([])));
+      act(() => setIdentity("u1:w1"));
+      await flush();
+
+      expect(field()).toHaveValue("backup");
+      expect(screen.queryByRole("button", { name: /Backup Squad/ })).not.toBeInTheDocument();
+    });
+
+    it("a query committed while in doubt is searched only once confirmed (CQ-10)", async () => {
+      renderPage();
+      fireEvent.change(screen.getByRole("searchbox", { name: FIELD }), {
+        target: { value: "backup" },
+      });
+      act(() => setIdentity(null));
+      await act(async () => {
+        vi.advanceTimersByTime(300);
+      });
+      await flush();
+      expect(mockSearchCategory).not.toHaveBeenCalled();
+
+      act(() => setIdentity("u1:w1"));
+      await flush();
+      expect(field()).toHaveValue("backup");
+      expect(mockSearchCategory).toHaveBeenCalledWith("messages", "backup", expect.anything());
+    });
+
+    it("what the reader typed over a restored search survives the same user's confirmation (CQ-11)", async () => {
+      renderPage(savedBy("u1:w1"), "u1:w1");
+      await flush();
+      expect(field()).toHaveValue("segredo");
+      fireEvent.change(field()!, { target: { value: "texto-novo-digitado" } });
+
+      act(() => setIdentity(null));
+      act(() => setIdentity("u1:w1"));
+      await flush();
+      expect(field()).toHaveValue("texto-novo-digitado");
+      expect(screen.getByRole("tab", { name: "Grupos" })).toHaveAttribute("aria-selected", "true");
+    });
+
+    it("no identity because the sidebar failed: a retry, no field, no request; then usable (CQ-10)", async () => {
+      const retrySidebar = vi.fn();
+      shellContext = {
+        sidebarLoading: false,
+        currentUserId: "",
+        refreshConversations: retrySidebar,
+      };
+      renderPage(undefined, null);
+      expect(screen.getByRole("alert")).toHaveTextContent("Não foi possível confirmar sua sessão.");
+      expect(field()).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Tentar novamente" }));
+      expect(retrySidebar).toHaveBeenCalledTimes(1);
+
+      act(() => setIdentity("u1:w1"));
+      await search("backup");
+      expect(mockSearchCategory).toHaveBeenCalledWith("messages", "backup", expect.anything());
+    });
+
+    it("a mounted search starts over for another user, and a late answer for the old query never lands", async () => {
+      renderPage();
+      await search("backup");
+      let answerLate!: (page: ReturnType<typeof resultPage>) => void;
+      mockSearchCategory.mockImplementation(() => new Promise((resolve) => (answerLate = resolve)));
+      await search("backup squad");
+      const staleRequests = mockSearchCategory.mock.calls.length;
+
+      act(() => setIdentity(null));
+      act(() => setIdentity("u2:w1"));
+      await flush();
+      expect(field()).toHaveValue("");
+      expect(screen.getByTestId("global-search-initial")).toBeInTheDocument();
+
+      await act(async () => answerLate(results.groups));
+      await flush();
+      expect(screen.queryByRole("button", { name: /Backup Squad/ })).not.toBeInTheDocument();
+      expect(field()).toHaveValue("");
+      expect(mockSearchCategory).toHaveBeenCalledTimes(staleRequests);
+
+      mockSearchCategory.mockImplementation((category: SearchCategory) =>
+        Promise.resolve(results[category]),
+      );
+      await search("novo");
+      expect(field()).toHaveValue("novo");
+    });
+
+    it("leaving for a result records the search with its owner", async () => {
+      renderPage();
+      await search("backup");
+      fireEvent.click(screen.getByRole("tab", { name: "Grupos" }));
+      await flush();
+      fireEvent.click(screen.getByRole("button", { name: /Grupo Backup Squad/ }));
+
+      // Back as another user: the entry is U1's, so nothing comes back.
+      act(() => setIdentity("u2:w1"));
+      fireEvent.click(screen.getByRole("button", { name: "voltar de /chat/dm/g2" }));
+      await flush();
+      expect(field()).toHaveValue("");
+    });
   });
 });

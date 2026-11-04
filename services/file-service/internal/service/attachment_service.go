@@ -9,18 +9,17 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/nicrepository/nchat/libs/go/platform/uploadpolicy"
 	"github.com/nicrepository/nchat/services/file-service/internal/crypto"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
+	"github.com/nicrepository/nchat/services/file-service/internal/filepolicy"
 )
 
-// sniffLimit is how much plaintext is inspected to detect the real content
-// type. It is the amount net/http.DetectContentType consumes; reading more
-// would buy nothing and cost memory.
+// sniffLimit bounds the preliminary MIME signal. Full format identification
+// happens on the encrypted object under filepolicy budgets before finalization.
 const sniffLimit = 512
 
 // compensationTimeout bounds the cleanup that follows a failed upload. It runs
@@ -49,8 +48,10 @@ const (
 	failureEnvelopeIncomplete = "envelope_incomplete"
 	// failureKeyWrap records a data key that could not be sealed against the
 	// final binding, which leaves the object unopenable and so unusable.
-	failureKeyWrap          = "key_wrap"
-	failureMetadataFinalize = "metadata_finalize"
+	failureKeyWrap              = "key_wrap"
+	failureMetadataFinalize     = "metadata_finalize"
+	failureFormatInspection     = "format_inspection"
+	failureAuthorizationChanged = "authorization_changed"
 )
 
 // DestinationAuthInput asks whether a session may attach a file to a
@@ -86,6 +87,7 @@ type DestinationAuthorizer interface {
 
 // NewAttachment is the row an upload starts from.
 type NewAttachment struct {
+	PolicyVersion    int
 	ID               string
 	WorkspaceID      string
 	UploaderID       string
@@ -120,8 +122,10 @@ type NewAttachment struct {
 //
 // The wrap version is absent by design: it was fixed when the row was created.
 type UploadedAttachment struct {
-	ID     string
-	Status domain.Status
+	PolicyVersion int
+	FormatID      string
+	ID            string
+	Status        domain.Status
 	// PreviewStatus schedules the preview job, or declares up front that there
 	// will never be one. It is written by the same UPDATE that finishes the
 	// upload, which is what makes the job durable without a queue: an
@@ -417,6 +421,7 @@ type AuthorizeUploadInput struct {
 // nothing but headers. Every field is server-derived: the workspace and the
 // limit come from the destination row, the uploader from the validated session.
 type UploadTarget struct {
+	SessionID      string
 	Destination    domain.Destination
 	WorkspaceID    string
 	UploaderID     string
@@ -505,16 +510,17 @@ type AttachmentService struct {
 	keys           *crypto.Keyring
 	maxUploadBytes int64
 	scanRequired   bool
+	profiles       filepolicy.Profiles
 	orphans        OrphanObserver
 	logger         *slog.Logger
-	// audioTranscoder is nil unless SetAudioTranscoder was called, which is
-	// how every existing test keeps its pre-transcoding behaviour unchanged:
-	// Download only attempts a re-encode when this is set.
+	// audioTranscoder is optional and used only by the explicit MP3 derivative.
+	// Download always opens the native original.
 	audioTranscoder AudioTranscoder
+	audioSlots      chan struct{}
 }
 
 // SetAudioTranscoder wires the Nic-Gravador compatibility task's MP3
-// re-encode into Download. It is optional and separate from
+// re-encode into DownloadMP3. It is optional and separate from
 // NewAttachmentService's constructor arguments on purpose: the constructor
 // already has ten parameters and this one dependency is wired later in
 // internal/app/app.go, alongside the same converter client the preview
@@ -543,6 +549,7 @@ func NewAttachmentService(
 	}
 	return &AttachmentService{
 		authorizer:     authorizer,
+		audioSlots:     make(chan struct{}, audioConversionConcurrency),
 		store:          store,
 		objects:        objects,
 		keys:           keys,
@@ -601,12 +608,14 @@ func (s *DraftExpiryService) ProcessDue(ctx context.Context) (int, error) {
 // uploadTarget is the authorised destination of an upload, with every value
 // the server decided itself: the caller supplies none of them directly.
 type uploadTarget struct {
-	destination    domain.Destination
-	workspaceID    string
-	uploaderID     string
-	filename       string
-	declaredMIME   string
-	draftExpiresAt *time.Time
+	filenameChanged bool
+	sessionID       string
+	destination     domain.Destination
+	workspaceID     string
+	uploaderID      string
+	filename        string
+	declaredMIME    string
+	draftExpiresAt  *time.Time
 	// maxUploadBytes is the limit this one upload is judged against: the
 	// destination workspace's administrative policy, narrowed by the deployment
 	// ceiling. Resolved once, here, so the policy cannot change underneath a
@@ -622,6 +631,7 @@ type uploadTarget struct {
 
 // sniffedContent is the head of the stream plus the type detected from it.
 type sniffedContent struct {
+	policy       filepolicy.Result
 	head         []byte
 	detectedMIME string
 	scanMarkup   bool
@@ -675,6 +685,7 @@ func (s *AttachmentService) AuthorizeUpload(
 		Destination: domain.Destination{Kind: input.Destination.Kind, ID: authorized.ID},
 		WorkspaceID: authorized.WorkspaceID,
 		UploaderID:  uploaderID,
+		SessionID:   sessionID,
 		// The workspace policy decides, the deployment ceiling can only narrow
 		// it, and a missing or out-of-range policy resolves to the default —
 		// never to "unlimited". Resolved once, here, so the policy cannot
@@ -770,9 +781,11 @@ func (s *AttachmentService) resolveUploadTarget(input UploadInput) (uploadTarget
 	declaredDurationMs, _ := domain.NormalizeDeclaredDurationMs(input.DurationMs)
 	return uploadTarget{
 		destination:        input.Target.Destination,
+		sessionID:          input.Target.SessionID,
 		workspaceID:        input.Target.WorkspaceID,
 		uploaderID:         input.Target.UploaderID,
 		filename:           filename,
+		filenameChanged:    filename != input.Filename,
 		declaredMIME:       domain.NormalizeDeclaredMIME(input.DeclaredMIME),
 		draftExpiresAt:     draftExpiresAt,
 		maxUploadBytes:     input.Target.MaxUploadBytes,
@@ -792,7 +805,7 @@ func sniffContent(source io.Reader) (sniffedContent, error) {
 		return sniffedContent{}, domain.ErrEmptyFile
 	}
 	detected := http.DetectContentType(head)
-	if !allowedUploadContent(detected, head) {
+	if blockedUploadPrefix(detected, head) {
 		return sniffedContent{}, domain.ErrUnsupportedMedia
 	}
 	return sniffedContent{
@@ -801,33 +814,11 @@ func sniffContent(source io.Reader) (sniffedContent, error) {
 	}, nil
 }
 
-func allowedUploadContent(detected string, head []byte) bool {
-	mediaType := domain.NormalizeDetectedMIME(detected)
-	if mediaType == "text/plain" {
-		prefix := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(string(head), "\ufeff")))
-		for _, active := range []string{"<!doctype html", "<html", "<script", "<svg", "<?xml"} {
-			if strings.Contains(prefix, active) {
-				return false
-			}
-		}
-	}
-	// Legacy Office documents use the Compound File Binary signature. It is a
-	// recognized container, not an arbitrary octet stream; PE/executable magic
-	// and every other unknown binary remain rejected.
-	if mediaType == "application/octet-stream" && len(head) >= 8 &&
-		bytes.Equal(head[:8], []byte{0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1}) {
+func blockedUploadPrefix(detected string, head []byte) bool {
+	if bytes.HasPrefix(head, []byte("MZ")) || bytes.HasPrefix(head, []byte{0x7f, 'E', 'L', 'F'}) {
 		return true
 	}
-	switch mediaType {
-	case "image/jpeg", "image/png", "image/gif", "image/webp",
-		"application/pdf", "application/zip", "application/gzip",
-		"text/plain", "text/csv", "application/json",
-		"audio/mpeg", "audio/ogg", "audio/wav", "audio/wave", "audio/x-wav", "application/ogg",
-		"video/mp4", "video/webm", "video/quicktime", "video/x-msvideo":
-		return true
-	default:
-		return false
-	}
+	return detected == "application/x-msdownload" || detected == "text/html; charset=utf-8"
 }
 
 // preparePendingAttachment does everything that must succeed before the first
@@ -877,6 +868,7 @@ func (s *AttachmentService) preparePendingAttachment(
 	// construction, rather than carrying a placeholder that would be.
 	if err := s.store.CreatePending(ctx, NewAttachment{
 		ID:                 attachmentID.String(),
+		PolicyVersion:      filepolicy.Version,
 		WorkspaceID:        target.workspaceID,
 		UploaderID:         target.uploaderID,
 		Destination:        target.destination,
@@ -892,6 +884,9 @@ func (s *AttachmentService) preparePendingAttachment(
 	}); err != nil {
 		// The insert failed, so no row and no object exist: nothing to undo.
 		return pendingAttachment{}, nil, fmt.Errorf("persist attachment metadata: %w", err)
+	}
+	if target.filenameChanged {
+		s.logger.LogAttrs(ctx, slog.LevelInfo, "attachment filename normalized", slog.String("attachment_id", pending.id.String()), slog.String("reason", "unsafe_display_name"))
 	}
 	return pending, encrypted, nil
 }
@@ -947,6 +942,19 @@ func (s *AttachmentService) finalizeUpload(
 			fmt.Errorf("stored envelope is %d bytes, expected %d", ciphertextSize, want))
 	}
 
+	result, err := s.inspectPending(ctx, target, pending, size)
+	if err != nil {
+		return AttachmentView{}, s.compensatePersistedObject(ctx, pending, failureFormatInspection, err)
+	}
+	content.detectedMIME = result.Format.MIME
+	content.policy = result
+	// Enterprise profiles always require AV, including explicit local development.
+	if result.Format.Enterprise {
+		status = domain.StatusPendingScan
+	}
+	if err := s.reauthorizeUpload(ctx, target); err != nil {
+		return AttachmentView{}, s.compensatePersistedObject(ctx, pending, failureAuthorizationChanged, err)
+	}
 	wrappedDEK, keyID, err := s.keys.Wrap(pending.dataKey, crypto.Binding{
 		AttachmentID:           pending.id,
 		WorkspaceID:            pending.workspaceID,
@@ -961,10 +969,12 @@ func (s *AttachmentService) finalizeUpload(
 
 	// Decided from the detected type and the counted size, both facts by now.
 	// An attachment nothing can render never enters the worker's queue.
-	previewStatus := domain.InitialDocumentPreviewStatus(content.detectedMIME, target.filename, size)
+	previewStatus := domain.InitialPolicyPreviewStatus(content.detectedMIME, size, content.policy.Format.ID, content.policy.Version)
 
 	if err := s.store.MarkUploaded(ctx, UploadedAttachment{
 		ID:             pending.id.String(),
+		PolicyVersion:  filepolicy.Version,
+		FormatID:       string(content.policy.Format.ID),
 		Status:         status,
 		PreviewStatus:  previewStatus,
 		DetectedMIME:   content.detectedMIME,
@@ -1162,26 +1172,11 @@ func (s *AttachmentService) Download(ctx context.Context, input AttachmentAuthIn
 	if err != nil {
 		return Download{}, err
 	}
-	// Nic-Gravador compatibility task: every audio download must be a real
-	// MP3, never the stored container renamed. isMP3Already and
-	// audioTranscodeFormat are mutually exclusive by construction (the first
-	// matches only audio/mpeg, the second explicitly excludes it), so at most
-	// one of these two branches runs.
-	if isMP3Already(record) {
-		content, err := s.openDecryptedContent(ctx, record)
-		if err != nil {
-			return Download{}, err
-		}
-		return Download{
-			Filename:    withMP3Extension(record.Filename),
-			ContentType: contentType(record),
-			Size:        record.Size,
-			Content:     content,
-		}, nil
-	}
-	if format, ok := audioTranscodeFormat(record); ok && s.audioTranscoder != nil {
-		return s.downloadTranscodedAudio(ctx, record, format)
-	}
+	return s.originalDownload(ctx, record)
+}
+
+// originalDownload opens the already-authorized original, without another lookup.
+func (s *AttachmentService) originalDownload(ctx context.Context, record StoredAttachment) (Download, error) {
 	content, err := s.openDecryptedContent(ctx, record)
 	if err != nil {
 		return Download{}, err

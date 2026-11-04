@@ -82,7 +82,7 @@ const (
 
 const RouteMetrics = "/metrics"
 
-func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler, directMessages *DMHandler, channels *ChannelHandler, channelCategories *ChannelCategoryHandler, antiSpam *AntiSpamGuard, sharedMetrics ...*observability.Metrics) http.Handler {
+func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler, directMessages *DMHandler, channels *ChannelHandler, channelCategories *ChannelCategoryHandler, meetings *MeetingHandler, antiSpam *AntiSpamGuard, sharedMetrics ...*observability.Metrics) http.Handler {
 	_ = logger
 	if wsHandler == nil {
 		wsHandler = unavailableWSHandler()
@@ -101,6 +101,7 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	r.registerSidebarRoutes(sidebar)
 	r.registerMessageRoutes(messages, metrics)
 	r.registerChannelRoutes(channels)
+	r.registerMeetingRoutes(meetings)
 	r.registerChannelCategoryRoutes(channelCategories)
 	r.registerDMRoutes(directMessages)
 	r.registerMessageLifecycleRoutes(messages)

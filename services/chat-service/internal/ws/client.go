@@ -122,7 +122,10 @@ func (c *Client) writePump(ctx context.Context, hub *Hub, logger *slog.Logger) {
 			if err := c.snd.Send(data); err != nil {
 				logger.WarnContext(ctx, "ws: send error; dropping client",
 					"client_id", c.id,
+					"reason", disconnectSendError,
+					"error", err,
 				)
+				hub.delivery().Disconnect(disconnectSendError)
 				// Close the underlying connection immediately so that any
 				// in-progress Ping in the sibling heartbeat goroutine fails
 				// fast rather than blocking until the ping timeout.

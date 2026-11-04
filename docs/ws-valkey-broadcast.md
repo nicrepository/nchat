@@ -86,8 +86,23 @@ Unregister, Subscribe) is in-process only.
 | At-least-once         | ❌ No — fire-and-forget                          |
 | Durability            | ❌ No — events are not persisted                 |
 | Replay                | ❌ No — missed events during disconnect are lost |
-| Missed-event recovery | ❌ No — no catch-up mechanism                    |
+| Missed-event recovery | ✅ Client-side, from PostgreSQL (issue #947)     |
 | In-process delivery   | Best-effort; independent of Valkey state         |
+
+Events are still never replayed. What converges is the client's view: every
+(re)subscription — the first one of a conversation, and every one after a
+reconnect — reads the open conversation back through the authorized message
+listing and the sidebar endpoint, and a delivery the hub had to withhold is
+followed by `conversation.sync_required` once access is proven again (see
+Authorization). The database stays the only source of truth.
+
+The read covers every message the client holds, not a recent window, so an old
+edit, deletion or reaction converges too. A gap of new messages longer than a
+few pages replaces the timeline with what was read, and older history is then
+paged in from the server. Events applied while the read is in flight are
+rebased on top of it, because reactions carry no version a timestamp could
+order. See `apps/web/src/chat/messages/useTimelineCatchUp.ts` and
+`catchUpReducer.ts`.
 
 Durable notification delivery is a separate future concern:
 
@@ -126,9 +141,33 @@ as locally published events via `SubscriptionAuthorizer.CanAccess`:
   do not bypass authorization.
 - Stale `channel_members`/`dm_members` are rejected because the SQL queries
   enforce active workspace membership on every call.
-- Auth error (transient DB issue): skip delivery, keep subscription.
+- Auth error or timeout (transient DB issue): skip delivery, keep
+  subscription, and record a **gap** for that connection and target (issue
+  #947). One entry per subscription however many events were skipped; it is
+  dropped on unsubscribe, revocation or disconnect.
 - Auth denied (`allowed=false`, no error): revoke subscription.
 - Auth allowed: deliver event to subscriber's outbox.
+- A check that fails only because the connection is already closing is
+  `client_closed`: no gap, no warning — its successor reconciles on open.
+
+A gap is closed when access is proven again for that subscription — by its next
+delivery or, if nobody posts, by one background recovery pass per hub
+(sequential, 500 ms then exponential backoff up to 30 s). The connection is then
+sent, alone and never over the bus:
+
+```json
+{ "type": "conversation.sync_required", "target_type": "dm", "target_id": "…" }
+```
+
+It is route-only and sent only after a successful re-check; a denial found by
+recovery revokes the subscription instead. Clients that predate it ignore the
+unknown frame. Queuing it is not proof the client reconciled: if it cannot be
+queued the client is dropped as slow, and every new connection reconciles on
+open anyway.
+
+Metrics (closed label sets, no user/target/connection labels):
+`chat_ws_auth_recheck_total{target_type,outcome}`,
+`chat_ws_sync_recovery_total{outcome}`, `chat_ws_disconnect_total{reason}`.
 
 ---
 
@@ -151,6 +190,33 @@ boundary. Authorization re-check is the security mechanism.
 | Valkey subscribe disconnects        | Reconnect loop with bounded backoff (100ms → 30s)              |
 | Valkey permanently unavailable      | In-process delivery continues normally; no distributed fan-out |
 | `VALKEY_WS_BROADCAST_ENABLED=false` | `NopBus` used; local-only delivery, no Valkey connection       |
+
+---
+
+## Testing across replicas
+
+`internal/ws/sync_recovery_valkey_test.go` runs two hubs — two pods, each with
+its own `ValkeyBus` connection — on a real Valkey: cross-pod delivery, a
+re-check failure on the receiving pod, recovery without a new broadcast that
+reaches only the affected connection, unsubscribe and reconnect during
+recovery, and goroutine cleanup after shutdown.
+
+What it does not cover: the authorizer and the client connections are test
+doubles (the transient authorization failure is injected), and there is no HTTP
+request, PostgreSQL or browser in the path. The browser half of the contract is
+covered by `apps/web/e2e/messaging/realtime-reconnect-convergence.spec.ts`
+against the mocked backend.
+
+It is owned by `Tests / Go Integration` (`scripts/ci/go-integration-test.sh`),
+whose job provisions the same Valkey image as the production overlay. The
+script refuses to run without `CHAT_TEST_VALKEY_URL`, and the suite fails —
+it does not skip — when that Valkey is unreachable. Locally:
+
+```sh
+docker run -d --rm --name valkey-test -p 56379:6379 valkey/valkey:8.1.3-alpine
+CHAT_TEST_VALKEY_URL=redis://127.0.0.1:56379 \
+  go test ./internal/ws -race -run '^TestSyncRecoveryValkey_' -count=1
+```
 
 ---
 

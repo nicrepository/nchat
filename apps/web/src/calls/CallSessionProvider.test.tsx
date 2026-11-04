@@ -1,3 +1,5 @@
+import MeetingSchedulingProvider from "../meetings/MeetingSchedulingProvider";
+import { useMeetingScheduling } from "../meetings/meetingContext";
 import { StrictMode } from "react";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router";
@@ -19,6 +21,11 @@ const { mockRingtoneEnabled, mockStartRingtone, mockStopRingtone } = vi.hoisted(
   mockRingtoneEnabled: vi.fn(() => true),
   mockStartRingtone: vi.fn(),
   mockStopRingtone: vi.fn(),
+}));
+
+vi.mock("../meetings/meetingApi", async (original) => ({
+  ...(await original<typeof import("../meetings/meetingApi")>()),
+  meetingCandidates: vi.fn(async () => ({ items: [] })),
 }));
 
 vi.mock("../chat/useCallMedia", () => ({ useCallMedia: vi.fn() }));
@@ -460,14 +467,35 @@ function Probe() {
   );
 }
 
-function providerTree(path = "/chat") {
+function SchedulingOpener() {
+  const open = useMeetingScheduling();
+  return (
+    <button onClick={(event) => open?.("channel", channelYId, event.currentTarget)}>
+      Agendar pelo teste
+    </button>
+  );
+}
+
+function providerTree(path = "/chat", scheduling = false) {
   return (
     <MemoryRouter initialEntries={[path]}>
       <Routes>
         <Route
           element={
             <CallSessionProvider>
-              <Probe />
+              {scheduling ? (
+                <MeetingSchedulingProvider
+                  userId={userB}
+                  workspaceId="workspace-1"
+                  channels={[{ id: channelYId, name: "Suporte", type: "public", canWrite: true }]}
+                  dms={[]}
+                >
+                  <Probe />
+                  <SchedulingOpener />
+                </MeetingSchedulingProvider>
+              ) : (
+                <Probe />
+              )}
             </CallSessionProvider>
           }
         >
@@ -1097,6 +1125,55 @@ describe("CallSessionProvider", () => {
     expect(media.stop).not.toHaveBeenCalled();
     await act(() => releaseResource(activeDirect() as never));
     expect(resource.leave).toHaveBeenCalledOnce();
+  });
+
+  it("preserves the floating call, media bridge and socket owner while scheduling another conversation", async () => {
+    const originalShow = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, "showModal");
+    const originalClose = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, "close");
+    Object.defineProperty(HTMLDialogElement.prototype, "showModal", {
+      configurable: true,
+      value() {
+        this.setAttribute("open", "");
+      },
+    });
+    Object.defineProperty(HTMLDialogElement.prototype, "close", {
+      configurable: true,
+      value() {
+        this.removeAttribute("open");
+      },
+    });
+    try {
+      const view = render(providerTree("/chat", true));
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+      fireEvent.click(screen.getByRole("button", { name: "Identidade" }));
+      calls.call = activeDirect();
+      view.rerender(providerTree("/chat", true));
+      const bridge = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
+      await act(() => bridge.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
+      const floating = await screen.findByTestId("floating-call-window");
+      const connects = media.connect.mock.calls.length;
+      const disconnects = media.stop.mock.calls.length;
+      const socketOwners = vi.mocked(acquireChatSocket).mock.calls.length;
+      const claims = ownership.claim.mock.calls.length;
+      fireEvent.click(screen.getByRole("button", { name: "Agendar pelo teste" }));
+      const scheduling = await screen.findByRole("dialog", { name: "Agendar reunião" });
+      expect(within(scheduling).getByRole("textbox", { name: "Título (obrigatório)" })).toHaveValue(
+        "Suporte",
+      );
+      fireEvent.click(within(scheduling).getByRole("button", { name: "Fechar agendamento" }));
+      expect(screen.getByTestId("floating-call-window")).toBe(floating);
+      expect(media.connect).toHaveBeenCalledTimes(connects);
+      expect(media.stop).toHaveBeenCalledTimes(disconnects);
+      expect(acquireChatSocket).toHaveBeenCalledTimes(socketOwners);
+      expect(ownership.claim).toHaveBeenCalledTimes(claims);
+      expect(calls.end).not.toHaveBeenCalled();
+    } finally {
+      if (originalShow)
+        Object.defineProperty(HTMLDialogElement.prototype, "showModal", originalShow);
+      else Reflect.deleteProperty(HTMLDialogElement.prototype, "showModal");
+      if (originalClose) Object.defineProperty(HTMLDialogElement.prototype, "close", originalClose);
+      else Reflect.deleteProperty(HTMLDialogElement.prototype, "close");
+    }
   });
 
   it("shows direct incoming controls, identity retry, and a persistent floating call", async () => {

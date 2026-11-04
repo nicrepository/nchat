@@ -1563,6 +1563,36 @@ describe("useMessages — WS message.created integration", () => {
     });
   });
 
+  // Issue #1099: realtime carries the same quoted-author projection as HTTP,
+  // through the same strict parser.
+  it.each([
+    ["a projected name", "Ana Antiga", "Ana Antiga"],
+    ["a pre-#1099 payload", undefined, undefined],
+    ["an author that no longer exists", "", ""],
+    ["a malformed name", 42, undefined],
+  ])("maps a realtime quote's author_display_name from %s", async (_case, raw, expected) => {
+    const payload = makePayload({
+      id: "msg-reply",
+      quoted: {
+        id: "msg-parent",
+        author_id: "user-parent",
+        body: "Salve",
+        created_at: "2024-01-15T09:00:00Z",
+        ...(raw === undefined ? {} : { author_display_name: raw }),
+      },
+    });
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => fireWsEventWithPayload("channel", "ch-1", payload));
+
+    await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
+    expect(result.current.state.messages[0].quoted?.authorDisplayName).toBe(expected);
+  });
+
   it("renders realtime payload without sender email", async () => {
     const payload = {
       ...makePayload({ id: "msg-no-email", sender_display_name: "Display Name" }),
@@ -4633,7 +4663,8 @@ describe("useMessages — reconnect reconciliation of withheld messages", () => 
     expect(result.current.state.sendError).toBe("Este link foi bloqueado por segurança.");
     expect(result.current.state.sending).toBe(false);
     // Recovered without the user reloading anything.
-    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
+    // The second listing read is the #947 catch-up, merged in place — not a reload.
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(2);
   });
 
   // RF-21 inconclusive: the scan itself finished terminal-but-undecided, so the

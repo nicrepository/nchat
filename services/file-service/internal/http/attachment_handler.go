@@ -512,6 +512,23 @@ func parseListLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
 // range is therefore never an alternative way in; it only narrows what an
 // already-authorised read returns.
 func (h *AttachmentHandler) DownloadContent(w http.ResponseWriter, r *http.Request) {
+	h.serveDownload(w, r, func(ctx context.Context, in service.AttachmentAuthInput) (service.Download, error) {
+		return h.useCases.Download(ctx, in)
+	})
+}
+
+func (h *AttachmentHandler) DownloadMP3(w http.ResponseWriter, r *http.Request) {
+	derivative, ok := h.useCases.(interface {
+		DownloadMP3(context.Context, service.AttachmentAuthInput) (service.Download, error)
+	})
+	if !ok {
+		writeAttachmentError(w, domain.ErrAudioTranscodeFailed)
+		return
+	}
+	h.serveDownload(w, r, derivative.DownloadMP3)
+}
+
+func (h *AttachmentHandler) serveDownload(w http.ResponseWriter, r *http.Request, load func(context.Context, service.AttachmentAuthInput) (service.Download, error)) {
 	startedAt := time.Now()
 	principal, ok := AuthenticatedPrincipal(r)
 	if !ok {
@@ -523,7 +540,7 @@ func (h *AttachmentHandler) DownloadContent(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	download, err := h.useCases.Download(r.Context(), service.AttachmentAuthInput{
+	download, err := load(r.Context(), service.AttachmentAuthInput{
 		AttachmentID: r.PathValue("attachmentID"),
 		UserID:       principal.UserID,
 		SessionID:    principal.SessionID,
@@ -548,7 +565,7 @@ func (h *AttachmentHandler) DownloadContent(w http.ResponseWriter, r *http.Reque
 	// misconfigured proxy caching one range of one user's video would serve it
 	// to the next caller who asked for the same bytes. Same policy as /preview,
 	// for the same reason.
-	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Cache-Control", "private, no-store, no-transform")
 
 	if hasMultipleRanges(r) {
 		h.refuseMultiRange(w, r, startedAt, download.Size)
@@ -971,6 +988,20 @@ func isAttrChar(b byte) bool {
 // attachmentErrorStatus maps a domain error to a status and a sanitised code.
 // No branch reveals storage state, SQL detail or whether an id exists.
 func attachmentErrorStatus(err error) (int, string) {
+	for _, failure := range []struct {
+		err  error
+		code string
+	}{
+		{domain.ErrFormatBlocked, "file_policy_blocked"}, {domain.ErrUnrecognizedContent, "file_content_unrecognized"}, {domain.ErrInspectionLimit, "file_inspection_limit"},
+	} {
+		if errors.Is(err, failure.err) {
+			return http.StatusUnsupportedMediaType, failure.code
+		}
+	}
+	return generalAttachmentErrorStatus(err)
+}
+
+func generalAttachmentErrorStatus(err error) (int, string) {
 	switch {
 	case errors.Is(err, domain.ErrTooLarge):
 		return http.StatusRequestEntityTooLarge, errCodePayloadTooLarge

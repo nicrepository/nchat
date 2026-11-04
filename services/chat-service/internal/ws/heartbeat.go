@@ -210,7 +210,10 @@ func startHeartbeat(
 				}
 				logger.WarnContext(ctx, "ws: heartbeat ping failed; dropping client",
 					"client_id", c.id,
+					"reason", disconnectHeartbeat,
+					"error", err,
 				)
+				hub.delivery().Disconnect(disconnectHeartbeat)
 				// Unregister before closing so hub state is consistent.
 				hub.Unregister(c)
 				// Close the connection immediately so any in-progress Send in

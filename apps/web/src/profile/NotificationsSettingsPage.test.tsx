@@ -135,6 +135,9 @@ function makeContext(
     dismissInAppAlert: vi.fn(),
     drafts: noopConversationDrafts,
     directMessage: inertDirectMessage,
+    goBack: () => false,
+    identityPending: () => false,
+    confirmingIdentity: false,
   };
 }
 

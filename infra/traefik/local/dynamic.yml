@@ -156,6 +156,32 @@ http:
         - strip-files-prefix
       tls: {}
 
+    # notification-service serves its probes at /healthz, /readyz and /version but
+    # Web Push under the full /api/notifications path (issue #902), so only the
+    # three probes are rewritten and everything else is forwarded verbatim.
+    nchat-notifications-health:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && (Path(`/api/notifications/healthz`) || Path(`/api/notifications/readyz`) || Path(`/api/notifications/version`))
+      priority: 200
+      service: notification-service
+      middlewares:
+        - security-headers
+        - compress
+        - rewrite-notifications-probe-prefix
+
+    nchat-notifications-health-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && (Path(`/api/notifications/healthz`) || Path(`/api/notifications/readyz`) || Path(`/api/notifications/version`))
+      priority: 200
+      service: notification-service
+      middlewares:
+        - security-headers
+        - compress
+        - rewrite-notifications-probe-prefix
+      tls: {}
+
     nchat-notifications:
       entryPoints:
         - web
@@ -165,7 +191,6 @@ http:
       middlewares:
         - security-headers
         - compress
-        - strip-notifications-prefix
 
     nchat-notifications-https:
       entryPoints:
@@ -176,7 +201,6 @@ http:
       middlewares:
         - security-headers
         - compress
-        - strip-notifications-prefix
       tls: {}
 
     # There is deliberately no /api/admin router on nchat.local. The Admin API
@@ -422,6 +446,11 @@ http:
         regex: "^/api/auth/(healthz|readyz|version)$"
         replacement: "/${1}"
 
+    rewrite-notifications-probe-prefix:
+      replacePathRegex:
+        regex: "^/api/notifications/(healthz|readyz|version)$"
+        replacement: "/${1}"
+
     strip-chat-prefix:
       stripPrefix:
         prefixes:
@@ -431,11 +460,6 @@ http:
       stripPrefix:
         prefixes:
           - /api/files
-
-    strip-notifications-prefix:
-      stripPrefix:
-        prefixes:
-          - /api/notifications
 
     strip-admin-prefix:
       stripPrefix:

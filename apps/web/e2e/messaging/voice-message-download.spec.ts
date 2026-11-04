@@ -96,11 +96,8 @@ test.describe("mensagem de voz — download", () => {
     await download.click();
     const file = await saved;
 
-    // file-service always re-encodes a voice-message download to real MP3
-    // (Nic-Gravador compatibility task), regardless of the stored container —
-    // WAV here, WebM for a real composer recording — so the saved name always
-    // ends in .mp3, never the container's own extension.
-    expect(file.suggestedFilename()).toMatch(/^mensagem-de-voz-2026-07-1[45]-\d{4}\.mp3$/);
+    // Original downloads preserve the native recording and its safe filename.
+    expect(file.suggestedFilename()).toBe("voice-message.wav");
     expect(scenario.requests.attachmentContentFetches.length).toBe(beforeDownload + 1);
     // Só a mídia daquela mensagem foi pedida, sempre pela rota autenticada.
     expect(new Set(scenario.requests.attachmentContentFetches)).toEqual(new Set([attachmentId]));

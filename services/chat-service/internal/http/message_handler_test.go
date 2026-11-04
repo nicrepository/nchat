@@ -1165,6 +1165,47 @@ func TestMessageHandler_ListChannelMessages_QuotedDeletedParentBodyWithheld(t *t
 	}
 }
 
+// Issue #1099: the quote names its author from the server's projection, and a
+// quote whose author no longer exists says so with "" — never by omitting the
+// field, which is what a pre-#1099 server sends.
+func TestMessageHandler_ListChannelMessages_QuoteAuthorDisplayName(t *testing.T) {
+	for _, tc := range []struct {
+		name, displayName string
+		present           bool
+	}{
+		{name: "projected", displayName: "Ana Souza", present: true},
+		{name: "author gone", displayName: "", present: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := testMessage()
+			msg.ParentMessageID = "66666666-6666-6666-6666-666666666666"
+			msg.Quoted = &domain.QuotedMessage{
+				ID: msg.ParentMessageID, AuthorID: msgTestUserID, BodyText: "Salve",
+				BodyFormat: domain.MessageBodyFormatV1, Status: domain.MessageStatusActive,
+				CreatedAt: testNow().Add(-time.Hour), AuthorDisplayName: tc.displayName,
+			}
+			msgs := &fakeMessageProvider{channelOut: service.ListChannelMessagesOutput{
+				Messages: []domain.Message{msg},
+			}}
+			h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+			rec := httptest.NewRecorder()
+			r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages", nil)
+			r.SetPathValue("channelID", testChannelID)
+			h.ListChannelMessages(rec, r)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d", rec.Code)
+			}
+			body := decodeBody(t, rec)
+			first := body["data"].(map[string]any)["messages"].([]any)[0].(map[string]any)
+			quoted := first["quoted"].(map[string]any)
+			got, ok := quoted["author_display_name"]
+			if ok != tc.present || (ok && got != tc.displayName) {
+				t.Fatalf("author_display_name = %#v (present %v), want %q", got, ok, tc.displayName)
+			}
+		})
+	}
+}
+
 func TestMessageHandler_ListChannelMessages_InaccessibleChannelReturnsNotFound(t *testing.T) {
 	msgs := &fakeMessageProvider{channelOutErr: domain.ErrNotFound}
 	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)

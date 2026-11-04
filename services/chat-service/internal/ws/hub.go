@@ -117,7 +117,12 @@ type revokeSubscriptionReq struct {
 	ctx    context.Context
 	client *Client
 	key    string
-	resp   chan error // buffered(1); hub writes result, caller reads
+	// generation, when non-zero, is the subscription a denial was answered for.
+	// The revocation applies only while the client still holds exactly that
+	// one: an answer about a subscription that has since been replaced must not
+	// end its replacement (CQ947-06).
+	generation uint64
+	resp       chan error // buffered(1); hub writes result, caller reads
 }
 
 // broadcastReq is an internal request to deliver an event.
@@ -127,6 +132,9 @@ type broadcastReq struct {
 	// done is closed by the hub after the broadcast is fully processed.
 	// It is non-nil only when the caller requires synchronization (e.g., tests).
 	done chan struct{}
+	// remote marks an event that arrived over the bus from another instance.
+	// Diagnostic only: delivery follows the same contract either way.
+	remote bool
 }
 
 type broadcastSubscription struct {
@@ -348,6 +356,8 @@ type Hub struct {
 	remoteBcast     chan broadcastReq // events received from the distributed bus
 	presenceSignal  chan struct{}     // capacity 1; wakes the presence fan-out
 	reconcileSignal chan struct{}     // capacity 1; wakes targeted reconciliation
+	syncSignal      chan struct{}     // capacity 1; wakes sync recovery (issue #947)
+	deliveryMetrics DeliveryMetrics
 	quit            chan struct{}
 	done            chan struct{}
 	broadcastDone   chan struct{}
@@ -437,6 +447,12 @@ type Hub struct {
 	clientSubs                 map[string]map[string]struct{} // clientID → set of targetKey strings
 	subscriptionGenerations    map[string]map[string]uint64   // clientID → targetKey → generation
 	nextSubscriptionGeneration uint64
+	// pendingSync records the deliveries this hub withheld because it could not
+	// prove access (issue #947): clientID → targetKey → the subscription
+	// generation that missed them. One entry per subscription however many
+	// events were skipped, and it goes when the subscription does, so it is
+	// bounded by clientSubs. See sync_recovery.go.
+	pendingSync map[string]map[string]uint64
 	// typingActive tracks which targets each client is currently marked typing
 	// on, so a disconnect or a lost subscription can promptly broadcast
 	// typing.stop instead of waiting out typingTTL. clientID → set of
@@ -476,6 +492,7 @@ func NewHub(authorizer SubscriptionAuthorizer, logger *slog.Logger, bus Broadcas
 		remoteBcast:             make(chan broadcastReq, 256),
 		presenceSignal:          make(chan struct{}, 1),
 		reconcileSignal:         make(chan struct{}, 1),
+		syncSignal:              make(chan struct{}, 1),
 		presencePending:         make(map[presenceKey]presenceChange),
 		published:               make(map[presenceKey]publishedPresence),
 		lingering:               make(map[presenceKey]lingeringCover),
@@ -608,8 +625,23 @@ func (h *Hub) Subscribe(ctx context.Context, c *Client, targetType TargetType, t
 }
 
 func (h *Hub) RevokeSubscription(ctx context.Context, c *Client, key string) error {
+	return h.requestRevocation(revokeSubscriptionReq{ctx: ctx, client: c, key: key})
+}
+
+// revokeDeniedSubscription revokes the subscription an authorization re-check
+// was asked about, and only that one. The check ran outside the hub, so by the
+// time its denial is acted on the client may have left and come back — a new
+// generation, authorized on its own. It returns errSubscriptionReplaced then.
+func (h *Hub) revokeDeniedSubscription(ctx context.Context, subscription broadcastSubscription, key string) error {
+	return h.requestRevocation(revokeSubscriptionReq{
+		ctx: ctx, client: subscription.client, key: key, generation: subscription.generation,
+	})
+}
+
+func (h *Hub) requestRevocation(req revokeSubscriptionReq) error {
+	ctx := req.ctx
 	resp := make(chan error, 1)
-	req := revokeSubscriptionReq{ctx: ctx, client: c, key: key, resp: resp}
+	req.resp = resp
 	select {
 	case h.revokeReq <- req:
 	case <-ctx.Done():
@@ -1360,15 +1392,7 @@ func (h *Hub) run() {
 			req.resp <- err
 
 		case req := <-h.revokeReq:
-			if err := req.ctx.Err(); err != nil {
-				req.resp <- err
-				continue
-			}
-			if !h.revokeSubscription(req.client, req.key) {
-				req.resp <- ErrClientNotRegistered
-				continue
-			}
-			req.resp <- nil
+			req.resp <- h.applyRevocation(req)
 
 		case <-h.quit:
 			// clearClients removes all clients from hub state and returns a snapshot.
@@ -1385,9 +1409,29 @@ func (h *Hub) run() {
 	}
 }
 
+// errSubscriptionReplaced reports a revocation that was not applied because the
+// subscription it named has been replaced since (CQ947-06).
+var errSubscriptionReplaced = errors.New("ws: subscription replaced since the authorization check")
+
+// applyRevocation runs on the hub goroutine, which is also the only place a
+// subscription is created, replaced or removed — so comparing its generation
+// and revoking it are one step that nothing can interleave with.
+func (h *Hub) applyRevocation(req revokeSubscriptionReq) error {
+	if err := req.ctx.Err(); err != nil {
+		return err
+	}
+	if req.generation != 0 && h.subscriptionGeneration(req.client, req.key) != req.generation {
+		return errSubscriptionReplaced
+	}
+	if !h.revokeSubscription(req.client, req.key) {
+		return ErrClientNotRegistered
+	}
+	return nil
+}
+
 func (h *Hub) startBroadcastWorkers() {
 	h.broadcastQueues = make([]chan broadcastReq, broadcastWorkerCount)
-	h.broadcastWG.Add(broadcastWorkerCount + 4)
+	h.broadcastWG.Add(broadcastWorkerCount + 5)
 	for index := range broadcastWorkerCount {
 		queue := make(chan broadcastReq, broadcastWorkerQueueCapacity)
 		h.broadcastQueues[index] = queue
@@ -1397,6 +1441,7 @@ func (h *Hub) startBroadcastWorkers() {
 	go h.runPresenceFanout()
 	go h.runDirectoryHeartbeat()
 	go h.runPresenceReconciler()
+	go h.runSyncRecovery()
 	go func() {
 		h.broadcastWG.Wait()
 		close(h.broadcastDone)
@@ -2707,7 +2752,7 @@ func (h *Hub) handleRemoteBusEvent(evt Event) {
 	}
 
 	select {
-	case h.remoteBcast <- broadcastReq{event: canonical, data: data}:
+	case h.remoteBcast <- broadcastReq{event: canonical, data: data, remote: true}:
 	default:
 		// Drop if queue is full — bounded, no goroutine block.
 		h.logger.WarnContext(context.Background(), "ws: remote broadcast queue full; event dropped",
@@ -3357,6 +3402,7 @@ func (h *Hub) removeClient(c *Client) *Client {
 	}
 	delete(h.clientSubs, c.id)
 	delete(h.subscriptionGenerations, c.id)
+	delete(h.pendingSync, c.id)
 	delete(h.typingActive, c.id)
 	return removed
 }
@@ -3374,6 +3420,7 @@ func (h *Hub) clearClients() []*Client {
 	h.subs = make(map[string]map[string]struct{})
 	h.clientSubs = make(map[string]map[string]struct{})
 	h.subscriptionGenerations = make(map[string]map[string]uint64)
+	h.pendingSync = nil
 	h.typingActive = make(map[string]map[string]struct{})
 	return clients
 }
@@ -3418,7 +3465,9 @@ func (h *Hub) handleSubscribe(req subscribeReq) error {
 //   - allowed=true, no error  → enqueue event; drop client if outbox full.
 //   - allowed=false, no error → subscription revoked silently; event not delivered.
 //   - any auth error          → skip delivery for this client; subscription kept.
-//     A transient DB error must not unsubscribe an authorized client.
+//     A transient DB error must not unsubscribe an authorized client, and the
+//     skipped delivery is recorded as a gap the connection is told to
+//     resynchronise once access is proven again (issue #947, sync_recovery.go).
 //
 // It snapshots subscribers under h.mu, then performs auth checks without the
 // lock. The final state validation and non-blocking enqueue are atomic with
@@ -3449,53 +3498,69 @@ func (h *Hub) handleBroadcast(req broadcastReq) {
 	encodings := h.recipientEncodingsFor(req, subscriptions)
 
 	for _, subscription := range subscriptions {
-		c := subscription.client
 		if !h.subscriptionIsCurrent(subscription, key) {
 			continue
 		}
-
-		// Re-check authorization before delivery using a fresh bounded context.
-		// Using context.Background() (not the caller's context) ensures that a
-		// cancelled publish context does not affect the auth check or revocation.
-		// TargetTypeUser events never reach this loop: handleBroadcast routes them
-		// to handleUserBroadcast and returns before this point.
-		authCtx, cancel := context.WithTimeout(c.ctx, broadcastAuthTimeout)
-		allowed, authErr := h.authorizer.CanAccess(authCtx, c.userID, c.workspaceID, req.event.TargetType, req.event.TargetID)
-
-		if authErr != nil {
-			cancel()
-			// Transient error: skip delivery but keep subscription.
-			// The client remains subscribed; the next broadcast will retry.
-			h.logger.WarnContext(context.Background(), "ws: auth re-check error on broadcast; skipping delivery",
-				"user_id", c.userID,
-				"target_type", string(req.event.TargetType),
-			)
-			continue
-		}
-
-		if !allowed {
-			cancel()
-			// Definitive revocation: access denied with no error.
-			_ = h.RevokeSubscription(context.Background(), c, key)
-			h.logger.DebugContext(context.Background(), "ws: subscription revoked on broadcast",
-				"user_id", c.userID,
-				"target_type", string(req.event.TargetType),
-			)
-			continue
-		}
-
-		_, outboxFull := h.enqueueAuthorizedBroadcast(
-			authCtx, subscription, key, encodings.bytesFor(c.userID, req.data))
-		cancel()
-		if outboxFull {
-			// Outbox full: slow client. Drop connection and clean up.
-			h.logger.WarnContext(context.Background(), "ws: dropping slow client",
-				"user_id", c.userID,
-			)
-			h.Unregister(c)
-			c.close()
-		}
+		h.deliverToSubscription(req, subscription, key, encodings.bytesFor(subscription.client.userID, req.data))
 	}
+}
+
+// deliverToSubscription re-checks one recipient's access and acts on the
+// answer.
+//
+// Re-check authorization before delivery using a fresh bounded context derived
+// from the connection, never from the publisher's, so a cancelled publish
+// cannot revoke anybody. TargetTypeUser events never reach this point:
+// handleBroadcast routes them to handleUserBroadcast first.
+//
+// Fail secure in every branch: only a proven allow delivers. A denial revokes.
+// Any other answer withholds the event and records the gap, so the connection
+// is told to resynchronise once access can be proven again (issue #947) — a
+// transient error must neither unsubscribe an authorized client nor silently
+// lose what it missed.
+func (h *Hub) deliverToSubscription(req broadcastReq, subscription broadcastSubscription, key string, data []byte) {
+	c := subscription.client
+	authCtx, cancel := context.WithTimeout(c.ctx, broadcastAuthTimeout)
+	defer cancel()
+	started := time.Now()
+	allowed, authErr := h.authorizer.CanAccess(authCtx, c.userID, c.workspaceID, req.event.TargetType, req.event.TargetID)
+	outcome := classifyRecheck(c, allowed, authErr)
+	h.delivery().AuthRecheck(string(req.event.TargetType), string(outcome))
+
+	switch outcome {
+	case recheckAllowed:
+		if _, outboxFull := h.enqueueAuthorizedBroadcast(authCtx, subscription, key, data); outboxFull {
+			h.dropSlowClient(c)
+		}
+	case recheckDenied:
+		// Definitive revocation of the subscription this check was about.
+		_ = h.revokeDeniedSubscription(context.Background(), subscription, key)
+		h.logger.DebugContext(context.Background(), "ws: subscription revoked on broadcast",
+			"user_id", c.userID,
+			"target_type", string(req.event.TargetType),
+		)
+	case recheckClientClosed:
+		// The connection is already closing; its unregistration is in flight.
+	default:
+		h.recordGap(subscription, key)
+		h.logger.WarnContext(context.Background(), "ws: auth re-check error on broadcast; skipping delivery",
+			"event_type", string(req.event.Type),
+			"target_type", string(req.event.TargetType),
+			"source", broadcastSource(req),
+			"error_class", string(outcome),
+			"duration_ms", time.Since(started).Milliseconds(),
+			"user_id", c.userID,
+			"client_id", c.id,
+			"error", authErr,
+		)
+	}
+}
+
+func broadcastSource(req broadcastReq) string {
+	if req.remote {
+		return "remote"
+	}
+	return "local"
 }
 
 // presenceSubjectStillVisible re-derives, at the moment of delivery, whether the
@@ -3713,6 +3778,7 @@ func (h *Hub) revokeSubscription(client *Client, key string) bool {
 	if generations, ok := h.subscriptionGenerations[client.id]; ok {
 		delete(generations, key)
 	}
+	h.forgetGapLocked(client.id, key)
 	if targets, ok := h.typingActive[client.id]; ok {
 		if _, typing := targets[key]; typing {
 			delete(targets, key)
@@ -3764,6 +3830,11 @@ func (h *Hub) enqueueAuthorizedBroadcast(
 	}
 	if !subscription.client.enqueue(data) {
 		return false, true
+	}
+	// Access was just proven for this subscription, so an earlier gap on it can
+	// be signalled now rather than waiting for a recovery pass (issue #947).
+	if !h.signalGapLocked(subscription, key) {
+		return true, true
 	}
 	return true, false
 }

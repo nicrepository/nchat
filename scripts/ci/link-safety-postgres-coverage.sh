@@ -72,6 +72,8 @@ case "$MODULE" in
       TestTwoURLConcurrentEditsUseStableLockOrderPostgreSQL
       TestMessageSecuritySnapshotsAreOneAuthorizedProjectionPostgreSQL
       TestMaliciousBodyIsWithheldFromEveryProjectionPostgreSQL
+      # Issue #1099. The quoted author named by the same statement as the quote.
+      TestQuoteAuthorDisplayNameProjectionPostgreSQL
       # Issue #807. Per-target convergence (the deadline that ends every
       # pending row, the policy terminal's compare-and-set, the fan-out index
       # bound to the current body) and the workspace-scoped preview queue with
@@ -212,6 +214,73 @@ case "$MODULE" in
       TestAWithheldMessageSchedulesNoRemindersPostgreSQL
       TestPublishingAWithheldMessageStartsItsRemindersPostgreSQL
       TestPromotingTwiceDoesNotRestartTheReminderClockPostgreSQL
+      # Issue #1052. The meeting store authorizes and writes inside one
+      # transaction, so its isolation, versioning, roster rules, locking
+      # against concurrent revocation and account suspension and schema
+      # invariants are only observable against a real database. The
+      # migration round trip runs in a database of its own that the test
+      # creates and drops.
+      TestMeetingCreateAndReadRoundTripPostgreSQL
+      TestMeetingCreateRefusalsPostgreSQL
+      TestMeetingSchemaInvariantsPostgreSQL
+      TestMeetingIsolationPostgreSQL
+      TestMeetingJoinPoliciesPostgreSQL
+      TestMeetingLifecyclePostgreSQL
+      TestMeetingCancelIsIdempotentPostgreSQL
+      TestMeetingOptimisticConcurrencyPostgreSQL
+      TestMeetingParticipantsPostgreSQL
+      TestMeetingConcurrentParticipantChangesPostgreSQL
+      TestMeetingRSVPPostgreSQL
+      TestMeetingMigrationRoundTripPostgreSQL
+      TestMeetingDisposableDatabaseCleanupPostgreSQL
+      TestMeetingRevocationBeforeWritePostgreSQL
+      TestMeetingWriteBeforeRevocationPostgreSQL
+      TestMeetingReadIsOneStatePostgreSQL
+      TestMeetingSuspensionBeforeWritePostgreSQL
+      TestMeetingWriteBeforeSuspensionPostgreSQL
+      TestMeetingMembershipAfterLockPostgreSQL
+      # Issue #1053: durable create, atomic invitees and lifecycle interleavings.
+      TestMeetingAPICreateRosterAndReplayPostgreSQL
+      TestMeetingAPICreateRefusalsAreAtomicPostgreSQL
+      TestMeetingAPICreationNamespacePostgreSQL
+      TestMeetingAPIClaimRollbackPostgreSQL
+      TestMeetingAPIReplayAfterUnknownCommitPostgreSQL
+      TestMeetingAPIReplayReauthorizesPostgreSQL
+      TestMeetingAPIClaimSchemaPostgreSQL
+      TestMeetingAPIClaimMigrationRoundTripPostgreSQL
+      TestMeetingAPISimultaneousClaimsPostgreSQL
+      TestMeetingAPIClaimWaitsForRollbackPostgreSQL
+      TestMeetingAPIMutationsSerializePostgreSQL
+      TestMeetingAPICreateRevocationFirstPostgreSQL
+      TestMeetingAPICreateBeforeRevocationPostgreSQL
+      TestMeetingAPICreateVersusSuspensionPostgreSQL
+      TestMeetingAPICreateBeforeSuspensionPostgreSQL
+      TestMeetingAPICohostAndCancelAuthorizationPostgreSQL
+      TestMeetingAPIRoleRevocationBeforeUpdatePostgreSQL
+      TestMeetingAPIReplayDuringRevocationPostgreSQL
+      TestMeetingAPIWriteErrorsLeaveNoSuccessPostgreSQL
+      TestMeetingAPIInvalidUpdatesLeaveHistoryPostgreSQL
+      TestMeetingAPIStorageRejectsInvalidInitialRolesPostgreSQL
+      # Issue #1054. Contextual selection, bounded roster, bulk and lock ordering.
+      TestMeetingSelectionContextsPostgreSQL
+      TestMeetingSelectionDirectDMPostgreSQL
+      TestMeetingSelectionLargeChannelPostgreSQL
+      TestMeetingSelectionBulkLimitPostgreSQL
+      TestMeetingSelectionBulkSemanticsPostgreSQL
+      TestMeetingSelectionBulkRollbackPostgreSQL
+      TestMeetingSelectionConstantQueriesPostgreSQL
+      TestMeetingSelectionCurrentEligibilityPostgreSQL
+      TestMeetingSelectionBulkConcurrentPostgreSQL
+      TestMeetingSelectionBulkSimultaneousPostgreSQL
+      TestMeetingSelectionBulkRevocationPostgreSQL
+      TestMeetingSelectionBulkLostConversationPostgreSQL
+      TestMeetingSelectionRoleSerializationPostgreSQL
+      # Q-001: PATCH merges against the same locked version used by CAS.
+      TestMeetingPatchStalePolicyPostgreSQL
+      TestMeetingPatchLockedSnapshotPostgreSQL
+      TestMeetingPatchCohostPartialPostgreSQL
+      TestMeetingPatchAuthorizationPrecedencePostgreSQL
+      TestMeetingPatchConcurrentHTTPPostgreSQL
     )
     ;;
   services/notification-service)

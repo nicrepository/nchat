@@ -44,6 +44,10 @@ const (
 // the source's loudness or codec.
 const mp3Bitrate = "128k"
 
+// The 500m CPU / 768 MiB pod admits one audio process, leaving room for the
+// existing document worker and bounded request/output buffers.
+const maxConcurrentAudioConversions = 1
+
 // AudioRunner shells out to ffmpeg to re-encode arbitrary audio (or an
 // audio-only WebM/MP4 recording) into real MP3. It mirrors LibreOfficeRunner's
 // process hygiene exactly: a scratch directory under a fixed, trusted work
@@ -53,6 +57,7 @@ type AudioRunner struct {
 	command string
 	workDir string
 	timeout time.Duration
+	slots   chan struct{}
 }
 
 // NewAudioRunner resolves command via exec.LookPath so a misconfigured or
@@ -63,10 +68,19 @@ func NewAudioRunner(command, workDir string, timeout time.Duration) (*AudioRunne
 	if err != nil {
 		return nil, fmt.Errorf("resolve audio converter command %q: %w", command, err)
 	}
-	return &AudioRunner{command: resolved, workDir: workDir, timeout: timeout}, nil
+	return &AudioRunner{command: resolved, workDir: workDir, timeout: timeout, slots: make(chan struct{}, maxConcurrentAudioConversions)}, nil
 }
 
 func (r *AudioRunner) ConvertAudio(ctx context.Context, format AudioFormat, audio []byte) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case r.slots <- struct{}{}:
+		defer func() { <-r.slots }()
+	default:
+		return nil, ErrBusy
+	}
 	// r.workDir is a fixed config value set once at process startup, never
 	// derived from a request — see runner.go's identical comment on this
 	// exact gosec finding.
@@ -102,41 +116,14 @@ func (r *AudioRunner) ConvertAudio(ctx context.Context, format AudioFormat, audi
 	inputPath := filepath.Join(requestDir, inputName)
 	outputPath := filepath.Join(requestDir, outputName)
 
-	commandCtx, cancel := context.WithTimeout(ctx, r.timeout)
-	defer cancel()
-	// r.command is resolved and verified executable once at startup by
-	// NewAudioRunner (never from a request), and every argument below is a
-	// fixed flag or a path this function generated itself — never anything
-	// taken from the request body.
-	cmd := exec.CommandContext(commandCtx, r.command, // #nosec G204,G702 -- see comment above
-		"-y", "-nostdin",
-		"-i", inputPath,
-		"-vn",
-		"-acodec", "libmp3lame",
-		"-b:a", mp3Bitrate,
-		"-f", "mp3",
-		outputPath,
-	)
-	cmd.Dir = requestDir
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
-	cmd.WaitDelay = time.Second
-	if output, err := cmd.CombinedOutput(); err != nil {
-		if errors.Is(commandCtx.Err(), context.DeadlineExceeded) {
-			return nil, ErrTimeout
-		}
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		_ = output // ffmpeg output may echo input metadata; never log it.
-		return nil, ErrConversionFailed
+	if err := r.runAudio(ctx, requestDir, inputPath, outputPath); err != nil {
+		return nil, err
 	}
 
+	return readMP3(requestRoot, outputName)
+}
+
+func readMP3(requestRoot *os.Root, outputName string) ([]byte, error) {
 	file, err := requestRoot.Open(outputName)
 	if err != nil {
 		return nil, ErrConversionFailed
@@ -150,4 +137,43 @@ func (r *AudioRunner) ConvertAudio(ctx context.Context, format AudioFormat, audi
 		return nil, ErrOutputTooLarge
 	}
 	return mp3, nil
+}
+
+func (r *AudioRunner) runAudio(ctx context.Context, requestDir, inputPath, outputPath string) error {
+	commandCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+	// r.command is resolved and verified executable once at startup by
+	// NewAudioRunner (never from a request), and every argument below is a
+	// fixed flag or a path this function generated itself — never anything
+	// taken from the request body.
+	cmd := exec.CommandContext(commandCtx, r.command, // #nosec G204,G702 -- see comment above
+		"-y", "-nostdin", "-threads", "1", "-filter_threads", "1",
+		"-i", inputPath,
+		"-vn",
+		"-acodec", "libmp3lame",
+		"-b:a", mp3Bitrate,
+		"-f", "mp3", "-threads", "1", "-fs", fmt.Sprint(MaxAudioOutputBytes+1),
+		outputPath,
+	)
+	cmd.Dir = requestDir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = time.Second
+	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
+	if err := cmd.Run(); err != nil {
+		if errors.Is(commandCtx.Err(), context.DeadlineExceeded) {
+			return ErrTimeout
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return ErrConversionFailed
+	}
+
+	return nil
 }

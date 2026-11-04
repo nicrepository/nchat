@@ -42,6 +42,7 @@ import (
 
 	converterapi "github.com/nicrepository/nchat/services/file-service/internal/converter"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
+	"github.com/nicrepository/nchat/services/file-service/internal/filepolicy"
 )
 
 // Error classes. They are the whole contract with the job: one means "this will
@@ -105,7 +106,7 @@ func (r *Renderer) RenderDocument(
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	}
-	switch domain.NormalizeDetectedMIME(detectedMIME) {
+	switch filepolicy.PreviewMIME(domain.NormalizeDetectedMIME(detectedMIME)) {
 	case "application/pdf":
 		pages, err := renderPDFPages(ctx, data)
 		if err != nil {
@@ -122,7 +123,7 @@ func (r *Renderer) RenderDocument(
 		}
 		return [][]byte{page}, domain.PreviewContentTypeSheet, nil
 	case "application/zip":
-		detected, err := InspectDocumentContainer(data)
+		detected, err := inspectDocumentContainer(ctx, data)
 		if err != nil {
 			return nil, "", fmt.Errorf("%w: %w", ErrUnsupported, err)
 		}

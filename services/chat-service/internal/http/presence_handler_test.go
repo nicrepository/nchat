@@ -79,7 +79,7 @@ func newPresenceRouteEnvWith(t *testing.T, writable bool) presenceRouteEnv {
 		WithPresence(httpapi.NewPresenceHandler(workspaces, settings, nil).WithWritesEnabled(writable))
 	router := httpapi.NewRouter(
 		sidebarTestConfig(), nil, httpapi.ReadinessState{}, makeTestValidator(t), allowAllSessionValidator{},
-		httpapi.NewSidebarHandler(nil), messages, nil, nil, nil, nil, nil,
+		httpapi.NewSidebarHandler(nil), messages, nil, nil, nil, nil, nil, nil,
 	)
 	return presenceRouteEnv{
 		router: router, settings: settings,
