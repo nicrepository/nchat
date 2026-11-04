@@ -1,0 +1,10 @@
+# PR #1155: reviewed historical generic-api-key findings from Security run
+# https://github.com/nicrepository/nchat/actions/runs/41400916309
+# Lines 80/396 are deterministic IdempotencyKey fixtures passed only to
+# CreateMessageInput, not authentication material. The release squash copied
+# the same two lines into a second commit. Pin all four immutable fingerprints:
+# new commits, changed lines, other files and other rules remain scanned.
+53cb7b52b5d7584a7141cfb497b582038d3149c9:services/chat-service/internal/storage/notification_outbox_promotion_postgres_test.go:generic-api-key:80
+53cb7b52b5d7584a7141cfb497b582038d3149c9:services/chat-service/internal/storage/notification_outbox_promotion_postgres_test.go:generic-api-key:396
+1d18b8eea4885becd3d6e7376a2637b0810c20fd:services/chat-service/internal/storage/notification_outbox_promotion_postgres_test.go:generic-api-key:80
+1d18b8eea4885becd3d6e7376a2637b0810c20fd:services/chat-service/internal/storage/notification_outbox_promotion_postgres_test.go:generic-api-key:396
