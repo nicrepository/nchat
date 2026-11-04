@@ -23,7 +23,7 @@ KDEV=(kubectl --context="$DIAG_CONTEXT" --namespace=nchat-dev --request-timeout=
 umask 077
 
 "${KDEV[@]}" get deployment file-service clamav \
-  -o jsonpath='{range .items[*]}{.metadata.name}{" replicas="}{.spec.replicas}{" ready="}{.status.readyReplicas}{" SA="}{.spec.template.spec.serviceAccountName}{" token="}{.spec.template.spec.automountServiceAccountToken}{"\n"}{range .spec.template.spec.initContainers[*]}{"init "}{.name}{" "}{.image}{" "}{.resources}{"\n"}{end}{range .spec.template.spec.containers[*]}{.name}{" "}{.image}{" "}{.resources}{"\n"}{end}{end}'
+  -o jsonpath='{range .items[*]}{.metadata.name}{" replicas="}{.spec.replicas}{" ready="}{.status.readyReplicas}{" SA="}{.spec.template.spec.serviceAccountName}{" automount="}{.spec.template.spec.automountServiceAccountToken}{"\n"}{range .spec.template.spec.initContainers[*]}{"init "}{.name}{" "}{.image}{" "}{.resources}{"\n"}{end}{range .spec.template.spec.containers[*]}{.name}{" "}{.image}{" "}{.resources}{"\n"}{end}{end}'
 
 "${KDEV[@]}" get pods -l 'app.kubernetes.io/component in (file,clamav)' \
   -o jsonpath='{range .items[*]}{.metadata.labels.app\.kubernetes\.io/component}{" "}{.status.phase}{"\n"}{range .status.initContainerStatuses[*]}{"init "}{.name}{" "}{.imageID}{" ready="}{.ready}{" restarts="}{.restartCount}{" last="}{.lastState.terminated.reason}{"\n"}{end}{range .status.containerStatuses[*]}{.name}{" "}{.imageID}{" ready="}{.ready}{" restarts="}{.restartCount}{" last="}{.lastState.terminated.reason}{"\n"}{end}{end}'
