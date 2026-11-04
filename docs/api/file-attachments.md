@@ -3,6 +3,10 @@
 Upload, consulta e download autenticados de arquivos e imagens em canais e DMs.
 O conteudo e cifrado com envelope encryption antes de chegar ao SeaweedFS.
 
+Diagnóstico passivo do antimalware e limitações do baseline da #1129:
+[runbook de coleta](../runbooks/clamav-baseline-1129.md) e
+[arquitetura/decomposição](../architecture/clamav-baseline-1129.md).
+
 **Política v1 (#1128):** o backend identifica formato/estrutura antes de finalizar
 o upload e revalida a política no worker AV. O catálogo, as restrições por família
 e os perfis desligados por padrão estão em
