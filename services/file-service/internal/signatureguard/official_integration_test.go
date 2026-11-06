@@ -2,11 +2,13 @@ package signatureguard
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,14 +32,8 @@ func TestIsolatedGuardianRealEngine(t *testing.T) {
 	runCtx, stop := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() { done <- Serve(runCtx, store, "/test/clamd.conf", "127.0.0.1:3310", age) }()
-	defer func() {
-		stop()
-		select {
-		case <-done:
-		case <-time.After(15 * time.Second):
-			t.Error("guardian failed to stop")
-		}
-	}()
+	finished := false
+	t.Cleanup(sync.OnceFunc(func() { stopRealGuardian(t, stop, done, &finished) }))
 	waitReady(t, ctx)
 	client, err := scanner.NewGuarded("127.0.0.1:3310", 10*time.Second, age)
 	requireSuccess(t, err)
@@ -48,15 +44,41 @@ func TestIsolatedGuardianRealEngine(t *testing.T) {
 		assertRealScan(t, ctx, client, test.body, test.verdict, manifest.ID())
 	}
 	// Removing the publisher state closes admission at the next poll and drains.
+	select {
+	case err := <-done:
+		finished = true
+		t.Fatalf("guardian exited before publication loss: %v", err)
+	default:
+	}
 	requireSuccess(t, os.Remove(filepath.Join(store.Root, "state.json")))
 	select {
-	case <-done:
-		done <- nil
+	case err := <-done:
+		finished = true
+		if err == nil || err.Error() != "signature publication unavailable" {
+			t.Fatalf("unexpected publication-loss shutdown: %v", err)
+		}
 	case <-time.After(35 * time.Second):
 		t.Fatal("publication loss left guardian available")
 	}
 	if _, err = client.Scan(ctx, strings.NewReader("benign")); err == nil {
 		t.Fatal("offline guardian approved")
+	}
+}
+
+func stopRealGuardian(t *testing.T, stop context.CancelFunc, done <-chan error, finished *bool) {
+	t.Helper()
+	stop()
+	if *finished {
+		return
+	}
+	select {
+	case err := <-done:
+		*finished = true
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("unexpected guardian shutdown: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Error("guardian failed to stop")
 	}
 }
 

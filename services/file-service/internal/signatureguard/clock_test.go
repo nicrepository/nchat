@@ -76,8 +76,8 @@ func TestClockWaitRecoversWithoutRestartLoop(t *testing.T) {
 	defer cancel()
 	go func() { done <- awaitClock(ctx, now, floor, ticks) }()
 	select {
-	case <-done:
-		t.Fatal("old clock authorized restart")
+	case err := <-done:
+		t.Fatalf("old clock authorized restart: %v", err)
 	default:
 	}
 	at.Store(floor.UnixNano())

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -73,19 +74,32 @@ func realSignatureGuardian(t *testing.T, ctx context.Context) (scanner.Scanner, 
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() { done <- signatureguard.Serve(runCtx, store, "/test/clamd.conf", "127.0.0.1:3310", age) }()
-	cleanup := func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(15 * time.Second):
-			t.Error("guardian shutdown timed out")
-		}
-	}
-	t.Cleanup(func() { cancel() })
+	cleanup := sync.OnceFunc(func() { cancelSignatureGuardian(t, cancel, done) })
+	t.Cleanup(cleanup)
 	waitSignatureGuardian(t, ctx)
 	client, err := scanner.NewGuarded("127.0.0.1:3310", 10*time.Second, age)
 	chainOK(t, err)
 	return client, m.ID(), cleanup
+}
+
+func cancelSignatureGuardian(t *testing.T, cancel context.CancelFunc, done <-chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		cancel()
+		t.Errorf("guardian exited before cleanup: %v", err)
+		return
+	default:
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("unexpected guardian shutdown: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Error("guardian shutdown timed out")
+	}
 }
 
 func runSignatureChain(t *testing.T, ctx context.Context, pool *pgxpool.Pool, malware scanner.Scanner) string {
