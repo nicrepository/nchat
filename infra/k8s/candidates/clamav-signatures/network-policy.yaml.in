@@ -1,0 +1,44 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: clamav-consumer-egress-denied
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: clamav
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: file
+      ports:
+        - { protocol: TCP, port: 3310 }
+  egress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: clamav-updater-isolation
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: clamav-updater
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - ipBlock:
+            cidr: __MIRROR_CIDR__
+      ports:
+        - { protocol: TCP, port: 443 }

@@ -61,6 +61,15 @@ while IFS= read -r module; do
       ;;
   esac
 
+  # Real ClamAV/tool/socket coverage is produced by the owned network-none
+  # integration runner, after every negative test and the persistence chain pass.
+  if [[ "$module" == services/file-service && -n "${CLAMAV_SIGNATURE_COVERAGE_PROFILE:-}" ]]; then
+    signature_merged="$COVERAGE_DIR/${safe_module}.signatures-merged.out"
+    awk -f "$ROOT_DIR/scripts/ci/merge-go-coverprofiles.awk" \
+      "$profile" "$CLAMAV_SIGNATURE_COVERAGE_PROFILE" >"$signature_merged"
+    mv "$signature_merged" "$profile"
+  fi
+
   echo "==> go tool cover $module"
   go tool cover -func="$profile" | tee "$summary"
 

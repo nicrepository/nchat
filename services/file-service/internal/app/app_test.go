@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"github.com/nicrepository/nchat/services/file-service/internal/scanner"
 	"io"
 	"log/slog"
 	"net/http"
@@ -451,6 +452,7 @@ func TestNoScannerConfiguredStartsNoWorkerAndApprovesNothing(t *testing.T) {
 func TestAConfiguredScannerStartsAWorkerThatShutdownStops(t *testing.T) {
 	cfg := uploadsEnabledConfig(t)
 	cfg.MalwareScannerAddress = "127.0.0.1:3310"
+	cfg.MalwareSignatureMaxAgeSeconds = 7200 // Isolated fixture policy only.
 	cfg.MalwareScanTimeoutSeconds = 30
 
 	pool := &stubPool{}
@@ -496,6 +498,7 @@ func TestAConfiguredScannerStartsAWorkerThatShutdownStops(t *testing.T) {
 func TestTheScanWorkerRunsWithoutABroadcastBus(t *testing.T) {
 	cfg := uploadsEnabledConfig(t)
 	cfg.MalwareScannerAddress = "127.0.0.1:3310"
+	cfg.MalwareSignatureMaxAgeSeconds = 7200 // Isolated fixture policy only.
 	cfg.ValkeyURL = ""
 
 	application, err := newApp(cfg, appDependencies{
@@ -528,6 +531,7 @@ func TestTheScanWorkerRunsWithoutABroadcastBus(t *testing.T) {
 func TestShutdownWithoutABroadcastBusReleasesEverything(t *testing.T) {
 	cfg := uploadsEnabledConfig(t)
 	cfg.MalwareScannerAddress = "127.0.0.1:3310"
+	cfg.MalwareSignatureMaxAgeSeconds = 7200 // Isolated fixture policy only.
 	cfg.ValkeyURL = ""
 
 	pool := &stubPool{}
@@ -559,6 +563,7 @@ func TestShutdownWithoutABroadcastBusReleasesEverything(t *testing.T) {
 func TestAnUnusableBusDoesNotStopTheScanWorker(t *testing.T) {
 	cfg := uploadsEnabledConfig(t)
 	cfg.MalwareScannerAddress = "127.0.0.1:3310"
+	cfg.MalwareSignatureMaxAgeSeconds = 7200 // Isolated fixture policy only.
 	cfg.ValkeyURL = "://not a url"
 
 	application, err := newApp(cfg, appDependencies{
@@ -583,6 +588,7 @@ func TestAnUnusableBusDoesNotStopTheScanWorker(t *testing.T) {
 func TestNoScanWorkerRunsWhileUploadsAreDisabled(t *testing.T) {
 	cfg := healthOnlyConfig()
 	cfg.MalwareScannerAddress = "127.0.0.1:3310"
+	cfg.MalwareSignatureMaxAgeSeconds = 7200 // Isolated fixture policy only.
 
 	application, err := newApp(cfg, appDependencies{tracingShutdown: noopShutdown})
 	if err != nil {
@@ -824,5 +830,34 @@ func TestPGXDependenciesRefuseANonPGXPool(t *testing.T) {
 	}
 	if _, err := newAttachmentFence(&stubPool{}, slog.Default()); !errors.Is(err, errDependenciesUnavailable) {
 		t.Fatalf("fence err = %v", err)
+	}
+}
+
+func TestMalwareScannerRequiresExplicitFreshnessPolicy(t *testing.T) {
+	cfg := config.Config{MalwareScannerAddress: "127.0.0.1:3310", MalwareScanTimeoutSeconds: 300}
+	if _, err := malwareScanner(cfg); err == nil {
+		t.Fatal("missing policy silently fell back to unproven scans")
+	}
+	cfg.MalwareSignatureMaxAgeSeconds = 7200
+	guarded, err := malwareScanner(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := guarded.(scanner.ProvenScanner); !ok {
+		t.Fatal("approved protocol lacks evidence")
+	}
+}
+
+func TestMissingFreshnessPolicyKeepsAPIUpAndApprovalClosed(t *testing.T) {
+	cfg := uploadsEnabledConfig(t)
+	cfg.MalwareScannerAddress = "127.0.0.1:3310"
+	cfg.MalwareSignatureMaxAgeSeconds = 0
+	application, err := newApp(cfg, appDependencies{openDB: openStub(&stubPool{}), openAdmission: admissionStub(), openFence: fenceStub(), tracingShutdown: noopShutdown})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = application.Shutdown(context.Background()) })
+	if application.scanCancel != nil || !application.Config.MalwareScanRequired {
+		t.Fatal("missing policy started unproven approvals or disabled the scan gate")
 	}
 }

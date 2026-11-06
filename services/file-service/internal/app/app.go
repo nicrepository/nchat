@@ -394,9 +394,7 @@ func (a *App) startMalwareScanWorker(
 		)
 		return
 	}
-	malware, err := scanner.New(
-		cfg.MalwareScannerAddress, time.Duration(cfg.MalwareScanTimeoutSeconds)*time.Second,
-	)
+	malware, err := malwareScanner(cfg)
 	if err != nil {
 		logger.LogAttrs(context.Background(), slog.LevelError, "malware scan worker not started",
 			slog.String("reason", "scanner_unavailable"),
@@ -675,4 +673,9 @@ func newUploadAdmission(
 		return nil, errDependenciesUnavailable
 	}
 	return storage.NewPGXUploadAdmission(lockPool, limits, logger), nil
+}
+
+func malwareScanner(cfg config.Config) (scanner.Scanner, error) {
+	return scanner.NewGuarded(cfg.MalwareScannerAddress, time.Duration(cfg.MalwareScanTimeoutSeconds)*time.Second,
+		time.Duration(cfg.MalwareSignatureMaxAgeSeconds)*time.Second)
 }

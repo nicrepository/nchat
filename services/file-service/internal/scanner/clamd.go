@@ -1,10 +1,10 @@
-// Package scanner speaks to an antimalware daemon (RF-22).
+// Package scanner streams content to isolated antimalware analyzers (RF-22).
 //
-// There is exactly one implementation and it is a network client: clamd's
-// INSTREAM command over TCP. Nothing here runs a process, builds a command line
-// or writes a temporary file, so no filename, MIME type or byte of content ever
-// reaches a shell, a path or an argument — the content travels as a length-
-// prefixed byte stream on a socket and nothing else does.
+// Guarded returns generation evidence; Clamd speaks the underlying INSTREAM
+// protocol over TCP or a private Unix socket. These clients start no process,
+// build no command line and write no temporary file. No filename, MIME type or
+// content reaches a shell, path or argument: content travels only as a stream
+// through the guardian to the daemon.
 package scanner
 
 import (
@@ -78,6 +78,7 @@ const (
 // shared state for two concurrent scans to corrupt.
 type Clamd struct {
 	address string
+	network string
 	timeout time.Duration
 	dialer  net.Dialer
 }
@@ -93,7 +94,7 @@ func New(address string, timeout time.Duration) (*Clamd, error) {
 	if timeout <= 0 {
 		return nil, errors.New("scanner: timeout must be positive")
 	}
-	return &Clamd{address: address, timeout: timeout}, nil
+	return &Clamd{address: address, timeout: timeout, network: "tcp"}, nil
 }
 
 // Scan streams content to the daemon and returns its verdict.
@@ -123,7 +124,7 @@ func (c *Clamd) Scan(ctx context.Context, content io.Reader) (Verdict, error) {
 	dialCtx, cancelDial := context.WithTimeout(ctx, c.timeout)
 	defer cancelDial()
 
-	conn, err := c.dialer.DialContext(dialCtx, "tcp", c.address)
+	conn, err := c.dialer.DialContext(dialCtx, c.network, c.address)
 	if err != nil {
 		// The address is deliberately absent from the message: it names internal
 		// topology, and the caller logs a category rather than a target.
@@ -375,4 +376,42 @@ func errRedacted(err error) error {
 		return err
 	}
 	return errors.New("transport failed")
+}
+
+// NewLocal is used only by the guardian, whose child clamd has no TCP listener.
+func NewLocal(path string, timeout time.Duration) (*Clamd, error) {
+	c, err := New(path, timeout)
+	if err == nil {
+		c.network = "unix"
+	}
+	return c, err
+}
+
+// Version returns the loaded engine/daily database identity, never the disk version.
+func (c *Clamd) Version(ctx context.Context) (string, error) { return c.command(ctx, "VERSION") }
+
+func (c *Clamd) Ping(ctx context.Context) error {
+	reply, err := c.command(ctx, "PING")
+	if err != nil {
+		return err
+	}
+	if reply != "PONG\x00" {
+		return ErrProtocol
+	}
+	return nil
+}
+
+func (c *Clamd) command(ctx context.Context, command string) (string, error) {
+	conn, err := c.dialer.DialContext(ctx, c.network, c.address)
+	if err != nil {
+		return "", errRedacted(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if err = conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return "", errRedacted(err)
+	}
+	if _, err = io.WriteString(conn, "z"+command+"\x00"); err != nil {
+		return "", errRedacted(err)
+	}
+	return readBounded(conn)
 }

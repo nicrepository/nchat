@@ -3,6 +3,7 @@ package storage_test
 import (
 	"context"
 	"errors"
+	"github.com/nicrepository/nchat/services/file-service/internal/signatures"
 	"strings"
 	"testing"
 	"time"
@@ -1098,5 +1099,30 @@ func TestLifecycleOperationsRefuseToRunWithoutAPool(t *testing.T) {
 		err, domain.ErrUnavailable,
 	) {
 		t.Fatalf("removal error = %v, want ErrUnavailable", err)
+	}
+}
+
+func TestProvenCleanPersistsExactEvidenceInOneStatement(t *testing.T) {
+	pool := &fakePool{queryRow: func(string, ...any) pgx.Row {
+		return valueRow{values: append(lifecycleRow(domain.StatusClean, domain.PreviewStatusPending), "applied")}
+	}}
+	proof := &signatures.Evidence{Generation: strings.Repeat("a", 64), Engine: signatures.Engine, DailyVersion: 28085, DatabaseTime: time.Now().Add(-time.Hour), LoadedAt: time.Now().Add(-time.Minute), CompletedAt: time.Now()}
+	approval := approvalInput()
+	approval.Evidence = proof
+	if _, err := mustFencedStore(pool).MarkScanClean(context.Background(), approval); err != nil {
+		t.Fatal(err)
+	}
+	if len(pool.lastArgs) != 9 || pool.lastArgs[2] != proof.Generation || pool.lastArgs[7] != proof.CompletedAt {
+		t.Fatal("proof detached from verdict")
+	}
+	if !strings.Contains(pool.lastSQL, "files.persist_proven_scan(") {
+		t.Fatal("proven write does not require approved DB policy")
+	}
+	approval.AttachmentID = ""
+	if _, err := mustFencedStore(pool).MarkScanClean(context.Background(), approval); err == nil {
+		t.Fatal("invalid verdict accepted")
+	}
+	if _, err := storage.NewPGXAttachmentStore(nil).MarkScanClean(context.Background(), approvalInput()); err == nil {
+		t.Fatal("missing store accepted")
 	}
 }
