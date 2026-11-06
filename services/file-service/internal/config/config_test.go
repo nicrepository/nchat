@@ -861,3 +861,18 @@ func TestNoConfigurationCanEnableAnUncertainResubmit(t *testing.T) {
 		t.Fatalf("the staleness threshold is unset: %d", cfg.LinkSafetySubmitUncertainTimeoutSeconds)
 	}
 }
+
+func TestSignatureAgeHasNoApprovedDefault(t *testing.T) {
+	for raw, want := range map[string]int{"": 0, "7200": 7200, "0": -1, "-1": -1, "bad": -1, "31536001": -1} {
+		t.Run(raw, func(t *testing.T) {
+			t.Setenv("FILE_MALWARE_SIGNATURE_MAX_AGE_SECONDS", raw)
+			if got := signatureMaxAge(); got != want {
+				t.Fatalf("age=%d want=%d", got, want)
+			}
+			cfg := Config{MalwareSignatureMaxAgeSeconds: signatureMaxAge(), MalwareScanRequired: true}
+			if (cfg.validateScanPolicy() == nil) != (want >= 0) {
+				t.Fatal("malformed policy silently disabled gate")
+			}
+		})
+	}
+}

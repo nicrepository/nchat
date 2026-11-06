@@ -490,6 +490,15 @@ var markScanCleanQuery = fmt.Sprintf(`
 func (s *PGXAttachmentStore) MarkScanClean(
 	ctx context.Context, approval service.ScanApproval,
 ) (service.AttachmentLifecycleState, error) {
+	if approval.Evidence != nil {
+		if s == nil || s.pool == nil {
+			return service.AttachmentLifecycleState{}, domain.ErrDependenciesUnavailable
+		}
+		if approval.AttachmentID == "" || approval.WorkspaceID == "" {
+			return service.AttachmentLifecycleState{}, domain.ErrInvalidInput
+		}
+		return markProvenClean(ctx, s.pool, approval)
+	}
 	return s.applyLifecycleTransition(ctx, markScanCleanQuery,
 		approval.AttachmentID, approval.WorkspaceID,
 		"a scan verdict needs an attachment and its workspace",
@@ -663,10 +672,11 @@ type TransactionalQuerier interface {
 
 // scanLifecycleTransition runs the statement and reads the resulting state back.
 func scanLifecycleTransition(
-	ctx context.Context, q TransactionalQuerier, query, attachmentID, workspaceID, notApplicable string,
+	ctx context.Context, q TransactionalQuerier, query, attachmentID, workspaceID, notApplicable string, extra ...any,
 ) (service.AttachmentLifecycleState, error) {
 	var status, previewStatus pgtype.Text
-	err := q.QueryRow(ctx, query, attachmentID, workspaceID).Scan(&status, &previewStatus)
+	args := append([]any{attachmentID, workspaceID}, extra...)
+	err := q.QueryRow(ctx, query, args...).Scan(&status, &previewStatus)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Never silently a success: a transition that matched nothing has

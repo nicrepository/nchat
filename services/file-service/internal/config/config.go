@@ -184,7 +184,8 @@ type Config struct {
 	// Those used to be a fixed 300s inside the service, which made a longer
 	// configured value unreachable: the service cancelled first, the job was
 	// recorded as a retry, and no configuration could fix it.
-	MalwareScanTimeoutSeconds int
+	MalwareScanTimeoutSeconds     int
+	MalwareSignatureMaxAgeSeconds int
 
 	// ValkeyURL is the broadcast bus this service publishes attachment status
 	// changes onto, shared with chat-service. Optional: without it a verdict is
@@ -309,6 +310,7 @@ func Load() Config {
 		formatProfilesInvalid:           dataInvalid || officeInvalid || archivesInvalid,
 		MalwareScanRequired:             scanRequired,
 		MalwareScannerAddress:           strings.TrimSpace(platformconfig.GetString("FILE_MALWARE_SCANNER_ADDRESS", "")),
+		MalwareSignatureMaxAgeSeconds:   signatureMaxAge(),
 		MalwareScanTimeoutSeconds:       positiveInt("FILE_MALWARE_SCAN_TIMEOUT_SECONDS", defaultMalwareScanTimeoutSeconds),
 		ValkeyURL:                       strings.TrimSpace(platformconfig.GetString("VALKEY_URL", "")),
 		WSInstanceID:                    sanitizeInstanceID(platformconfig.GetString("WS_INSTANCE_ID", "")),
@@ -650,6 +652,12 @@ var wsInstanceIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 // empty, whitespace, misspelled or simply unrecognised is treated as a deployed
 // environment and the escape hatch is refused.
 func (c Config) validateScanPolicy() error {
+	if c.MalwareSignatureMaxAgeSeconds > 0 && !c.MalwareScanRequired {
+		return errors.New("signature freshness requires FILE_MALWARE_SCAN_REQUIRED=true")
+	}
+	if c.MalwareSignatureMaxAgeSeconds < 0 {
+		return errors.New("FILE_MALWARE_SIGNATURE_MAX_AGE_SECONDS must be a positive integer when configured")
+	}
 	if c.MalwareScanRequired || isExplicitDevelopmentEnvironment(c.Env) {
 		return nil
 	}
@@ -746,4 +754,18 @@ func (c Config) validateFeatureFlags() error {
 		return errors.New("FILE_MALWARE_SCAN_REQUIRED must be a valid boolean")
 	}
 	return nil
+}
+
+// signatureMaxAge intentionally has no approved default. -1 preserves malformed
+// input for validation. Missing age leaves the worker closed, with no fallback.
+func signatureMaxAge() int {
+	raw := strings.TrimSpace(os.Getenv("FILE_MALWARE_SIGNATURE_MAX_AGE_SECONDS"))
+	if raw == "" {
+		return 0
+	}
+	age, err := strconv.Atoi(raw)
+	if err != nil || age <= 0 || age > 31536000 {
+		return -1
+	}
+	return age
 }

@@ -1,0 +1,76 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: clamav-signature-updater
+  annotations:
+    nchat.nicrepository.io/policy-approval: __APPROVAL__
+spec:
+  suspend: true
+  schedule: "17 */2 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 1200
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/component: clamav-updater
+        spec:
+          restartPolicy: Never
+          serviceAccountName: clamav-updater
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 100
+            runAsGroup: 101
+            fsGroup: 101
+            seccompProfile:
+              type: RuntimeDefault
+          initContainers:
+            - name: install-guardian
+              image: __HELPER_IMAGE__
+              args: ["--mode=install"]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              resources:
+                requests: { cpu: 25m, memory: 32Mi, ephemeral-storage: 16Mi }
+                limits: { cpu: 250m, memory: 128Mi, ephemeral-storage: 32Mi }
+              volumeMounts:
+                - { name: tools, mountPath: /tools }
+          containers:
+            - name: freshclam
+              image: clamav/clamav:1.4@sha256:d97f5ef70fbe9f1f8e5490278082067f16f5824eca2eb4176f4df3748a45a4c2
+              command: ["/init-unprivileged"]
+              args:
+                - /tools/clamav-signatures
+                - --mode=update
+                - --max-age=__MAX_AGE__s
+                - --mirror=__MIRROR__
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              resources:
+                requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 64Mi }
+                limits: { cpu: 500m, memory: 3Gi, ephemeral-storage: 2Gi }
+              volumeMounts:
+                - { name: tools, mountPath: /tools, readOnly: true }
+                - { name: signatures, mountPath: /signatures }
+                - { name: tmp, mountPath: /tmp }
+          volumes:
+            - name: tools
+              emptyDir: { sizeLimit: 32Mi }
+            - name: tmp
+              emptyDir: { sizeLimit: 1Gi }
+            - name: signatures
+              persistentVolumeClaim: { claimName: clamav-signatures }

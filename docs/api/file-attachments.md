@@ -1919,3 +1919,14 @@ apenas o binding persistido.
 O DSN precisa apontar para um banco `*_test` -- mesma guarda das suites de
 integracao do chat-service. Cada execucao inventa o proprio workspace UUID e
 remove no final apenas as linhas e os objetos que criou.
+
+## Candidato de frescor ClamAV (#1129, Entrega B)
+
+A [cadeia proposta e implementada localmente](../architecture/clamav-signatures-1129.md)
+acrescenta evidência da geração por scan e gate PostgreSQL na aprovação. O
+[runbook](../runbooks/clamav-signatures-1129.md) define ativação futura em dev.
+Não está habilitada no overlay ativo: idade máxima depende de decisão humana.
+`FILE_MALWARE_SIGNATURE_MAX_AGE_SECONDS` configurada seleciona o protocolo com
+prova; ausência deixa novas aprovações fechadas no binário novo, sem iniciar o worker.
+Valor inválido é recusado, e o caminho com prova exige policy DB habilitada.
+Nenhum contrato público de status, download, Range, preview ou realtime muda.

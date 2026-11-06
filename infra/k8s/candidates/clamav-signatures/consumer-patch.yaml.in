@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clamav
+  namespace: nchat
+  annotations:
+    nchat.nicrepository.io/policy-approval: __APPROVAL__
+spec:
+  # Candidate remains dormant. GitOps promotion must explicitly enable one replica.
+  replicas: 0
+  strategy:
+    type: Recreate
+  template:
+    spec:
+      serviceAccountName: clamav-consumer
+      terminationGracePeriodSeconds: 325
+      initContainers:
+        - $patch: replace
+        - name: install-guardian
+          image: __HELPER_IMAGE__
+          args: ["--mode=install"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests: { cpu: 25m, memory: 32Mi, ephemeral-storage: 16Mi }
+            limits: { cpu: 250m, memory: 128Mi, ephemeral-storage: 32Mi }
+          volumeMounts:
+            - { name: tools, mountPath: /tools }
+      containers:
+        - $patch: replace
+        - name: clamav
+          image: clamav/clamav:1.4@sha256:d97f5ef70fbe9f1f8e5490278082067f16f5824eca2eb4176f4df3748a45a4c2
+          command: ["/init-unprivileged"]
+          args:
+            - /tools/clamav-signatures
+            - --mode=serve
+            - --max-age=__MAX_AGE__s
+            - --isolated-synthetic-approved
+          ports:
+            - { name: clamd, containerPort: 3310 }
+          startupProbe:
+            httpGet: { path: /readyz, port: clamd }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /readyz, port: clamd }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 1
+          livenessProbe:
+            httpGet: { path: /healthz, port: clamd }
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests: { cpu: 500m, memory: 1536Mi, ephemeral-storage: 512Mi }
+            limits: { cpu: 1250m, memory: 3Gi, ephemeral-storage: 4Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - {
+                name: config,
+                mountPath: /etc/clamav/clamd.conf,
+                subPath: clamd.conf,
+                readOnly: true,
+              }
+            - { name: tools, mountPath: /tools, readOnly: true }
+            - { name: signatures, mountPath: /signatures, readOnly: true }
+            - { name: acknowledgement, mountPath: /ack, subPath: ack }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - $patch: replace
+        - name: config
+          configMap: { name: clamav-config }
+        - name: tools
+          emptyDir: { sizeLimit: 32Mi }
+        - name: tmp
+          emptyDir: { sizeLimit: 2Gi }
+        - name: acknowledgement
+          persistentVolumeClaim: { claimName: clamav-signatures }
+        - name: signatures
+          persistentVolumeClaim: { claimName: clamav-signatures, readOnly: true }

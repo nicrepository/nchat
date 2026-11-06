@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: clamav-signatures
+spec:
+  # Different pods/nodes require RWX. No assumption that current local-path can provide it.
+  accessModes: [ReadWriteMany]
+  storageClassName: __STORAGE_CLASS__
+  resources:
+    requests:
+      storage: 8Gi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: clamav-updater
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: clamav-consumer
+automountServiceAccountToken: false

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/nicrepository/nchat/services/file-service/internal/signatures"
 	"io"
 	"log/slog"
 	"net/http"
@@ -259,12 +260,13 @@ type ScanRejection struct {
 
 // ScanApproval names the attachment a malware scan has cleared.
 //
-// It is a distinct type from ScanRejection even though the fields match: these
+// It is a distinct type from ScanRejection although both name an attachment: these
 // are the two verdicts, they move the row in opposite directions, and a
 // compiler that cannot tell them apart is one refactor away from applying the
-// wrong one. Like a rejection, it carries identifiers only — the caller states
-// what the scanner found, never what the row should become.
+// wrong one. Proven scanners also carry the immutable generation evidence;
+// the database policy revalidates it in the approval transaction.
 type ScanApproval struct {
+	Evidence     *signatures.Evidence
 	AttachmentID string
 	WorkspaceID  string
 }
@@ -281,6 +283,8 @@ type AttachmentRemoval struct {
 type AttachmentLifecycleState struct {
 	Status        domain.Status
 	PreviewStatus domain.PreviewStatus
+	// A fresh rescan can replace evidence without changing the public status.
+	ScanStatusUnchanged bool `json:"-"`
 }
 
 // ScanRejectionOutcome is the rejection's result. It is an alias rather than a

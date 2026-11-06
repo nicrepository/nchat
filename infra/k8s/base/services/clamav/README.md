@@ -80,3 +80,17 @@ them are security properties rather than tuning:
 
 `User`, `LocalSocket`, `PidFile` and `ForceToDisk` are absent on purpose; each
 absence is explained in the file.
+
+## Entrega B da #1129 — candidata, ainda fora do overlay ativo
+
+O modelo acima continua sendo o caminho operacional legado. A atualização por
+FreshClam isolado, gerações imutáveis, guardião e gate transacional está descrita
+em [arquitetura B](../../../../../docs/architecture/clamav-signatures-1129.md) e
+[runbook B](../../../../../docs/runbooks/clamav-signatures-1129.md). Os templates
+em `infra/k8s/candidates/clamav-signatures` não estão referenciados neste
+Kustomization. Política de idade, RWX, mirror/egress, digests e capacidade ainda
+bloqueiam rollout; render estático não comprova implantação.
+
+A [remediação consolidada da Entrega B](../../../../../docs/architecture/clamav-signatures-1129-remediation.md)
+registra os pareceres reconciliados, as correções locais e o bloqueio arquitetural
+de confiança do Guardian. Não altera este deployment legado nem ativa candidatos.
