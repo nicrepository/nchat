@@ -722,6 +722,9 @@ test.describe("interações de mensagem — reação, favorito e pin", () => {
     await expect(pinsBar).toBeVisible();
     await expect(pinsBar).toHaveAttribute("aria-label", "Mensagem fixada");
     await expectPinPreview(pinsBar, pinnedText);
+    // The bar pushes the message down from under the still pointer, so its
+    // hover toolbar closes as it should; hover the message again to read it.
+    await revealActions(page, original.id);
     await expect(
       messageBubble(page, original.id).getByRole("button", { name: "Desafixar mensagem" }),
     ).toHaveAttribute("aria-pressed", "true");

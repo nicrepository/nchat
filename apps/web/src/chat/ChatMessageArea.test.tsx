@@ -30,6 +30,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import { clearTokens, setTokens } from "../lib/authSession";
 import { flushResizeObservers, observedElements } from "../setupTests";
 import ChatMessageArea from "./ChatMessageArea";
+import { LONG_PRESS_MS } from "./useMessageTouchGestures";
 import { withMessageJump } from "./useConversationTarget";
 import { isCatalogedEmoji, loadEmojiCatalog, resetEmojiCatalogCache } from "./emoji/emojiCatalog";
 import { avatarColorFor } from "./messageDisplay";
@@ -2822,7 +2823,7 @@ describe("ChatMessageArea — message list", () => {
     clearTimeoutSpy.mockRestore();
   });
 
-  it("reveals the reaction menu by keyboard focus and touch", async () => {
+  it("reveals the reaction menu by keyboard focus and by a long press, not by a touch", async () => {
     mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
     renderChannelAreaForUser();
     const bubble = await screen.findByTestId("chat-msg-bubble");
@@ -2834,8 +2835,20 @@ describe("ChatMessageArea — message list", () => {
     await waitFor(() =>
       expect(screen.queryByRole("button", { name: "Mais reações" })).not.toBeInTheDocument(),
     );
-    fireEvent.touchStart(bubble);
-    expect(screen.getByRole("button", { name: "Mais reações" })).toBeVisible();
+
+    // Issue #1152: a touch — which is also how every scroll starts — no longer
+    // reveals the toolbar; holding the finger still does.
+    vi.useFakeTimers();
+    try {
+      const text = within(bubble).getByText(makeMessage().bodyText);
+      fireEvent.touchStart(bubble);
+      fireEvent.pointerDown(text, { pointerType: "touch", pointerId: 1, isPrimary: true });
+      expect(screen.queryByRole("button", { name: "Mais reações" })).not.toBeInTheDocument();
+      act(() => vi.advanceTimersByTime(LONG_PRESS_MS));
+      expect(screen.getByRole("button", { name: "Mais reações" })).toBeVisible();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("puts the reader's own recent emoji first in the quick row", async () => {

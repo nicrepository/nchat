@@ -36,6 +36,7 @@ import {
 import { nextEmojiIndex } from "./emojiGridNavigation";
 import EmojiTonePalette from "./EmojiTonePalette";
 import { frequentEmojis, recentEmojis, type EmojiUsage } from "./emojiUsage";
+import type { VisibleBounds } from "./useAnchoredPicker";
 import { useEmojiCatalog, type EmojiCatalogStatus } from "./useEmojiCatalog";
 
 /** Must match the column count in the stylesheet: the arrows step by a row. */
@@ -54,6 +55,14 @@ export interface EmojiPickerProps {
   usage: EmojiUsage;
   onToneChange: (tone: number) => void;
   onSelect: (emoji: string) => void;
+  /**
+   * The message whose reaction picker this is, carried onto the tone palette:
+   * that portal leaves the picker's DOM too, and must still read as the same
+   * message's (issue #1152). Absent for any other host.
+   */
+  reactionFor?: string;
+  /** Where the tone palette must stay: see EmojiTonePalette. */
+  toneBounds?: () => VisibleBounds;
 }
 
 /**
@@ -275,7 +284,13 @@ interface TonePick {
   cell: HTMLButtonElement;
 }
 
-export default function EmojiPicker({ usage, onToneChange, onSelect }: EmojiPickerProps) {
+export default function EmojiPicker({
+  usage,
+  onToneChange,
+  onSelect,
+  reactionFor,
+  toneBounds,
+}: EmojiPickerProps) {
   const { status, catalog, retry } = useEmojiCatalog();
   const [query, setQuery] = useState("");
   const [tab, setTab] = useState<EmojiTab | null>(null);
@@ -360,6 +375,8 @@ export default function EmojiPicker({ usage, onToneChange, onSelect }: EmojiPick
           tone={usage.tone}
           onSelect={pickTone}
           onDismiss={dismissTone}
+          reactionFor={reactionFor}
+          bounds={toneBounds}
         />
       )}
     </div>
