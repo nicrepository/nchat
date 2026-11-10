@@ -876,3 +876,29 @@ func TestSignatureAgeHasNoApprovedDefault(t *testing.T) {
 		})
 	}
 }
+
+func TestScanConcurrencyFailsClosed(t *testing.T) {
+	for _, raw := range []string{"0", "00", "-1", "5", "garbage", "", "999999999999999999999999"} {
+		t.Run(raw, func(t *testing.T) {
+			enableUploads(t)
+			t.Setenv("FILE_MALWARE_SCAN_CONCURRENCY", raw)
+			c := Load()
+			if c.Validate() == nil {
+				t.Fatalf("invalid concurrency %q accepted", raw)
+			}
+		})
+	}
+}
+
+func TestScanConcurrencyReservesPoolCapacity(t *testing.T) {
+	enableUploads(t)
+	t.Setenv("FILE_MALWARE_SCAN_CONCURRENCY", "4")
+	t.Setenv("FILE_DB_MAX_CONNECTIONS", strconv.Itoa(defaultUploadMaxConcurrent+dbConnectionHeadroom+2))
+	if Load().Validate() == nil {
+		t.Fatal("scan slots exhausted pool headroom")
+	}
+	t.Setenv("FILE_DB_MAX_CONNECTIONS", strconv.Itoa(defaultUploadMaxConcurrent+dbConnectionHeadroom+3))
+	if err := Load().Validate(); err != nil {
+		t.Fatal(err)
+	}
+}

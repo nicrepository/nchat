@@ -10,7 +10,6 @@ import (
 
 	"github.com/nicrepository/nchat/services/file-service/internal/crypto"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
-	"github.com/nicrepository/nchat/services/file-service/internal/storage"
 )
 
 // readFilesMigration loads a migration from the repository so the schema
@@ -876,7 +875,7 @@ func TestScanMigrationIndexesTheWorkerQueue(t *testing.T) {
 func TestScanQueueIndexCoversTheClaimOrdering(t *testing.T) {
 	up := sqlOnly(readFilesMigration(t, scanUpMigration))
 
-	columns := orderByColumns(t, storage.ClaimDueScansQueryForTest())
+	columns := orderByColumns(t, readFilesMigration(t, "000021_scan_queue_fencing.up.sql"))
 	if len(columns) < 2 {
 		t.Fatalf("the claim must break ties deterministically; ORDER BY = %v", columns)
 	}

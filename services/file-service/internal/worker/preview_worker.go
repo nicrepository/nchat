@@ -1,7 +1,7 @@
 // Package worker runs file-service's background work.
 //
-// Background jobs share one loop: attachment previews (RF-31), object cleanup
-// (SR-002), antimalware scanning (RF-22), URL scans and draft expiry. Each names itself in its log
+// Previews, object cleanup, URL scans and draft expiry share this loop.
+// Antimalware uses a separate bounded drain with one consumer per slot. Each names itself in its log
 // lines, so the shared loop stays one implementation without its failures
 // becoming indistinguishable. It follows the
 // shape auth's e-mail outbox worker already established in this repository —
@@ -35,20 +35,8 @@ const cleanupPollInterval = 30 * time.Second
 
 const draftExpiryPollInterval = time.Minute
 
-// scanPollInterval is how often outstanding antimalware scans are claimed
-// (RF-22).
-//
-// The same cadence as the preview poll, and for the same reason: it is the
-// latency budget of the feature. A fresh upload is not downloadable until the
-// scan approves it, so this interval is what a user waits before their own file
-// becomes usable — and the claim is one indexed query against a partial index
-// that is empty whenever there is no backlog, so idle polling costs almost
-// nothing.
-//
-// Retries are not paced by this. A scan that failed is rescheduled by its own
-// claim, which pushes the next attempt out by a lease that grows with the
-// attempt count, so a daemon outage does not turn this ticker into a retry
-// storm against clamd.
+// scanPollInterval bounds idle polling and recovery after database failures.
+// The dedicated scan worker drains eligible jobs between polls.
 const scanPollInterval = 10 * time.Second
 
 // PreviewProcessor is the use case this worker drives. It is an interface so
@@ -100,22 +88,6 @@ func NewLinkScan(processor PreviewProcessor, logger *slog.Logger) *Preview {
 	return &Preview{
 		processor: processor, interval: linkScanPollInterval,
 		name: workerNameLinkScan, logger: logger,
-	}
-}
-
-// NewMalwareScan builds the worker that drains the antimalware scan queue
-// (RF-22).
-//
-// It is the same loop as the preview worker's, with its own cadence, and
-// deliberately not a third implementation of it: all three claim a batch,
-// process it, and stop when their context ends.
-func NewMalwareScan(processor PreviewProcessor, logger *slog.Logger) *Preview {
-	if logger == nil {
-		logger = slog.Default()
-	}
-	return &Preview{
-		processor: processor, interval: scanPollInterval,
-		name: workerNameMalwareScan, logger: logger,
 	}
 }
 

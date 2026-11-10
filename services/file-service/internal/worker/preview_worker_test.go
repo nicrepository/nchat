@@ -206,7 +206,6 @@ func TestAFailedPassNamesTheWorkerThatFailed(t *testing.T) {
 	}{
 		{"preview", worker.NewPreview, "preview"},
 		{"cleanup", worker.NewObjectCleanup, "object_cleanup"},
-		{"scan", worker.NewMalwareScan, "malware_scan"},
 		{"draft expiry", worker.NewDraftExpiry, "draft_expiry"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

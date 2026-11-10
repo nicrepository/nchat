@@ -251,6 +251,7 @@ type ListedAttachment struct {
 // operation is that the transition is decided in one place and applied in one
 // statement. A verdict is an input; the resulting state is not.
 type ScanRejection struct {
+	ClaimToken   string
 	AttachmentID string
 	// WorkspaceID scopes the write to one tenant. The scanner reads the row it
 	// is ruling on, so it always has this, and requiring it means a verdict can
@@ -266,6 +267,7 @@ type ScanRejection struct {
 // wrong one. Proven scanners also carry the immutable generation evidence;
 // the database policy revalidates it in the approval transaction.
 type ScanApproval struct {
+	ClaimToken   string
 	Evidence     *signatures.Evidence
 	AttachmentID string
 	WorkspaceID  string

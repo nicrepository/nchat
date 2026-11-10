@@ -413,6 +413,10 @@ const markScanRejectedQuery = `
 func (s *PGXAttachmentStore) MarkScanRejected(
 	ctx context.Context, rejection service.ScanRejection,
 ) (service.ScanRejectionOutcome, error) {
+	if rejection.ClaimToken != "" {
+		return s.persistScanAttempt(ctx, service.ScanApproval{AttachmentID: rejection.AttachmentID, WorkspaceID: rejection.WorkspaceID, ClaimToken: rejection.ClaimToken}, "rejected")
+	}
+
 	// Fenced: a verdict must not commit while a renderer is already holding
 	// this attachment's plaintext. Acquiring waits for a render in progress, so
 	// the two possible orderings are the only two outcomes — reject then no
@@ -490,6 +494,10 @@ var markScanCleanQuery = fmt.Sprintf(`
 func (s *PGXAttachmentStore) MarkScanClean(
 	ctx context.Context, approval service.ScanApproval,
 ) (service.AttachmentLifecycleState, error) {
+	if approval.ClaimToken != "" {
+		return s.persistScanAttempt(ctx, approval, "clean")
+	}
+
 	if approval.Evidence != nil {
 		if s == nil || s.pool == nil {
 			return service.AttachmentLifecycleState{}, domain.ErrDependenciesUnavailable

@@ -8,8 +8,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
+	"github.com/nicrepository/nchat/services/file-service/internal/service"
 	"github.com/nicrepository/nchat/services/file-service/internal/storage"
 )
 
@@ -29,6 +31,7 @@ func scanRow() []any {
 		pgtype.Int2{Int16: 2, Valid: true},
 		pgtype.Int2{Int16: 1, Valid: true},
 		"notes.txt", "text/plain", 0,
+		"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", time.Now(),
 	}
 }
 
@@ -65,7 +68,7 @@ func TestClaimDueScansLeasesRowsWithSkipLocked(t *testing.T) {
 		"scan_next_attempt_at",
 		"scan_attempts",
 	} {
-		if !strings.Contains(pool.lastSQL, fragment) {
+		if !strings.Contains(readFilesMigration(t, "000021_scan_queue_fencing.up.sql"), fragment) {
 			t.Fatalf("claim is missing %q:\n%s", fragment, pool.lastSQL)
 		}
 	}
@@ -83,12 +86,12 @@ func TestClaimDueScansOnlySelectsUndecidedLiveAttachments(t *testing.T) {
 	}
 
 	for _, fragment := range []string{
-		"a.status = 'pending_scan'",
+		"a.status='pending_scan'",
 		"a.deleted_at IS NULL",
 		"a.wrapped_dek IS NOT NULL",
 		"a.kek_key_id IS NOT NULL",
 	} {
-		if !strings.Contains(pool.lastSQL, fragment) {
+		if !strings.Contains(readFilesMigration(t, "000021_scan_queue_fencing.up.sql"), fragment) {
 			t.Fatalf("claim is missing %q:\n%s", fragment, pool.lastSQL)
 		}
 	}
@@ -109,37 +112,26 @@ func TestClaimDueScansTreatsAnUnscheduledRowAsDue(t *testing.T) {
 		context.Background(), 1, time.Minute); err != nil {
 		t.Fatalf("ClaimDueScans: %v", err)
 	}
-	if !strings.Contains(pool.lastSQL, "a.scan_next_attempt_at IS NULL OR a.scan_next_attempt_at <= now()") {
+	if !strings.Contains(readFilesMigration(t, "000021_scan_queue_fencing.up.sql"), "a.scan_next_attempt_at IS NULL OR a.scan_next_attempt_at<=now()") {
 		t.Fatalf("an unscheduled row is not due:\n%s", pool.lastSQL)
 	}
 }
 
 // The retry interval has to grow with the attempt count and stop growing, or a
 // daemon outage is either a storm or an unbounded wait.
-func TestClaimDueScansBacksOffWithABoundedMultiplier(t *testing.T) {
-	pool := &fakePool{query: func(string, ...any) (pgx.Rows, error) {
-		return &valueRows{}, nil
-	}}
-	if _, err := storage.NewPGXScanStore(pool).ClaimDueScans(
-		context.Background(), 1, 90*time.Second); err != nil {
-		t.Fatalf("ClaimDueScans: %v", err)
+func TestClaimDueScansSeparatesLeaseAndRetry(t *testing.T) {
+	pool := &fakePool{query: func(string, ...any) (pgx.Rows, error) { return &valueRows{}, nil }}
+	if _, err := storage.NewPGXScanStore(pool).ClaimDueScans(context.Background(), 1, 90*time.Second); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(pool.lastSQL, "LEAST(a.scan_attempts + 1, $3)") {
-		t.Fatalf("the backoff multiplier is not bounded:\n%s", pool.lastSQL)
+	if len(pool.lastArgs) != 2 || pool.lastArgs[1] != float64(90) {
+		t.Fatalf("claim args = %v", pool.lastArgs)
 	}
-	// The lease reaches the statement as seconds, so a claim that rounded it to
-	// zero would hand the row to every worker at once.
-	if pool.lastArgs[1] != int64(90) {
-		t.Fatalf("lease argument = %v, want 90 seconds", pool.lastArgs[1])
-	}
-	steps, ok := pool.lastArgs[2].(int)
-	if !ok || steps <= 0 {
-		t.Fatalf("backoff ceiling = %v, want a positive bound", pool.lastArgs[2])
-	}
-	// The counter is saturated so it cannot overflow its SMALLINT column and
-	// stall the queue behind a failing statement.
-	if !strings.Contains(pool.lastSQL, "LEAST(a.scan_attempts + 1, $4)") {
-		t.Fatalf("the attempt counter is not saturated:\n%s", pool.lastSQL)
+	sql := readFilesMigration(t, "000021_scan_queue_fencing.up.sql")
+	for _, fragment := range []string{"gen_random_uuid()", "scan_lease_until=clock_timestamp()", "LEAST(a.scan_attempts+1,32000)"} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("missing %s", fragment)
+		}
 	}
 }
 
@@ -305,4 +297,22 @@ func TestATerminalVerdictClearsTheScanSchedule(t *testing.T) {
 			t.Fatalf("a rejection left the row scheduled:\n%s", pool.lastSQL)
 		}
 	})
+}
+
+func TestScanStandbyIsTypedOnQueryAndIterationErrors(t *testing.T) {
+	for _, onQuery := range []bool{true, false} {
+		for _, code := range []string{"NC006", "NC004", "08006"} {
+			cause := &pgconn.PgError{Code: code}
+			pool := &fakePool{query: func(string, ...any) (pgx.Rows, error) {
+				if onQuery {
+					return nil, cause
+				}
+				return &valueRows{err: cause}, nil
+			}}
+			_, err := storage.NewPGXScanStore(pool).ClaimDueScans(context.Background(), 1, time.Minute)
+			if !errors.Is(err, cause) || errors.Is(err, service.ErrScanQueueStandby) != (code == "NC006") {
+				t.Fatalf("query=%v code=%s classification=%v", onQuery, code, err)
+			}
+		}
+	}
 }

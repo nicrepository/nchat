@@ -60,6 +60,10 @@ func signatureWriteError(err error) error {
 			return fmt.Errorf("%w: %w", service.ErrSignaturePolicyInactive, err)
 		case "NC002":
 			return fmt.Errorf("%w: %w", service.ErrSignaturePolicyInvalid, err)
+		case "NC005":
+			return fmt.Errorf("%w: %w", service.ErrScanSuperseded, err)
+		case "NC004":
+			return fmt.Errorf("%w: %w", service.ErrScanFencingInactive, err)
 		case "NC003", "40001", "40P01":
 			return fmt.Errorf("%w: %w", service.ErrScanConflict, err)
 		}
