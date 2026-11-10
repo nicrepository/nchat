@@ -174,8 +174,7 @@ BEGIN
   ORDER BY a.scan_next_attempt_at NULLS FIRST,a.created_at
   LIMIT p_limit FOR UPDATE SKIP LOCKED
  )
- UPDATE files.attachments a SET scan_attempts=LEAST(a.scan_attempts+1,32000),
-  scan_claim_token=gen_random_uuid(),
+ UPDATE files.attachments a SET scan_attempts=LEAST(a.scan_attempts+1,32000), scan_claim_token = gen_random_uuid(),
   scan_lease_until=clock_timestamp()+p_lease_seconds*interval '1 second',updated_at=now()
  FROM due WHERE a.id=due.id RETURNING a.*;
 END $$;
@@ -262,7 +261,7 @@ BEGIN
   RAISE EXCEPTION 'invalid retry parameters' USING ERRCODE='22023';
  END IF;
  UPDATE files.attachments SET scan_next_attempt_at=clock_timestamp()+p_delay_seconds*interval '1 second',
-  scan_lease_until=NULL,scan_claim_token=NULL,scan_last_error=p_error,scan_failed_at=clock_timestamp(),
+  scan_lease_until=NULL,scan_claim_token = NULL,scan_last_error=p_error,scan_failed_at=clock_timestamp(),
   updated_at=now() WHERE id=p_id;
  RETURN true;
 END $$;

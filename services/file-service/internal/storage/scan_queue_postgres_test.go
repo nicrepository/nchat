@@ -357,7 +357,7 @@ func (e *scanPG) proof(t *testing.T) {
 	proof.CompletedAt = proof.CompletedAt.Add(time.Millisecond)
 	requireScanPG(t, e.approve(newer, proof))
 	if err := e.approve(j, proof); !errors.Is(err, service.ErrScanSuperseded) {
-		t.Fatalf("old rescan token=%v", err)
+		t.Fatalf("old rescan token = %v", err)
 	}
 	e.exec(t, "UPDATE files.signature_policy SET enabled=false WHERE id=1")
 	e.clear(t)

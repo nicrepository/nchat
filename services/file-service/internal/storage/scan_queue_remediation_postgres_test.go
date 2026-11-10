@@ -28,7 +28,7 @@ func (e *scanPG) lifecycleRemediation(t *testing.T) {
 		e.assertRuntimeDenied(t, "UPDATE files.attachments SET status=$2 WHERE id=$1", j.AttachmentID, status)
 	}
 	for _, sql := range []string{
-		"UPDATE files.attachments SET scan_claim_token=gen_random_uuid() WHERE id=$1",
+		"UPDATE files.attachments SET scan_claim_token = gen_random_uuid() WHERE id=$1",
 		"UPDATE files.attachments SET scan_lease_until=now()+interval '1 hour' WHERE id=$1",
 		"UPDATE files.attachments SET workspace_id=gen_random_uuid() WHERE id=$1",
 	} {
