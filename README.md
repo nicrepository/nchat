@@ -82,7 +82,7 @@ Versoes base:
 
 - Node 24
 - pnpm 11
-- Go 1.25
+- Go 1.26.11
 
 Instalacao:
 

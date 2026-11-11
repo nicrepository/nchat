@@ -1,6 +1,6 @@
 module github.com/nicrepository/nchat/services/media-service
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/go-jose/go-jose/v4 v4.1.6 // CVE-2026-116587: minimum patched version.
