@@ -28,39 +28,18 @@ const HARNESS = `<!doctype html>
   </head>
   <body>
     <script type="module">
-      import RefreshRuntime from "/@react-refresh";
-      RefreshRuntime.injectIntoGlobalHook(window);
-      window.$RefreshReg$ = () => {};
-      window.$RefreshSig$ = () => (type) => type;
-      window.__vite_plugin_react_preamble_installed__ = true;
+      try {
+        const { default: RefreshRuntime } = await import("/@react-refresh");
+        RefreshRuntime.injectIntoGlobalHook(window);
+        window.$RefreshReg$ = () => {};
+        window.$RefreshSig$ = () => (type) => type;
+        window.__vite_plugin_react_preamble_installed__ = true;
 
-      const source = await (await fetch("/src/chat/useMessageTouchGestures.ts")).text();
-      const reactUrl = source.match(/"(\\/node_modules\\/\\.vite\\/deps\\/react\\.js\\?v=\\w+)"/)[1];
-      const version = new URL(reactUrl, location.href).searchParams.get("v");
-      const React = (await import(reactUrl)).default;
-      const client = await import("/node_modules/.vite/deps/react-dom_client.js?v=" + version);
-      const { createRoot } = client.default ?? client;
-      const { useMessageTouchGestures } = await import("/src/chat/useMessageTouchGestures.ts");
-
-      window.events = [];
-      function Row({ id }) {
-        const handlers = useMessageTouchGestures({
-          messageId: id,
-          disabled: false,
-          swipeBlocked: false,
-          onLongPress: (messageId) => window.events.push("long:" + messageId),
-          onSwipeReply: (messageId) => window.events.push("reply:" + messageId),
-        });
-        return React.createElement("div", { className: "row", "data-row": id, ...handlers }, "mensagem " + id);
+        await import("/e2e/helpers/messageGesturesHarness.ts");
+      } catch (error) {
+        window.bootstrapError = error instanceof Error ? error.stack ?? error.message : String(error);
+        console.error("Gesture harness bootstrap failed", error);
       }
-      window.mountRow = (id, parent) => {
-        const host = document.createElement("div");
-        parent.append(host);
-        createRoot(host).render(
-          React.createElement(React.StrictMode, null, React.createElement(Row, { id })),
-        );
-      };
-      window.ready = true;
     </script>
   </body>
 </html>`;
@@ -114,7 +93,11 @@ async function scene(
     route.fulfill({ contentType: "text/html", body: HARNESS }),
   );
   await page.goto("/__gesture-harness");
-  await page.waitForFunction(() => (window as unknown as { ready?: boolean }).ready === true);
+  await page.waitForFunction(() => {
+    const state = window as unknown as { ready?: boolean; bootstrapError?: string };
+    if (state.bootstrapError) throw new Error(state.bootstrapError);
+    return state.ready === true;
+  });
   await page.clock.pauseAt(new Date("2026-11-04T10:01:00Z"));
   await page.evaluate(
     ({ elements, rows }) => {
