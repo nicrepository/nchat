@@ -117,6 +117,138 @@ async function submit(page: Page) {
   await dialog(page).getByRole("button", { name: "Agendar reunião", exact: true }).click();
 }
 
+test.describe("meeting scheduling with mobile message actions #1152", () => {
+  test.use({ viewport: { width: 390, height: 740 }, hasTouch: true, isMobile: true });
+
+  test("cancels a pending message long press when the scheduling modal opens by keyboard", async ({
+    page,
+    browserName,
+  }) => {
+    test.skip(browserName !== "chromium", "Native held touch uses Chromium CDP");
+    await fixture(page);
+    const message = page.getByTestId("chat-msg-bubble").last();
+    await message.scrollIntoViewIfNeeded();
+    const box = await message.locator(".chat-msg-area__msg-bubble").boundingBox();
+    if (!box) throw new Error("Message bubble has no bounds");
+    const finger = await page.context().newCDPSession(page);
+    await finger.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [{ x: box.x + 30, y: box.y + box.height / 2 }],
+    });
+    const trigger = page.getByRole("button", { name: "Agendar reunião", exact: true });
+    await trigger.focus();
+    await page.keyboard.press("Enter");
+    await expect(dialog(page)).toBeVisible();
+    // The pending 500 ms gesture must not surface actions above the native modal.
+    await page.waitForTimeout(650);
+    await finger.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await expect(page.locator(".chat-msg-area__reaction-menu")).toHaveCount(0);
+    await expect
+      .poll(() => dialog(page).evaluate((element) => element.contains(document.activeElement)))
+      .toBe(true);
+    await page.keyboard.press("Escape");
+    await expect(dialog(page)).toHaveCount(0);
+    await expect(trigger).toBeFocused();
+
+    // Nothing of the old press survives the modal; a new hold works as before.
+    await expect(page.locator(".chat-msg-area__reaction-menu")).toHaveCount(0);
+    await finger.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [{ x: box.x + 30, y: box.y + box.height / 2 }],
+    });
+    await expect(page.getByRole("toolbar", { name: "Reagir à mensagem" })).toBeVisible();
+    await finger.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  });
+
+  test("drops a pending swipe when the scheduling modal opens by keyboard", async ({
+    page,
+    browserName,
+  }) => {
+    test.skip(browserName !== "chromium", "Native held touch uses Chromium CDP");
+    await fixture(page);
+    const composer = page.getByTestId("chat-composer-input");
+    await composer.fill("Rascunho intocado");
+    const message = page.getByTestId("chat-msg-bubble").last();
+    await message.scrollIntoViewIfNeeded();
+    const box = await message.locator(".chat-msg-area__msg-bubble").boundingBox();
+    if (!box) throw new Error("Message bubble has no bounds");
+    const finger = await page.context().newCDPSession(page);
+    const at = (dx: number) => [{ x: box.x + 30 + dx, y: box.y + box.height / 2 }];
+    await finger.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: at(0) });
+    for (const dx of [20, 50, 100]) {
+      await finger.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: at(dx) });
+    }
+    await expect(message).toHaveAttribute("data-swipe-armed", "");
+    const trigger = page.getByRole("button", { name: "Agendar reunião", exact: true });
+    await trigger.focus();
+    await page.keyboard.press("Enter");
+    await expect(dialog(page)).toBeVisible();
+    await expect(message).not.toHaveAttribute("data-swiping");
+    await finger.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: at(110) });
+    await finger.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await page.keyboard.press("Escape");
+    await expect(dialog(page)).toHaveCount(0);
+    await expect(trigger).toBeFocused();
+    await expect(page.getByTestId("chat-composer-quote")).toHaveCount(0);
+    await expect(page.locator(".chat-msg-area__reaction-menu")).toHaveCount(0);
+    await expect(composer).toHaveText("Rascunho intocado");
+  });
+
+  test("isolates menu, picker and modal focus while preserving both drafts and the timeline", async ({
+    page,
+  }) => {
+    const { scenario, requests } = await fixture(page);
+    const composer = page.getByTestId("chat-composer-input");
+    await composer.fill("Rascunho antes dos gestos e da reunião");
+    const message = page.getByTestId("chat-msg-bubble").last();
+    await message.scrollIntoViewIfNeeded();
+    const messageId = await message.getAttribute("data-message-id");
+    const list = page.locator(".chat-msg-area__list");
+    const scrollTop = await list.evaluate((element) => element.scrollTop);
+    const menu = page.getByRole("toolbar", { name: "Reagir à mensagem" });
+    await message.getByRole("button", { name: "Ações da mensagem" }).click();
+    await expect(menu).toBeVisible();
+    await menu.getByRole("button", { name: "Mais reações" }).click();
+    await expect(page.getByRole("dialog", { name: "Escolher reação" })).toBeVisible();
+
+    const trigger = page.getByRole("button", { name: "Agendar reunião", exact: true });
+    await trigger.click();
+    await expect(dialog(page)).toBeVisible();
+    await expect(page.locator(".chat-msg-area__reaction-menu")).toHaveCount(0);
+    await expect(page.locator('[role="dialog"][aria-label="Escolher reação"]')).toHaveCount(0);
+    await dialog(page).getByLabel("Título (obrigatório)").fill("Rascunho da reunião preservado");
+    const url = page.url();
+    await page.keyboard.press("Alt+ArrowDown");
+    await page.keyboard.press("Control+k");
+    expect(page.url()).toBe(url);
+    await expect(dialog(page)).toBeVisible();
+    await expect(dialog(page).getByLabel("Título (obrigatório)")).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(dialog(page)).toHaveCount(0);
+    await expect(trigger).toBeFocused();
+    await expect(composer).toHaveText("Rascunho antes dos gestos e da reunião");
+    await expect.poll(() => list.evaluate((element) => element.scrollTop)).toBe(scrollTop);
+
+    await message.getByRole("button", { name: "Ações da mensagem" }).click();
+    await menu.getByRole("button", { name: "Responder", exact: true }).click();
+    await expect(page.getByTestId("chat-composer-quote")).toContainText(
+      [...scenario.messagesByTarget.values()].flat().find((entry) => entry.id === messageId)!
+        .body_text!,
+    );
+    await expect(composer).toHaveText("Rascunho antes dos gestos e da reunião");
+    expect(scenario.requests.channelPosts).toHaveLength(0);
+    expect(requests).toHaveLength(0);
+    await trigger.click();
+    await expect(dialog(page).getByLabel("Título (obrigatório)")).toHaveValue(
+      "Rascunho da reunião preservado",
+    );
+    await page.keyboard.press("Escape");
+    await expect(dialog(page)).toHaveCount(0);
+    await expect(menu).toHaveCount(0);
+    await expect(trigger).toBeFocused();
+  });
+});
+
 test.describe("meeting scheduling #1055", () => {
   for (const kind of ["dm", "group", "channel"] as const) {
     test(`schedules from the ${kind} header with contextual selection`, async ({ page }) => {

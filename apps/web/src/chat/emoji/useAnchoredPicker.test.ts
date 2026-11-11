@@ -9,7 +9,12 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { anchorIsVisible, placeAgainstAnchor, type VisibleBounds } from "./useAnchoredPicker";
+import {
+  anchorIsVisible,
+  bandBeside,
+  placeAgainstAnchor,
+  type VisibleBounds,
+} from "./useAnchoredPicker";
 
 /** A 900×1280 band, as a list filling a desktop viewport would give. */
 const bounds: VisibleBounds = { top: 0, bottom: 900, left: 0, right: 1280 };
@@ -71,6 +76,25 @@ describe("anchorIsVisible", () => {
  * all — a box "nudged" into the band by clamping would land over its own
  * anchor, and a toolbar drawn across its message misattributes every action.
  */
+describe("bandBeside", () => {
+  const band: VisibleBounds = { top: 0, bottom: 210, left: 0, right: 320 };
+  const menu = new DOMRect(8, 140, 304, 62);
+
+  it("keeps the part above a box, for an element above it", () => {
+    expect(bandBeside(band, menu, new DOMRect(8, 8, 304, 125))).toEqual({ ...band, bottom: 140 });
+  });
+
+  it("keeps the part below a box, for an element below it", () => {
+    const top = new DOMRect(8, 8, 304, 36);
+    expect(bandBeside(band, top, new DOMRect(8, 51, 304, 150))).toEqual({ ...band, top: 44 });
+  });
+
+  it("is the whole band without both boxes", () => {
+    expect(bandBeside(band, undefined, menu)).toBe(band);
+    expect(bandBeside(band, menu)).toBe(band);
+  });
+});
+
 describe("placeAgainstAnchor", () => {
   /** The list's band: a 640px-tall list below a header, across the window. */
   const band: VisibleBounds = { top: 60, bottom: 700, left: 0, right: 1280 };

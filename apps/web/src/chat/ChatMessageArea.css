@@ -1316,6 +1316,110 @@
   font-size: 17px;
 }
 
+/* Opened by a long press (issue #1152): a finger needs a target, not an aim. */
+.chat-msg-area__reaction-menu--touch button {
+  min-width: 44px;
+  height: 44px;
+  font-size: 20px;
+}
+
+.chat-msg-area__reaction-menu--touch .material-symbols-outlined {
+  font-size: 22px;
+}
+
+/* The same menu with no room beside its bubble: a sheet along the bottom of
+   the visual viewport, wrapping instead of shrinking its targets. Its left,
+   width, bottom and height limit are written by the placement, which knows
+   where the visual viewport is and what the keyboard covers; past that limit
+   the sheet scrolls rather than leaving the screen. */
+.chat-msg-area__reaction-menu--sheet {
+  box-sizing: border-box;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 4px;
+  padding: 8px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* A touch menu whose picker would show no whole row of results beside it
+   (issue #1152): it keeps only the button the picker belongs to, which is
+   where focus goes back. The placement sets this while the picker is open and
+   the toolbar removes it when the picker closes. */
+.chat-msg-area__reaction-menu--cramped > button:not([aria-haspopup="dialog"]) {
+  display: none;
+}
+
+/* The message's actions without a long press (issue #1152), where there is
+   no hover to reveal them: a 44px target beside the bubble, never over it. A
+   mouse and a desktop keyboard keep the hover/focus reveal and never see it. */
+.chat-msg-area__msg-actions {
+  display: none;
+}
+
+@media (hover: none), (pointer: coarse) {
+  .chat-msg-area__msg-actions {
+    display: inline-flex;
+    flex: none;
+    align-self: center;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--color-muted);
+    cursor: pointer;
+    /* Its own pressed state below; the browser's square flash is not round. */
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .chat-msg-area__msg-actions:focus-visible,
+  .chat-msg-area__msg-actions[aria-expanded="true"] {
+    background: var(--color-primary-tint);
+  }
+}
+
+/* Swipe to reply (issue #1152). Vertical panning and pinch zoom stay native;
+   only the horizontal pan is the page's, and only on a message row — never
+   `none`, never the whole page. The row follows the finger by transform, so
+   its height and the virtualizer's measurement never change. */
+.chat-msg-area__msg {
+  touch-action: pan-y pinch-zoom;
+  transition: transform 160ms ease-out;
+}
+
+.chat-msg-area__msg[data-swiping] {
+  transition: none;
+}
+
+.chat-msg-area__msg[data-swipe-armed]::before {
+  content: "reply";
+  position: absolute;
+  top: 50%;
+  left: -32px;
+  transform: translateY(-50%);
+  font-family: "Material Symbols Outlined";
+  font-size: 22px;
+  color: var(--color-primary);
+  pointer-events: none;
+}
+
+/* A dragged row must not give the list a sideways scroll on a phone. */
+@media (pointer: coarse) {
+  .chat-msg-area__list {
+    overflow-x: hidden;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-msg-area__msg {
+    transition: none;
+  }
+}
+
 .chat-msg-area__favorite--active .material-symbols-outlined {
   color: var(--color-warning, #f5a623);
   font-variation-settings: "FILL" 1;
@@ -1496,8 +1600,15 @@
 .chat-emoji-picker {
   display: flex;
   flex-direction: column;
-  width: min(21rem, calc(100vw - 24px));
-  max-height: min(24rem, calc(100vh - 96px));
+  /* The two variables are the band a touch-opened picker is confined to
+     (issue #1152), less the surface's own padding and border; unset, they
+     limit nothing and the picker keeps its usual size. */
+  width: min(21rem, calc(100vw - 24px), calc(var(--chat-emoji-picker-max-width, 100vw) - 16px));
+  max-height: min(
+    24rem,
+    calc(100vh - 96px),
+    calc(var(--chat-emoji-picker-max-height, 100vh) - 16px)
+  );
   animation: chat-emoji-picker-in 150ms ease-out;
 }
 
@@ -1563,6 +1674,12 @@
   transition:
     background-color 140ms ease-out,
     transform 140ms ease-out;
+}
+
+/* The same squeeze, on the picker's side: search and results stay, the tabs
+   go — every category is still there, by scrolling or by searching. */
+.chat-emoji-surface--cramped .chat-emoji-picker__tabs {
+  display: none;
 }
 
 .chat-emoji-picker__tab:hover,

@@ -9,7 +9,7 @@
 
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { createPortal } from "react-dom";
-import type { RefObject } from "react";
+import type { MouseEvent as ReactMouseEvent, RefObject } from "react";
 
 import type { Message } from "./chatTypes";
 import type { EmojiUsage } from "./emoji/emojiUsage";
@@ -17,10 +17,13 @@ import ReactionBadge from "./ReactionBadge";
 import { useReactionPresence } from "./useReactionPresence";
 import {
   anchorIsVisible,
+  bandBeside,
+  intersectBounds,
   placeAgainstAnchor,
   useAnchoredPicker,
   viewportPadding,
   visibleBounds,
+  visualViewportBounds,
   type VisibleBounds,
 } from "./emoji/useAnchoredPicker";
 
@@ -52,6 +55,33 @@ const popoverSupported =
  */
 const toolbarGap = 3;
 
+/** The bottom-sheet presentation of the same menu, for touch (issue #1152). */
+const sheetClass = "chat-msg-area__reaction-menu--sheet";
+
+/**
+ * A touch menu and its picker, when the two do not fit the screen together
+ * (issue #1152): the menu keeps only the picker's own button and the picker
+ * drops its category tabs, so at least one row of results is left whole. Both
+ * come back when the picker closes.
+ */
+const crampedMenuClass = "chat-msg-area__reaction-menu--cramped";
+const crampedPickerClass = "chat-emoji-surface--cramped";
+
+/**
+ * Whether a placed picker shows no whole row of results: its results area is
+ * shorter than the distance from its top to the bottom of the first cell, at
+ * any scroll position. No cell — still loading, or nothing found — is nothing
+ * to judge yet.
+ */
+function showsNoResultRow(picker: HTMLElement): boolean {
+  const results = picker.querySelector(".chat-emoji-picker__sections");
+  const cell = results?.querySelector(".chat-emoji-picker__emoji");
+  if (!results || !cell) return false;
+  const firstRow =
+    cell.getBoundingClientRect().bottom - results.getBoundingClientRect().top + results.scrollTop;
+  return results.clientHeight < firstRow;
+}
+
 export interface MessageToolbarProps {
   message: Message;
   /** Placement mirrors for the reader's own messages, which sit on the right. */
@@ -73,6 +103,14 @@ export interface MessageToolbarProps {
   onReactionMenuVisibleChange: (messageId: string, visible: boolean) => void;
   pickerOpen: boolean;
   onPickerOpenChange: (messageId: string, open: boolean) => void;
+  /**
+   * The menu was opened by a long press (issue #1152): touch-sized targets,
+   * a bottom sheet when it fits nowhere beside its bubble, and Escape or a tap
+   * elsewhere closes it, since there is no pointer leaving to do that.
+   */
+  touchMode?: boolean;
+  /** The menu's id, for the actions button that opens it (aria-controls). */
+  menuId?: string;
   onStartEdit?: () => void;
   onDelete?: () => void;
   deleting: boolean;
@@ -204,6 +242,7 @@ type PlacementInput = Pick<
   | "pickerOpen"
   | "onPickerOpenChange"
   | "onReactionMenuVisibleChange"
+  | "touchMode"
 > & { messageId: string };
 
 interface Placement {
@@ -211,6 +250,9 @@ interface Placement {
   anchorRef: RefObject<HTMLButtonElement | null>;
   pickerRef: RefObject<HTMLDivElement | null>;
   closePicker: (restoreFocus: boolean) => void;
+  dismiss: () => void;
+  /** Where the picker's tone palette may sit; absent for a hover toolbar. */
+  toneBounds?: () => VisibleBounds;
 }
 
 /**
@@ -305,6 +347,98 @@ function placeBeside(
 }
 
 /**
+ * The toolbar against its own bubble, as on desktop (issues #839, #852):
+ * beside it first, then above or below inside the list's visible band and
+ * clear of the neighbouring messages. Returns whether it was placed.
+ */
+function placeAnchored(
+  menu: HTMLElement,
+  anchor: HTMLElement,
+  bubble: DOMRect,
+  bounds: VisibleBounds,
+  isMine: boolean,
+): boolean {
+  const box = menu.getBoundingClientRect();
+  const midX = bubble.left + bubble.width / 2;
+  const left = isMine ? midX - box.width : midX;
+  // Beside its own bubble is where the toolbar sits by default (issue
+  // #852): a stack of messages almost always sits closer together than
+  // the toolbar is tall, so above/below either cross into a neighbor
+  // outright or leave only a pointer's-width of clearance to aim at — a
+  // hitbox the reader cannot reliably hit without opening the wrong
+  // message's toolbar instead. The row's own horizontal room is usually
+  // wider than the bubble, so that is the side that actually has space,
+  // and it is the same regardless of what sits above or below.
+  let placed = placeBeside(menu, bubble, box, isMine, toolbarGap, bounds);
+  // No horizontal room beside it: the list's own top/bottom edge, or a
+  // neighboring message's bubble, is where it goes instead — confined to
+  // what the reader can see of the list, so a bubble near its top edge
+  // gets the toolbar below it rather than over the header, and narrowed
+  // further by the immediate neighbor so a pair grouped close together
+  // does not cross into it (with the same edge padding the list's own
+  // edges get, for the same aiming reason placeBeside is now preferred).
+  // A bubble with no room on any side gets no toolbar rather than one
+  // drawn where its message is not.
+  if (!placed) {
+    const previousBottom = previousBubbleBottom(anchor);
+    const nextTop = nextBubbleTop(anchor);
+    // A message genuinely before or after this one ends or begins at its
+    // own edge; a reading that crosses into this one's own box is not one
+    // to trust — it says nothing sane about the timeline — so the list's
+    // own edge stays the bound instead of forcing a fallback the layout
+    // does not call for.
+    const constrainedBounds = {
+      ...bounds,
+      top:
+        previousBottom !== null && previousBottom > bounds.top && previousBottom <= bubble.top
+          ? previousBottom
+          : bounds.top,
+      bottom:
+        nextTop !== null && nextTop < bounds.bottom && nextTop >= bubble.bottom
+          ? nextTop
+          : bounds.bottom,
+    };
+    placed = placeAgainstAnchor(menu, bubble, box, left, toolbarGap, toolbarGap, constrainedBounds);
+  }
+  return placed;
+}
+
+/** Whether the menu's width fits inside the band, edge padding included. */
+function fitsBand(menu: HTMLElement, bounds: VisibleBounds): boolean {
+  return menu.getBoundingClientRect().width <= bounds.right - bounds.left - 2 * viewportPadding;
+}
+
+/**
+ * The menu as a bottom sheet (issue #1152), wholly inside the visual viewport:
+ * zoomed in, the reader sees only part of the layout viewport a fixed element
+ * is placed in, and the on-screen keyboard or the browser's own bars cover its
+ * bottom — so `left: 0; right: 0; bottom: 0` would put the sheet off-screen or
+ * under them. Edges, width and height limit all come from what is visible,
+ * less the padding and the device's safe areas; past the limit it scrolls.
+ */
+function placeSheet(menu: HTMLElement) {
+  const view = visualViewportBounds();
+  const covered = Math.max(0, window.innerHeight - view.bottom);
+  const pad = viewportPadding;
+  menu.style.top = "";
+  menu.style.left = `calc(${view.left + pad}px + env(safe-area-inset-left, 0px))`;
+  menu.style.width = `calc(${view.right - view.left - 2 * pad}px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px))`;
+  menu.style.bottom = `calc(${covered + pad}px + env(safe-area-inset-bottom, 0px))`;
+  menu.style.maxHeight = `calc(${view.bottom - view.top - 2 * pad}px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px))`;
+  menu.style.visibility = "visible";
+}
+
+/**
+ * The band a toolbar may be drawn in: the list's visible band, and for a
+ * touch-opened menu only the part of it the visual viewport shows (issue
+ * #1152). The desktop keeps the band it was approved with (#839, #852).
+ */
+function placementBounds(anchor: Element, touchMode: boolean): VisibleBounds {
+  const bounds = visibleBounds(anchor);
+  return touchMode ? intersectBounds(bounds, visualViewportBounds()) : bounds;
+}
+
+/**
  * Where the hover toolbar sits, and when the picker it holds closes.
  *
  * The toolbar floats outside the message's own box, so it cannot be placed by
@@ -328,9 +462,11 @@ function useReactionPickerPlacement({
   pickerOpen,
   onPickerOpenChange,
   onReactionMenuVisibleChange,
+  touchMode,
 }: PlacementInput): Placement {
   const menuRef = useRef<HTMLDivElement>(null);
   const anchorRef = useRef<HTMLButtonElement>(null);
+  const sheetRef = useRef(false);
 
   const dismiss = useCallback(() => {
     onPickerOpenChange(messageId, false);
@@ -340,61 +476,29 @@ function useReactionPickerPlacement({
   const positionMenu = useCallback(() => {
     const anchor = bubbleRef.current;
     const menu = menuRef.current;
-    if (!reactionMenuVisible || !anchor || !menu) return;
-    const bubble = anchor.getBoundingClientRect();
-    const box = menu.getBoundingClientRect();
-    const midX = bubble.left + bubble.width / 2;
-    const left = isMine ? midX - box.width : midX;
-    // Beside its own bubble is where the toolbar sits by default (issue
-    // #852): a stack of messages almost always sits closer together than
-    // the toolbar is tall, so above/below either cross into a neighbor
-    // outright or leave only a pointer's-width of clearance to aim at — a
-    // hitbox the reader cannot reliably hit without opening the wrong
-    // message's toolbar instead. The row's own horizontal room is usually
-    // wider than the bubble, so that is the side that actually has space,
-    // and it is the same regardless of what sits above or below.
-    const bounds = visibleBounds(anchor);
-    let placed = placeBeside(menu, bubble, box, isMine, toolbarGap, bounds);
-    // No horizontal room beside it: the list's own top/bottom edge, or a
-    // neighboring message's bubble, is where it goes instead — confined to
-    // what the reader can see of the list, so a bubble near its top edge
-    // gets the toolbar below it rather than over the header, and narrowed
-    // further by the immediate neighbor so a pair grouped close together
-    // does not cross into it (with the same edge padding the list's own
-    // edges get, for the same aiming reason placeBeside is now preferred).
-    // A bubble with no room on any side gets no toolbar rather than one
-    // drawn where its message is not.
-    if (!placed) {
-      const previousBottom = previousBubbleBottom(anchor);
-      const nextTop = nextBubbleTop(anchor);
-      // A message genuinely before or after this one ends or begins at its
-      // own edge; a reading that crosses into this one's own box is not one
-      // to trust — it says nothing sane about the timeline — so the list's
-      // own edge stays the bound instead of forcing a fallback the layout
-      // does not call for.
-      const constrainedBounds = {
-        ...bounds,
-        top:
-          previousBottom !== null && previousBottom > bounds.top && previousBottom <= bubble.top
-            ? previousBottom
-            : bounds.top,
-        bottom:
-          nextTop !== null && nextTop < bounds.bottom && nextTop >= bubble.bottom
-            ? nextTop
-            : bounds.bottom,
-      };
-      placed = placeAgainstAnchor(
-        menu,
-        bubble,
-        box,
-        left,
-        toolbarGap,
-        toolbarGap,
-        constrainedBounds,
-      );
+    if (!reactionMenuVisible) {
+      sheetRef.current = false;
+      return;
     }
-    if (!placed) dismiss();
-  }, [bubbleRef, dismiss, isMine, reactionMenuVisible]);
+    if (!anchor || !menu) return;
+    const bubble = anchor.getBoundingClientRect();
+    const bounds = placementBounds(anchor, !!touchMode);
+    // The sheet is decided once per opening: measured again in its own
+    // layout, the toolbar would flip between the two on every commit.
+    // A touch menu wider than the list (touch-sized targets on a phone) is not
+    // anchored at all: the horizontal clamp would push it off-screen left.
+    const anchorable = !sheetRef.current && (!touchMode || fitsBand(menu, bounds));
+    if (anchorable && placeAnchored(menu, anchor, bubble, bounds, isMine)) return;
+    // Touch only (issue #1152): on a phone a bubble spans the row and its
+    // neighbours sit closer than the toolbar is tall, so no anchored spot
+    // exists and closing — the desktop verdict — left the reader with nothing.
+    // The menu stays bound to its message, just not drawn beside it. An anchor
+    // that has left the list's band still closes it, sheet or not.
+    sheetRef.current = !!touchMode && anchorIsVisible(bubble, bounds);
+    menu.classList.toggle(sheetClass, sheetRef.current);
+    if (sheetRef.current) placeSheet(menu);
+    else dismiss();
+  }, [bubbleRef, dismiss, isMine, reactionMenuVisible, touchMode]);
 
   // No dependency list on purpose: every commit of the toolbar is a moment the
   // timeline may have moved its anchor, and re-reading one rect is cheaper than
@@ -403,6 +507,8 @@ function useReactionPickerPlacement({
     // Into the top layer before measuring — see the toolbar's CSS. A no-op
     // once shown.
     if (popoverSupported) menuRef.current?.togglePopover(true);
+    // A closed picker gives the menu back the actions it set aside.
+    if (!pickerOpen) menuRef.current?.classList.remove(crampedMenuClass);
     positionMenu();
   });
 
@@ -413,9 +519,15 @@ function useReactionPickerPlacement({
     if (!reactionMenuVisible) return;
     document.addEventListener("scroll", positionMenu, true);
     window.addEventListener("resize", positionMenu);
+    // The on-screen keyboard and pinch zoom move the visual viewport only:
+    // resizing it, or panning it across a zoomed page.
+    window.visualViewport?.addEventListener("resize", positionMenu);
+    window.visualViewport?.addEventListener("scroll", positionMenu);
     return () => {
       document.removeEventListener("scroll", positionMenu, true);
       window.removeEventListener("resize", positionMenu);
+      window.visualViewport?.removeEventListener("resize", positionMenu);
+      window.visualViewport?.removeEventListener("scroll", positionMenu);
     };
   }, [positionMenu, reactionMenuVisible]);
 
@@ -437,14 +549,122 @@ function useReactionPickerPlacement({
     [messageId, onPickerOpenChange, onReactionMenuVisibleChange],
   );
 
+  /**
+   * Makes room for a touch picker that shows no whole row of results beside its
+   * menu. Once per opening: the classes only ever shrink the menu and the
+   * picker's header, which the placement observes and re-places against, and
+   * nothing here undoes them while the picker is open — so a placement cannot
+   * flip it back and forth.
+   */
+  const makeRoom = useCallback(
+    (picker: HTMLElement) => {
+      const menu = menuRef.current;
+      if (!menu || menu.classList.contains(crampedMenuClass) || !showsNoResultRow(picker)) return;
+      menu.classList.add(crampedMenuClass);
+      picker.classList.add(crampedPickerClass);
+      positionMenu();
+    },
+    [positionMenu],
+  );
+
   const pickerRef = useAnchoredPicker({
     open: pickerOpen,
     anchorRef,
     onDismiss: closePicker,
     containerRef: menuRef,
+    // Opened by touch, the picker stays inside what the reader can see.
+    bounds: touchMode ? visualViewportBounds : undefined,
+    // And clear of the touch menu, which is painted over anything under it.
+    clearRef: touchMode ? menuRef : undefined,
+    onPlaced: touchMode ? makeRoom : undefined,
   });
 
-  return { menuRef, anchorRef, pickerRef, closePicker };
+  useTouchMenuDismissal({
+    active: reactionMenuVisible && !!touchMode,
+    pickerOpen,
+    menuRef,
+    pickerRef,
+    dismiss,
+  });
+
+  // Where a touch picker's tone palette may sit (issue #1152): the visual
+  // viewport on the picker's side of its menu. The menu is in the top layer, so
+  // a palette crossing it is painted under it and cannot be touched there.
+  const toneBounds = useCallback(
+    () =>
+      bandBeside(
+        visualViewportBounds(),
+        menuRef.current?.getBoundingClientRect(),
+        pickerRef.current?.getBoundingClientRect(),
+      ),
+    [pickerRef],
+  );
+
+  return {
+    menuRef,
+    anchorRef,
+    pickerRef,
+    closePicker,
+    dismiss,
+    toneBounds: touchMode ? toneBounds : undefined,
+  };
+}
+
+/**
+ * How a touch-opened menu closes (issue #1152). A hover menu closes when the
+ * pointer leaves; a finger never leaves, so a tap outside the message (and
+ * outside its picker) closes it, and so does Escape — returning focus to what
+ * opened it: the message's actions button when that was it, the message itself
+ * otherwise. Focus starts on the menu's first action, so assistive technology
+ * lands inside it.
+ */
+function useTouchMenuDismissal({
+  active,
+  pickerOpen,
+  menuRef,
+  pickerRef,
+  dismiss,
+}: {
+  active: boolean;
+  pickerOpen: boolean;
+  menuRef: RefObject<HTMLDivElement | null>;
+  pickerRef: RefObject<HTMLDivElement | null>;
+  dismiss: () => void;
+}) {
+  const openerRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!active) return;
+    const shell = menuRef.current?.closest<HTMLElement>("[data-message-id]") ?? null;
+    const closeOnOutsidePress = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (shell?.contains(target) || pickerRef.current?.contains(target)) return;
+      if (target instanceof Element && target.closest(".chat-emoji-tone")) return;
+      dismiss();
+    };
+    // With the picker open, Escape is the picker's: it closes that first.
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || pickerOpen) return;
+      dismiss();
+      (openerRef.current ?? shell)?.focus({ preventScroll: true });
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePress, true);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePress, true);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [active, dismiss, menuRef, pickerOpen, pickerRef]);
+
+  // Once per opening, not per picker toggle: closing the picker hands focus
+  // back to its own button, which must not be taken away again.
+  useEffect(() => {
+    if (!active) return;
+    const opener = document.activeElement;
+    const shell = menuRef.current?.closest("[data-message-id]");
+    openerRef.current = opener instanceof HTMLElement && shell?.contains(opener) ? opener : null;
+    menuRef.current?.querySelector("button")?.focus({ preventScroll: true });
+  }, [active, menuRef]);
 }
 
 function ReactionBadges({
@@ -498,10 +718,21 @@ function QuickReactionButtons({
 
 export default function MessageToolbar(props: MessageToolbarProps) {
   const { message, currentUserId, onToggleReaction, reactionMenuVisible } = props;
-  const { menuRef, anchorRef, pickerRef, closePicker } = useReactionPickerPlacement({
-    ...props,
-    messageId: message.id,
-  });
+  const { menuRef, anchorRef, pickerRef, closePicker, dismiss, toneBounds } =
+    useReactionPickerPlacement({
+      ...props,
+      messageId: message.id,
+    });
+  const touchMode = props.touchMode ?? false;
+
+  // A touch menu closes once an action in it is chosen — except "Mais
+  // reações", which opens the picker over it. A click inside the picker is not
+  // a click inside the menu: the picker is portalled out of its DOM.
+  const closeAfterTouchAction = (event: ReactMouseEvent<HTMLDivElement>) => {
+    const button = event.target instanceof Element ? event.target.closest("button") : null;
+    if (!touchMode || !button || button === anchorRef.current) return;
+    if (event.currentTarget.contains(button)) dismiss();
+  };
 
   const selectReaction = (emoji: string) => {
     onToggleReaction(message.id, emoji);
@@ -519,7 +750,12 @@ export default function MessageToolbar(props: MessageToolbarProps) {
       {reactionMenuVisible && (
         <div
           ref={menuRef}
-          className="chat-msg-area__reaction-menu"
+          id={props.menuId}
+          className={
+            touchMode
+              ? "chat-msg-area__reaction-menu chat-msg-area__reaction-menu--touch"
+              : "chat-msg-area__reaction-menu"
+          }
           role="toolbar"
           // A manual popover is rendered in the top layer, where the transform
           // that positions a virtualized row is not its containing block
@@ -528,6 +764,7 @@ export default function MessageToolbar(props: MessageToolbarProps) {
           popover={popoverSupported ? "manual" : undefined}
           aria-label="Reagir à mensagem"
           onMouseEnter={() => props.onReactionMenuVisibleChange(message.id, true)}
+          onClick={closeAfterTouchAction}
           style={{ visibility: "hidden" }}
         >
           <QuickReactionButtons
@@ -558,6 +795,9 @@ export default function MessageToolbar(props: MessageToolbarProps) {
                 // surface it belongs to, instead of falling back to the root
                 // theme.
                 className="chat-theme chat-emoji-surface"
+                // Whose picker this is, for the message's focus handling: see
+                // useToolbarReveal.
+                data-reaction-picker-for={message.id}
                 role="dialog"
                 aria-label="Escolher reação"
                 style={{ visibility: "hidden" }}
@@ -573,6 +813,8 @@ export default function MessageToolbar(props: MessageToolbarProps) {
                     usage={props.emojiUsage}
                     onToneChange={props.onEmojiToneChange}
                     onSelect={selectReaction}
+                    reactionFor={message.id}
+                    toneBounds={toneBounds}
                   />
                 </Suspense>
               </div>,
