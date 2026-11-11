@@ -8,9 +8,9 @@ stages:
 
 variables:
   NODE_VERSION: "24"
-  GO_VERSION: "1.25.10"
+  GO_VERSION: "1.26.11"
   PNPM_VERSION: "11.1.2"
-  GOTOOLCHAIN: "auto"
+  GOTOOLCHAIN: "local"
   PNPM_HOME: "$CI_PROJECT_DIR/.pnpm"
   PNPM_STORE_PATH: "$CI_PROJECT_DIR/.pnpm-store"
   GOCACHE: "$CI_PROJECT_DIR/.cache/go-build"
@@ -71,7 +71,7 @@ quality:
 
 backend:
   stage: backend
-  image: golang:1.25-bookworm
+  image: golang:${GO_VERSION}-bookworm@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0
   # The RF-21 Link Safety tests only run against a real PostgreSQL and the
   # coverage gate merges their profile in. Ephemeral service credentials, local
   # to this job; the database name must end in _test because the suites refuse
@@ -143,7 +143,7 @@ manifests:
 
 security-govulncheck:
   stage: security
-  image: golang:1.25-bookworm
+  image: golang:${GO_VERSION}-bookworm@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0
   before_script:
     - export PATH="$(go env GOPATH)/bin:$PATH"
     - go install golang.org/x/vuln/cmd/govulncheck@latest
