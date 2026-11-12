@@ -184,6 +184,8 @@ type Config struct {
 	// Those used to be a fixed 300s inside the service, which made a longer
 	// configured value unreachable: the service cancelled first, the job was
 	// recorded as a retry, and no configuration could fix it.
+	// MalwareScanConcurrency defaults to one and is bounded by scanner and DB budgets.
+	MalwareScanConcurrency        int
 	MalwareScanTimeoutSeconds     int
 	MalwareSignatureMaxAgeSeconds int
 
@@ -311,6 +313,7 @@ func Load() Config {
 		MalwareScanRequired:             scanRequired,
 		MalwareScannerAddress:           strings.TrimSpace(platformconfig.GetString("FILE_MALWARE_SCANNER_ADDRESS", "")),
 		MalwareSignatureMaxAgeSeconds:   signatureMaxAge(),
+		MalwareScanConcurrency:          platformconfig.GetInt("FILE_MALWARE_SCAN_CONCURRENCY", 1),
 		MalwareScanTimeoutSeconds:       positiveInt("FILE_MALWARE_SCAN_TIMEOUT_SECONDS", defaultMalwareScanTimeoutSeconds),
 		ValkeyURL:                       strings.TrimSpace(platformconfig.GetString("VALKEY_URL", "")),
 		WSInstanceID:                    sanitizeInstanceID(platformconfig.GetString("WS_INSTANCE_ID", "")),
@@ -652,6 +655,10 @@ var wsInstanceIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 // empty, whitespace, misspelled or simply unrecognised is treated as a deployed
 // environment and the escape hatch is refused.
 func (c Config) validateScanPolicy() error {
+	if err := c.validateScanConcurrency(); err != nil {
+		return err
+	}
+
 	if c.MalwareSignatureMaxAgeSeconds > 0 && !c.MalwareScanRequired {
 		return errors.New("signature freshness requires FILE_MALWARE_SCAN_REQUIRED=true")
 	}
@@ -768,4 +775,20 @@ func signatureMaxAge() int {
 		return -1
 	}
 	return age
+}
+
+func (c Config) validateScanConcurrency() error {
+	if raw, ok := os.LookupEnv("FILE_MALWARE_SCAN_CONCURRENCY"); ok {
+		slots, err := strconv.Atoi(raw)
+		if err != nil || slots < 1 || slots > 4 {
+			return errors.New("FILE_MALWARE_SCAN_CONCURRENCY must be an integer between 1 and 4")
+		}
+	}
+	if c.MalwareScanConcurrency < 0 || c.MalwareScanConcurrency > 4 {
+		return errors.New("invalid scan concurrency")
+	}
+	if c.MalwareScanConcurrency > 1 && c.DBMaxConnections < c.UploadMaxConcurrent+dbConnectionHeadroom+c.MalwareScanConcurrency-1 {
+		return errors.New("database pool lacks scan concurrency headroom")
+	}
+	return nil
 }

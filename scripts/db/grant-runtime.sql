@@ -44,3 +44,12 @@ BEGIN
   GRANT EXECUTE ON FUNCTION files.persist_proven_scan TO nchat_app;
  END IF;
 END $$;
+
+DO $$ BEGIN
+ IF to_regclass('files.scan_queue_policy') IS NOT NULL THEN
+  REVOKE ALL ON files.scan_queue_policy FROM nchat_app;
+  GRANT SELECT ON files.scan_queue_policy TO nchat_app;
+  REVOKE ALL ON FUNCTION files.persist_proven_scan_internal FROM nchat_app;
+  GRANT EXECUTE ON FUNCTION files.scan_fencing_enabled(),files.claim_scans(integer,double precision),files.persist_scan_v2,files.retry_scan TO nchat_app;
+ END IF;
+END $$;

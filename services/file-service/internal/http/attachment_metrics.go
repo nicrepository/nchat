@@ -26,6 +26,14 @@ type AttachmentMetrics struct {
 	cleanups           *prometheus.CounterVec
 	scans              *prometheus.CounterVec
 	scanQueue          prometheus.Gauge
+	scanActive         prometheus.Gauge
+	scanCapacity       prometheus.Gauge
+	scanEligible       prometheus.Gauge
+	scanLeased         prometheus.Gauge
+	scanClaims         prometheus.Counter
+	scanDuration       prometheus.Histogram
+	scanWait           prometheus.Histogram
+	scanBackoff        *prometheus.HistogramVec
 	orphans            prometheus.Counter
 }
 
@@ -113,6 +121,14 @@ func NewAttachmentMetrics(metrics *observability.Metrics) *AttachmentMetrics {
 			Name: "nchat_file_malware_scan_queue_depth",
 			Help: "Attachments awaiting an antimalware verdict.",
 		}),
+		scanCapacity: prometheus.NewGauge(prometheus.GaugeOpts{Name: "nchat_file_malware_scan_capacity", Help: "Configured local execution slots."}),
+		scanActive:   prometheus.NewGauge(prometheus.GaugeOpts{Name: "nchat_file_malware_scan_active", Help: "Local scans occupying an execution slot."}),
+		scanEligible: prometheus.NewGauge(prometheus.GaugeOpts{Name: "nchat_file_malware_scan_eligible", Help: "Eligible persistent scan jobs."}),
+		scanLeased:   prometheus.NewGauge(prometheus.GaugeOpts{Name: "nchat_file_malware_scan_leased", Help: "Persistent scan jobs with a live lease."}),
+		scanClaims:   prometheus.NewCounter(prometheus.CounterOpts{Name: "nchat_file_malware_scan_claims_total", Help: "Claims admitted to execution."}),
+		scanDuration: prometheus.NewHistogram(prometheus.HistogramOpts{Name: "nchat_file_malware_scan_duration_seconds", Help: "Scan attempt duration including persistence.", Buckets: []float64{.01, .1, 1, 5, 10, 30, 60, 300, 600}}),
+		scanWait:     prometheus.NewHistogram(prometheus.HistogramOpts{Name: "nchat_file_malware_scan_wait_seconds", Help: "Time since upload finalization at execution (legacy falls back to creation).", Buckets: []float64{1, 5, 10, 30, 60, 300, 3600, 86400}}),
+		scanBackoff:  prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "nchat_file_malware_scan_backoff_seconds", Help: "Persisted retry delays.", Buckets: []float64{10, 20, 40, 80, 160, 320, 640, 1320, 2640}}, []string{"reason"}),
 		orphans: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "nchat_file_orphaned_objects_total",
 			Help: "Failed uploads whose stored object could not be cleaned up.",
@@ -121,7 +137,7 @@ func NewAttachmentMetrics(metrics *observability.Metrics) *AttachmentMetrics {
 	// Register reports false when metrics are disabled; the counters still work
 	// as no-op accumulators, so callers never need a nil check.
 	metrics.Register(m.inspections, m.inspectionDuration, m.uploads, m.downloads, m.previews, m.previewAttempts, m.previewDuration, m.linkPreviews, m.cleanups,
-		m.scans, m.scanQueue, m.orphans)
+		m.scans, m.scanQueue, m.scanActive, m.scanCapacity, m.scanEligible, m.scanLeased, m.scanClaims, m.scanDuration, m.scanWait, m.scanBackoff, m.orphans)
 	return m
 }
 
@@ -213,4 +229,40 @@ func (m *AttachmentMetrics) ObserveOrphanedObject() {
 		return
 	}
 	m.orphans.Inc()
+}
+
+func (m *AttachmentMetrics) ScanStarted(wait time.Duration) {
+	if m == nil {
+		return
+	}
+	m.scanActive.Inc()
+	m.scanClaims.Inc()
+	if wait >= 0 {
+		m.scanWait.Observe(wait.Seconds())
+	}
+}
+func (m *AttachmentMetrics) ScanFinished(elapsed time.Duration) {
+	if m == nil {
+		return
+	}
+	m.scanActive.Dec()
+	m.scanDuration.Observe(elapsed.Seconds())
+}
+func (m *AttachmentMetrics) ObserveScanBackoff(delay time.Duration, reason string) {
+	if m != nil {
+		m.scanBackoff.WithLabelValues(reason).Observe(delay.Seconds())
+	}
+}
+func (m *AttachmentMetrics) SetScanQueueState(eligible, leased int64) {
+	if m == nil {
+		return
+	}
+	m.scanEligible.Set(float64(eligible))
+	m.scanLeased.Set(float64(leased))
+}
+
+func (m *AttachmentMetrics) SetScanCapacity(slots int) {
+	if m != nil {
+		m.scanCapacity.Set(float64(slots))
+	}
 }

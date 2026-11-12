@@ -70,6 +70,16 @@ while IFS= read -r module; do
     mv "$signature_merged" "$profile"
   fi
 
+  if [[ "$module" == services/file-service && -n "${SCAN_QUEUE_COVERAGE_DIR:-}" ]]; then
+    queue_merged="$COVERAGE_DIR/${safe_module}.queue-merged.out"
+    for version in 16 17; do
+      queue_profile="$SCAN_QUEUE_COVERAGE_DIR/postgres-$version.out"
+      [[ -s "$queue_profile" ]] || { echo "Missing scan queue coverage: PostgreSQL $version" >&2; exit 1; }
+      awk -f "$ROOT_DIR/scripts/ci/merge-go-coverprofiles.awk" "$profile" "$queue_profile" >"$queue_merged"
+      mv "$queue_merged" "$profile"
+    done
+  fi
+
   echo "==> go tool cover $module"
   go tool cover -func="$profile" | tee "$summary"
 

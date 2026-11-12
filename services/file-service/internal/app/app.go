@@ -446,11 +446,22 @@ func (a *App) startMalwareScanWorker(
 		logger,
 	)
 	scans.SetFormatProfiles(filepolicy.Profiles{Data: cfg.EnterpriseDataEnabled, Office: cfg.EnterpriseOfficeEnabled, Archives: cfg.EnterpriseArchivesEnabled})
+	scanWorker := worker.NewMalwareScan(scans, logger)
+	slots := cfg.MalwareScanConcurrency
+	if slots == 0 {
+		slots = 1
+	}
+	if err := scanWorker.SetConcurrency(slots); err != nil {
+		logger.Error("invalid malware worker concurrency")
+		return
+	}
+	metrics.SetScanCapacity(slots)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		worker.NewMalwareScan(scans, logger).Start(ctx)
+		scanWorker.Start(ctx)
 	}()
 	a.scanCancel = cancel
 	a.scanDone = done

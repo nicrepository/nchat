@@ -358,10 +358,15 @@ jobs:
           CLAMAV_SIGNATURE_COVERAGE_PROFILE: ${{ github.workspace }}/coverage/go/clamav-signatures.out
           # A signed second CVD snapshot tests recurring upgrades; no runtime promotion.
           CLAMAV_SIGNATURE_NEXT_IMAGE: clamav/clamav:1.4.6@sha256:8ad6197396974726c35d017e50aaaaf4b91745726a04faec8480c203edd98052
+      - name: Verify scan queue fencing on PostgreSQL 16 and 17
+        run: bash scripts/testing/scan-queue-postgres.sh
+        env:
+          SCAN_QUEUE_COVERAGE_DIR: ${{ github.workspace }}/coverage/go/scan-queue
       - name: Check coverage
         run: bash scripts/ci/go-coverage-check.sh
         env:
           CLAMAV_SIGNATURE_COVERAGE_PROFILE: ${{ github.workspace }}/coverage/go/clamav-signatures.out
+          SCAN_QUEUE_COVERAGE_DIR: ${{ github.workspace }}/coverage/go/scan-queue
       # The merged profiles are what SonarQube reads, and the per-module summary
       # is what makes a threshold failure readable without rerunning anything.
       - name: Upload coverage

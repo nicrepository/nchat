@@ -787,67 +787,29 @@ apagado. A janela e fechada, nao apenas estreita.
 
 #### Como os vereditos sao gravados
 
-Um veredito de rejeicao **nao** e um `UPDATE` de `status`. Ele e uma operacao de
-dominio -- `MarkScanRejected`, em `PGXAttachmentStore` -- que grava, em **uma
-unica statement PostgreSQL**:
+`MarkScanClean` e `MarkScanRejected` recebem attachment, workspace e o UUID
+persistente do claim. A migration 000021 introduz `files.persist_scan_v2`:
+sob lock da linha, a mesma transacao verifica estado, exclusao, token e lease
+antes de mudar status. Tentativa obsoleta nao altera veredito, Evidence,
+agendamento ou preview e nao publica `attachment.status`.
 
-- `status = 'rejected'`;
-- `preview_status = 'unsupported'`, **somente** se era `pending`;
-- `preview_next_attempt_at = NULL`, pelo mesmo criterio.
+Aprovacao exige `pending_scan`, inspecao completa, versao de formato compativel
+e, quando a politica B esta habilitada, Evidence fresca validada pela funcao e
+pelos triggers da 000020. Rejeicao exige a mesma autoridade; finaliza preview
+`pending` como `unsupported`, remove sua agenda e enfileira cleanup de um
+objeto de preview `ready`. O advisory fence entre invalidacao e render continua
+na transacao de rejeicao. O scan nao segura conexao nem lock durante I/O.
 
-As duas coisas andam juntas porque separa-las produz uma linha que nenhum codigo
-consegue concluir: o claim exige `clean`, entao o worker nunca mais olha para
-ela, e o preview continua `pending`, entao nada nunca a finaliza. A linha ficaria
-agendada para sempre. `status` e as colunas de preview vivem na mesma linha, logo
-uma statement basta -- nao ha transacao nem CTE, e nao existe janela entre as
-duas escritas porque nao existem duas escritas.
+Repeticao do mesmo resultado no token atual e sem mudanca de estado retorna
+`already_recorded`, sem outro evento. Novo rescan exige quarentena e novo claim.
+Nenhuma rota HTTP ou entrada do cliente pode decidir um veredito.
 
-Detalhes do contrato:
-
-- **estados aceitos:** `pending_scan` (veredito comum), `clean` (rescan, ou
-  veredito durante a renderizacao) e `rejected` (repeticao do veredito, e
-  reparo de linha deixada em `rejected + pending` por build anterior).
-  `pending_upload`, `failed` e `deleted` nao aceitam veredito;
-- **escopo:** id **e** workspace; um veredito nunca atravessa tenant;
-- **zero linhas** e erro (`not_found`), nunca sucesso silencioso;
-- **idempotente:** repetir o veredito deixa o mesmo estado e o reporta;
-- **preview terminal e preservado:** `ready`, `failed` e `unsupported` nao sao
-  reescritos. Um preview `ready` continua existindo internamente e **deixa de
-  ser entregavel**, porque a entrega le o `status` atual do anexo, nao o do
-  preview -- ver "`ready` interno nao significa entregavel";
-- **`preview_attempts` e preservado:** e historico de auditoria, e um veredito
-  nao desfaz trabalho que aconteceu.
-
-O veredito **limpo** tem a operacao simetrica, `MarkScanClean`, tambem em uma
-unica statement:
-
-- **estados aceitos:** `pending_scan` (a transicao real) e `clean` (repeticao
-  idempotente do mesmo veredito);
-- **`rejected` esta fora:** uma aprovacao atrasada, repetida ou forjada **nunca**
-  reabre um arquivo condenado. A rejeicao e final nessa direcao;
-- **`deleted_at IS NULL`:** um anexo removido nao volta a circular por um
-  veredito que chegou tarde;
-- **`pending_upload` e `failed` estao fora:** nao existe objeto armazenado que
-  possa ter sido escaneado;
-- **nao toca nenhuma coluna de preview:** o upload ja deixou o job agendado
-  (`preview_status = 'pending'`, `preview_next_attempt_at = now()`), entao a
-  linha se torna reivindicavel no instante em que o status vira `clean` -- sem
-  segunda escrita e sem janela entre os dois fatos;
-- **escopo, zero linhas e idempotencia:** identicos aos da rejeicao.
-
-`MarkScanClean` e a **unica** forma de um anexo virar `clean`. Ela nao e
-alcancavel por nenhuma rota HTTP: nao existe endpoint, campo de request ou valor
-vindo do cliente que decida veredito de scan, nem para o dono do arquivo, nem
-para admin de workspace. Quem pudesse escolher `clean` poderia colocar um
-arquivo nao verificado na frente do parser de PDF.
-
-> **O produtor do veredito e o worker do RF-22.** Ele e a unica coisa que chama
-> `MarkScanClean` e `MarkScanRejected`, roda dentro do proprio file-service e nao
-> tem superficie HTTP. Ver "Scan assincrono de malware" para a fila, o retry e o
-> comportamento quando o daemon esta indisponivel. Sem um scanner configurado
-> (`FILE_MALWARE_SCANNER_ADDRESS` vazio) o worker nao inicia e, com scan
-> obrigatorio, **nenhum anexo e aprovado e nenhum preview e gerado** -- falha
-> fechada, nao regressao.
+O contrato legado permanece apenas antes do cutover. A migration e expansiva:
+na preparacao, o worker N continua funcionando e o N+1 espera. Depois da
+ativacao explicita, triggers recusam SQL legado e o wrapper
+`files.persist_proven_scan` recusa aprovacoes sem token. Nao existe rollback
+normal que reabra esse caminho. Ver [arquitetura C](../architecture/scan-queue-fencing-1129.md)
+e [runbook C](../runbooks/scan-queue-fencing-1129.md).
 
 #### Como a remocao e gravada
 
@@ -1356,7 +1318,7 @@ A maquina de estados tem exatamente duas transicoes de veredito:
 ```
 pending_scan --(clean)----> clean
 pending_scan --(infected)-> rejected
-pending_scan --(erro)-----> pending_scan   (nada e gravado)
+pending_scan --(erro)-----> pending_scan   (retry protegido por token)
 ```
 
 A terceira linha e o requisito central: **erro de infraestrutura nao e resultado
@@ -1368,48 +1330,33 @@ nunca decide veredito: nao ha rota, campo de request ou header que alcance
 
 ### A fila
 
-A fila **e a coluna `status`**. Nao existe tabela de jobs: a migration 000005
-adiciona apenas `scan_attempts` e `scan_next_attempt_at` a `files.attachments`, e
-o agendamento e escrito pelo **mesmo `UPDATE`** que finaliza o upload
-(`MarkUploaded`). Nao ha dual write -- um anexo que existe em `pending_scan` esta,
-por essa mesma statement, enfileirado -- entao um crash entre duas gravacoes nao
-pode perder o job, porque nao ha duas gravacoes.
+A fila persistente continua em `files.attachments`. `MarkUploaded` grava
+`pending_scan` e `scan_next_attempt_at` no mesmo UPDATE. A migration 000021
+separa `scan_claim_token`, `scan_lease_until`, elegibilidade, contador,
+`scan_last_error` e `scan_failed_at`.
 
-O claim e o mesmo primitivo do preview e do outbox de e-mail:
+`files.claim_scans` toma exatamente uma linha elegivel com `FOR UPDATE SKIP LOCKED`,
+cria UUID novo e lease de timeout + 30s (330s por padrao). `scan_attempts` satura
+em 32000 e nunca e identidade de autoridade. O slot precisa estar disponivel
+antes do claim; nao existe prefetch. Crash recupera pelo lease. Scan, rejeicao
+e retry so escrevem sob token atual e lease valido, na transacao do resultado.
 
-```sql
-SELECT ... WHERE status = 'pending_scan' AND deleted_at IS NULL ...
-FOR UPDATE SKIP LOCKED
-```
+Erro operacional deixa quarentena e usa backoff exponencial com equal jitter
+por token: primeira falha 10–20s; teto 1320–2640s. O cooldown local de 10s tambem
+limita claims novos durante indisponibilidade, compartilhado pelos slots.
+Falha no retry de banco conserva a recuperacao pelo lease.
 
-seguido de um `UPDATE` que empurra `scan_next_attempt_at` para o futuro (o lease)
-e incrementa `scan_attempts`. Consequencias:
+`FILE_MALWARE_SCAN_CONCURRENCY` tem default 1, aceita 1–4 e exige headroom no
+pool PGX. Aumentar depende de capacidade comprovada considerando replicas e
+o daemon compartilhado; `MaxThreads=4` nao autoriza tuning automatico.
+Cada slot drena ate 32 jobs ou 1s, depois cede por 100ms. Fila vazia/erro de
+claim espera 10s. Cancelamento impede novos claims, cancela I/O e aguarda os
+consumidores; escrita desacoplada continua limitada a 10s.
 
-- **varias replicas** rodam o mesmo loop e passam por cima das linhas umas das
-  outras em vez de bloquear; uma linha nunca e entregue duas vezes ao mesmo tempo;
-- **crash e recuperavel**: nao ha estado `processing` para vazar. O lease expira
-  e a linha volta a estar devida, sem janitor;
-- **restart nao perde nada**: o agendamento esta no banco, nao em memoria.
-
-Nenhuma transacao fica aberta enquanto o arquivo e transmitido. Sao tres passos
-separados: claim curto e atomico, operacao externa (streaming para o clamd), e
-gravacao curta e atomica do resultado.
-
-### Retry e backoff
-
-O lease **e** a agenda de retry -- um mecanismo, nao dois. A n-esima tentativa
-agenda a proxima para `lease * min(n, 8)` segundos adiante, deterministico e
-limitado. Um daemon fora do ar custa um `UPDATE` a cada poucos minutos por anexo,
-nunca uma tempestade de conexoes contra o clamd.
-
-Nao ha teto de tentativas e isso e deliberado: um estado que significasse
-"desisti" seria um quarto estado externo, indistinguivel de "ainda em analise"
-para o cliente, e exigiria uma varredura manual para sair dele. Uma linha que
-ninguem consegue escanear fica onde pertence -- nao aprovada -- e volta a ser
-tentada quando o daemon voltar.
-
-`scan_attempts` e saturado (`LEAST`) para nao estourar o `SMALLINT` e travar a
-statement de claim atras de uma linha em falha permanente.
+Polling e o fallback autoritativo; nao ha LISTEN/NOTIFY nesta entrega. O indice
+`idx_attachments_scan_pending` e a ordem por elegibilidade/created_at permanecem.
+Nao ha garantia de quota por tenant; novos uploads agendados com `now()` nao
+saltam atrasados de agenda anterior. Medicoes e limites estao na arquitetura C.
 
 ### Integracao com o ClamAV
 
@@ -1866,8 +1813,8 @@ Metricas: `nchat_file_uploads_total{result}`,
 filename ou caminho.
 
 `nchat_file_malware_scan_queue_depth` e um gauge **sem labels**: quantos anexos
-aguardam veredito no cluster. Ele e reescrito a cada passada do worker, inclusive
-nas que nao encontram trabalho, porque um gauge escrito so quando ha backlog
+aguardam veredito no cluster. Ele e atualizado no maximo uma vez a cada 10s por processo, inclusive
+em polling sem trabalho, porque um gauge escrito so quando ha backlog
 continuaria reportando o ultimo valor para sempre depois que a fila esvaziasse.
 Nao ha recorte por workspace, canal ou usuario: a cardinalidade cresceria com o
 produto e a pergunta que ele responde -- a fila esta drenando? -- nao precisa de

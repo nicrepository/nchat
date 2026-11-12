@@ -57,3 +57,7 @@ func PreviewTuningForTest() PreviewTuning {
 		Lease:               previewLease,
 	}
 }
+
+func (s *MalwareScanService) ResetScanCooldownForTest() { s.cooldownUntil.Store(0) }
+
+func (s *MalwareScanService) ResetScanQueueRefreshForTest() { s.nextDepthRefresh.Store(0) }

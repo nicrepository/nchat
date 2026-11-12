@@ -2,9 +2,11 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
 	"github.com/nicrepository/nchat/services/file-service/internal/service"
@@ -33,88 +35,13 @@ func NewPGXScanStore(pool Pool) *PGXScanStore {
 
 var _ service.ScanQueueStore = (*PGXScanStore)(nil)
 
-// maxScanAttemptsCounter caps the stored attempt counter.
-//
-// scan_attempts is a SMALLINT and claiming is not bounded by it — a row stays
-// due for as long as it is unscanned — so a daemon that has been down for weeks
-// would eventually overflow the column and make the claim statement itself fail,
-// stalling every other row behind it. Saturating costs one LEAST() and keeps the
-// queue moving; the backoff below has reached its own ceiling long before this.
-const maxScanAttemptsCounter = 32000
-
-// scanBackoffSteps caps the multiplier the retry interval grows by.
-//
-// The backoff is deterministic and bounded: the nth attempt schedules the next
-// one lease*min(n, steps) seconds out. That is enough to turn a daemon outage
-// from a request per poll into a request every few minutes per attachment,
-// which is the whole requirement — no busy loop, no storm against clamd — and
-// it needs no jitter, because these are rows in one queue drained by a small
-// number of workers, not a herd of clients racing back to a server.
-const scanBackoffSteps = 8
-
-// claimDueScansQuery takes a batch of due rows and leases them in one statement.
-//
-// FOR UPDATE SKIP LOCKED is the same queue primitive the preview claim and the
-// notification outbox use: concurrent workers step over each other's rows
-// instead of blocking, so every replica can run this loop and no row is handed
-// out twice.
-//
-// The lease is the whole concurrency control, and it is also the retry schedule
-// — one mechanism, not two. Claiming pushes the next attempt out by
-// lease * min(attempts, scanBackoffSteps) and counts the try in the same UPDATE,
-// so:
-//
-//   - a worker still streaming to clamd holds the row, because the multiplier is
-//     at least one and the base lease outlives the scan timeout by construction;
-//   - a worker that died holds nothing: the row is due again once its lease
-//     expires, with no 'processing' state to get stuck in and no janitor to run;
-//   - a daemon that keeps failing costs geometrically fewer attempts, up to the
-//     ceiling, instead of one attempt per poll forever.
-//
-// There is deliberately no attempts ceiling in the predicate. A row nothing can
-// scan must stay in the queue: the alternative is a fourth state meaning "gave
-// up", which would be indistinguishable to a client from "still being scanned"
-// and would need a manual sweep to leave. The cost of an unscannable row is one
-// UPDATE per (stretched) lease, and the row stays exactly where it belongs —
-// not downloadable.
-//
-// # Which rows are due
-//
-// status = 'pending_scan' is the queue. It is the state MarkUploaded writes for
-// a finished upload whenever the scan is required, and the only one a verdict
-// can be applied from — so the queue and the state machine are the same column
-// and cannot disagree.
-//
-// deleted_at and the key columns complete the set: a removed attachment and one
-// whose key was never sealed are both unopenable, and neither is a live file.
-// A NULL scan_next_attempt_at counts as due, which is what makes the migration's
-// backfill fail-safe — a row that somehow lacks a schedule is scanned, never
-// skipped.
 const claimDueScansQuery = `
-	WITH due AS (
-		SELECT a.id
-		FROM files.attachments AS a
-		WHERE a.status = 'pending_scan'
-		  AND a.deleted_at IS NULL
-		  AND a.wrapped_dek IS NOT NULL
-		  AND a.kek_key_id IS NOT NULL
-		  AND (a.scan_next_attempt_at IS NULL OR a.scan_next_attempt_at <= now())
-		ORDER BY a.scan_next_attempt_at NULLS FIRST, a.created_at
-		LIMIT $1
-		FOR UPDATE SKIP LOCKED
-	)
-	UPDATE files.attachments AS a
-	   SET scan_attempts = LEAST(a.scan_attempts + 1, $4),
-	       scan_next_attempt_at =
-	           now() + ($2 * LEAST(a.scan_attempts + 1, $3) * interval '1 second'),
-	       updated_at = now()
-	  FROM due
-	 WHERE a.id = due.id
-	RETURNING a.id::text, a.workspace_id::text, a.destination_kind,
-	          COALESCE(a.channel_id::text, a.conversation_id::text),
-	          a.size_bytes, a.storage_object_key, a.envelope_version,
-	          a.wrapped_dek, COALESCE(a.kek_key_id, ''), a.dek_wrap_version,
-	          a.scan_attempts, a.original_filename, a.declared_mime, a.format_policy_version`
+ SELECT a.id::text,a.workspace_id::text,a.destination_kind,
+ COALESCE(a.channel_id::text,a.conversation_id::text),a.size_bytes,a.storage_object_key,
+ a.envelope_version,a.wrapped_dek,COALESCE(a.kek_key_id,''),a.dek_wrap_version,
+ a.scan_attempts,a.original_filename,a.declared_mime,a.format_policy_version,
+ a.scan_claim_token::text,COALESCE(a.uploaded_at,a.created_at)
+ FROM files.claim_scans($1,$2) a`
 
 // ClaimDueScans leases up to batchSize attachments awaiting a verdict.
 func (s *PGXScanStore) ClaimDueScans(
@@ -123,17 +50,17 @@ func (s *PGXScanStore) ClaimDueScans(
 	if s == nil || s.pool == nil {
 		return nil, domain.ErrDependenciesUnavailable
 	}
-	if batchSize <= 0 || lease <= 0 {
+	if batchSize != 1 || lease < time.Second || lease > 3630*time.Second {
 		// A zero lease would hand the same row to every worker at once, and a
 		// zero batch would spin. Both are wiring mistakes, refused not defaulted.
 		return nil, fmt.Errorf("%w: invalid scan claim parameters", domain.ErrInvalidInput)
 	}
 
 	rows, err := s.pool.Query(ctx, claimDueScansQuery,
-		batchSize, int64(lease.Seconds()), scanBackoffSteps, maxScanAttemptsCounter,
+		batchSize, lease.Seconds(),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("claim due scans: %w", err)
+		return nil, scanClaimError(err)
 	}
 	defer rows.Close()
 
@@ -152,6 +79,7 @@ func (s *PGXScanStore) ClaimDueScans(
 			&job.Size, &job.StorageObjectKey, &envelopeVersion,
 			&job.WrappedDEK, &job.KEKKeyID, &keyWrapVersion, &attempts,
 			&job.Filename, &job.DeclaredMIME, &job.PolicyVersion,
+			&job.ClaimToken, &job.QueuedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan claimed attachment: %w", err)
 		}
@@ -163,9 +91,17 @@ func (s *PGXScanStore) ClaimDueScans(
 		claimed = append(claimed, job)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate claimed scans: %w", err)
+		return nil, scanClaimError(err)
 	}
 	return claimed, nil
+}
+
+func scanClaimError(err error) error {
+	var pgerr *pgconn.PgError
+	if errors.As(err, &pgerr) && pgerr.Code == "NC006" {
+		return fmt.Errorf("%w: %w", service.ErrScanQueueStandby, err)
+	}
+	return fmt.Errorf("claim due scans: %w", err)
 }
 
 // countPendingScansQuery is the queue depth: everything still awaiting a
