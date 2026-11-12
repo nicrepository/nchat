@@ -1,5 +1,9 @@
-import { useCallback, useRef, useState } from "react";
-import type { FocusEvent as ReactFocusEvent, MouseEvent as ReactMouseEvent } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import type {
+  FocusEvent as ReactFocusEvent,
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
+} from "react";
 
 import type { CallParticipantProfile } from "./chatApi";
 import type {
@@ -18,6 +22,7 @@ import { presenceLabel, usePresence, type PresenceState } from "./presence";
 import { UserAvatar } from "./UserAvatar";
 import type { MentionInteraction } from "./RichTextRenderer";
 import { useMessageEditing } from "./useMessageEditing";
+import { useMessageTouchGestures } from "./useMessageTouchGestures";
 
 export interface MessageBubbleProps {
   message: Message;
@@ -60,6 +65,14 @@ export interface MessageBubbleProps {
   onReactionMenuVisibleChange: (messageId: string, visible: boolean) => void;
   pickerOpen: boolean;
   onPickerOpenChange: (messageId: string, open: boolean) => void;
+  /** True when this message's menu was opened by a long press (issue #1152). */
+  reactionMenuTouch?: boolean;
+  /** Opens this message's menu from a long press (issue #1152). */
+  onReactionMenuLongPress?: (messageId: string) => void;
+  /** A touch menu or picker is open somewhere: a swipe must not reply under it. */
+  gesturesBlocked?: boolean;
+  /** Closes what this message has open when it is removed or unmounted (issue #1152). */
+  onReactionMenuRelease?: (messageId: string) => void;
   quoteAuthorLabel?: string;
   canJumpToQuote?: boolean;
   onQuoteJump?: (messageId: string) => void;
@@ -219,16 +232,49 @@ function messageShellClassName(flags: {
 }
 
 /**
+ * How long after a touch the browser's compatibility mouse events and the focus
+ * a tap gives the row still belong to that touch.
+ */
+const touchEchoMs = 800;
+
+/**
  * The pointer and focus handlers that reveal the hover toolbar.
  *
  * Both "leave" handlers check containment, because moving into the toolbar —
  * which is a descendant — must not read as leaving the message.
+ *
+ * A touch reveals nothing (issue #1152): a tap fires mouseenter and focuses the
+ * row as compatibility events, and a scroll starts with a touch too, so showing
+ * on any of them opened the toolbar under every finger. Touch has its own way
+ * in — the long press — so those echoes are ignored, while mouse hover and
+ * keyboard focus behave exactly as before.
  */
 function useToolbarReveal(
   messageId: string,
   onVisibleChange: (messageId: string, visible: boolean) => void,
 ) {
-  const show = useCallback(() => onVisibleChange(messageId, true), [messageId, onVisibleChange]);
+  const lastTouchRef = useRef(Number.NEGATIVE_INFINITY);
+  const markTouch = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === "touch") lastTouchRef.current = event.timeStamp;
+  }, []);
+  const show = useCallback(
+    (event: { timeStamp: number }) => {
+      if (event.timeStamp - lastTouchRef.current < touchEchoMs) return;
+      onVisibleChange(messageId, true);
+    },
+    [messageId, onVisibleChange],
+  );
+  // Focus moving inside the message — into its menu, or handed back to the row
+  // or its actions button when Escape closes that menu — is not the reader
+  // arriving: revealing on it would reopen what they just closed.
+  const showOnFocus = useCallback(
+    (event: ReactFocusEvent<HTMLDivElement>) => {
+      const from = event.relatedTarget;
+      if (from instanceof Node && event.currentTarget.contains(from)) return;
+      show(event);
+    },
+    [show],
+  );
   const hideOnLeave = useCallback(
     (event: ReactMouseEvent<HTMLDivElement>) => {
       const nextTarget = event.relatedTarget;
@@ -238,19 +284,116 @@ function useToolbarReveal(
     },
     [messageId, onVisibleChange],
   );
+  // The message's picker is portalled out of its DOM, and its tone palette out
+  // of the picker's; both are marked with the message. Focus going into them —
+  // the search field taking focus once the catalog loads, the palette its tone
+  // — stays with the message: hiding on it closed a touch-opened menu, picker
+  // and all.
   const hideOnBlur = useCallback(
     (event: ReactFocusEvent<HTMLDivElement>) => {
-      if (!event.currentTarget.contains(event.relatedTarget)) onVisibleChange(messageId, false);
+      const next = event.relatedTarget;
+      if (event.currentTarget.contains(next)) return;
+      const picker = next instanceof Element ? next.closest("[data-reaction-picker-for]") : null;
+      if (picker?.getAttribute("data-reaction-picker-for") === messageId) return;
+      onVisibleChange(messageId, false);
     },
     [messageId, onVisibleChange],
   );
   return {
     onMouseEnter: show,
     onMouseLeave: hideOnLeave,
-    onFocus: show,
+    onFocus: showOnFocus,
     onBlur: hideOnBlur,
-    onTouchStart: show,
+    onPointerDownCapture: markTouch,
+    onPointerUpCapture: markTouch,
   };
+}
+
+/**
+ * Swipe-to-reply and long-press for one message (issue #1152). The gestures
+ * are recognised by useMessageTouchGestures; what they are allowed to do is
+ * decided here, against the message as it is when the finger lifts — a reply
+ * is only ever the existing reply action, for the message the gesture started
+ * on, and never for one that has since been removed.
+ */
+function useMessageGestures(props: MessageBubbleProps) {
+  const { message, onReplyMessage, onReactionMenuLongPress } = props;
+  const replyIfStillValid = useCallback(
+    (messageId: string) => {
+      if (messageId === message.id && !message.isRemoved) onReplyMessage(message);
+    },
+    [message, onReplyMessage],
+  );
+  return useMessageTouchGestures({
+    messageId: message.id,
+    disabled: message.isRemoved || !onReactionMenuLongPress,
+    swipeBlocked: props.gesturesBlocked ?? false,
+    onLongPress: (messageId) => onReactionMenuLongPress?.(messageId),
+    onSwipeReply: replyIfStillValid,
+  });
+}
+
+/**
+ * A message that is removed, or whose row is unmounted or recycled for another
+ * message, takes the touch menu or picker it owns with it (issue #1152):
+ * otherwise the shared state still names it, every swipe stays blocked behind
+ * a menu nobody can see, and the menu reappears when the message comes back.
+ * The release names this message, so it never closes another one's.
+ */
+function useReleaseSurfacesOnExit(props: MessageBubbleProps) {
+  const { message, onReactionMenuRelease: release } = props;
+  // Read when the message leaves, not tracked as a dependency: a menu merely
+  // closing (the picker handing focus back to it, say) is not the message
+  // leaving, and must not take the rest of its state with it.
+  const ownsRef = useRef(false);
+  useEffect(() => {
+    ownsRef.current = !!props.reactionMenuTouch || props.pickerOpen;
+  });
+  useEffect(() => {
+    if (!release) return;
+    if (message.isRemoved && ownsRef.current) release(message.id);
+    return () => {
+      if (ownsRef.current) release(message.id);
+    };
+  }, [message.id, message.isRemoved, release]);
+}
+
+/**
+ * The way to a message's actions that needs no long press (issue #1152): a
+ * button a screen reader announces, a keyboard reaches and a finger taps,
+ * opening the same menu the long press opens — the same controller, the same
+ * permissions. Shown where there is no hover (see its CSS); the desktop keeps
+ * its hover and focus reveal and never draws it.
+ */
+function MessageActionsButton({ props, menuId }: { props: MessageBubbleProps; menuId: string }) {
+  const { message, onReactionMenuLongPress } = props;
+  if (!onReactionMenuLongPress || message.isRemoved) return null;
+  // The menu this button opens is the touch-opened one. A hover menu that
+  // keyboard focus revealed on the way here is not it: pressing then opens the
+  // touch menu, focus inside, instead of closing what the reader never chose.
+  const open = !!props.reactionMenuTouch && (props.reactionMenuVisible || props.pickerOpen);
+  // WebKit does not focus a pressed button — a tap focuses the row around it —
+  // so the menu would take the row for its opener and Escape would land there.
+  const toggle = (event: ReactMouseEvent<HTMLButtonElement>) => {
+    event.currentTarget.focus({ preventScroll: true });
+    if (!open) return onReactionMenuLongPress(message.id);
+    props.onPickerOpenChange(message.id, false);
+    props.onReactionMenuVisibleChange(message.id, false);
+  };
+  return (
+    <button
+      type="button"
+      className="chat-msg-area__msg-actions"
+      aria-label="Ações da mensagem"
+      aria-expanded={open}
+      aria-controls={open ? menuId : undefined}
+      onClick={toggle}
+    >
+      <span className="material-symbols-outlined" aria-hidden="true">
+        more_vert
+      </span>
+    </button>
+  );
 }
 
 /**
@@ -264,9 +407,11 @@ function useToolbarReveal(
 function MessageBubbleBody({
   props,
   senderPresence,
+  menuId,
 }: {
   props: MessageBubbleProps;
   senderPresence: PresenceState;
+  menuId: string;
 }) {
   const { message, isMine = false, isGrouped = false } = props;
   const { onReactionMenuVisibleChange } = props;
@@ -346,6 +491,8 @@ function MessageBubbleBody({
         onReactionMenuVisibleChange={onReactionMenuVisibleChange}
         pickerOpen={props.pickerOpen}
         onPickerOpenChange={props.onPickerOpenChange}
+        touchMode={props.reactionMenuTouch}
+        menuId={menuId}
         onStartEdit={editing.startEdit}
         onDelete={editing.requestDelete}
         deleting={editing.deleting}
@@ -366,6 +513,9 @@ export default function MessageBubble(props: MessageBubbleProps) {
   // conversation's roster is the one that would have named them.
   const senderPresence = usePresence(message.senderId, props.presenceTarget);
   const reveal = useToolbarReveal(message.id, props.onReactionMenuVisibleChange);
+  const gestures = useMessageGestures(props);
+  useReleaseSurfacesOnExit(props);
+  const menuId = useId();
 
   return (
     <div
@@ -375,6 +525,7 @@ export default function MessageBubble(props: MessageBubbleProps) {
       data-message-id={message.id}
       tabIndex={0}
       {...reveal}
+      {...gestures}
     >
       {!isMine && (
         <MessageAvatar
@@ -383,7 +534,8 @@ export default function MessageBubble(props: MessageBubbleProps) {
           workspaceId={props.workspaceId ?? ""}
         />
       )}
-      <MessageBubbleBody props={props} senderPresence={senderPresence} />
+      <MessageBubbleBody props={props} senderPresence={senderPresence} menuId={menuId} />
+      <MessageActionsButton props={props} menuId={menuId} />
     </div>
   );
 }

@@ -73,6 +73,45 @@ export function placeAgainstAnchor(
 }
 
 /**
+ * The part of the page the reader actually sees (issue #1152), in the same
+ * coordinates a fixed element is placed in: pinch zoom, the on-screen keyboard
+ * and a browser's own bars shrink and shift it inside the layout viewport,
+ * which `window.innerWidth/innerHeight` alone do not report. A browser without
+ * the Visual Viewport API gets the window.
+ */
+export function visualViewportBounds(): VisibleBounds {
+  const visual = window.visualViewport;
+  if (!visual) return viewportBounds();
+  return {
+    top: visual.offsetTop,
+    left: visual.offsetLeft,
+    bottom: visual.offsetTop + visual.height,
+    right: visual.offsetLeft + visual.width,
+  };
+}
+
+/** Where two bands overlap. */
+export function intersectBounds(a: VisibleBounds, b: VisibleBounds): VisibleBounds {
+  return {
+    top: Math.max(a.top, b.top),
+    bottom: Math.min(a.bottom, b.bottom),
+    left: Math.max(a.left, b.left),
+    right: Math.min(a.right, b.right),
+  };
+}
+
+/**
+ * The part of a band on one side of a box: the side another element is on
+ * (issue #1152). Without both boxes, the whole band.
+ */
+export function bandBeside(band: VisibleBounds, box?: DOMRect, side?: DOMRect): VisibleBounds {
+  if (!box || !side) return band;
+  return side.top < box.top
+    ? { ...band, bottom: Math.min(band.bottom, box.top) }
+    : { ...band, top: Math.max(band.top, box.bottom) };
+}
+
+/**
  * Whether any part of an anchor is inside the band it can be painted in.
  *
  * A floating surface may only be drawn against an anchor the reader can see. The
@@ -114,6 +153,29 @@ export function visibleBounds(anchor: Element): VisibleBounds {
   };
 }
 
+/**
+ * Caps a picker to a band before it is measured: no wider than the band, no
+ * taller than the larger side of its anchor. The picker's own stylesheet reads
+ * these as limits on top of its usual size, and its list scrolls inside.
+ */
+function capToBand(element: HTMLElement, anchor: DOMRect, band: VisibleBounds, gap: number) {
+  const room = Math.max(anchor.top - band.top, band.bottom - anchor.bottom) - gap;
+  const width = band.right - band.left - 2 * viewportPadding;
+  element.style.setProperty("--chat-emoji-picker-max-width", `${Math.max(0, width)}px`);
+  element.style.setProperty(
+    "--chat-emoji-picker-max-height",
+    `${Math.max(0, room - viewportPadding)}px`,
+  );
+}
+
+/** For a caller with nothing to do once its picker is placed. */
+function ignorePlacement(): void {}
+
+/** The box a picker is placed against: its button's, or the one it must clear. */
+function placementBox(button: DOMRect, clearRef?: RefObject<HTMLElement | null>): DOMRect {
+  return clearRef?.current?.getBoundingClientRect() ?? button;
+}
+
 export interface AnchoredPickerOptions {
   open: boolean;
   /** The control the picker belongs to; also where focus returns on Escape. */
@@ -132,6 +194,29 @@ export interface AnchoredPickerOptions {
   containerRef?: RefObject<HTMLElement | null>;
   /** How the picker lines up with the anchor horizontally. */
   align?: "start" | "end";
+  /**
+   * The band the picker must stay inside, when the window is not it (issue
+   * #1152: the visual viewport, for a menu opened by touch). The picker is
+   * then also capped to that band — width, and the taller of the two sides of
+   * its button — and scrolls inside instead of being cut off or closed.
+   */
+  bounds?: () => VisibleBounds;
+  /**
+   * What the picker must keep clear of, when that is more than its button
+   * (issue #1152): a touch menu, whose button sits in a second row. The menu is
+   * a popover in the top layer, so whatever overlaps it is painted under it and
+   * cannot be touched there, whatever its z-index. The picker is placed above
+   * or below this box instead of the button; it still lines up with the button
+   * horizontally. The box is watched too: a menu that grows or shrinks under
+   * an open picker — its quick reactions arriving late — moves its edge, and
+   * the picker follows it there.
+   */
+  clearRef?: RefObject<HTMLElement | null>;
+  /**
+   * Called with the picker after every placement, for a caller whose layout
+   * depends on what the placed picker has room to show.
+   */
+  onPlaced?: (picker: HTMLElement) => void;
   gap?: number;
 }
 
@@ -146,22 +231,32 @@ export function useAnchoredPicker({
   containerRef,
   align = "end",
   gap = 7,
+  bounds,
+  clearRef,
+  onPlaced = ignorePlacement,
 }: AnchoredPickerOptions): RefObject<HTMLDivElement | null> {
   const pickerRef = useRef<HTMLDivElement>(null);
 
   const position = useCallback(() => {
     if (!open || !anchorRef.current || !pickerRef.current) return;
-    const anchor = anchorRef.current.getBoundingClientRect();
+    const button = anchorRef.current.getBoundingClientRect();
+    const anchor = placementBox(button, clearRef);
+    const band = (bounds ?? viewportBounds)();
     // An anchor scrolled out of sight has nothing to hang off any more.
-    if (anchor.bottom < 0 || anchor.top > window.innerHeight) {
+    if (anchor.bottom < band.top || anchor.top > band.bottom) {
       onDismiss(false);
       return;
     }
+    if (bounds) capToBand(pickerRef.current, anchor, band, gap);
     const picker = pickerRef.current.getBoundingClientRect();
-    const left = align === "end" ? anchor.right - picker.width : anchor.left;
+    const left = align === "end" ? button.right - picker.width : button.left;
     // No room on either side of the button is as good as no button.
-    if (!placeAgainstAnchor(pickerRef.current, anchor, picker, left, gap, gap)) onDismiss(false);
-  }, [align, anchorRef, gap, onDismiss, open]);
+    if (!placeAgainstAnchor(pickerRef.current, anchor, picker, left, gap, gap, band)) {
+      onDismiss(false);
+      return;
+    }
+    onPlaced(pickerRef.current);
+  }, [align, anchorRef, bounds, clearRef, gap, onDismiss, onPlaced, open]);
 
   useLayoutEffect(position, [position]);
 
@@ -186,19 +281,28 @@ export function useAnchoredPicker({
     // against a box that is about to change. Watching the picker itself is what
     // makes the second placement happen at the moment the size actually
     // changes — no timer, no guessed delay, and one observer for the whole
-    // picker rather than one per emoji.
+    // picker rather than one per emoji. The box it keeps clear of is watched
+    // for the same reason. A placement writes only the picker's own limits and
+    // position, never that box, and a box whose size did not change is not
+    // reported again, so this settles rather than loops.
     const resize = new ResizeObserver(() => position());
     if (pickerRef.current) resize.observe(pickerRef.current);
+    if (clearRef?.current) resize.observe(clearRef.current);
     document.addEventListener("mousedown", closeOnOutsideClick);
     document.addEventListener("keydown", closeOnEscape);
     document.addEventListener("scroll", position, true);
+    // Zoom, the keyboard and rotation move the visual viewport only.
+    window.visualViewport?.addEventListener("resize", position);
+    window.visualViewport?.addEventListener("scroll", position);
     return () => {
       resize.disconnect();
       document.removeEventListener("mousedown", closeOnOutsideClick);
       document.removeEventListener("keydown", closeOnEscape);
       document.removeEventListener("scroll", position, true);
+      window.visualViewport?.removeEventListener("resize", position);
+      window.visualViewport?.removeEventListener("scroll", position);
     };
-  }, [containerRef, onDismiss, open, position]);
+  }, [clearRef, containerRef, onDismiss, open, position]);
 
   return pickerRef;
 }

@@ -17,6 +17,7 @@ import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import { skinToneLabels } from "./emojiCategories";
 import { withSkinTone, type EmojiEntry } from "./emojiCatalog";
+import type { VisibleBounds } from "./useAnchoredPicker";
 
 export interface EmojiTonePaletteProps {
   entry: EmojiEntry;
@@ -26,30 +27,44 @@ export interface EmojiTonePaletteProps {
   tone: number;
   onSelect: (emoji: string, tone: number) => void;
   onDismiss: () => void;
+  /** The message whose reaction picker opened this palette: see EmojiPicker. */
+  reactionFor?: string;
+  /**
+   * The band the palette must stay inside, when the window is not it (issue
+   * #1152): a touch reaction picker passes the part of the visual viewport its
+   * menu does not cover. Absent for any other host.
+   */
+  bounds?: () => VisibleBounds;
+}
+
+/** The window itself: where a palette is kept unless its host knows better. */
+function windowBounds(): VisibleBounds {
+  return { top: 0, bottom: window.innerHeight, left: 0, right: window.innerWidth };
 }
 
 /**
  * Places the palette over its emoji: centred, above when there is room and below
- * when there is not, and always whole inside the viewport.
+ * when there is not, and always whole inside its band — over the emoji itself
+ * when the band is too short for either side.
  */
-function placePalette(element: HTMLElement, anchor: DOMRect): void {
+function placePalette(element: HTMLElement, anchor: DOMRect, bounds: VisibleBounds): void {
   const padding = 8;
   const gap = 6;
   const box = element.getBoundingClientRect();
   const left = Math.min(
-    Math.max(padding, anchor.left + anchor.width / 2 - box.width / 2),
-    window.innerWidth - box.width - padding,
+    Math.max(bounds.left + padding, anchor.left + anchor.width / 2 - box.width / 2),
+    bounds.right - box.width - padding,
   );
   const above = anchor.top - box.height - gap;
-  const top =
-    above >= padding
-      ? above
-      : Math.min(anchor.bottom + gap, window.innerHeight - box.height - padding);
+  const fitsAbove = above >= bounds.top + padding;
+  const top = fitsAbove
+    ? above
+    : Math.min(anchor.bottom + gap, bounds.bottom - box.height - padding);
   element.style.left = `${left}px`;
   element.style.top = `${top}px`;
   // The origin points back at the emoji, so the open animation reads as the
   // palette growing out of the thing it is about.
-  element.style.transformOrigin = above >= padding ? "center bottom" : "center top";
+  element.style.transformOrigin = fitsAbove ? "center bottom" : "center top";
   element.style.visibility = "visible";
 }
 
@@ -78,13 +93,15 @@ export default function EmojiTonePalette({
   tone,
   onSelect,
   onDismiss,
+  reactionFor,
+  bounds = windowBounds,
 }: EmojiTonePaletteProps) {
   const paletteRef = useRef<HTMLDivElement>(null);
   const [active, setActive] = useState(tone);
 
   useLayoutEffect(() => {
-    if (paletteRef.current) placePalette(paletteRef.current, anchor);
-  }, [anchor]);
+    if (paletteRef.current) placePalette(paletteRef.current, anchor, bounds());
+  }, [anchor, bounds]);
 
   // Opening moves focus onto the tone the reader last chose, so the palette is
   // usable from the keyboard the instant it appears.
@@ -129,6 +146,7 @@ export default function EmojiTonePalette({
       // Portalled out of the conversation, so it carries the chat scope with it
       // — see the picker's own container for why.
       className="chat-theme chat-emoji-tone"
+      data-reaction-picker-for={reactionFor}
       role="dialog"
       aria-label={`Tom de pele para ${entry.label}`}
       style={{ visibility: "hidden" }}

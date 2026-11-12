@@ -249,6 +249,10 @@ function TimelineMessageRow({
       onReactionMenuVisibleChange={reactionMenu.onReactionMenuVisibleChange}
       pickerOpen={reactionMenu.openPickerMessageId === message.id}
       onPickerOpenChange={reactionMenu.onPickerOpenChange}
+      reactionMenuTouch={reactionMenu.touchMessageId === message.id}
+      onReactionMenuLongPress={reactionMenu.onReactionMenuLongPress}
+      gesturesBlocked={reactionMenu.touchSurfaceOpen}
+      onReactionMenuRelease={reactionMenu.onReactionMenuRelease}
       quoteAuthorLabel={quoted ? quoteAuthorLabel(quoted, context.messagesById) : undefined}
       canJumpToQuote={quoted ? canFollowQuote(quoted) : false}
       onQuoteJump={actions.onQuoteJump}
