@@ -58,12 +58,18 @@ async function openConversation(
   kind: Kind,
   targetId: string,
   history: ReturnType<typeof makeMessage>[],
+  conversationType: "direct" | "group" = "group",
 ) {
   const scenario = createScenario({
     kind,
-    conversationType: kind === "dm" ? "group" : undefined,
+    conversationType: kind === "dm" ? conversationType : undefined,
     targetId,
-    targetName: kind === "dm" ? "Grupo antigo" : "infraestrutura",
+    targetName:
+      kind === "channel"
+        ? "infraestrutura"
+        : conversationType === "group"
+          ? "Grupo antigo"
+          : OTHER_USER_NAME,
     messages: history,
   });
   await installMessagingMocks(page, scenario);
@@ -190,37 +196,59 @@ test("teclado: original inalcançável devolve o foco à lista de mensagens", as
   expect(await page.evaluate(() => document.activeElement === document.body)).toBe(false);
 });
 
-test("teclado: foco movido pelo leitor durante a busca não é tomado de volta", async ({
-  page,
-}, testInfo) => {
-  const targetId = uniqueId(testInfo, "channel");
-  const { history, target, reply } = historyWithOldQuote(targetId);
-  await openConversation(page, "channel", targetId, history);
+for (const { kind, conversationType, prefix } of [
+  { kind: "channel", conversationType: undefined, prefix: "" },
+  { kind: "dm", conversationType: "group", prefix: "grupo: " },
+  { kind: "dm", conversationType: "direct", prefix: "DM: " },
+] as const) {
+  test(`${prefix}teclado: foco movido pelo leitor durante a busca não é tomado de volta`, async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, kind);
+    const { history, target, reply } = historyWithOldQuote(targetId);
+    const focusInListeners = await trackFocusInListeners(page);
+    await openConversation(page, kind, targetId, history, conversationType);
+    const search = await holdMessages(page, targetId, false, kind);
 
-  const highlighted = highlightOf(page, target.id);
-  await expectInitialFocusSettled(page);
-  await quoteOf(page, reply.id).focus();
-  await page.keyboard.press("Enter");
-  // While the history is still being paged in, the reader goes to the composer.
-  const composer = page.getByTestId("chat-composer-input");
-  await composer.click();
-  await expect(composer).toBeFocused();
+    const highlighted = highlightOf(page, target.id);
+    await expectInitialFocusSettled(page);
+    const before = await focusInListeners();
+    await quoteOf(page, reply.id).focus();
+    const requested = search.requested();
+    await page.keyboard.press("Enter");
+    await requested;
+    // The newest page has reopened the list; the older page cannot arrive yet.
+    // A click before this point races the composer's temporary disabled state.
+    const composer = page.getByTestId("chat-composer-input");
+    await expect(composer).toBeEditable();
+    await expect(messageBubble(page, target.id)).toHaveCount(0);
+    expect(await focusInListeners()).toBe(before + 1);
+    await composer.click();
+    await expect(composer).toBeFocused();
+    // The reader's choice cancels the return immediately, including its listener.
+    expect(await focusInListeners()).toBe(before);
+    await page.keyboard.insertText("rascunho durante a busca");
+    search.release();
 
-  await highlighted;
-  await expectLandedOn(page, history, target.id);
-  await expect(composer).toBeFocused();
-});
+    await highlighted;
+    await expectLandedOn(page, history, target.id);
+    await expect(composer).toBeFocused();
+    await expect(composer).toHaveText("rascunho durante a busca");
+    expect(await focusInListeners()).toBe(before);
+  });
+}
 
 /**
  * Holds every matching request of this conversation until `release()`, then
  * aborts it (`fail`) or lets the fixture answer it. `newest` picks the page the
  * reopening loads; otherwise the older pages the search asks for.
  */
-async function holdMessages(page: Page, targetId: string, newest: boolean) {
+async function holdMessages(page: Page, targetId: string, newest: boolean, kind: Kind = "channel") {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => (release = resolve));
   const state = { fail: false };
-  await page.route(`**/api/chat/channels/${targetId}/messages*`, async (route) => {
+  const collection = kind === "channel" ? "channels" : "dm";
+  await page.route(`**/api/chat/${collection}/${targetId}/messages*`, async (route) => {
     const before = new URL(route.request().url()).searchParams.get("before");
     if (route.request().method() !== "GET" || Boolean(before) === newest) {
       await route.fallback();
@@ -234,7 +262,7 @@ async function holdMessages(page: Page, targetId: string, newest: boolean) {
     page.waitForRequest((request) => {
       const url = new URL(request.url());
       return (
-        url.pathname.endsWith(`/channels/${targetId}/messages`) &&
+        url.pathname.endsWith(`/${collection}/${targetId}/messages`) &&
         url.searchParams.has("before") === before
       );
     });
