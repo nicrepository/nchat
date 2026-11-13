@@ -15,7 +15,7 @@ func (e *scanPG) queueObservability(t *testing.T) {
 	e.seed(t)
 	e.exec(t, "UPDATE files.attachments SET uploaded_at=now()-interval '20 seconds' WHERE id=$1", a.AttachmentID)
 	e.exec(t, "UPDATE files.attachments SET uploaded_at=now()-interval '10 seconds',scan_attempts=2,scan_next_attempt_at=now()+interval '60 seconds' WHERE id=$1", b.AttachmentID)
-	e.exec(t, "UPDATE files.attachments SET uploaded_at=now()-interval '10 seconds',scan_lease_until=now()+interval '60 seconds',scan_claim_token=gen_random_uuid() WHERE id=$1", c.AttachmentID)
+	e.exec(t, "UPDATE files.attachments SET uploaded_at=now()-interval '10 seconds',scan_lease_until=now()+interval '60 seconds',scan_claim_token = gen_random_uuid() WHERE id=$1", c.AttachmentID)
 	snapshot, err := e.queue.ScanQueueSnapshot(e.ctx)
 	requireScanPG(t, err)
 	if snapshot.Depth != 4 || snapshot.Eligible != 2 || snapshot.Leased != 1 || snapshot.Backoff != 1 || snapshot.UnknownFinalization != 1 || snapshot.OverFiveSeconds != 3 || snapshot.OldestAge.Seconds() < 20 || !snapshot.PolicyEnabled {
