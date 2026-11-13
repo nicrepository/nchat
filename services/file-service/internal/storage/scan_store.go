@@ -40,7 +40,7 @@ const claimDueScansQuery = `
  COALESCE(a.channel_id::text,a.conversation_id::text),a.size_bytes,a.storage_object_key,
  a.envelope_version,a.wrapped_dek,COALESCE(a.kek_key_id,''),a.dek_wrap_version,
  a.scan_attempts,a.original_filename,a.declared_mime,a.format_policy_version,
- a.scan_claim_token::text,COALESCE(a.uploaded_at,a.created_at)
+ a.scan_claim_token::text,a.uploaded_at
  FROM files.claim_scans($1,$2) a`
 
 // ClaimDueScans leases up to batchSize attachments awaiting a verdict.
@@ -73,13 +73,14 @@ func (s *PGXScanStore) ClaimDueScans(
 			envelopeVersion pgtype.Int2
 			keyWrapVersion  pgtype.Int2
 			attempts        pgtype.Int2
+			finalized       pgtype.Timestamptz
 		)
 		if err := rows.Scan(
 			&job.AttachmentID, &job.WorkspaceID, &destinationKind, &destinationID,
 			&job.Size, &job.StorageObjectKey, &envelopeVersion,
 			&job.WrappedDEK, &job.KEKKeyID, &keyWrapVersion, &attempts,
 			&job.Filename, &job.DeclaredMIME, &job.PolicyVersion,
-			&job.ClaimToken, &job.QueuedAt,
+			&job.ClaimToken, &finalized,
 		); err != nil {
 			return nil, fmt.Errorf("scan claimed attachment: %w", err)
 		}
@@ -88,6 +89,9 @@ func (s *PGXScanStore) ClaimDueScans(
 		job.EnvelopeVersion = int(envelopeVersion.Int16)
 		job.KeyWrapVersion = int(keyWrapVersion.Int16)
 		job.Attempts = int(attempts.Int16)
+		if finalized.Valid {
+			job.QueuedAt = finalized.Time
+		}
 		claimed = append(claimed, job)
 	}
 	if err := rows.Err(); err != nil {

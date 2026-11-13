@@ -1,0 +1,182 @@
+{
+  "base_head": "5a040225c2d57430711306855acb1870615139d7",
+  "branch": "feature/files-1129-clamav-observability",
+  "date": "2026-11-12",
+  "checks": [
+    {
+      "command": "make test-go",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-test-go-final.log",
+      "log_sha256": "dd6abc036fa52db89095e90838bce3e5e7c36b4dfb1d4409a436df02a5fe6777"
+    },
+    {
+      "command": "make ci-static-go",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-static-go-latest.log",
+      "log_sha256": "17bec6aa49d125d23006511c04223750efe04538905db2766053b21e873757a7"
+    },
+    {
+      "command": "bash scripts/ci/go-test.sh -race",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-race-final.log",
+      "log_sha256": "2843686d124db2ec14defb9864957563ee9f30dcbcfcec17cc4d344178658bf8"
+    },
+    {
+      "command": "make test-integration-go (owned network-none PostgreSQL16 and Valkey)",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-integration.log",
+      "log_sha256": "0d883af679213412b9e97a62f129c948b4c9eb7abc25e009bbff0521992abcdf"
+    },
+    {
+      "command": "make go-coverage-check (owned fresh DB, official B/C profiles, threshold90)",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-coverage.log",
+      "log_sha256": "9e4f582617c54a626db812302a7e2097c90d9348d73c385b2513b4c37dc32760"
+    },
+    {
+      "command": "make ci-static-repository",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-static-repository-final.log",
+      "log_sha256": "290c4f0290c32af2c3d53eafa4eefc1b7d1405eef711ff50dc8c23b9427c1d83"
+    },
+    {
+      "command": "make ci-infra-config",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-infra-config.log",
+      "log_sha256": "b871f4d4cb78787e92555de1d7bfe7d2df41fd0b863628c5d19d428b6e4952f1"
+    },
+    {
+      "command": "make ci-infra-kubernetes",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-infra-kubernetes.log",
+      "log_sha256": "bcd8a7423973b69cdd9618a78c94f254fd728c96f083c7018844d6fe13191d4f"
+    },
+    {
+      "command": "make ci-infra-migrations",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-infra-migrations.log",
+      "log_sha256": "5469813198bfd592c48710d9becc4b9d554c01b9a1d3a9b6ee73ae3fb71246f4"
+    },
+    {
+      "command": "make ci-architecture-check",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-architecture.log",
+      "log_sha256": "9674877599e45e2da0d4ccaf5adb7a0e65b04a167bd91e70014606f2d778dfff"
+    },
+    {
+      "command": "make grafana-dashboard-check; final dashboard expressions and quantiles through same owner helper",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-dashboard-closed.log",
+      "log_sha256": "2d140731bbe4be316525f102b6526ac21006bdea1f49cadee72bf22a11dc1ded"
+    },
+    {
+      "command": "python3 scripts/security/test_govulncheck_gate.py",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-govuln-gate.log",
+      "log_sha256": "8bca12ecb76719fa6f7f067e193e9bc38c2dfe405091dafbc80fa16c447cf5d7"
+    },
+    {
+      "command": "bash scripts/security/govulncheck.sh (v1.1.4 rebuilt with Go1.26.11)",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-govuln-final.log",
+      "log_sha256": "ffe16653f8b413d1ff4aa09d0d376f2bbe123c3fbd34f95899201732ec50815a"
+    },
+    {
+      "command": "make security-trivy-fs",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-trivy-fs.log",
+      "log_sha256": "b0a205605c03b7b9f72229ad3fcc125165bb87182af1537de483539e69e196cc"
+    },
+    {
+      "command": "make security-trivy-config",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-trivy-config.log",
+      "log_sha256": "518297d489ede743059ab2867a7e2e9f78949f055bbfa86d944c45dd309b1954"
+    },
+    {
+      "command": "bash scripts/testing/scan-queue-postgres.sh (PG16/17 final bounded SELECT)",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-queue-bounded.log",
+      "log_sha256": "bbc537e2f27f7e63ce6607be4b491801a8f8c8cdd877d17a18f2875485d09e37"
+    },
+    {
+      "command": "bash scripts/testing/clamav-signatures-isolated.sh",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-signatures.log",
+      "log_sha256": "5b87fa97e400346d34cec89abd6eeb4d4c4ca41a7a405e87e577988c27629e73"
+    },
+    {
+      "command": "CLAMAV_POLICY_TEST_POSTGRES=16 python3 scripts/testing/test_clamav_signature_policy.py -v",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-signature-policy16.log",
+      "log_sha256": "d06324cbc9ce723c8d5aa3fa96b88b330f902d5bc634e6ee5c3c503037d78943"
+    },
+    {
+      "command": "CLAMAV_POLICY_TEST_POSTGRES=17 python3 scripts/testing/test_clamav_signature_policy.py -v",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-signature-policy17.log",
+      "log_sha256": "59e1e7dfbe824d2b5678a5343f5d82ee8ed8892744292270b74f7bbf0c054e35"
+    },
+    {
+      "command": "bash scripts/testing/clamav-efficacy-isolated.sh (PG16/17 final counters)",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-efficacy-latest.log",
+      "log_sha256": "01a4257b429520b88e812ea0a34ecb39a252354ec21fb8c82c89cea5c688fee5"
+    },
+    {
+      "command": "NCHAT_D_BENCHMARK=true bash scripts/testing/clamav-efficacy-isolated.sh",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-efficacy-benchmark-final.log",
+      "log_sha256": "239b03143696a6b0a1a467bf213537195630f154c4bcb63d3adc84973a2492a5"
+    },
+    {
+      "command": "semgrep scan (two local rules, four runtime files)",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-semgrep.log",
+      "log_sha256": "027fdb86e1cc80d07975ab6fb80b87784dcf695d387ba9614435f1db2c04bb78"
+    },
+    {
+      "command": "gitleaks dir --redact (private delta copy)",
+      "status": "PASS",
+      "local_log": "/tmp/nchat-d-gitleaks.log",
+      "log_sha256": "0493440b425575f64da774beb342659f6b3c2dac8fbb42bdaddcc8b306d9b0ef"
+    },
+    {
+      "command": "kubectl config get-contexts -o name / operational baseline and B/C activation",
+      "status": "BLOCKED",
+      "evidence": "No configured contexts; no cluster requests or operational assertions."
+    },
+    {
+      "command": "Operational SLOs / before-after comparison / nominal load / browser ACK",
+      "status": "NOT RUN",
+      "evidence": "Only isolated component samples are recorded; not an operational benchmark."
+    },
+    {
+      "command": "Optional second signed image for recurring upgrade in B runner",
+      "status": "NOT RUN",
+      "evidence": "Existing pinned base exercised; no image promotion or activation."
+    },
+    {
+      "command": "git diff --check and final SHA-256 inventory",
+      "status": "PASS",
+      "evidence": "Manifest excludes only itself; worktree files remain uncommitted."
+    }
+  ],
+  "coverage_percent": {
+    "libs/go/platform": 94.4,
+    "services/admin-service": 91.3,
+    "services/auth-service": 90.8,
+    "services/chat-service": 91.0,
+    "services/document-converter": 92.7,
+    "services/file-service": 90.8,
+    "services/media-service": 92.4,
+    "services/notification-service": 95.9,
+    "services/search-service": 98.1
+  },
+  "notes": [
+    "Raw logs are local and unversioned; hashes identify the executions summarized here.",
+    "No claim of independent review, operational activation, production state or SLO validation.",
+    "Initial fixture/tool failures and corrections are documented in the report; only successful final executions are marked PASS.",
+    "Full history secret scan, image scan, Sonar and remote CI not run."
+  ]
+}

@@ -15,6 +15,7 @@ import (
 // never labels: they are unbounded, and two of them are the identifiers this
 // service exists to keep private.
 type AttachmentMetrics struct {
+	diagnostics        scanDiagnostics
 	inspections        *prometheus.CounterVec
 	inspectionDuration *prometheus.HistogramVec
 	uploads            *prometheus.CounterVec
@@ -41,6 +42,7 @@ type AttachmentMetrics struct {
 // registry. The app builds it so the service and the handlers share one set.
 func NewAttachmentMetrics(metrics *observability.Metrics) *AttachmentMetrics {
 	m := &AttachmentMetrics{
+		diagnostics:        newScanDiagnostics(metrics),
 		inspections:        prometheus.NewCounterVec(prometheus.CounterOpts{Name: "nchat_file_format_inspections_total", Help: "Format inspection outcomes; no user metadata."}, []string{"family", "decision", "code", "mime_mismatch"}),
 		inspectionDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "nchat_file_format_inspection_duration_seconds", Help: "Bounded attachment format inspection duration."}, []string{"family"}),
 		uploads: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -127,7 +129,7 @@ func NewAttachmentMetrics(metrics *observability.Metrics) *AttachmentMetrics {
 		scanLeased:   prometheus.NewGauge(prometheus.GaugeOpts{Name: "nchat_file_malware_scan_leased", Help: "Persistent scan jobs with a live lease."}),
 		scanClaims:   prometheus.NewCounter(prometheus.CounterOpts{Name: "nchat_file_malware_scan_claims_total", Help: "Claims admitted to execution."}),
 		scanDuration: prometheus.NewHistogram(prometheus.HistogramOpts{Name: "nchat_file_malware_scan_duration_seconds", Help: "Scan attempt duration including persistence.", Buckets: []float64{.01, .1, 1, 5, 10, 30, 60, 300, 600}}),
-		scanWait:     prometheus.NewHistogram(prometheus.HistogramOpts{Name: "nchat_file_malware_scan_wait_seconds", Help: "Time since upload finalization at execution (legacy falls back to creation).", Buckets: []float64{1, 5, 10, 30, 60, 300, 3600, 86400}}),
+		scanWait:     prometheus.NewHistogram(prometheus.HistogramOpts{Name: "nchat_file_malware_scan_wait_seconds", Help: "Known upload finalization to attempt execution, including previous backoff; missing/future timestamps omitted.", Buckets: []float64{1, 5, 10, 30, 60, 300, 3600, 86400}}),
 		scanBackoff:  prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "nchat_file_malware_scan_backoff_seconds", Help: "Persisted retry delays.", Buckets: []float64{10, 20, 40, 80, 160, 320, 640, 1320, 2640}}, []string{"reason"}),
 		orphans: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "nchat_file_orphaned_objects_total",
@@ -138,6 +140,11 @@ func NewAttachmentMetrics(metrics *observability.Metrics) *AttachmentMetrics {
 	// as no-op accumulators, so callers never need a nil check.
 	metrics.Register(m.inspections, m.inspectionDuration, m.uploads, m.downloads, m.previews, m.previewAttempts, m.previewDuration, m.linkPreviews, m.cleanups,
 		m.scans, m.scanQueue, m.scanActive, m.scanCapacity, m.scanEligible, m.scanLeased, m.scanClaims, m.scanDuration, m.scanWait, m.scanBackoff, m.orphans)
+	// Known zero outcomes allow rate-based idle/stall queries before the first
+	// completion without filling absent telemetry with synthetic health.
+	for _, result := range []string{"clean", "infected", "policy_rejected", "retry", "too_large", "superseded", "rescanned", "policy_blocked", "already_recorded", "retry_write_failed"} {
+		m.scans.WithLabelValues(result)
+	}
 	return m
 }
 
@@ -208,7 +215,10 @@ func (m *AttachmentMetrics) ObserveScan(result string) {
 	if m == nil {
 		return
 	}
-	m.scans.WithLabelValues(result).Inc()
+	switch result {
+	case "clean", "infected", "policy_rejected", "retry", "too_large", "superseded", "rescanned", "policy_blocked", "already_recorded", "retry_write_failed":
+		m.scans.WithLabelValues(result).Inc()
+	}
 }
 
 // SetScanQueueDepth satisfies service.ScanObserver.
@@ -246,10 +256,16 @@ func (m *AttachmentMetrics) ScanFinished(elapsed time.Duration) {
 		return
 	}
 	m.scanActive.Dec()
-	m.scanDuration.Observe(elapsed.Seconds())
+	if elapsed >= 0 {
+		m.scanDuration.Observe(elapsed.Seconds())
+	}
 }
 func (m *AttachmentMetrics) ObserveScanBackoff(delay time.Duration, reason string) {
-	if m != nil {
+	if m == nil || delay < 0 {
+		return
+	}
+	switch reason {
+	case "storage_read", "decrypt", "clamd_unavailable", "clamd_protocol", "clamd_stream_too_large", "timeout", "canceled", "database", "unsupported_policy", "signature_policy":
 		m.scanBackoff.WithLabelValues(reason).Observe(delay.Seconds())
 	}
 }

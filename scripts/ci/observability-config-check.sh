@@ -60,32 +60,8 @@ else
   echo "  [SKIP] docker not available"
 fi
 
-# Validate prometheus config with promtool if available.
-echo
-echo "--- Prometheus config validation ---"
-if command -v promtool > /dev/null 2>&1; then
-  if promtool check config "$PROMETHEUS_CFG" > /dev/null 2>&1; then
-    echo "  [OK]   promtool check passed"
-  else
-    echo "  [FAIL] promtool check failed" >&2
-    ERRORS=$((ERRORS + 1))
-  fi
-else
-  # Try via Docker if available.
-  PROMETHEUS_IMAGE="${PROMETHEUS_IMAGE:-prom/prometheus:v2.54.1}"
-  if command -v docker > /dev/null 2>&1; then
-    if docker run --rm \
-      -v "$PROMETHEUS_CFG:/etc/prometheus/prometheus.yml:ro" \
-      "$PROMETHEUS_IMAGE" \
-      promtool check config /etc/prometheus/prometheus.yml > /dev/null 2>&1; then
-      echo "  [OK]   promtool via Docker passed"
-    else
-      echo "  [SKIP] promtool via Docker skipped (image may not be pulled)"
-    fi
-  else
-    echo "  [SKIP] promtool not available"
-  fi
-fi
+# Real PromQL/rule/dashboard validation is owned by grafana-dashboard-check,
+# which runs alongside this check in Infra / Config. No silent Docker fallback.
 
 # Validate YAML syntax of datasources config.
 echo

@@ -58,6 +58,7 @@ func TestScanQueueFencingPostgreSQL(t *testing.T) {
 	t.Run("commit races serialize authority", e.commitRace)
 	t.Run("rolled back claim cannot revive authority", e.rolledBackClaim)
 	t.Run("deletion invalidates claim", e.deleted)
+	t.Run("bounded authoritative observability", e.queueObservability)
 	t.Run("signature policy and idempotency", e.proof)
 	t.Run("retry releases authority and bounds delay", e.retry)
 	t.Run("format version advances before approval", e.formatConflicts)

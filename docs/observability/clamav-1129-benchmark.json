@@ -1,0 +1,154 @@
+{
+  "kind": "isolated component measurements, not SLO validation or before/after comparison",
+  "date_utc": "2026-11-12",
+  "base_head": "5a040225c2d57430711306855acb1870615139d7",
+  "host_cpu": "AMD Ryzen 7 5825U",
+  "host_logical_cpus": 16,
+  "go": "1.26.11",
+  "engine": "1.4.6",
+  "clamav_image": "clamav/clamav:1.4@sha256:d97f5ef70fbe9f1f8e5490278082067f16f5824eca2eb4176f4df3748a45a4c2",
+  "daily_version": 28085,
+  "daily_timestamp_utc": "2026-08-07",
+  "scanner_and_go_container_limits": {
+    "cpus": 2,
+    "memory": "3 GiB",
+    "pids": 64,
+    "tmpfs": "2 GiB"
+  },
+  "postgres_container_limits": {
+    "cpus": 1,
+    "memory": "512 MiB",
+    "pids": 128,
+    "tmpfs": "256 MiB"
+  },
+  "replicas": 1,
+  "network": "none, private Unix PostgreSQL socket and loopback Guardian",
+  "source_command": "NCHAT_D_BENCHMARK=true bash scripts/testing/clamav-efficacy-isolated.sh",
+  "limitations": [
+    "10 measured samples per size/version: nearest-rank p95 and p99 both equal maximum, statistically weak",
+    "one warm-up per size, correctness failures abort; errors not discarded",
+    "ProcessDue directly invoked: no scheduler idle polling or burst load",
+    "in-memory ciphertext storage, real PostgreSQL authorization and runtime B/C persistence",
+    "test JWT validator, no real browser or Valkey delivery",
+    "latencies do not isolate daemon CPU from overlapped storage/decryption",
+    "CPU/RSS/throttling, representative formats, bursts and outage recovery not benchmarked",
+    "other validations ran concurrently on this workstation; results are not capacity claims",
+    "no authorized nchat-dev context, operational comparison pending"
+  ],
+  "results": [
+    {
+      "bytes": 1024,
+      "concurrency": 1,
+      "errors": 0,
+      "format": "text/plain",
+      "p50_p95_p99_seconds_nearest_rank": {
+        "finalized_to_clean_ack": [0.004702612, 0.005656883, 0.005656883],
+        "finalized_to_download_complete": [0.005614469, 0.006405024, 0.006405024],
+        "queue_age": [0.001422228, 0.001650479, 0.001650479],
+        "scan_attempt": [0.003250735, 0.004436214, 0.004436214]
+      },
+      "samples": 10,
+      "scheduler": "direct ProcessDue, no idle poll",
+      "seconds_including_warmup": 0.1027412,
+      "sha256": "f9bc1587b71bc772056b1fe4cdde4d78b4899a58b21835d9cebc18698571092e",
+      "storage": "in-memory ciphertext fixture",
+      "warmup": 1,
+      "postgres_major": "16"
+    },
+    {
+      "bytes": 1048576,
+      "concurrency": 1,
+      "errors": 0,
+      "format": "text/plain",
+      "p50_p95_p99_seconds_nearest_rank": {
+        "finalized_to_clean_ack": [0.012841837, 0.014503501, 0.014503501],
+        "finalized_to_download_complete": [0.015584507, 0.017262906, 0.017262906],
+        "queue_age": [0.001738953, 0.002361417, 0.002361417],
+        "scan_attempt": [0.010844029, 0.012551966, 0.012551966]
+      },
+      "samples": 10,
+      "scheduler": "direct ProcessDue, no idle poll",
+      "seconds_including_warmup": 0.3177322,
+      "sha256": "4e127211011b8478f9787612c51d1a06eae3d94d2a42152a183d141081aa7447",
+      "storage": "in-memory ciphertext fixture",
+      "warmup": 1,
+      "postgres_major": "16"
+    },
+    {
+      "bytes": 10485760,
+      "concurrency": 1,
+      "errors": 0,
+      "format": "text/plain",
+      "p50_p95_p99_seconds_nearest_rank": {
+        "finalized_to_clean_ack": [0.069094273, 0.07451169, 0.07451169],
+        "finalized_to_download_complete": [0.093457499, 0.100900759, 0.100900759],
+        "queue_age": [0.001556728, 0.002392014, 0.002392014],
+        "scan_attempt": [0.067431755, 0.072629795, 0.072629795]
+      },
+      "samples": 10,
+      "scheduler": "direct ProcessDue, no idle poll",
+      "seconds_including_warmup": 2.039890646,
+      "sha256": "dc6b0e9db09a3cd0ac7f09a47fa383aab88483048050dafcefd612431f454e6e",
+      "storage": "in-memory ciphertext fixture",
+      "warmup": 1,
+      "postgres_major": "16"
+    },
+    {
+      "bytes": 1024,
+      "concurrency": 1,
+      "errors": 0,
+      "format": "text/plain",
+      "p50_p95_p99_seconds_nearest_rank": {
+        "finalized_to_clean_ack": [0.004430079, 0.006125451, 0.006125451],
+        "finalized_to_download_complete": [0.004968555, 0.006676393, 0.006676393],
+        "queue_age": [0.001458769, 0.002022611, 0.002022611],
+        "scan_attempt": [0.002792718, 0.004189843, 0.004189843]
+      },
+      "samples": 10,
+      "scheduler": "direct ProcessDue, no idle poll",
+      "seconds_including_warmup": 0.093526482,
+      "sha256": "f9bc1587b71bc772056b1fe4cdde4d78b4899a58b21835d9cebc18698571092e",
+      "storage": "in-memory ciphertext fixture",
+      "warmup": 1,
+      "postgres_major": "17"
+    },
+    {
+      "bytes": 1048576,
+      "concurrency": 1,
+      "errors": 0,
+      "format": "text/plain",
+      "p50_p95_p99_seconds_nearest_rank": {
+        "finalized_to_clean_ack": [0.01232401, 0.014559584, 0.014559584],
+        "finalized_to_download_complete": [0.014712263, 0.017145114, 0.017145114],
+        "queue_age": [0.00169836, 0.002326856, 0.002326856],
+        "scan_attempt": [0.010799144, 0.012307398, 0.012307398]
+      },
+      "samples": 10,
+      "scheduler": "direct ProcessDue, no idle poll",
+      "seconds_including_warmup": 0.308704421,
+      "sha256": "4e127211011b8478f9787612c51d1a06eae3d94d2a42152a183d141081aa7447",
+      "storage": "in-memory ciphertext fixture",
+      "warmup": 1,
+      "postgres_major": "17"
+    },
+    {
+      "bytes": 10485760,
+      "concurrency": 1,
+      "errors": 0,
+      "format": "text/plain",
+      "p50_p95_p99_seconds_nearest_rank": {
+        "finalized_to_clean_ack": [0.06412578, 0.070587739, 0.070587739],
+        "finalized_to_download_complete": [0.087913083, 0.094097988, 0.094097988],
+        "queue_age": [0.001859381, 0.002527167, 0.002527167],
+        "scan_attempt": [0.062727018, 0.068157323, 0.068157323]
+      },
+      "samples": 10,
+      "scheduler": "direct ProcessDue, no idle poll",
+      "seconds_including_warmup": 1.9394730550000001,
+      "sha256": "dc6b0e9db09a3cd0ac7f09a47fa383aab88483048050dafcefd612431f454e6e",
+      "storage": "in-memory ciphertext fixture",
+      "warmup": 1,
+      "postgres_major": "17"
+    }
+  ]
+}
