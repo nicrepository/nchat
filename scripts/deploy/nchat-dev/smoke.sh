@@ -223,6 +223,17 @@ print_verdict() {
 main() {
   [[ -n "${NCHAT_DEV_HOST:-}" ]] ||
     { echo "NCHAT_DEV_HOST must name the public host of the environment" >&2; return 1; }
+  # GitOps delivery (gitops-publish.sh) runs on a GitHub-hosted runner with no
+  # access to the cluster API: only the public surface can be asked. Rollouts,
+  # restart loops and the migrations Job are Flux's health checks there.
+  if [[ "${NCHAT_DEV_SMOKE_SCOPE:-cluster}" == public ]]; then
+    echo "=== nchat-dev smoke (public surface only) ==="
+    check_web_served
+    check_protected_api_refuses_anonymous /api/chat/sidebar
+    check_websocket_route_guarded
+    print_verdict
+    return
+  fi
   [[ "$(kubectl config current-context)" == nchat-dev-deployer ]] ||
     { echo "the current kube context is not nchat-dev-deployer" >&2; return 1; }
   echo "=== nchat-dev smoke ==="
