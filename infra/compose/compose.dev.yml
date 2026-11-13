@@ -302,6 +302,7 @@ services:
       - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9090}:9090"
     volumes:
       - ../observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../observability/prometheus/rules:/etc/prometheus/rules:ro
       - nchat_prometheus_data:/prometheus
     command:
       - --config.file=/etc/prometheus/prometheus.yml

@@ -399,3 +399,9 @@ arquivos ou contas de outros usuários.
 Rollback de A: parar coleta, descartar evidência incompleta, remover os arquivos
 locais restritos conforme política de retenção; nenhuma ação em banco/cluster.
 Não há migração, configuração ou funcionalidade de produção para reverter.
+
+## Complemento da Entrega D
+
+[Instrumentação e evidências locais D](../observability/clamav-1129-delivery-d.md)
+ampliam os instrumentos; não substituem esta coleta passiva nem comprovam o
+baseline nchat-dev. Nenhum contexto Kubernetes estava configurado na execução D.

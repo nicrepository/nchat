@@ -31,7 +31,7 @@ func scanRow() []any {
 		pgtype.Int2{Int16: 2, Valid: true},
 		pgtype.Int2{Int16: 1, Valid: true},
 		"notes.txt", "text/plain", 0,
-		"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", time.Now(),
+		"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	}
 }
 

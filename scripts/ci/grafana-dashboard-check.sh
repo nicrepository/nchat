@@ -111,4 +111,6 @@ if [ "$ERRORS" -gt 0 ]; then
   exit 1
 fi
 
+bash "$ROOT_DIR/scripts/ci/file-antimalware-check.sh"
+
 echo "Grafana dashboard check passed."

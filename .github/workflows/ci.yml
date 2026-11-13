@@ -362,6 +362,8 @@ jobs:
         run: bash scripts/testing/scan-queue-postgres.sh
         env:
           SCAN_QUEUE_COVERAGE_DIR: ${{ github.workspace }}/coverage/go/scan-queue
+      - name: Verify isolated real-engine upload and delivery gates
+        run: bash scripts/testing/clamav-efficacy-isolated.sh
       - name: Check coverage
         run: bash scripts/ci/go-coverage-check.sh
         env:

@@ -824,7 +824,7 @@ Services use span names `<METHOD> <path>` and record `http.method`, `http.route`
 make observability-config-check
 ```
 
-Validates Prometheus config, Grafana datasources, Compose config and security properties — no containers started. Included automatically in `make ci`.
+Validates Grafana datasources, Compose config and security properties without starting the stack. Prometheus config/rules and dashboard queries are validated by `make grafana-dashboard-check`, using promtool locally or in an isolated container. Both checks belong to `make ci-infra-config`.
 
 ### Dashboards
 

@@ -32,3 +32,14 @@ make dev-observability-up
 ```bash
 make grafana-dashboard-check
 ```
+
+## File antimalware (#1129 D1)
+
+`NChat File Antimalware` (`nchat-file-antimalware`) uses the same Prometheus
+source and file provider as Overview. It distinguishes local execution slots
+from global PostgreSQL snapshots and displays absent telemetry as unknown.
+Signature panels normally have no data until a separately approved B rollout
+and authorized scrape. No engine effectiveness or client receipt is inferred
+from HTTP availability or a successful event publication.
+
+[Detailed contracts and runbook](../../../docs/observability/clamav-1129-delivery-d.md).

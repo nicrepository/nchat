@@ -1877,3 +1877,24 @@ Não está habilitada no overlay ativo: idade máxima depende de decisão humana
 prova; ausência deixa novas aprovações fechadas no binário novo, sem iniciar o worker.
 Valor inválido é recusado, e o caminho com prova exige policy DB habilitada.
 Nenhum contrato público de status, download, Range, preview ou realtime muda.
+
+## Observabilidade complementar (#1129 D)
+
+O [contrato de métricas, dashboard e runbook](../observability/clamav-1129-delivery-d.md)
+distingue snapshots PostgreSQL globais de execução local. Falha/limite da coleta
+preserva gauges anteriores e invalida seu frescor; não representa fila vazia.
+Nenhuma observação altera autorização, fencing ou a política de assinaturas.
+
+`scan_wait_seconds` passa a omitir finalizações desconhecidas/futuras: não usa
+`created_at` como finalização. Continua incluindo backoff e tentativas anteriores;
+não é uma distribuição exclusiva da primeira espera. `scan_duration_seconds`
+conserva a duração da tentativa incluindo persistência/publicação.
+O novo `scan_finalized_to_verdict_seconds{result}` termina no ACK da persistência
+confirmada, antes do publish; não mede chegada/renderização no cliente. Repetição,
+rescan sem mudança de status, conflito e commit não confirmado não o alimentam.
+
+`scripts/testing/clamav-efficacy-isolated.sh` exercita ClamAV real, políticas B/C
+somente em PostgreSQL descartável, autorização de canal/DM/grupo, criptografia,
+SHA-256, gates HTTP e refetch após evento perdido. Não é ensaio operacional nem
+prova de renderização do frontend. `NCHAT_D_BENCHMARK=true` acrescenta um corpus
+fixo de texto e percentis locais; as limitações estão no relatório.

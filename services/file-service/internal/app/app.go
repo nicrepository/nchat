@@ -111,7 +111,9 @@ func newApp(cfg config.Config, deps appDependencies) (*App, error) {
 	application := &App{Config: cfg, Logger: logger, TracingShutdown: shutdown}
 
 	metrics := observability.NewMetrics(obsCfg)
-	routerDeps := httpapi.RouterDependencies{Observability: metrics}
+	attachmentMetrics := httpapi.NewAttachmentMetrics(metrics)
+	attachmentMetrics.SetScanRequired(cfg.UploadsEnabled && cfg.MalwareScanRequired)
+	routerDeps := httpapi.RouterDependencies{Observability: metrics, Metrics: attachmentMetrics}
 
 	// One pool for the whole process, opened before any feature is wired.
 	//
@@ -295,7 +297,11 @@ func (a *App) wireAttachments(
 		return errDependenciesUnavailable
 	}
 
-	attachmentMetrics := httpapi.NewAttachmentMetrics(metrics)
+	attachmentMetrics := routerDeps.Metrics
+	if attachmentMetrics == nil {
+		attachmentMetrics = httpapi.NewAttachmentMetrics(metrics)
+	}
+	attachmentMetrics.SetScanRequired(cfg.UploadsEnabled && cfg.MalwareScanRequired)
 	limiter := httpapi.NewUserRateLimiter(uploadRateLimitPerMinute, uploadRateLimitWindow)
 	a.rateLimiter = limiter
 
