@@ -5,7 +5,8 @@ resources:
   - ../../../base/migrations
 patches:
   # The dev server is a single named node and its PostgreSQL PersistentVolume is
-  # bound to it; the Job has to run where the database is.
+  # bound to it; the Job has to run where the database is. Since the migration
+  # off srv-apps-01 that node is vm-dev-01.
   - target:
       kind: Job
       name: nchat-migrations
@@ -13,7 +14,7 @@ patches:
       - op: add
         path: /spec/template/spec/nodeSelector
         value:
-          kubernetes.io/hostname: srv-apps-01
+          kubernetes.io/hostname: vm-dev-01
 images:
   - name: ghcr.io/nicrepository/nchat/migrations
     newTag: sha-placeholder

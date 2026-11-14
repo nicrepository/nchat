@@ -4,14 +4,20 @@ name: Deploy nchat-dev
 #
 # Called by cd-develop.yml with a commit `CI / Required` has already passed.
 # It holds no eligibility rule of its own -- the caller decided that -- and it
-# holds no Kubernetes logic of its own either: deploy.sh applies and rolls out,
-# smoke.sh proves the environment is serving the release, and this file wires
-# them together and publishes what happened.
+# holds no Kubernetes logic of its own either: gitops-publish.sh writes the
+# release into the infrastructure repository, smoke.sh asks the public surface,
+# and this file wires them together and publishes what happened.
 #
-# Deploy and smoke are two steps rather than one because they answer different
-# questions. A failed deploy means Kubernetes rejected the change; a failed
-# smoke means the change is bad. An operator reading the summary needs to know
-# which, and neither may be reported as success.
+# Since the migration off srv-apps-01, nchat-dev runs on a k3s cluster that Flux
+# reconciles from that repository: no runner reaches the cluster's API. Flux applies the release's migrations Job first, waits for it, and only
+# then the images (the order deploy.sh used); its health checks take the place
+# of the rollout and migration checks this job used to run with kubectl.
+#
+# Publish and smoke are two steps rather than one because they answer different
+# questions. A failed publish means the release never reached the repository;
+# a failed smoke means the environment is not serving correctly. An operator
+# reading the summary needs to know which, and neither may be reported as
+# success.
 
 on:
   workflow_call:
@@ -30,7 +36,7 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: [self-hosted, linux, x64, nchat-dev-deploy]
+    runs-on: ubuntu-24.04
     environment: nchat-dev
     timeout-minutes: 20
     steps:
@@ -57,24 +63,25 @@ jobs:
           NCHAT_DEV_HOST: ${{ vars.NCHAT_DEV_HOST }}
           NCHAT_DEV_TURN_EXTERNAL_IP: ${{ vars.NCHAT_DEV_TURN_EXTERNAL_IP }}
         run: scripts/ci/nchat-dev-deployment-check.sh
-      - name: Deploy data, migrations and application
+      # The repository URL is a variable and the token (write_repository on that
+      # repository only) a secret, both of the nchat-dev environment.
+      - name: Publish the release to the infrastructure repository
         id: apply
         env:
           ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
           DEPLOY_SHA: ${{ inputs.sha }}
-          NCHAT_DEV_NODE_IP: ${{ vars.NCHAT_DEV_NODE_IP }}
-          NCHAT_DEV_NODE_CIDR: ${{ vars.NCHAT_DEV_NODE_CIDR }}
-          NCHAT_DEV_HOST: ${{ vars.NCHAT_DEV_HOST }}
-          NCHAT_DEV_TURN_EXTERNAL_IP: ${{ vars.NCHAT_DEV_TURN_EXTERNAL_IP }}
-        run: scripts/deploy/nchat-dev/deploy.sh
-      # Rollout completion is not delivery. This is the step that asks whether
-      # the environment is actually serving the release: migrations complete,
-      # nothing in a restart back-off, the public host answering, the protected
-      # API and the WebSocket route refusing anonymous access rather than 404ing.
+          K3S_DEV_REPOSITORY: ${{ vars.K3S_DEV_REPOSITORY }}
+          K3S_DEV_TOKEN: ${{ secrets.K3S_DEV_DEPLOY_TOKEN }}
+        run: scripts/deploy/nchat-dev/gitops-publish.sh
+      # Publishing is not delivery. This step asks the public surface whether
+      # the environment is serving: the host answering, the protected API and
+      # the WebSocket route refusing anonymous access rather than 404ing.
+      # Rollouts, restart loops and the migrations Job are Flux's health checks.
       - name: Smoke the deployed environment
         id: smoke
         env:
           NCHAT_DEV_HOST: ${{ vars.NCHAT_DEV_HOST }}
+          NCHAT_DEV_SMOKE_SCOPE: public
         run: scripts/deploy/nchat-dev/smoke.sh
       # Last, and it reports rather than decides: every step above keeps its
       # own status, this one adds no `continue-on-error`, and a failed deploy
@@ -99,7 +106,7 @@ jobs:
             echo "|---|---|"
             echo "| SHA | \`$DEPLOY_SHA\` |"
             echo "| Images | $(find "$DIGEST_DIR" -name 'digest-*.txt' -type f | wc -l) pinned by OCI digest |"
-            echo "| Migrations, rollout, readiness | ${APPLY_RESULT:-not reached} |"
+            echo "| Published for Flux (migrations, then images) | ${APPLY_RESULT:-not reached} |"
             echo "| Smoke | ${SMOKE_RESULT:-not reached} |"
             echo
             echo "Single-slot deployment; no Blue/Green and no traffic switch in this environment."

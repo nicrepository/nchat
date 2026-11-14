@@ -78,7 +78,10 @@ MUTATION_CONCURRENCY = {
     "cancel-in-progress": False,
 }
 DEPLOY_RUNNER = ["self-hosted", "linux", "x64", "nchat-prod-deploy"]
-DEV_RUNNER = ["self-hosted", "linux", "x64", "nchat-dev-deploy"]
+# nchat-dev is delivered through GitOps (gitops-publish.sh writes the release
+# into the infrastructure repository and Flux applies it): nothing in this job needs to reach
+# the cluster, so it runs on a GitHub-hosted runner.
+DEV_RUNNER = "ubuntu-24.04"
 # nchat-dev has its own exclusion. It shares no lock with production: the two
 # environments have nothing to serialise against each other, and a shared group
 # would make a development deploy able to delay a production rollback.
@@ -745,21 +748,28 @@ DEV_DEPLOY_JOBS = {
             },
             {"run": ["scripts/deploy/nchat-dev/install-kustomize.sh"]},
             {"env": DEV_HOST_ENV, "run": ["scripts/ci/nchat-dev-deployment-check.sh"]},
+            # The token is the only credential: write_repository on the
+            # infrastructure repository, scoped to the nchat-dev environment.
             {
                 "id": "apply",
                 "env": {
                     "ARTIFACTS_DIR": "${{ github.workspace }}/artifacts",
                     "DEPLOY_SHA": DEV_INPUT_SHA,
-                    **DEV_HOST_ENV,
+                    "K3S_DEV_REPOSITORY": "${{ vars.K3S_DEV_REPOSITORY }}",
+                    "K3S_DEV_TOKEN": "${{ secrets.K3S_DEV_DEPLOY_TOKEN }}",
                 },
-                "run": ["scripts/deploy/nchat-dev/deploy.sh"],
+                "run": ["scripts/deploy/nchat-dev/gitops-publish.sh"],
             },
-            # Rollout completion is not delivery. Dropping this step is the
-            # regression the contract exists to refuse: a deploy that applied
-            # cleanly and serves nothing would then report success.
+            # Publishing is not delivery. Dropping this step is the regression
+            # the contract exists to refuse: a release that reached the
+            # repository while the environment serves nothing would then
+            # report success.
             {
                 "id": "smoke",
-                "env": {"NCHAT_DEV_HOST": "${{ vars.NCHAT_DEV_HOST }}"},
+                "env": {
+                    "NCHAT_DEV_HOST": "${{ vars.NCHAT_DEV_HOST }}",
+                    "NCHAT_DEV_SMOKE_SCOPE": "public",
+                },
                 "run": ["scripts/deploy/nchat-dev/smoke.sh"],
             },
             {
@@ -779,7 +789,7 @@ DEV_DEPLOY_JOBS = {
                     'echo "|---|---|"',
                     'echo "| SHA | \\`$DEPLOY_SHA\\` |"',
                     'echo "| Images | $(find "$DIGEST_DIR" -name \'digest-*.txt\' -type f | wc -l) pinned by OCI digest |"',
-                    'echo "| Migrations, rollout, readiness | ${APPLY_RESULT:-not reached} |"',
+                    'echo "| Published for Flux (migrations, then images) | ${APPLY_RESULT:-not reached} |"',
                     'echo "| Smoke | ${SMOKE_RESULT:-not reached} |"',
                     "echo",
                     'echo "Single-slot deployment; no Blue/Green and no traffic switch in this environment."',
