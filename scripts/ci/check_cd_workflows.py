@@ -101,7 +101,7 @@ WORKFLOW_PERMISSIONS = CONTENTS_ONLY
 ROOT_KEYS = {"name", "on", "permissions", "concurrency", "jobs"}
 ROOT_KEYS_WITHOUT_LOCK = ROOT_KEYS - {"concurrency"}
 STEP_KEYS = {"name", "id", "if", "uses", "with", "env", "run"}
-CALLED_JOB_KEYS = {"needs", "permissions", "uses", "with", "if"}
+CALLED_JOB_KEYS = {"needs", "permissions", "uses", "with", "if", "secrets"}
 STEP_JOB_KEYS = {
     "name", "needs", "permissions", "runs-on", "timeout-minutes", "steps", "concurrency",
 }
@@ -725,6 +725,8 @@ DEVELOP_JOBS = {
         "permissions": READ_ONLY,
         "uses": "./.github/workflows/deploy-nchat-dev.yml",
         "with": {"sha": DEV_SHA},
+        # The environment secret reaches the called job only through this.
+        "secrets": "inherit",
     },
 }
 
