@@ -491,6 +491,12 @@ class ProductionWorkflowContracts(unittest.TestCase):
 
         self.refuses(DEVELOP, mutate, "the images deployed are the ones this run built")
 
+    def test_develop_may_not_withhold_the_environment_secret(self):
+        def mutate(workflow):
+            del workflow["jobs"]["deploy"]["secrets"]
+
+        self.refuses(DEVELOP, mutate, "a called workflow sees no secret its caller did not pass")
+
     def test_develop_may_not_deploy_before_the_build(self):
         def mutate(workflow):
             workflow["jobs"]["deploy"]["needs"] = "eligibility"

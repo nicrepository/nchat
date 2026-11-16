@@ -82,3 +82,8 @@ jobs:
     uses: ./.github/workflows/deploy-nchat-dev.yml
     with:
       sha: ${{ needs.eligibility.outputs.sha }}
+    # A called workflow only sees the secrets its caller passes, environment
+    # secrets included: without this the nchat-dev environment's deploy token
+    # reached gitops-publish.sh empty. The repository holds no other secret a
+    # deploy could misuse, and the token itself stays scoped to nchat-dev.
+    secrets: inherit
