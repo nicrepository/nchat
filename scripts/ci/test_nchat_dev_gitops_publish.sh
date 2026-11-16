@@ -92,6 +92,8 @@ if publish "$SHA"; then
     fail "the migrations Job is not named after the release"
   show nchat-dev-migracoes/job.yaml | grep -q "nchat/migrations@$(<"$WORK/artifacts/digest-migrations.txt")" ||
     fail "the migrations Job does not run the release's migrations image"
+  ! show nchat-dev-migracoes/job.yaml | grep -q 'ttlSecondsAfterFinished' ||
+    fail "the migrations Job expires, and Flux would run it again every hour"
   show nchat-dev-migracoes/kustomization.yaml | grep -q 'job.yaml' ||
     fail "the migrations folder does not include the Job"
 else
