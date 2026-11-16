@@ -537,11 +537,24 @@ class ProductionWorkflowContracts(unittest.TestCase):
 
         self.refuses(DEVELOP, mutate, "nchat-dev is single-slot")
 
-    def test_the_dev_deploy_may_not_drop_the_smoke(self):
+    def test_the_dev_deploy_may_not_drop_the_flux_wait(self):
         def mutate(workflow):
             del workflow["jobs"]["deploy"]["steps"][6]
 
-        self.refuses(DEV_DEPLOY, mutate, "rollout completion is not delivery")
+        self.refuses(DEV_DEPLOY, mutate, "publishing is not delivery")
+
+    def test_the_dev_deploy_waits_on_the_commit_it_published(self):
+        def mutate(workflow):
+            workflow["jobs"]["deploy"]["steps"][6]["env"]["INFRA_COMMIT"] = "${{ inputs.sha }}"
+
+        self.refuses(DEV_DEPLOY, mutate, "the status that matters is the one on the infrastructure commit")
+
+    def test_the_dev_deploy_waits_for_the_migrations_too(self):
+        def mutate(workflow):
+            step = workflow["jobs"]["deploy"]["steps"][6]
+            step["run"] = step["run"].replace(" nchat-dev/producao-migracoes", "")
+
+        self.refuses(DEV_DEPLOY, mutate, "a release whose migrations failed is not delivered")
 
     def test_the_dev_deploy_may_not_drop_the_summary(self):
         def mutate(workflow):
@@ -549,11 +562,11 @@ class ProductionWorkflowContracts(unittest.TestCase):
 
         self.refuses(DEV_DEPLOY, mutate, "the run must report what it deployed")
 
-    def test_the_dev_smoke_may_not_be_made_advisory(self):
+    def test_the_dev_flux_wait_may_not_be_made_advisory(self):
         def mutate(workflow):
             workflow["jobs"]["deploy"]["steps"][6]["continue-on-error"] = True
 
-        self.refuses(DEV_DEPLOY, mutate, "a failed smoke must fail the delivery")
+        self.refuses(DEV_DEPLOY, mutate, "a release Flux did not bring up must fail the delivery")
 
     def test_the_dev_deploy_may_not_deploy_an_unvalidated_sha(self):
         def mutate(workflow):

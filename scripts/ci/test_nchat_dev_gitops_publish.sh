@@ -68,7 +68,11 @@ make_artifacts() {
 
 publish() {
   K3S_DEV_REPOSITORY="file://$WORK/k3s-dev.git" ARTIFACTS_DIR="$WORK/artifacts" \
-    DEPLOY_SHA="$1" K3S_DEV_TOKEN=test "$PUBLISH" >"$WORK/out" 2>&1
+    DEPLOY_SHA="$1" K3S_DEV_TOKEN=test "$PUBLISH" >"$WORK/stdout" 2>"$WORK/out"
+}
+
+head_commit() {
+  git -C "$WORK/k3s-dev.git" rev-parse main
 }
 
 commits() {
@@ -84,6 +88,8 @@ make_repository
 make_artifacts
 if publish "$SHA"; then
   [[ "$(commits)" -eq 2 ]] || fail "publishing a release must add exactly one commit"
+  [[ "$(cat "$WORK/stdout")" == "commit=$(head_commit)" ]] ||
+    fail "stdout must be exactly the published commit, got: $(cat "$WORK/stdout")"
   for image in "${IMAGES[@]}"; do
     show "nchat-dev/deployment-$image.yaml" | grep -q "nchat/$image@$(<"$WORK/artifacts/digest-$image.txt")" ||
       fail "$image was not pinned to the release digest"
@@ -92,6 +98,8 @@ if publish "$SHA"; then
     fail "the migrations Job is not named after the release"
   show nchat-dev-migracoes/job.yaml | grep -q "nchat/migrations@$(<"$WORK/artifacts/digest-migrations.txt")" ||
     fail "the migrations Job does not run the release's migrations image"
+  ! show nchat-dev-migracoes/job.yaml | grep -q 'ttlSecondsAfterFinished' ||
+    fail "the migrations Job expires, and Flux would run it again every hour"
   show nchat-dev-migracoes/kustomization.yaml | grep -q 'job.yaml' ||
     fail "the migrations folder does not include the Job"
 else
@@ -101,6 +109,8 @@ fi
 # The same release again is a no-op, not a second commit.
 if publish "$SHA"; then
   [[ "$(commits)" -eq 2 ]] || fail "republishing the same release added a commit"
+  [[ "$(cat "$WORK/stdout")" == "commit=$(head_commit)" ]] ||
+    fail "a republish must still name the commit that carries the release, got: $(cat "$WORK/stdout")"
 else
   fail "republishing the same release failed: $(cat "$WORK/out")"
 fi

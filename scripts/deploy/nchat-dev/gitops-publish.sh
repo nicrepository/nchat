@@ -25,6 +25,9 @@
 #   DEPLOY_SHA     the 40-character commit the images were built from
 #   K3S_DEV_REPOSITORY  HTTPS URL of the infrastructure repository (environment variable)
 #   K3S_DEV_TOKEN  project access token, write_repository on that repository only
+#
+# Progress goes to stderr. stdout is one line, commit=<sha>: the commit of the
+# infrastructure repository that carries the release, for flux-wait.sh.
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -58,6 +61,11 @@ render_migrations() {
   cp -a "$ROOT_DIR/infra/k8s" "$WORK/infra-k8s"
   set_digest_image "$overlay" "$IMAGE_PREFIX/migrations" "$ARTIFACTS_DIR/digest-migrations.txt"
   (cd "$overlay" && kustomize edit set namesuffix -- "-${DEPLOY_SHA:0:12}")
+  # No TTL in the repository: Flux re-creates any object the cluster deletes,
+  # so a Job that expires an hour after it finishes would run the migrations
+  # again every hour. The Job is replaced by the next release instead.
+  (cd "$overlay" && kustomize edit add patch --kind Job \
+    --patch '[{"op": "remove", "path": "/spec/ttlSecondsAfterFinished"}]')
   validate_rendered_overlay "$overlay" "$WORK/migrations.yaml"
   [[ "$(grep -c '^kind: Job$' "$WORK/migrations.yaml")" -eq 1 ]] || fail "the migrations overlay must render exactly one Job"
 }
@@ -109,7 +117,10 @@ publish() {
   local repository="$WORK/k3s-dev"
   git -C "$repository" add nchat-dev nchat-dev-migracoes
   if git -C "$repository" diff --cached --quiet; then
-    echo "the infrastructure repository already carries $DEPLOY_SHA"
+    # Already there is not proof it is applied: the commit that last wrote
+    # these folders is the one flux-wait.sh is pointed at instead.
+    echo "the infrastructure repository already carries $DEPLOY_SHA" >&2
+    echo "commit=$(git -C "$repository" log -1 --format=%H -- nchat-dev nchat-dev-migracoes)"
     return 0
   fi
   git -C "$repository" -c user.name="nchat CD" -c user.email="nchat-cd@nic-labs.com" \
@@ -117,7 +128,8 @@ publish() {
     -m "Source: https://github.com/nicrepository/nchat/commit/$DEPLOY_SHA"
   for _ in 1 2 3; do
     if git -C "$repository" push --quiet origin HEAD:main; then
-      echo "published $DEPLOY_SHA to the infrastructure repository as $(git -C "$repository" rev-parse --short HEAD)"
+      echo "published $DEPLOY_SHA to the infrastructure repository as $(git -C "$repository" rev-parse --short HEAD)" >&2
+      echo "commit=$(git -C "$repository" rev-parse HEAD)"
       return 0
     fi
     git -C "$repository" pull --quiet --rebase origin main || return 1
