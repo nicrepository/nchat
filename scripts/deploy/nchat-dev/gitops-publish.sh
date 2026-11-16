@@ -58,6 +58,11 @@ render_migrations() {
   cp -a "$ROOT_DIR/infra/k8s" "$WORK/infra-k8s"
   set_digest_image "$overlay" "$IMAGE_PREFIX/migrations" "$ARTIFACTS_DIR/digest-migrations.txt"
   (cd "$overlay" && kustomize edit set namesuffix -- "-${DEPLOY_SHA:0:12}")
+  # No TTL in the repository: Flux re-creates any object the cluster deletes,
+  # so a Job that expires an hour after it finishes would run the migrations
+  # again every hour. The Job is replaced by the next release instead.
+  (cd "$overlay" && kustomize edit add patch --kind Job \
+    --patch '[{"op": "remove", "path": "/spec/ttlSecondsAfterFinished"}]')
   validate_rendered_overlay "$overlay" "$WORK/migrations.yaml"
   [[ "$(grep -c '^kind: Job$' "$WORK/migrations.yaml")" -eq 1 ]] || fail "the migrations overlay must render exactly one Job"
 }
