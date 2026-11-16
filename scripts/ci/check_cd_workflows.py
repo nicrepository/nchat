@@ -760,26 +760,31 @@ DEV_DEPLOY_JOBS = {
                     "K3S_DEV_REPOSITORY": "${{ vars.K3S_DEV_REPOSITORY }}",
                     "K3S_DEV_TOKEN": "${{ secrets.K3S_DEV_DEPLOY_TOKEN }}",
                 },
-                "run": ["scripts/deploy/nchat-dev/gitops-publish.sh"],
+                "run": ['scripts/deploy/nchat-dev/gitops-publish.sh >>"$GITHUB_OUTPUT"'],
             },
             # Publishing is not delivery. Dropping this step is the regression
             # the contract exists to refuse: a release that reached the
-            # repository while the environment serves nothing would then
-            # report success.
+            # repository while Flux never brought it up would then report
+            # success. The commit waited on is the one the publish wrote, and
+            # both Kustomizations must be named: the migrations, then the slot.
             {
-                "id": "smoke",
+                "id": "flux",
                 "env": {
-                    "NCHAT_DEV_HOST": "${{ vars.NCHAT_DEV_HOST }}",
-                    "NCHAT_DEV_SMOKE_SCOPE": "public",
+                    "K3S_DEV_REPOSITORY": "${{ vars.K3S_DEV_REPOSITORY }}",
+                    "INFRA_COMMIT": "${{ steps.apply.outputs.commit }}",
+                    "FLUX_STATUS_TOKEN": "${{ secrets.K3S_DEV_STATUS_TOKEN }}",
                 },
-                "run": ["scripts/deploy/nchat-dev/smoke.sh"],
+                "run": [
+                    'scripts/deploy/flux-wait.sh "$K3S_DEV_REPOSITORY" "$INFRA_COMMIT"'
+                    " nchat-dev/producao-migracoes nchat-dev/producao"
+                ],
             },
             {
                 "if": "${{ !cancelled() }}",
                 "env": {
                     "DEPLOY_SHA": DEV_INPUT_SHA,
                     "APPLY_RESULT": "${{ steps.apply.conclusion }}",
-                    "SMOKE_RESULT": "${{ steps.smoke.conclusion }}",
+                    "FLUX_RESULT": "${{ steps.flux.conclusion }}",
                     "DIGEST_DIR": "${{ github.workspace }}/artifacts",
                 },
                 "run": [
@@ -792,7 +797,7 @@ DEV_DEPLOY_JOBS = {
                     'echo "| SHA | \\`$DEPLOY_SHA\\` |"',
                     'echo "| Images | $(find "$DIGEST_DIR" -name \'digest-*.txt\' -type f | wc -l) pinned by OCI digest |"',
                     'echo "| Published for Flux (migrations, then images) | ${APPLY_RESULT:-not reached} |"',
-                    'echo "| Smoke | ${SMOKE_RESULT:-not reached} |"',
+                    'echo "| Migrated and healthy (Flux) | ${FLUX_RESULT:-not reached} |"',
                     "echo",
                     'echo "Single-slot deployment; no Blue/Green and no traffic switch in this environment."',
                     '} >>"$GITHUB_STEP_SUMMARY"',
