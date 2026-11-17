@@ -14,6 +14,11 @@
 # Required environment:
 #   FLUX_STATUS_TOKEN  read_api on that repository only
 # Optional:
+#   FLUX_GIT_SERVER_ADDRESS    an IPv4 address to reach the Git server at,
+#                              bypassing DNS. The name still goes in SNI and
+#                              the certificate is still verified against it.
+#                              For a CDN in front of the server that refuses
+#                              API reads from cloud-hosted runners.
 #   FLUX_WAIT_TIMEOUT_SECONDS  default 1200
 #   FLUX_WAIT_POLL_SECONDS     default 15
 set -Eeuo pipefail
@@ -29,6 +34,8 @@ shift 2
 [[ "$repository" =~ ^https://[^/]+/.+ ]] || fail "the repository must be an https URL"
 [[ "$commit" =~ ^[a-f0-9]{40}$ ]] || fail "the commit must be a full lowercase SHA"
 [[ -n "${FLUX_STATUS_TOKEN:-}" ]] || fail "FLUX_STATUS_TOKEN is required"
+address="${FLUX_GIT_SERVER_ADDRESS:-}"
+[[ -z "$address" || "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail "FLUX_GIT_SERVER_ADDRESS must be an IPv4 address"
 timeout="${FLUX_WAIT_TIMEOUT_SECONDS:-1200}"
 poll="${FLUX_WAIT_POLL_SECONDS:-15}"
 
@@ -36,6 +43,8 @@ base="${repository%.git}"
 path="${base#https://*/}"
 host="${base%/"$path"}"
 url="$host/api/v4/projects/${path//\//%2F}/repository/commits/$commit/statuses"
+resolve=()
+[[ -z "$address" ]] || resolve=(--resolve "${host#https://}:443:$address")
 
 statuses="$(mktemp)"
 trap 'rm -f "$statuses"' EXIT
@@ -43,7 +52,7 @@ deadline=$((SECONDS + timeout))
 echo "waiting for Flux to report $* on ${commit:0:12}"
 while :; do
   # The token reaches curl through a header file, never through argv.
-  curl --silent --show-error --fail --max-time 20 \
+  curl --silent --show-error --fail --max-time 20 "${resolve[@]}" \
     --header @<(printf 'PRIVATE-TOKEN: %s\n' "$FLUX_STATUS_TOKEN") "$url" >"$statuses" ||
     fail "could not read the commit status of ${commit:0:12}"
   done_all=1

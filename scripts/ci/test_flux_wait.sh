@@ -38,6 +38,16 @@ grep -q 'https://git.example.test/api/v4/projects/group%2Finfra/repository/commi
   fail "the statuses URL is wrong: $(cat "$WORK/args")"
 ! grep -q secret-token "$WORK/args" || fail "the token reached curl's argv"
 
+rm -f "$WORK/args"
+STATUSES="$both" FLUX_GIT_SERVER_ADDRESS=203.0.113.7 run "$REPO" "$COMMIT" ns/producao ||
+  fail "a direct address was not accepted: $(cat "$WORK/out")"
+grep -qx 'git.example.test:443:203.0.113.7' "$WORK/args" || fail "the direct address did not reach curl as --resolve"
+STATUSES="$both" FLUX_GIT_SERVER_ADDRESS='1.2.3.4 --insecure' run "$REPO" "$COMMIT" ns/producao &&
+  fail "a malformed direct address was accepted"
+rm -f "$WORK/args"
+STATUSES="$both" run "$REPO" "$COMMIT" ns/producao
+grep -q -- '--resolve' "$WORK/args" && fail "--resolve was used without an address"
+
 STATUSES='[{"name":"ns/producao","status":"success"}]' run "$REPO" "$COMMIT" ns/producao-migracoes ns/producao &&
   fail "a missing status was accepted"
 STATUSES='[{"name":"ns/producao","status":"failed","description":"health check failed"}]' run "$REPO" "$COMMIT" ns/producao &&

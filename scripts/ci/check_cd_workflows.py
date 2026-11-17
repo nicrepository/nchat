@@ -773,6 +773,7 @@ DEV_DEPLOY_JOBS = {
                     "K3S_DEV_REPOSITORY": "${{ vars.K3S_DEV_REPOSITORY }}",
                     "INFRA_COMMIT": "${{ steps.apply.outputs.commit }}",
                     "FLUX_STATUS_TOKEN": "${{ secrets.K3S_DEV_STATUS_TOKEN }}",
+                    "FLUX_GIT_SERVER_ADDRESS": "${{ vars.K3S_DEV_GIT_SERVER_ADDRESS }}",
                 },
                 "run": [
                     'scripts/deploy/flux-wait.sh "$K3S_DEV_REPOSITORY" "$INFRA_COMMIT"'

@@ -88,6 +88,9 @@ jobs:
           K3S_DEV_REPOSITORY: ${{ vars.K3S_DEV_REPOSITORY }}
           INFRA_COMMIT: ${{ steps.apply.outputs.commit }}
           FLUX_STATUS_TOKEN: ${{ secrets.K3S_DEV_STATUS_TOKEN }}
+          # The CDN in front of the Git server refuses API reads from hosted
+          # runners (403); the address reaches the server itself, by name.
+          FLUX_GIT_SERVER_ADDRESS: ${{ vars.K3S_DEV_GIT_SERVER_ADDRESS }}
         run: scripts/deploy/flux-wait.sh "$K3S_DEV_REPOSITORY" "$INFRA_COMMIT" nchat-dev/producao-migracoes nchat-dev/producao
       # Last, and it reports rather than decides: every step above keeps its
       # own status, this one adds no `continue-on-error`, and a failed publish
