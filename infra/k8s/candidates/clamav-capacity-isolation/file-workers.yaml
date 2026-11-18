@@ -1,0 +1,332 @@
+# Provisional budgets; calibrate with the controlled dev corpus before scale-out.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: file-scan-worker
+  namespace: nchat
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: file-scan-worker
+    app.kubernetes.io/version: 0.0.0
+  annotations:
+    nchat.nicrepository.io/image-placeholder: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nchat
+      app.kubernetes.io/part-of: nchat
+      app.kubernetes.io/component: file-scan-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nchat
+        app.kubernetes.io/part-of: nchat
+        app.kubernetes.io/managed-by: kustomize
+        app.kubernetes.io/component: file-scan-worker
+        app.kubernetes.io/version: 0.0.0
+        app.kubernetes.io/instance: nchat-dev
+      annotations:
+        nchat.nicrepository.io/image-placeholder: "true"
+    spec:
+      serviceAccountName: nchat-file-scan-worker
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: file-service
+          image: ghcr.io/nicrepository/nchat/file-service:0.0.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: nchat-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-postgres-runtime
+                  key: DATABASE_URL
+            - name: VALKEY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: VALKEY_URL
+                  optional: true
+            - name: FILE_ENCRYPTION_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-file-encryption
+                  key: FILE_ENCRYPTION_MASTER_KEY
+            - name: FILE_ENCRYPTION_MASTER_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-file-encryption
+                  key: FILE_ENCRYPTION_MASTER_KEY_ID
+            - name: FILE_ENCRYPTION_PREVIOUS_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-file-encryption
+                  key: FILE_ENCRYPTION_PREVIOUS_KEYS
+                  optional: true
+            - name: PORT
+              value: "8083"
+            - name: SERVICE_NAME
+              value: file-service
+            - name: FILE_BOOT_MODE
+              value: scan-worker
+            - name: FILE_MALWARE_SCAN_CONCURRENCY
+              value: "1"
+            - name: FILE_LINK_SAFETY_ENABLED
+              value: "false"
+            - name: FILE_LINK_PREVIEW_ENABLED
+              value: "false"
+          ports:
+            - name: http
+              containerPort: 8083
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+              ephemeral-storage: 64Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+              ephemeral-storage: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+      terminationGracePeriodSeconds: 60
+      imagePullSecrets:
+        - name: ghcr-pull
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nchat-file-scan-worker
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: file-scan-worker
+  labels:
+    app.kubernetes.io/component: file-scan-worker
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: /metrics
+    prometheus.io/port: "8083"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/component: file-scan-worker
+  ports:
+    - name: http
+      port: 8083
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: file-preview-worker
+  namespace: nchat
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: file-preview-worker
+    app.kubernetes.io/version: 0.0.0
+  annotations:
+    nchat.nicrepository.io/image-placeholder: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nchat
+      app.kubernetes.io/part-of: nchat
+      app.kubernetes.io/component: file-preview-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nchat
+        app.kubernetes.io/part-of: nchat
+        app.kubernetes.io/managed-by: kustomize
+        app.kubernetes.io/component: file-preview-worker
+        app.kubernetes.io/version: 0.0.0
+        app.kubernetes.io/instance: nchat-dev
+      annotations:
+        nchat.nicrepository.io/image-placeholder: "true"
+    spec:
+      serviceAccountName: nchat-file-preview-worker
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: file-service
+          image: ghcr.io/nicrepository/nchat/file-service:0.0.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: nchat-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-postgres-runtime
+                  key: DATABASE_URL
+            - name: FILE_ENCRYPTION_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-file-encryption
+                  key: FILE_ENCRYPTION_MASTER_KEY
+            - name: FILE_ENCRYPTION_MASTER_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-file-encryption
+                  key: FILE_ENCRYPTION_MASTER_KEY_ID
+            - name: FILE_ENCRYPTION_PREVIOUS_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-file-encryption
+                  key: FILE_ENCRYPTION_PREVIOUS_KEYS
+                  optional: true
+            - name: PORT
+              value: "8083"
+            - name: SERVICE_NAME
+              value: file-service
+            - name: FILE_BOOT_MODE
+              value: preview-worker
+            - name: FILE_MALWARE_SCAN_CONCURRENCY
+              value: "1"
+            - name: FILE_LINK_SAFETY_ENABLED
+              value: "false"
+            - name: FILE_LINK_PREVIEW_ENABLED
+              value: "false"
+            - name: DOCUMENT_CONVERTER_URL
+              value: http://document-converter:8089
+          ports:
+            - name: http
+              containerPort: 8083
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+              ephemeral-storage: 64Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+              ephemeral-storage: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+      terminationGracePeriodSeconds: 60
+      imagePullSecrets:
+        - name: ghcr-pull
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nchat-file-preview-worker
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: file-preview-worker
+  labels:
+    app.kubernetes.io/component: file-preview-worker
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: /metrics
+    prometheus.io/port: "8083"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/component: file-preview-worker
+  ports:
+    - name: http
+      port: 8083
+      targetPort: http

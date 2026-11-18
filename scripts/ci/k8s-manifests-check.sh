@@ -1194,4 +1194,6 @@ if [[ -z "${K8S_OVERLAY:-}" ]]; then
   done
 fi
 
+python3 "$ROOT_DIR/scripts/ci/test_file_worker_isolation.py"
+
 echo "K8s manifests CI check passed."

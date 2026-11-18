@@ -46,6 +46,7 @@ func TestScanQueueFencingPostgreSQL(t *testing.T) {
 	t.Run("preparation and reversible expansion", e.preparation)
 	_, err = admin.Exec(ctx, "UPDATE files.scan_queue_policy SET enabled=true,approval_reference='synthetic-local-cutover' WHERE id=1")
 	requireScanPG(t, err)
+	t.Run("global capacity", e.globalCapacity)
 	t.Run("pre remediation counterexamples", e.preRemediation)
 	t.Run("real runtime grants and legacy barriers", e.grants)
 	t.Run("restricted lifecycle and legitimate cancellation", e.lifecycleRemediation)
@@ -85,7 +86,10 @@ func (e *scanPG) seed(t *testing.T) service.ScanJob {
  'text/plain','seaweedfs',$5,1,2,'\x01','test-only','pending_scan',now())`, id, workspace, uuid.NewString(), uuid.NewString(), "synthetic/"+id)
 	return service.ScanJob{AttachmentID: id, WorkspaceID: workspace}
 }
-func (e *scanPG) clear(t *testing.T) { t.Helper(); e.exec(t, "DELETE FROM files.attachments") }
+func (e *scanPG) clear(t *testing.T) {
+	t.Helper()
+	e.exec(t, "DELETE FROM files.scan_capacity_reservations; DELETE FROM files.attachments")
+}
 func (e *scanPG) claim(t *testing.T) service.ScanJob {
 	t.Helper()
 	jobs, err := e.queue.ClaimDueScans(e.ctx, 1, 330*time.Second)
@@ -137,8 +141,10 @@ func (e *scanPG) preparation(t *testing.T) {
 	if scanCode(err) != "NC006" || !errors.Is(err, service.ErrScanQueueStandby) {
 		t.Fatalf("new worker must wait: %v", err)
 	}
+	e.exec(t, readFilesMigration(t, "000022_scan_global_capacity.down.sql"))
 	e.exec(t, readFilesMigration(t, "000021_scan_queue_fencing.down.sql"))
 	e.exec(t, readFilesMigration(t, "000021_scan_queue_fencing.up.sql"))
+	e.exec(t, readFilesMigration(t, "000022_scan_global_capacity.up.sql"))
 	e.clear(t)
 }
 func (e *scanPG) grants(t *testing.T) {
@@ -228,6 +234,8 @@ func (e *scanPG) concurrentClaims(t *testing.T) {
 func (e *scanPG) expire(t *testing.T, j service.ScanJob) {
 	t.Helper()
 	e.exec(t, "UPDATE files.attachments SET scan_lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", j.AttachmentID)
+	// C fixtures simulate time beyond both deadlines. E tests advance them separately.
+	e.expireCapacity(t, j)
 }
 func (e *scanPG) expired(t *testing.T) {
 	e.seed(t)
@@ -376,6 +384,7 @@ func (e *scanPG) retry(t *testing.T) {
 		t.Fatalf("released claim=%v", err)
 	}
 	e.exec(t, "UPDATE files.attachments SET scan_next_attempt_at=now() WHERE id=$1", a.AttachmentID)
+	e.expireCapacity(t, a)
 	b := e.claim(t)
 	if b.Attempts != 2 {
 		t.Fatalf("attempts=%d", b.Attempts)

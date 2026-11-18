@@ -60,8 +60,10 @@ func NewRouter(cfg config.Config, logger *slog.Logger, dependencies ...RouterDep
 	mux.Handle(RouteVersion, httputil.MethodNotAllowed(http.MethodGet, Version(cfg)))
 	mux.Handle(RouteMetrics, metrics.Handler())
 
-	registerAttachmentRoutes(mux, cfg, logger, deps)
-	registerLinkPreviewRoute(mux, cfg, deps)
+	if cfg.ServesAPI() {
+		registerAttachmentRoutes(mux, cfg, logger, deps)
+		registerLinkPreviewRoute(mux, cfg, deps)
+	}
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
