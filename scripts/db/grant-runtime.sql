@@ -53,3 +53,12 @@ DO $$ BEGIN
   GRANT EXECUTE ON FUNCTION files.scan_fencing_enabled(),files.claim_scans(integer,double precision),files.persist_scan_v2,files.retry_scan TO nchat_app;
  END IF;
 END $$;
+
+-- Capacity is migration-owner controlled; regrants must not reopen admission.
+DO $$ BEGIN
+ IF to_regclass('files.scan_capacity_policy') IS NOT NULL THEN
+  REVOKE ALL ON files.scan_capacity_policy,files.scan_capacity_reservations FROM nchat_app;
+  GRANT SELECT ON files.scan_capacity_policy,files.scan_capacity_reservations TO nchat_app;
+  REVOKE ALL ON FUNCTION files.release_terminal_scan_capacity() FROM nchat_app;
+ END IF;
+END $$;

@@ -43,7 +43,9 @@ func main() {
 	}
 
 	application.Logger.Info("service starting", "port", cfg.Port)
-	serveErr := httpserver.Run(httpServer, application.Logger)
+	serveErr := httpserver.RunWithOptions(httpServer, application.Logger, httpserver.Options{
+		OnShutdown: application.StopWorkers,
+	})
 	shutdownWithBudget(application)
 	if serveErr != nil && serveErr != http.ErrServerClosed {
 		log.Fatalf("%s failed: %v", cfg.ServiceName, serveErr)

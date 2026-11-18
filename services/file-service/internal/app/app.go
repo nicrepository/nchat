@@ -123,38 +123,31 @@ func newApp(cfg config.Config, deps appDependencies) (*App, error) {
 	// uploads, so a deployment running link previews without uploads had no pool
 	// for it. The decision is now stated once, by needsDatabase, and the pool is
 	// shared rather than opened twice.
-	if needsDatabase(cfg) {
-		if deps.openDB == nil {
-			_ = shutdownTracing(shutdown)
-			return nil, errDependenciesUnavailable
-		}
-		pool, err := deps.openDB(
-			context.Background(), cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds, cfg.DBMaxConnections,
-		)
-		if err != nil {
-			// The DSN and the driver message never reach the caller or the log.
-			_ = shutdownTracing(shutdown)
-			return nil, errDependenciesUnavailable
-		}
-		application.pool = pool
+	if err := application.openPool(cfg, deps); err != nil {
+		_ = shutdownTracing(shutdown)
+		return nil, err
 	}
-	if cfg.UploadsEnabled {
-		if err := application.wireAttachments(cfg, logger, metrics, deps, &routerDeps); err != nil {
-			application.closePool()
-			_ = shutdownTracing(shutdown)
-			return nil, err
-		}
-	}
-	// Independent of uploads: link previews touch no database, no storage and
-	// no key material, so a deployment may run them with uploads switched off.
-	if cfg.LinkPreviewEnabled {
-		if err := application.wireLinkPreviews(cfg, metrics, &routerDeps, logger); err != nil {
-			_ = shutdownTracing(shutdown)
-			return nil, err
-		}
+	if err := application.wireFeatures(cfg, metrics, attachmentMetrics, deps, &routerDeps); err != nil {
+		_ = application.Shutdown(context.Background())
+		return nil, err
 	}
 	application.Handler = httpapi.NewRouter(cfg, logger, routerDeps)
 	return application, nil
+}
+
+func (a *App) wireFeatures(cfg config.Config, metrics *observability.Metrics, attachments *httpapi.AttachmentMetrics, deps appDependencies, router *httpapi.RouterDependencies) error {
+	if cfg.IsWorker() {
+		return a.wireWorker(cfg, attachments, router, deps)
+	}
+	if cfg.UploadsEnabled {
+		if err := a.wireAttachments(cfg, a.Logger, metrics, deps, router); err != nil {
+			return err
+		}
+	}
+	if cfg.LinkPreviewEnabled {
+		return a.wireLinkPreviews(cfg, metrics, router, a.Logger)
+	}
+	return nil
 }
 
 // needsDatabase reports whether any enabled capability requires persistence.
@@ -169,14 +162,6 @@ func newApp(cfg config.Config, deps appDependencies) (*App, error) {
 // poll, so the verdict queue has to survive a restart.
 func needsDatabase(cfg config.Config) bool {
 	return cfg.UploadsEnabled || (cfg.LinkPreviewEnabled && cfg.LinkSafetyEnabled)
-}
-
-// closePool releases the shared pool if one was opened. Safe to call twice.
-func (a *App) closePool() {
-	if a.pool != nil {
-		a.pool.Close()
-		a.pool = nil
-	}
 }
 
 // wireLinkPreviews builds the RF-10 route's dependencies.
@@ -272,7 +257,7 @@ func (a *App) wireAttachments(
 	if err != nil {
 		return err
 	}
-	if deps.openAdmission == nil || deps.openFence == nil {
+	if deps.openAdmission == nil {
 		return errDependenciesUnavailable
 	}
 	// The pool is the process-wide one, opened by New before any feature wiring.
@@ -325,13 +310,21 @@ func (a *App) wireAttachments(
 	routerDeps.StoragePinger = objects
 	routerDeps.Metrics = attachmentMetrics
 
-	fence, err := deps.openFence(pool, logger)
+	fence, err := deps.attachmentFence(pool, logger)
 	if err != nil {
 		// The pool is owned by the App and released by Shutdown; closing it here
 		// would pull it out from under the other features already wired on it.
 		return errDependenciesUnavailable
 	}
 
+	return a.wireAttachmentBackground(cfg, pool, fence, objects, keys, attachmentService, attachmentMetrics, logger)
+}
+
+func (a *App) wireAttachmentBackground(
+	cfg config.Config, pool storage.Pool, fence storage.AttachmentFencing,
+	objects service.ObjectStore, keys *crypto.Keyring, attachmentService *service.AttachmentService,
+	attachmentMetrics *httpapi.AttachmentMetrics, logger *slog.Logger,
+) error {
 	cleanupStore := storage.NewPGXObjectCleanupStore(pool)
 	converterURL := cfg.DocumentConverterURL
 	if converterURL == "" {
@@ -349,21 +342,25 @@ func (a *App) wireAttachments(
 	// pipeline already uses to rasterize documents also re-encodes audio to
 	// MP3 for download — one HTTP client, one base URL/timeout, two routes.
 	attachmentService.SetAudioTranscoder(converterClient)
-	a.startPreviewWorker(service.NewPreviewService(
-		storage.NewPGXPreviewStore(pool),
-		objects,
-		keys,
-		preview.NewWithDocumentConverter(converterClient),
-		fence,
-		cleanupStore,
-		attachmentMetrics,
-		logger,
-	), logger)
+	if cfg.BootMode != "api" {
+		a.startPreviewWorker(service.NewPreviewService(
+			storage.NewPGXPreviewStore(pool),
+			objects,
+			keys,
+			preview.NewWithDocumentConverter(converterClient),
+			fence,
+			cleanupStore,
+			attachmentMetrics,
+			logger,
+		), logger)
+	}
 	a.startCleanupWorker(service.NewObjectCleanupService(
 		cleanupStore, objects, attachmentMetrics, logger,
 	), logger)
-	a.startDraftExpiryWorker(service.NewDraftExpiryService(attachmentStore, 50), logger)
-	a.startMalwareScanWorker(cfg, pool, fence, objects, keys, attachmentMetrics, logger)
+	a.startDraftExpiryWorker(service.NewDraftExpiryService(storage.NewPGXAttachmentStore(pool), 50), logger)
+	if cfg.BootMode != "api" {
+		a.startMalwareScanWorker(cfg, pool, fence, objects, keys, attachmentMetrics, logger)
+	}
 	return nil
 }
 
@@ -562,44 +559,40 @@ func (a *App) Shutdown(ctx context.Context) error {
 		draftExpiryStopped := a.stopWorker(ctx, a.draftExpiryCancel, a.draftExpiryDone)
 		scanStopped := a.stopWorker(ctx, a.scanCancel, a.scanDone)
 		linkScanStopped := a.stopWorker(ctx, a.linkScanCancel, a.linkScanDone)
-		if previewStopped && cleanupStopped && draftExpiryStopped && scanStopped && linkScanStopped {
-			if a.pool != nil {
-				a.pool.Close()
-			}
-			// After the workers, never before: the publish that follows a
-			// verdict runs on a context detached from the job's, so closing the
-			// bus first would drop the announcement of a verdict that was
-			// already written.
-			//
-			// Nil whenever no bus is configured, which is a supported
-			// deployment. Checked here rather than relied on inside Close, so
-			// this reads like every other optional resource above it.
-			if a.statusPublisher != nil {
-				a.statusPublisher.Close()
-			}
-		} else {
-			// The worker did not stop inside the grace period. Closing the pool
-			// now would pull it out from under work that is still running, so
-			// it is deliberately left open: the process is about to exit and
-			// the operating system will reclaim the sockets, which is the
-			// lesser of the two failures. Saying so is the point — an
-			// incomplete shutdown must be visible in the exit path, not
-			// swallowed by a function that reports success either way.
-			a.Logger.LogAttrs(ctx, slog.LevelError, "shutdown incomplete",
-				slog.String("reason", "preview_worker_still_running"),
-				slog.Bool("pool_closed", false),
-			)
-			failures = append(failures, errShutdownIncomplete)
+		if err := a.finishWorkerShutdown(ctx, previewStopped && cleanupStopped && draftExpiryStopped && scanStopped && linkScanStopped); err != nil {
+			failures = append(failures, err)
 		}
-		if a.TracingShutdown != nil {
-			if err := a.TracingShutdown(ctx); err != nil {
-				failures = append(failures, err)
-			}
+		if err := a.shutdownTracing(ctx); err != nil {
+			failures = append(failures, err)
 		}
 		// Join of nothing is nil, so the ordinary path still reports success.
 		a.shutdownErr = errors.Join(failures...)
 	})
 	return a.shutdownErr
+}
+
+// finishWorkerShutdown releases dependencies only after every consumer stopped.
+func (a *App) finishWorkerShutdown(ctx context.Context, stopped bool) error {
+	if !stopped {
+		a.Logger.LogAttrs(ctx, slog.LevelError, "shutdown incomplete",
+			slog.String("reason", "worker_shutdown_incomplete"), slog.Bool("pool_closed", false))
+		return errShutdownIncomplete
+	}
+	if a.pool != nil {
+		a.pool.Close()
+	}
+	// Persisted verdicts may still be announced during worker shutdown.
+	if a.statusPublisher != nil {
+		a.statusPublisher.Close()
+	}
+	return nil
+}
+
+func (a *App) shutdownTracing(ctx context.Context) error {
+	if a.TracingShutdown == nil {
+		return nil
+	}
+	return a.TracingShutdown(ctx)
 }
 
 // stopPreviewWorker cancels the worker and waits for it to return, reporting
@@ -640,11 +633,11 @@ func (a *App) stopWorker(ctx context.Context, cancel context.CancelFunc, done <-
 
 var (
 	errDependenciesUnavailable = errors.New("attachment dependencies unavailable")
-	// errShutdownIncomplete is returned when the preview worker outlived the
+	// errShutdownIncomplete is returned when a worker outlived the
 	// shutdown deadline. It is an error rather than a log line alone because
 	// the process is about to exit with dependencies still in use, and whoever
 	// called Shutdown is the only one who can still act on that.
-	errShutdownIncomplete = errors.New("shutdown incomplete: preview worker did not stop in time")
+	errShutdownIncomplete = errors.New("shutdown incomplete: worker did not stop in time")
 )
 
 func shutdownTracing(shutdown observability.ShutdownFunc) error {

@@ -1,0 +1,16 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: file-service
+  namespace: nchat
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: file-service
+          env:
+            - name: FILE_BOOT_MODE
+              value: api
+            - name: FILE_MALWARE_SCAN_CONCURRENCY
+              value: "1"

@@ -90,6 +90,7 @@ const (
 )
 
 type Config struct {
+	BootMode                        string
 	EnterpriseDataEnabled           bool
 	EnterpriseOfficeEnabled         bool
 	EnterpriseArchivesEnabled       bool
@@ -280,6 +281,7 @@ func Load() Config {
 
 	return Config{
 		ServiceName: serviceName,
+		BootMode:    platformconfig.GetString("FILE_BOOT_MODE", "combined"),
 		// No default. An absent APP_ENV must stay absent: defaulting it to
 		// "development" would hand the malware-scan escape hatch to any
 		// deployment that simply forgot to set the variable, which is the
@@ -357,6 +359,9 @@ func Load() Config {
 // it actually asks — limits, scan policy, dependencies — so each stays readable
 // on its own.
 func (c Config) Validate() error {
+	if err := c.validateBootMode(); err != nil {
+		return err
+	}
 	if err := c.validateFeatureFlags(); err != nil {
 		return err
 	}
@@ -384,7 +389,10 @@ func (c Config) Validate() error {
 	if err := c.validateScanPolicy(); err != nil {
 		return err
 	}
-	return c.validateUploadDependencies()
+	if err := c.validateUploadDependencies(); err != nil {
+		return err
+	}
+	return c.validatePreviewConverter()
 }
 
 // validateUploadLimits checks the deployment ceiling. An explicitly configured
@@ -447,8 +455,10 @@ func (c Config) validateUploadDependencies() error {
 	if c.DatabaseURL == "" {
 		return errors.New("database URL is required when uploads are enabled")
 	}
-	if err := c.validateAuthDependencies(); err != nil {
-		return err
+	if c.ServesAPI() {
+		if err := c.validateAuthDependencies(); err != nil {
+			return err
+		}
 	}
 	// One check for the whole key ring: the active key, its id and any previous
 	// key kept for reading. It builds the ring the service will use, so a

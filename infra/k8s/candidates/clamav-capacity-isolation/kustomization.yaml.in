@@ -1,0 +1,45 @@
+# Deliberately not a deployable default: requires the explicitly rendered B candidate.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nchat-dev
+resources:
+  - ../../overlays/nchat-dev-server
+  - file-workers.yaml
+  - file-workers-network-policies.yaml
+  - guardian/storage.yaml
+  - guardian/updater.yaml
+  - guardian/network-policy.yaml
+patches:
+  - path: api-patch.yaml
+  - path: guardian/consumer-patch.yaml
+  - target:
+      kind: ConfigMap
+      name: nchat-config
+    patch: |-
+      - op: add
+        path: /data/FILE_MALWARE_SIGNATURE_MAX_AGE_SECONDS
+        value: "__APPROVED_MAX_AGE_SECONDS__"
+  - target:
+      kind: NetworkPolicy
+      name: clamav-consumer-egress-denied
+    patch: |-
+      - op: replace
+        path: /spec/ingress/0/from/0/podSelector/matchLabels/app.kubernetes.io~1component
+        value: file-scan-worker
+  - target:
+      kind: NetworkPolicy
+      name: nchat-allow-file-clamav-egress
+    patch: |-
+      - op: replace
+        path: /spec/podSelector/matchLabels/app.kubernetes.io~1component
+        value: file-scan-worker
+  - target:
+      kind: NetworkPolicy
+      name: nchat-allow-clamav
+    patch: |-
+      - op: replace
+        path: /spec/ingress/0/from/0/podSelector/matchLabels/app.kubernetes.io~1component
+        value: file-scan-worker
+images:
+  - name: ghcr.io/nicrepository/nchat/file-service
+    digest: sha256:__APPROVED_FILE_SERVICE_DIGEST__
