@@ -24,6 +24,7 @@ import (
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
 	"github.com/nicrepository/nchat/services/file-service/internal/crypto"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
+	"github.com/nicrepository/nchat/services/file-service/internal/filepolicy"
 	httpapi "github.com/nicrepository/nchat/services/file-service/internal/http"
 	"github.com/nicrepository/nchat/services/file-service/internal/scanner"
 	"github.com/nicrepository/nchat/services/file-service/internal/service"
@@ -80,7 +81,8 @@ func TestIsolatedMalwareEfficacyHTTP(t *testing.T) {
 			{"eicar", signatureguard.SyntheticPayload, false},
 		} {
 			t.Run(destination.name+"/"+tc.name, func(t *testing.T) {
-				f, worker, metrics, publisher := newEfficacyFixture(t, ctx, pool, malware, []byte(tc.body), destination.target)
+				input := service.UploadInput{Filename: "synthetic.txt", DeclaredMIME: "text/plain", Content: strings.NewReader(tc.body)}
+				f, worker, metrics, publisher := newEfficacyFixture(t, ctx, pool, malware, input, destination.target)
 				assertEfficacyBlocked(t, f)
 				// Prove quarantine storage is ciphertext, not the original bytes.
 				f.objects.mu.Lock()
@@ -126,13 +128,39 @@ func TestIsolatedMalwareEfficacyHTTP(t *testing.T) {
 			})
 		}
 	}
+	t.Run("clean AV cannot override structural policy", func(t *testing.T) {
+		body := `{"synthetic":true}`
+		verdict, err := malware.Scan(ctx, strings.NewReader(body))
+		efficacyOK(t, err)
+		if verdict != scanner.VerdictClean {
+			t.Fatal("synthetic JSON was not clean under real ClamAV")
+		}
+		input := service.UploadInput{Filename: "synthetic.json", DeclaredMIME: "application/json", Content: strings.NewReader(body)}
+		f, worker, metrics, publisher := newEfficacyFixture(t, ctx, pool, malware, input, domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID})
+		// Upload permits Data; worker deliberately revalidates with Data disabled.
+		assertEfficacyBlocked(t, f)
+		n, err := worker.ProcessDue(ctx)
+		efficacyOK(t, err)
+		if n != 1 || publisher.calls != 1 {
+			t.Fatal("missing persisted policy decision")
+		}
+		assertEfficacyBlocked(t, f)
+		requireScanSamples(t, scrapeScanMetrics(metrics), `nchat_file_malware_scans_total{result="policy_rejected"} 1`, `nchat_file_malware_scans_total{result="clean"} 0`)
+		metadata := f.get(t, "", nil)
+		if metadata.Code != http.StatusOK || !bytes.Contains(metadata.Body.Bytes(), []byte(`"status":"rejected"`)) {
+			t.Fatal("clean AV overrode disabled structural profile")
+		}
+	})
+	t.Run("native originals and ranges", func(t *testing.T) {
+		testStructuralNativeRoundTrips(t, ctx, pool, malware)
+	})
 	if os.Getenv("NCHAT_D_BENCHMARK") == "true" {
 		runEfficacyBenchmark(t, ctx, pool, malware)
 	}
 
 }
 
-func newEfficacyFixture(t *testing.T, ctx context.Context, pool *pgxpool.Pool, malware scanner.Scanner, body []byte, destination domain.Destination) (*gateFixture, *service.MalwareScanService, *observability.Metrics, *lostEfficacyEvent) {
+func newEfficacyFixture(t *testing.T, ctx context.Context, pool *pgxpool.Pool, malware scanner.Scanner, input service.UploadInput, destination domain.Destination) (*gateFixture, *service.MalwareScanService, *observability.Metrics, *lostEfficacyEvent) {
 	t.Helper()
 	keys, err := crypto.NewKeyring(gateKeyID, base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, crypto.KeySize)), "")
 	efficacyOK(t, err)
@@ -147,9 +175,11 @@ func newEfficacyFixture(t *testing.T, ctx context.Context, pool *pgxpool.Pool, m
 	a := httpapi.NewAttachmentMetrics(metrics)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	attachments := service.NewAttachmentService(storage.NewPGXDestinationAuthorizer(pool), db, objects, keys, domain.DefaultMaxUploadBytes, true, a, logger)
+	attachments.SetFormatProfiles(filepolicy.Profiles{Data: true, Office: true, Archives: true})
 	target, err := attachments.AuthorizeUpload(ctx, service.AuthorizeUploadInput{Destination: destination, UserID: testUserID, SessionID: testSessionID})
 	efficacyOK(t, err)
-	view, err := attachments.Upload(ctx, service.UploadInput{Target: target, Filename: "synthetic.txt", DeclaredMIME: "text/plain", Content: bytes.NewReader(body)})
+	input.Target = target
+	view, err := attachments.Upload(ctx, input)
 	efficacyOK(t, err)
 	if view.Status != "pending_scan" {
 		t.Fatal("upload skipped quarantine")
@@ -267,7 +297,8 @@ func runEfficacyBenchmark(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 		samples := map[string][]float64{"queue_age": {}, "scan_attempt": {}, "finalized_to_clean_ack": {}, "finalized_to_download_complete": {}}
 		started := time.Now()
 		for i := 0; i < 11; i++ {
-			f, worker, metrics, publisher := newEfficacyFixture(t, ctx, pool, malware, body, domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID})
+			input := service.UploadInput{Filename: "synthetic.txt", DeclaredMIME: "text/plain", Content: bytes.NewReader(body)}
+			f, worker, metrics, publisher := newEfficacyFixture(t, ctx, pool, malware, input, domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID})
 			publisher.failure = nil
 			var finalized time.Time
 			efficacyOK(t, pool.QueryRow(ctx, "SELECT uploaded_at FROM files.attachments WHERE id=$1", f.store.attachmentID()).Scan(&finalized))
