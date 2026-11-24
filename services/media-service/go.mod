@@ -3,7 +3,7 @@ module github.com/nicrepository/nchat/services/media-service
 go 1.26.11
 
 require (
-	github.com/go-jose/go-jose/v4 v4.1.6 // CVE-2026-116587: minimum patched version.
+	github.com/go-jose/go-jose/v4 v4.1.9 // CVE-2026-116587: minimum patched version.
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.2
@@ -75,9 +75,7 @@ require (
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.47.0 // indirect
 	go.opentelemetry.io/otel/log v1.47.0 // indirect
 	go.opentelemetry.io/otel/metric v1.47.0 // indirect
-	go.opentelemetry.io/otel/metric/x v0.69.0 // indirect
 	go.opentelemetry.io/otel/sdk v1.47.0 // indirect
-	go.opentelemetry.io/otel/sdk/metric v1.47.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
