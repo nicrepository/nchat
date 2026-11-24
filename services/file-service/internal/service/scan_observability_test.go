@@ -78,7 +78,11 @@ func TestScanTimingObservesOnlyAcknowledgedNewVerdicts(t *testing.T) {
 			if (len(o.commits) == 1) != want {
 				t.Fatalf("commits=%v", o.commits)
 			}
-			if o.finishes != 1 || len(o.waits) != 1 || o.phases["storage_open"] != 1 {
+			opens := 2 // Structural and AV passes own independent storage contexts.
+			if kind == "storage" {
+				opens = 1
+			}
+			if o.finishes != 1 || len(o.waits) != 1 || o.phases["storage_open"] != opens {
 				t.Fatal("unbalanced attempt")
 			}
 			if kind == "unknown_finalized" && o.waits[0] >= 0 {

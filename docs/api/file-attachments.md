@@ -13,6 +13,8 @@ e os perfis desligados por padrão estão em
 [supported-file-types.md](supported-file-types.md); arquitetura, ameaças,
 integridade e rollout estão em
 [enterprise-attachment-policy.md](../architecture/enterprise-attachment-policy.md).
+Composição das evidências, limites do worker e validação da Entrega F:
+[structural-analysis-1129.md](../architecture/structural-analysis-1129.md).
 As descrições históricas de MIME coarse abaixo não são a autoridade da admissão.
 `/content` sempre retorna o original, inclusive áudio. MP3 convertido é uma
 representação explicitamente solicitada em `/attachments/{id}/audio.mp3`.

@@ -47,6 +47,7 @@ for version in 16 17; do
   --cap-drop ALL --security-opt no-new-privileges --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=2g,uid=100,gid=101,mode=700 \
   --mount "type=bind,source=$TASK_DIR,target=/test,readonly" \
+  --mount "type=bind,source=$ROOT/services/file-service/internal/filepolicy/testdata,target=/corpus,readonly" \
   --mount "type=volume,source=$SOCKET_VOLUME,target=/pgsocket,readonly" \
   -e NCHAT_D_EFFICACY_TEST=owned-network-none -e NCHAT_D_BENCHMARK="${NCHAT_D_BENCHMARK:-false}" --entrypoint /test/http.test "$IMAGE" \
   -test.run '^TestIsolatedMalwareEfficacyHTTP$' -test.v -test.timeout 180s
