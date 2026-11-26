@@ -62,6 +62,8 @@ import { AccessDeniedState } from "./message-area/ConversationStates";
 import PinnedBar from "./message-area/PinnedBar";
 import ConversationDialogs from "./message-area/dialogs/ConversationDialogs";
 import ConversationTimeline from "./message-area/timeline/ConversationTimeline";
+import { useReactionMenu } from "./message-area/timeline/useReactionMenu";
+import { useSelectionMode } from "./message-area/timeline/useSelectionMode";
 import { quickReactionEmojis } from "./message-area/conversationText";
 import { directCallBar } from "./message-area/directCallBar";
 import { inertDirectMessage, useDirectMessageAccess } from "./directMessage";
@@ -218,6 +220,11 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     }),
     [kind, targetId, pinCollection, pendingPinIds, openMessageTarget, togglePin, reloadPins],
   );
+
+  // Issue #1238: the header and the timeline share one contextual surface — a
+  // message's menu, picker and touch selection — so it lives above both.
+  const reactionMenu = useReactionMenu(`${kind}:${targetId}`);
+  const selection = useSelectionMode(reactionMenu);
 
   const detailsToggleRef = useRef<HTMLButtonElement>(null);
   const details = useConversationDetailsPanel({
@@ -619,6 +626,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           detailsToggleRef={detailsToggleRef}
           onBack={back.onBack}
           backRef={back.ref}
+          selection={selection}
         />
 
         <ConversationCallBars
@@ -638,6 +646,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           currentUserId={ctx.currentUserId}
           workspaceId={ctx.workspaceId}
           actions={messageActions}
+          reactionMenu={reactionMenu}
           onLoadMore={loadMore}
           onRetry={retry}
           editDisabledIds={editDisabledIds}

@@ -14,6 +14,15 @@ import { useCallback, useEffect, useLayoutEffect, useRef, type RefObject } from 
 /** Distance kept from every edge of the band a floating element is placed in. */
 export const viewportPadding = 8;
 
+/**
+ * Dispatched by a picker, bubbling, each time it has been placed (CQR R9 of
+ * issue #1238): whatever hangs off a cell inside it — the tone palette, which
+ * is portalled out of it — follows the cell there. The picker is placed on
+ * every resize, viewport change, scroll (its own results included) and change
+ * of its size, so one event covers every way a cell moves on the screen.
+ */
+export const pickerPlacedEvent = "chat-emoji-picker-placed";
+
 /** The band of screen an anchor is actually painted in. */
 export interface VisibleBounds {
   top: number;
@@ -168,8 +177,13 @@ function capToBand(element: HTMLElement, anchor: DOMRect, band: VisibleBounds, g
   );
 }
 
-/** For a caller with nothing to do once its picker is placed. */
+/** For a caller with nothing to do before or after its picker is placed. */
 function ignorePlacement(): void {}
+
+/** A band as a value, to tell whether it moved. */
+function bandKey(band: VisibleBounds): string {
+  return `${band.top} ${band.right} ${band.bottom} ${band.left}`;
+}
 
 /** The box a picker is placed against: its button's, or the one it must clear. */
 function placementBox(button: DOMRect, clearRef?: RefObject<HTMLElement | null>): DOMRect {
@@ -186,6 +200,18 @@ export interface AnchoredPickerOptions {
    * belongs wherever the click put it.
    */
   onDismiss: (restoreFocus: boolean) => void;
+  /**
+   * The picker's anchor read as gone — out of its band, or no room on either
+   * side — for a caller whose verdict on that is its own (CQR R10 F-1 of issue
+   * #1238): a touch menu still confirming that its message left the reader's
+   * view. Absent, the picker closes as for a click elsewhere.
+   */
+  onLost?: () => void;
+  /**
+   * Given the picker's placement, for a caller that must place it again on its
+   * own terms — a touch menu whose message came back into view (CQR R10 F-1).
+   */
+  placeRef?: RefObject<() => void>;
   /**
    * An element that counts as inside for the outside-click test, beyond the
    * picker itself: the toolbar the anchor lives in, so pressing the button
@@ -213,10 +239,19 @@ export interface AnchoredPickerOptions {
    */
   clearRef?: RefObject<HTMLElement | null>;
   /**
-   * Called with the picker after every placement, for a caller whose layout
-   * depends on what the placed picker has room to show.
+   * Places the box in clearRef, for a caller that owns where it is drawn and
+   * draws it in the same band (CQR R7 of issue #1238). Run before every
+   * placement: when the band moves — a search's results changing what a touch
+   * sheet needs — that box is still where the old band put it, and judged
+   * there an anchor in plain sight reads as scrolled away.
    */
-  onPlaced?: (picker: HTMLElement) => void;
+  placeClear?: () => void;
+  /**
+   * Called with the picker after every placement, for a caller whose layout
+   * depends on what the placed picker has room to show. True when that moved
+   * the box in clearRef: the picker is placed once more, against it.
+   */
+  onPlaced?: (picker: HTMLElement) => boolean | void;
   gap?: number;
 }
 
@@ -228,37 +263,61 @@ export function useAnchoredPicker({
   open,
   anchorRef,
   onDismiss,
+  onLost,
+  placeRef,
   containerRef,
   align = "end",
   gap = 7,
   bounds,
   clearRef,
+  placeClear = ignorePlacement,
   onPlaced = ignorePlacement,
 }: AnchoredPickerOptions): RefObject<HTMLDivElement | null> {
   const pickerRef = useRef<HTMLDivElement>(null);
+  // The caller's band the picker was last placed in.
+  const placedBandRef = useRef("");
+
+  const lost = useCallback(() => (onLost ? onLost() : onDismiss(false)), [onDismiss, onLost]);
 
   const position = useCallback(() => {
-    if (!open || !anchorRef.current || !pickerRef.current) return;
-    const button = anchorRef.current.getBoundingClientRect();
-    const anchor = placementBox(button, clearRef);
-    const band = (bounds ?? viewportBounds)();
-    // An anchor scrolled out of sight has nothing to hang off any more.
-    if (anchor.bottom < band.top || anchor.top > band.bottom) {
-      onDismiss(false);
-      return;
-    }
-    if (bounds) capToBand(pickerRef.current, anchor, band, gap);
-    const picker = pickerRef.current.getBoundingClientRect();
-    const left = align === "end" ? button.right - picker.width : button.left;
-    // No room on either side of the button is as good as no button.
-    if (!placeAgainstAnchor(pickerRef.current, anchor, picker, left, gap, gap, band)) {
-      onDismiss(false);
-      return;
-    }
-    onPlaced(pickerRef.current);
-  }, [align, anchorRef, bounds, clearRef, gap, onDismiss, onPlaced, open]);
+    const place = (): boolean => {
+      if (!open || !anchorRef.current || !pickerRef.current) return false;
+      placeClear();
+      const button = anchorRef.current.getBoundingClientRect();
+      const anchor = placementBox(button, clearRef);
+      const band = (bounds ?? viewportBounds)();
+      // An anchor scrolled out of sight has nothing to hang off any more.
+      if (anchor.bottom < band.top || anchor.top > band.bottom) {
+        lost();
+        return false;
+      }
+      // Only a band the picker was capped to counts as placed in (CQR R10 F-1
+      // of issue #1238): a rotation's first reading, judged lost while its touch
+      // menu confirms it, capped nothing — and taken for placed, the next
+      // observer callback capped the picker inside itself, a loop in WebKit.
+      placedBandRef.current = bandKey(band);
+      if (bounds) capToBand(pickerRef.current, anchor, band, gap);
+      const picker = pickerRef.current.getBoundingClientRect();
+      const left = align === "end" ? button.right - picker.width : button.left;
+      // No room on either side of the button is as good as no button.
+      if (!placeAgainstAnchor(pickerRef.current, anchor, picker, left, gap, gap, band)) {
+        lost();
+        return false;
+      }
+      return onPlaced(pickerRef.current) === true;
+    };
+    // A caller that moved what the picker clears, without resizing it (CQR R6
+    // of issue #1238), gets one more placement against where that is now; once,
+    // so the two cannot chase each other.
+    if (place()) place();
+    pickerRef.current?.dispatchEvent(new Event(pickerPlacedEvent, { bubbles: true }));
+  }, [align, anchorRef, bounds, clearRef, gap, lost, onPlaced, open, placeClear]);
 
   useLayoutEffect(position, [position]);
+
+  useLayoutEffect(() => {
+    if (placeRef) placeRef.current = position;
+  }, [placeRef, position]);
 
   useEffect(() => {
     if (!open) return;
@@ -285,7 +344,21 @@ export function useAnchoredPicker({
     // for the same reason. A placement writes only the picker's own limits and
     // position, never that box, and a box whose size did not change is not
     // reported again, so this settles rather than loops.
-    const resize = new ResizeObserver(() => position());
+    //
+    // Unless the caller's band moved with that size (CQR R6 of issue #1238: a
+    // touch sheet's band is chosen from what the arrived catalog shows): the
+    // new band's cap would resize the picker inside its own observer's
+    // callback, which the browser reports as a loop. That placement waits for
+    // the next frame, outside the callback.
+    let frame = 0;
+    const resize = new ResizeObserver(() => {
+      if (bounds && bandKey(bounds()) !== placedBandRef.current) {
+        cancelAnimationFrame(frame);
+        frame = requestAnimationFrame(position);
+        return;
+      }
+      position();
+    });
     if (pickerRef.current) resize.observe(pickerRef.current);
     if (clearRef?.current) resize.observe(clearRef.current);
     document.addEventListener("mousedown", closeOnOutsideClick);
@@ -295,6 +368,7 @@ export function useAnchoredPicker({
     window.visualViewport?.addEventListener("resize", position);
     window.visualViewport?.addEventListener("scroll", position);
     return () => {
+      cancelAnimationFrame(frame);
       resize.disconnect();
       document.removeEventListener("mousedown", closeOnOutsideClick);
       document.removeEventListener("keydown", closeOnEscape);
@@ -302,7 +376,7 @@ export function useAnchoredPicker({
       window.visualViewport?.removeEventListener("resize", position);
       window.visualViewport?.removeEventListener("scroll", position);
     };
-  }, [clearRef, containerRef, onDismiss, open, position]);
+  }, [bounds, clearRef, containerRef, onDismiss, open, position]);
 
   return pickerRef;
 }

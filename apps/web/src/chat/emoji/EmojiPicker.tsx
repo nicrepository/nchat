@@ -280,8 +280,22 @@ function EmojiSections({
 /** The emoji whose tone is being chosen, and the cell the palette hangs off. */
 interface TonePick {
   entry: EmojiEntry;
-  anchor: DOMRect;
   cell: HTMLButtonElement;
+}
+
+/**
+ * Where focus goes as the palette closes: back to its cell, or — the cell gone
+ * with a search's results (CQR R9 of issue #1238) — to the search field, so it
+ * never drops to the body with the palette.
+ */
+function toneReturn(cell: HTMLElement, search: HTMLInputElement | null): HTMLElement | null {
+  return cell.isConnected ? cell : search;
+}
+
+/** Whether focus is left where a closing palette takes it: in it, or nowhere. */
+function focusInPalette(): boolean {
+  const active = document.activeElement;
+  return !active || active === document.body || !!active.closest(".chat-emoji-tone");
 }
 
 export default function EmojiPicker({
@@ -323,14 +337,25 @@ export default function EmojiPicker({
         onSelect(entry.unicode);
         return;
       }
-      setTonePick({ entry, anchor: cell.getBoundingClientRect(), cell });
+      setTonePick({ entry, cell });
     },
     [onSelect],
   );
 
   const dismissTone = useCallback(() => {
     setTonePick((current) => {
-      current?.cell.focus();
+      if (current) toneReturn(current.cell, searchRef.current)?.focus();
+      return null;
+    });
+  }, []);
+
+  // The cell went out of sight under an open palette (CQR R9): it closes, and
+  // focus it held goes to the search field — the cell is not where the reader
+  // can reach it. Focus already elsewhere (the search field a new term was
+  // typed in) stays.
+  const loseTone = useCallback(() => {
+    setTonePick((current) => {
+      if (current && focusInPalette()) searchRef.current?.focus();
       return null;
     });
   }, []);
@@ -371,7 +396,8 @@ export default function EmojiPicker({
       {tonePick && (
         <EmojiTonePalette
           entry={tonePick.entry}
-          anchor={tonePick.anchor}
+          cell={tonePick.cell}
+          onLost={loseTone}
           tone={usage.tone}
           onSelect={pickTone}
           onDismiss={dismissTone}

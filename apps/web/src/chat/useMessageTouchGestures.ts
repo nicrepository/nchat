@@ -49,9 +49,10 @@ export const EDGE_GUARD_PX = 24;
 /**
  * Where a press is not a message gesture. `[role=toolbar]` and
  * `[role=dialog]` are the menu and picker this gesture opens: pressing inside
- * them is using them.
+ * them is using them. A tap there is not selecting the message either (issue
+ * #1238).
  */
-const CONTROL_SELECTOR =
+export const CONTROL_SELECTOR =
   'a, button, input, textarea, select, label, audio, video, img, pre, [contenteditable="true"], [role="toolbar"], [role="dialog"], .chat-msg-area__attachments';
 
 type Phase = "pending" | "swiping" | "longPressed" | "cancelled";

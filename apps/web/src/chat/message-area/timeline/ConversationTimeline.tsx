@@ -33,6 +33,7 @@ import {
 } from "../viewport/useListBoundaries";
 import MessageList from "./MessageList";
 import type { ConversationMessageActions } from "./MessageTimelineItem";
+import type { ReactionMenuState } from "./useReactionMenu";
 
 export interface ConversationTimelineProps {
   kind: "channel" | "dm";
@@ -45,6 +46,8 @@ export interface ConversationTimelineProps {
   workspaceId: string;
   /** Every callback a message offers; see MessageTimelineItem. */
   actions: ConversationMessageActions;
+  /** The conversation's contextual surface (issue #1238); see useReactionMenu. */
+  reactionMenu: ReactionMenuState;
   onLoadMore: () => void;
   onRetry: () => void;
   editDisabledIds: Set<string>;
@@ -140,6 +143,7 @@ export default function ConversationTimeline(props: ConversationTimelineProps) {
       olderPagesSettled={state.olderPagesSettled}
       lastMutation={state.lastMutation}
       onLoadMore={props.onLoadMore}
+      reactionMenu={props.reactionMenu}
       actions={{
         ...actions,
         // Forwarding is a channel affordance: a DM has no channel to forward from.
