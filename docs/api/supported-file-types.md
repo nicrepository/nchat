@@ -84,7 +84,7 @@ de 512 MiB. Não é um limite independente de upload a ser aumentado por usuári
 | Nome de entrada / comentário por entrada | 255 bytes                                                                                                               |
 | Extra field                              | 1 KiB; somente timestamps e UID/GID conhecidos; sem Unicode path alternativo/ZIP64/AES                                  |
 | XML                                      | Profundidade 64; até 64 atributos por elemento; sem atributos duplicados                                                |
-| Tempo                                    | 10 s no upload; revalidação usa o deadline total do job AV                                                              |
+| Tempo                                    | 10 s por inspeção no upload e no worker, incluindo I/O de storage; também limitado pelo deadline total do job AV        |
 | Memória/CPU                              | Buffers/entradas limitados; sem extração em disco; cancelamento em leituras; teto do processo permanece o do Deployment |
 
 Offsets locais são contíguos, sem prefixo/payload escondido, sobreposição ou gaps;
