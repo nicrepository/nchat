@@ -4,8 +4,9 @@
  * timeline wires them — no mocked callbacks between the two. Covers what only
  * shows up when both halves run together: Escape and the focus it hands back,
  * a message removed, unmounted or recycled while it owns the menu, a stale
- * release racing a newer menu, a conversation switch, the actions button, and
- * the real meeting-scheduling modal opening over a gesture still in progress.
+ * release racing a newer menu, a conversation switch, the header's selection
+ * mode (issue #1238), and the real meeting-scheduling modal opening over a
+ * gesture still in progress.
  */
 
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -18,7 +19,9 @@ import MeetingSchedulingProvider from "../meetings/MeetingSchedulingProvider";
 import { emptyEmojiUsage } from "./emoji/emojiUsage";
 import MessageBubble from "./MessageBubble";
 import type { Channel, Message } from "./chatTypes";
+import { SelectionHeader } from "./message-area/ConversationHeader";
 import { useReactionMenu } from "./message-area/timeline/useReactionMenu";
+import { useSelectionMode } from "./message-area/timeline/useSelectionMode";
 import { LONG_PRESS_MS, SWIPE_REPLY_PX } from "./useMessageTouchGestures";
 
 function messageWith(id: string, overrides: Partial<Message> = {}): Message {
@@ -48,17 +51,24 @@ function messageWith(id: string, overrides: Partial<Message> = {}): Message {
 const onReplyMessage = vi.fn();
 const onToggleReaction = vi.fn();
 
-/** The timeline's wiring, minus the virtualizer: one controller, many rows. */
+/**
+ * The conversation's wiring, minus the virtualizer: one controller, the
+ * header's selection mode and many rows.
+ */
 function Conversation({
   messages,
   keyByIndex = false,
+  conversationKey = "",
 }: {
   messages: Message[];
   keyByIndex?: boolean;
+  conversationKey?: string;
 }) {
-  const menu = useReactionMenu();
+  const menu = useReactionMenu(conversationKey);
+  const selection = useSelectionMode(menu);
   return (
     <div>
+      {selection && <SelectionHeader selection={selection} />}
       {messages.map((message, index) => (
         <MessageBubble
           key={keyByIndex ? index : message.id}
@@ -81,6 +91,8 @@ function Conversation({
           onPickerOpenChange={menu.onPickerOpenChange}
           reactionMenuTouch={menu.touchMessageId === message.id}
           onReactionMenuLongPress={menu.onReactionMenuLongPress}
+          selected={menu.selectedMessageId === message.id}
+          onMessageSelect={menu.onMessageSelect}
           gesturesBlocked={menu.touchSurfaceOpen}
           onReactionMenuRelease={menu.onReactionMenuRelease}
         />
@@ -95,6 +107,14 @@ const body = (id: string) => screen.getByText(`texto ${id}`);
 const shell = (id: string) =>
   document.querySelector<HTMLElement>(`[data-message-id="${id}"]`) as HTMLElement;
 const menu = () => screen.queryByRole("toolbar", { name: "Reagir à mensagem" });
+/**
+ * Whose menu it is: the message it sits in, or — in the body, where a touch
+ * menu goes without the top layer (jsdom has no Popover API) — the message it
+ * is marked with.
+ */
+const owner = (element: HTMLElement | null) =>
+  element?.closest<HTMLElement>("[data-message-id]")?.dataset.messageId ??
+  element?.getAttribute("data-reaction-picker-for");
 
 function longPress(id: string) {
   fireEvent.pointerDown(body(id), { ...touch, clientX: 100, clientY: 200 });
@@ -117,6 +137,8 @@ beforeEach(() => {
   vi.useFakeTimers();
   onReplyMessage.mockClear();
   onToggleReaction.mockClear();
+  // jsdom implements no scrolling; the header's menu brings its message into view.
+  Element.prototype.scrollIntoView = vi.fn();
   // Room beside every bubble, so the menu anchors and nothing closes it.
   vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
     const box = this.classList.contains("chat-msg-area__msg-bubble")
@@ -223,7 +245,7 @@ describe("a message leaving while it owns the menu", () => {
 
     rerender(<Conversation messages={[two]} />);
     expect(menu()).toBeInTheDocument();
-    expect(shell("msg-2")).toContainElement(menu());
+    expect(owner(menu())).toBe("msg-2");
     expect(screen.getByRole("button", { name: "Mais reações" })).toHaveAttribute(
       "aria-expanded",
       "true",
@@ -240,17 +262,75 @@ describe("a message leaving while it owns the menu", () => {
   });
 });
 
-describe("the actions button", () => {
+/**
+ * CQR R3 of #1238: a tap selects a message and the header trades its controls
+ * for the selection's — "Cancelar seleção" and the message's actions. Escape
+ * closes the menu first and the selection next; a tap of the way back, focus
+ * going elsewhere, the message leaving or a conversation switch end it too.
+ */
+describe("the header's selection mode", () => {
   const actions = () => screen.getByRole("button", { name: "Ações da mensagem" });
+  const cancel = () => screen.getByRole("button", { name: "Cancelar seleção" });
+  const mode = () => screen.queryByRole("group", { name: "Mensagem selecionada" });
 
-  it("opens the same menu, names it, and hands focus back to itself on Escape", () => {
-    render(<Conversation messages={[messageWith("msg-1")]} />);
+  beforeEach(() => {
+    vi.stubGlobal("matchMedia", (query: string) => ({ matches: true, media: query }));
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("starts on a tap, naming the message selected, with nothing opened", () => {
+    render(<Conversation messages={[messageWith("msg-1"), messageWith("msg-2")]} />);
+    expect(mode()).not.toBeInTheDocument();
+    fireEvent.click(body("msg-1"));
+    expect(mode()).toBeInTheDocument();
+    expect(within(mode()!).getAllByRole("button")).toEqual([cancel(), actions()]);
+    expect(shell("msg-1")).toHaveClass("chat-msg-area__msg--selected");
     expect(actions()).toHaveAttribute("aria-expanded", "false");
     expect(actions()).not.toHaveAttribute("aria-controls");
+    expect(menu()).not.toBeInTheDocument();
 
-    act(() => actions().focus());
+    // Another message takes the selection: one at a time.
+    fireEvent.click(body("msg-2"));
+    expect(shell("msg-1")).not.toHaveClass("chat-msg-area__msg--selected");
+    expect(shell("msg-2")).toHaveClass("chat-msg-area__msg--selected");
+  });
+
+  it("brings its message into view only when none of its bubble is in view", () => {
+    render(<Conversation messages={[messageWith("msg-1")]} />);
+    // The bubble is the menu's anchor: what the menu needs in view.
+    const bubble = shell("msg-1").querySelector(".chat-msg-area__msg-bubble")!;
+    const rowBox = vi.spyOn(bubble, "getBoundingClientRect");
+    // Partly in view (a 210px-tall phone): the timeline stays where it is.
+    rowBox.mockReturnValue(DOMRect.fromRect({ x: 0, y: -30, width: 300, height: 60 }));
+    fireEvent.click(body("msg-1"));
+    tapActions();
+    expect(menu()).toBeInTheDocument();
+    expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled();
+
+    // Wholly out of view (zoomed in, panned to the header): brought back.
+    tapActions();
+    settle();
+    expect(menu()).not.toBeInTheDocument();
+    rowBox.mockReturnValue(DOMRect.fromRect({ x: 0, y: 900, width: 300, height: 60 }));
+    // jsdom does not scroll: the call brings the row back as a browser would.
+    vi.mocked(Element.prototype.scrollIntoView).mockImplementation(() => {
+      rowBox.mockReturnValue(DOMRect.fromRect({ x: 0, y: 100, width: 300, height: 60 }));
+    });
+    tapActions();
+    expect(menu()).toBeInTheDocument();
+    expect(vi.mocked(Element.prototype.scrollIntoView).mock.contexts).toEqual([shell("msg-1")]);
+  });
+
+  it("opens the same menu, and Escape closes the menu first and the selection next", () => {
+    render(<Conversation messages={[messageWith("msg-1")]} />);
+    fireEvent.click(body("msg-1"));
     fireEvent.click(actions());
     expect(menu()).toHaveClass("chat-msg-area__reaction-menu--touch");
+    expect(owner(menu())).toBe("msg-1");
+    // Its bubble already in view: nothing scrolls (see the test above).
+    expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled();
     expect(actions()).toHaveAttribute("aria-expanded", "true");
     expect(actions()).toHaveAttribute("aria-controls", menu()!.id);
     expect(menu()!.querySelector("button")).toHaveFocus();
@@ -258,53 +338,82 @@ describe("the actions button", () => {
     fireEvent.keyDown(document, { key: "Escape" });
     settle();
     expect(menu()).not.toBeInTheDocument();
+    expect(mode()).toBeInTheDocument();
     expect(actions()).toHaveFocus();
+    expect(actions()).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(mode()).not.toBeInTheDocument();
+    expect(shell("msg-1")).toHaveFocus();
+    expect(shell("msg-1")).not.toHaveClass("chat-msg-area__msg--selected");
     act(() => vi.advanceTimersByTime(2000));
     expect(menu()).not.toBeInTheDocument();
   });
 
-  it("opens the touch menu even when keyboard focus already revealed the hover one", () => {
+  it("ends on Escape with only the selection, focus staying on the message", () => {
     render(<Conversation messages={[messageWith("msg-1")]} />);
     act(() => shell("msg-1").focus());
-    expect(menu()).not.toHaveClass("chat-msg-area__reaction-menu--touch");
-    act(() => actions().focus());
+    fireEvent.click(body("msg-1"));
+    settle();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(mode()).not.toBeInTheDocument();
+    expect(shell("msg-1")).toHaveFocus();
+  });
+
+  it("ends on Cancelar seleção, focus back on the message and nothing revealed", () => {
+    render(<Conversation messages={[messageWith("msg-1")]} />);
+    fireEvent.click(body("msg-1"));
+    act(() => cancel().focus());
+    fireEvent.click(cancel());
+    expect(mode()).not.toBeInTheDocument();
+    expect(shell("msg-1")).toHaveFocus();
+    settle();
+    expect(menu()).not.toBeInTheDocument();
+  });
+
+  it("closes the menu and ends together when cancelled with the menu open", () => {
+    render(<Conversation messages={[messageWith("msg-1")]} />);
+    fireEvent.click(body("msg-1"));
     fireEvent.click(actions());
-    expect(menu()).toHaveClass("chat-msg-area__reaction-menu--touch");
-    expect(actions()).toHaveAttribute("aria-expanded", "true");
+    fireEvent.pointerDown(cancel(), touch);
+    fireEvent.click(cancel());
+    settle();
+    expect(menu()).not.toBeInTheDocument();
+    expect(mode()).not.toBeInTheDocument();
   });
 
   /**
-   * A finger's tap the way WebKit delivers it: the compatibility mousedown
-   * focuses the row — the nearest focusable ancestor — never the button.
+   * A finger's tap the way WebKit delivers it: the button never takes focus,
+   * and a pointerdown outside the message is what closes a touch menu.
    */
-  function tapActions(id: string) {
+  function tapActions() {
     fireEvent.pointerDown(actions(), touch);
     fireEvent.pointerUp(actions(), touch);
-    act(() => shell(id).focus());
     fireEvent.click(actions());
   }
 
-  it("hands focus back to itself after a tap that focused the row instead", () => {
+  it("toggles from a tap without focus, and hands focus back to the button on Escape", () => {
     render(<Conversation messages={[messageWith("msg-1")]} />);
-    act(() => screen.getByRole("button", { name: "fora" }).focus());
-    tapActions("msg-1");
+    fireEvent.click(body("msg-1"));
+    tapActions();
     expect(menu()).toHaveClass("chat-msg-area__reaction-menu--touch");
-    expect(menu()!.querySelector("button")).toHaveFocus();
-
     fireEvent.keyDown(document, { key: "Escape" });
     settle();
-    expect(menu()).not.toBeInTheDocument();
     expect(actions()).toHaveFocus();
-    act(() => vi.advanceTimersByTime(2000));
-    expect(menu()).not.toBeInTheDocument();
 
-    tapActions("msg-1");
+    tapActions();
     expect(menu()).toBeInTheDocument();
+    // Pressed again, it closes the menu rather than reopening it.
+    tapActions();
+    settle();
+    expect(menu()).not.toBeInTheDocument();
+    expect(mode()).toBeInTheDocument();
   });
 
-  it("keeps the menu and its picker open when focus moves into the picker", () => {
+  it("keeps the menu, its picker and the selection when focus moves into the picker", () => {
     render(<Conversation messages={[messageWith("msg-1")]} />);
-    tapActions("msg-1");
+    fireEvent.click(body("msg-1"));
+    tapActions();
     const more = screen.getByRole("button", { name: "Mais reações" });
     act(() => more.focus());
     fireEvent.click(more);
@@ -319,7 +428,17 @@ describe("the actions button", () => {
 
     expect(screen.getByRole("dialog", { name: "Escolher reação" })).toBeInTheDocument();
     expect(menu()).toHaveClass("chat-msg-area__reaction-menu--touch");
+    expect(mode()).toBeInTheDocument();
     expect(search).toHaveFocus();
+  });
+
+  it("ends when focus goes somewhere else", () => {
+    render(<Conversation messages={[messageWith("msg-1")]} />);
+    fireEvent.click(body("msg-1"));
+    act(() => actions().focus());
+    expect(mode()).toBeInTheDocument();
+    act(() => screen.getByRole("button", { name: "fora" }).focus());
+    expect(mode()).not.toBeInTheDocument();
   });
 
   it("does the same under StrictMode", () => {
@@ -328,44 +447,52 @@ describe("the actions button", () => {
         <Conversation messages={[messageWith("msg-1")]} />
       </StrictMode>,
     );
-    tapActions("msg-1");
+    fireEvent.click(body("msg-1"));
+    tapActions();
     fireEvent.keyDown(document, { key: "Escape" });
     settle();
     expect(menu()).not.toBeInTheDocument();
     expect(actions()).toHaveFocus();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(mode()).not.toBeInTheDocument();
   });
 
-  it("focuses nothing of a message removed while its tapped menu is open", () => {
+  it("ends when the selected message is removed, with its menu", () => {
     const { rerender } = render(<Conversation messages={[messageWith("msg-1")]} />);
-    tapActions("msg-1");
+    fireEvent.click(body("msg-1"));
+    tapActions();
     rerender(<Conversation messages={[messageWith("msg-1", { isRemoved: true })]} />);
-    fireEvent.keyDown(document, { key: "Escape" });
-    settle();
+    expect(mode()).not.toBeInTheDocument();
     expect(menu()).not.toBeInTheDocument();
-    expect(shell("msg-1").contains(document.activeElement)).toBe(false);
   });
 
-  it("focuses nothing of the old conversation after a switch", () => {
-    const { rerender } = render(<Conversation key="a" messages={[messageWith("msg-1")]} />);
-    tapActions("msg-1");
-    rerender(<Conversation key="b" messages={[messageWith("msg-9")]} />);
-    fireEvent.keyDown(document, { key: "Escape" });
-    settle();
-    expect(menu()).not.toBeInTheDocument();
-    expect(document.activeElement).toBe(document.body);
+  it("ends when the selected row unmounts, and stays ended when it comes back", () => {
+    const one = messageWith("msg-1");
+    const two = messageWith("msg-2");
+    const { rerender } = render(<Conversation messages={[one, two]} />);
+    fireEvent.click(body("msg-1"));
+    rerender(<Conversation messages={[two]} />);
+    expect(mode()).not.toBeInTheDocument();
+    rerender(<Conversation messages={[one, two]} />);
+    expect(mode()).not.toBeInTheDocument();
   });
 
-  it("closes the menu when pressed again", () => {
+  it("starts a switched-to conversation with nothing selected", () => {
+    const { rerender } = render(
+      <Conversation conversationKey="channel:a" messages={[messageWith("msg-1")]} />,
+    );
+    fireEvent.click(body("msg-1"));
+    rerender(<Conversation conversationKey="channel:b" messages={[messageWith("msg-1")]} />);
+    expect(mode()).not.toBeInTheDocument();
+    expect(shell("msg-1")).not.toHaveClass("chat-msg-area__msg--selected");
+  });
+
+  it("is entered by a long press too, the menu open on the same message", () => {
     render(<Conversation messages={[messageWith("msg-1")]} />);
-    fireEvent.click(actions());
-    fireEvent.click(actions());
-    settle();
-    expect(menu()).not.toBeInTheDocument();
-  });
-
-  it("is not offered for a removed message", () => {
-    render(<Conversation messages={[messageWith("msg-1", { isRemoved: true })]} />);
-    expect(screen.queryByRole("button", { name: "Ações da mensagem" })).not.toBeInTheDocument();
+    longPress("msg-1");
+    expect(mode()).toBeInTheDocument();
+    expect(actions()).toHaveAttribute("aria-expanded", "true");
+    expect(actions()).toHaveAttribute("aria-controls", menu()!.id);
   });
 });
 
@@ -548,7 +675,7 @@ describe("the picker's tone palette", () => {
   /** The menu, its picker and the palette all open, touch-opened, for msg-1. */
   function expectStillOpen() {
     expect(menu()).toHaveClass("chat-msg-area__reaction-menu--touch");
-    expect(shell("msg-1")).toContainElement(menu());
+    expect(owner(menu())).toBe("msg-1");
     expect(picker()).toBeInTheDocument();
     expect(palette()).toBeInTheDocument();
   }
@@ -628,13 +755,22 @@ describe("the picker's tone palette", () => {
    * Focus leaving with no press is the hover rule as it always was: the menu
    * stops being the message's touch menu. The picker keeps to its own rules —
    * a press outside, Escape, a choice, or no room left beside the bubble.
+   *
+   * Issue #1238: on a narrow screen a touch menu whose picker is open is the
+   * sheet, which is not a hover placement — so once the touch mark is gone
+   * there is no room beside the bubble, and menu and picker close together,
+   * leaving nothing touch-sized or orphaned behind.
    */
-  const expectTouchMarkDropped = () =>
-    expect(screen.getByRole("toolbar", { name: "Reagir à mensagem" })).not.toHaveClass(
-      "chat-msg-area__reaction-menu--touch",
-    );
+  const expectTouchMarkDropped = () => {
+    expect(screen.queryByRole("toolbar", { name: "Reagir à mensagem" })).not.toBeInTheDocument();
+    expect(picker()).not.toBeInTheDocument();
+  };
+
+  /** A column too narrow for the menu and its picker side by side: the sheet. */
+  const narrowScreen = () => vi.spyOn(window, "innerWidth", "get").mockReturnValue(400);
 
   it("drops the touch mark when focus moves outside", async () => {
+    narrowScreen();
     render(<Conversation messages={[messageWith("msg-1")]} />);
     await openPalette();
     act(() => screen.getByRole("button", { name: "fora" }).focus());
@@ -643,11 +779,42 @@ describe("the picker's tone palette", () => {
   });
 
   it("drops the touch mark when focus is dropped to nowhere", async () => {
+    narrowScreen();
     render(<Conversation messages={[messageWith("msg-1")]} />);
     const { options } = await openPalette();
+    // Past the touch echo: the long press that opened it is not this blur.
+    act(() => vi.advanceTimersByTime(1000));
     act(() => options[0].blur());
     settle();
     expectTouchMarkDropped();
+  });
+
+  // CQR R4 of issue #1238: WebKit does not focus a tapped button, so a tap on
+  // the menu's own buttons drops focus to nowhere. That is the tap, not the
+  // reader leaving: the touch menu and its picker stay.
+  it("keeps the touch menu when a tap on it drops focus to nowhere (WebKit)", async () => {
+    narrowScreen();
+    render(<Conversation messages={[messageWith("msg-1")]} />);
+    const { options } = await openPalette();
+    fireEvent.pointerDown(options[0], touch);
+    act(() => options[0].blur());
+    settle();
+    expect(menu()).toHaveClass("chat-msg-area__reaction-menu--touch");
+    expect(picker()).toBeInTheDocument();
+  });
+
+  // CQR R4 of issue #1238: with room beside the bubble the menu kept its
+  // anchor when the picker opened, so it is the hover toolbar once the touch
+  // mark is gone — nothing touch-sized, the picker still its own message's.
+  it("leaves an anchored menu as the hover toolbar when focus is dropped on a wide screen", async () => {
+    render(<Conversation messages={[messageWith("msg-1")]} />);
+    const { options } = await openPalette();
+    expect(menu()).not.toHaveClass("chat-msg-area__reaction-menu--sheet");
+    act(() => vi.advanceTimersByTime(1000));
+    act(() => options[0].blur());
+    settle();
+    expect(menu()).not.toHaveClass("chat-msg-area__reaction-menu--touch");
+    expect(owner(picker()!)).toBe("msg-1");
   });
 
   it("does not take another message's surface for its own", async () => {
@@ -674,7 +841,7 @@ describe("the picker's tone palette", () => {
     expect(picker()).not.toBeInTheDocument();
     expect(palette()).not.toBeInTheDocument();
     expect(menu()).toHaveClass("chat-msg-area__reaction-menu--touch");
-    expect(shell("msg-2")).toContainElement(menu());
+    expect(owner(menu())).toBe("msg-2");
   });
 
   it("closes everything when its message is removed", async () => {

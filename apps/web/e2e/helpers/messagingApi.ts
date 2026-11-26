@@ -3551,6 +3551,39 @@ export async function revealActions(page: Page, messageId: string): Promise<Loca
   return bubble;
 }
 
+/**
+ * Issue #1238 (CQR R3): no toque, as ações de uma mensagem sem long-press estão
+ * no modo de seleção do header da conversa — um toque simples na bolha a
+ * seleciona e o header troca os seus controles por "Cancelar seleção" e "Ações
+ * da mensagem". Devolve esse botão, já visível e com alvo de toque inteiro. Uma
+ * mensagem já selecionada não é tocada de novo.
+ *
+ * `via: "keyboard"` seleciona pelo foco de teclado chegando à mensagem (o
+ * Shift+Tab e o Tab de volta), o outro caminho sem long-press — para telas tão
+ * baixas (320×210) que o composer cobre o que a lista mostra e não sobra ponto
+ * da mensagem a tocar.
+ */
+export async function selectMessageActions(
+  target: Locator,
+  { via = "tap" }: { via?: "tap" | "keyboard" } = {},
+): Promise<Locator> {
+  const page = target.page();
+  const actions = page.getByTestId("chat-msg-header").getByTestId("chat-selection-actions");
+  const selected = () =>
+    target.evaluate((shell) => shell.classList.contains("chat-msg-area__msg--selected"));
+  if (!(await selected()) && via === "keyboard") {
+    await target.focus();
+    await page.keyboard.press("Shift+Tab");
+    await page.keyboard.press("Tab");
+  }
+  if (!(await selected()) && via === "tap") {
+    await target.locator(".chat-msg-area__msg-bubble").tap();
+  }
+  await expect.poll(selected).toBe(true);
+  await expect(actions).toHaveCSS("width", "44px");
+  return actions;
+}
+
 export async function fillComposer(page: Page, text: string) {
   const input = page.getByTestId("chat-composer-input");
   await expect(input).toBeVisible();

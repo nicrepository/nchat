@@ -1,8 +1,9 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import EmojiPicker from "./EmojiPicker";
+import { pickerPlacedEvent } from "./useAnchoredPicker";
 import { loadEmojiCatalog, resetEmojiCatalogCache } from "./emojiCatalog";
 import { emptyEmojiUsage, type EmojiUsage } from "./emojiUsage";
 
@@ -501,5 +502,86 @@ describe("EmojiPicker skin tone", () => {
     // fit above it.
     expect(palette).toHaveStyle({ left: "8px", top: "48px", visibility: "visible" });
     spy.mockRestore();
+  });
+
+  /**
+   * CQR R9 of issue #1238, measured at 430×440 → 360×350: the palette was
+   * placed against its cell's box from when it opened (191–240), the resize
+   * moved the cell to 65–114 and the touch menu to 127–189, and the palette
+   * stayed at 133–187 — under the menu, every tone's centre the menu's.
+   */
+  describe("following its cell (CQR R9 of #1238)", () => {
+    const rect = (top: number, left: number, width: number, height: number) =>
+      ({
+        x: left,
+        y: top,
+        top,
+        left,
+        width,
+        height,
+        bottom: top + height,
+        right: left + width,
+        toJSON: () => ({}),
+      }) as DOMRect;
+    const geometry = { cell: rect(191, 200, 38, 49), results: rect(150, 0, 400, 300) };
+
+    beforeEach(() => {
+      geometry.cell = rect(191, 200, 38, 49);
+      geometry.results = rect(150, 0, 400, 300);
+      vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+        this: Element,
+      ) {
+        if (this.classList.contains("chat-emoji-tone")) return rect(0, 0, 220, 54);
+        if (this.classList.contains("chat-emoji-picker__sections")) return geometry.results;
+        if (this.getAttribute("aria-label") === "polegar para cima") return geometry.cell;
+        return rect(0, 0, 0, 0);
+      });
+    });
+    afterEach(() => vi.restoreAllMocks());
+
+    const palette = () => screen.queryByRole("dialog", { name: /Tom de pele/ });
+    const pickerPlaced = () =>
+      act(() => void document.body.dispatchEvent(new Event(pickerPlacedEvent, { bubbles: true })));
+
+    it("is placed again against where its cell is now, each time the picker is placed", async () => {
+      await openToneFor("polegar para cima");
+      // 191 − 54 − 6 above the cell, centred on it.
+      expect(palette()).toHaveStyle({ top: "131px", left: "109px" });
+      geometry.cell = rect(65, 160, 38, 49);
+      geometry.results = rect(20, 0, 400, 100);
+      pickerPlaced();
+      // No room above 65 any more: below it, 65 + 49 + 6.
+      expect(palette()).toHaveStyle({ top: "120px", left: "69px", visibility: "visible" });
+      expect(within(palette()!).getAllByRole("button")[0]).toHaveFocus();
+    });
+
+    it("closes once its cell is scrolled out of the results, focus to the search field", async () => {
+      const { onSelect } = await openToneFor("polegar para cima");
+      await waitFor(() => expect(within(palette()!).getAllByRole("button")[0]).toHaveFocus());
+      geometry.cell = rect(500, 200, 38, 49);
+      pickerPlaced();
+      expect(palette()).toBeNull();
+      expect(searchBox()).toHaveFocus();
+      expect(onSelect).not.toHaveBeenCalled();
+    });
+
+    it("closes when a new search takes its cell, leaving focus in the search field", async () => {
+      const { onSelect } = await openToneFor("polegar para cima");
+      searchBox().focus();
+      fireEvent.change(searchBox(), { target: { value: "foguete" } });
+      await screen.findByRole("button", { name: "foguete" });
+      expect(palette()).toBeNull();
+      expect(searchBox()).toHaveFocus();
+      expect(onSelect).not.toHaveBeenCalled();
+    });
+
+    it("returns focus to its cell on Escape, and stops listening once closed", async () => {
+      const { cell } = await openToneFor("polegar para cima");
+      const remove = vi.spyOn(document, "removeEventListener");
+      await userEvent.keyboard("{Escape}");
+      expect(palette()).toBeNull();
+      expect(cell).toHaveFocus();
+      expect(remove).toHaveBeenCalledWith(pickerPlacedEvent, expect.any(Function));
+    });
   });
 });

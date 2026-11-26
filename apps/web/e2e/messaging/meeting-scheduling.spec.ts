@@ -5,6 +5,7 @@ import {
   makeMessage,
   OTHER_USER_ID,
   CURRENT_USER_ID,
+  selectMessageActions,
   sidebarResponseBody,
 } from "../helpers/messagingApi";
 
@@ -206,12 +207,17 @@ test.describe("meeting scheduling with mobile message actions #1152", () => {
     const list = page.locator(".chat-msg-area__list");
     const scrollTop = await list.evaluate((element) => element.scrollTop);
     const menu = page.getByRole("toolbar", { name: "Reagir à mensagem" });
-    await message.getByRole("button", { name: "Ações da mensagem" }).click();
+    await (await selectMessageActions(message)).tap();
     await expect(menu).toBeVisible();
     await menu.getByRole("button", { name: "Mais reações" }).click();
     await expect(page.getByRole("dialog", { name: "Escolher reação" })).toBeVisible();
 
+    // Com a mensagem selecionada, o header é o modo de seleção (CQR R3 #1238):
+    // sair dele fecha menu e picker e devolve os controles da conversa.
     const trigger = page.getByRole("button", { name: "Agendar reunião", exact: true });
+    await expect(trigger).toHaveCount(0);
+    await page.getByTestId("chat-selection-cancel").tap();
+    await expect(page.getByRole("dialog", { name: "Escolher reação" })).toHaveCount(0);
     await trigger.click();
     await expect(dialog(page)).toBeVisible();
     await expect(page.locator(".chat-msg-area__reaction-menu")).toHaveCount(0);
@@ -229,7 +235,8 @@ test.describe("meeting scheduling with mobile message actions #1152", () => {
     await expect(composer).toHaveText("Rascunho antes dos gestos e da reunião");
     await expect.poll(() => list.evaluate((element) => element.scrollTop)).toBe(scrollTop);
 
-    await message.getByRole("button", { name: "Ações da mensagem" }).click();
+    await (await selectMessageActions(message)).tap();
+    await menu.getByRole("button", { name: "Mais ações" }).tap();
     await menu.getByRole("button", { name: "Responder", exact: true }).click();
     await expect(page.getByTestId("chat-composer-quote")).toContainText(
       [...scenario.messagesByTarget.values()].flat().find((entry) => entry.id === messageId)!

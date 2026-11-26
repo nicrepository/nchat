@@ -23,6 +23,7 @@ import {
   installMessagingMocks,
   makeMessage,
   messageBubble,
+  selectMessageActions,
   uniqueId,
 } from "../helpers/messagingApi";
 import {
@@ -74,10 +75,16 @@ async function openConversation(page: Page, testInfo: TestInfo, single = false) 
   return { scenario, messages };
 }
 
-/** Menu pelo botão de ações; o gate abre a janela antes do toque em "Mais reações". */
+/**
+ * Menu pelo botão de ações; o gate abre a janela antes do toque em "Mais reações".
+ * A mensagem é selecionada pelo teclado e o botão do header acionado com Enter
+ * (issue #1238): a 320×210 o composer cobre o que a lista mostra, e o que este
+ * gate mede é o picker, não a seleção. O foco de teclado também mostra a
+ * toolbar de hover sobre a mensagem, por isso Enter, como quem chega pelo Tab.
+ */
 async function openGatedPicker(page: Page, gate: Gate, target: Locator) {
-  const actions = target.getByRole("button", { name: "Ações da mensagem" });
-  await actions.tap();
+  const actions = await selectMessageActions(target, { via: "keyboard" });
+  await actions.press("Enter");
   await expect(menu(page)).toBeVisible();
   const more = menu(page).getByRole("button", { name: "Mais reações" });
   await gate.opening();
@@ -157,6 +164,48 @@ async function expectTappable(picker: Locator, cell: Locator) {
   return hit;
 }
 
+/**
+ * Uma caixa alheia ao picker e ao menu que muda de tamanho uma vez dentro do
+ * próprio callback: pela especificação, a nova medida fica para a atualização
+ * seguinte e o motor relata o aviso de loop. Devolve quantas entregas houve —
+ * 2 prova que a condição foi de fato provocada.
+ *
+ * Os quadros são pedidos até a entrega adiada chegar (CQR R4 da #1238): um
+ * observer só é entregue numa atualização de renderização, e uma caixa
+ * transparente, com o picker já parado, não pinta nada que obrigue o WebKit a
+ * fazer uma. Sem quadro pedido o controle esperava, às vezes, um aviso que nem
+ * chegou a ser provocado (o trace do R4 registrou `[]`).
+ */
+async function provokeForeignNotice(page: Page) {
+  return page.evaluate(
+    () =>
+      new Promise<number>((resolve) => {
+        const box = document.createElement("div");
+        box.style.cssText =
+          "position:fixed;left:0;top:0;width:10px;height:10px;pointer-events:none";
+        document.body.append(box);
+        let deliveries = 0;
+        let frames = 0;
+        const finish = () => {
+          observer.disconnect();
+          box.remove();
+          resolve(deliveries);
+        };
+        const observer = new ResizeObserver(() => {
+          if (++deliveries === 1) box.style.height = "20px";
+          else finish();
+        });
+        const tick = () => {
+          if (deliveries >= 2) return;
+          if (++frames > 120) finish();
+          else requestAnimationFrame(tick);
+        };
+        observer.observe(box);
+        requestAnimationFrame(tick);
+      }),
+  );
+}
+
 /** Só os motivos esperados, todos presentes; `incidental` pode aparecer junto. */
 function expectRejectedFor(verdict: Verdict, expected: Reason[], incidental: Reason[] = []) {
   const found = verdict.failures.map((failure) => failure.reason);
@@ -179,7 +228,7 @@ test.describe("gate do ResizeObserver a 320×210", () => {
     const message = messages.at(-2)!;
     const target = messageBubble(page, message.id);
     // Configuração pronta: as reações rápidas já chegaram quando o picker abre.
-    await target.getByRole("button", { name: "Ações da mensagem" }).tap();
+    await (await selectMessageActions(target, { via: "keyboard" })).press("Enter");
     await expect(
       menu(page).getByRole("button", { name: "Reagir rapidamente com 👍" }),
     ).toBeVisible();
@@ -200,11 +249,14 @@ test.describe("gate do ResizeObserver a 320×210", () => {
     gate.selected(hit, scenario.requests.reactions.length);
     await expect(target.locator(".chat-msg-area__reactions")).toContainText("🚀");
 
-    // O contrato: escolher pelo picker fecha só o picker. O menu fica, com o
-    // foco em "Mais reações", e é por ele que o picker reabre.
-    await expect(menu(page)).toBeVisible();
-    await expect(more).toBeFocused();
+    // O contrato (CQR R4 da #1238): a reação confirmada no picker encerra o
+    // picker e o menu, com o foco de volta no botão de ações do header — e é
+    // por ele que o picker reabre. Cancelar o picker fecha só o picker.
+    await expect(menu(page)).toHaveCount(0);
+    await expect(actions).toBeFocused();
     await gate.closed();
+    await actions.press("Enter");
+    await expect(menu(page)).toBeVisible();
     expect(await ownsItsCentre(more), "outra superfície intercepta Mais reações").toBe(true);
     await gate.opening();
     await more.tap();
@@ -276,11 +328,10 @@ test.describe("gate do ResizeObserver com o fallback a 390×740", () => {
       { messageId: message.id, emoji: "🚀", added: true },
     ]);
     gate.selected(hit, scenario.requests.reactions.length);
-    await expect(menu(page)).toBeVisible();
-    await expect(second.more).toBeFocused();
-    await gate.closed();
-    await page.keyboard.press("Escape");
+    // A reação confirmada encerra picker e menu (CQR R4 da #1238).
     await expect(menu(page)).toHaveCount(0);
+    await expect(second.actions).toBeFocused();
+    await gate.closed();
 
     expect((await gate.verdict()).failures).toEqual([]);
   });
@@ -297,11 +348,11 @@ for (const height of [210, 220]) {
       const { scenario, messages } = await openConversation(page, testInfo);
       const message = messages.at(-1)!;
       const target = messageBubble(page, message.id);
-      const { more, picker } = await openGatedPicker(page, gate, target);
+      const { actions, picker } = await openGatedPicker(page, gate, target);
       await expect(picker.locator(".chat-emoji-picker__emoji").first()).toBeVisible();
       expect(await gate.settle(), "o picker não parou por 20 quadros").toBe(true);
       // Tela baixa: o menu ficou só com "Mais reações" enquanto o picker está aberto.
-      await expect(menu(page).getByRole("button", { name: "Responder" })).toBeHidden();
+      await expect(menu(page).getByRole("button", { name: "Mais ações" })).toBeHidden();
 
       // A primeira linha escondida abaixo vai ao topo dos resultados.
       const results = picker.locator(".chat-emoji-picker__sections");
@@ -324,10 +375,10 @@ for (const height of [210, 220]) {
       await expect(picker).toHaveCount(0);
       expect(scenario.requests.reactions).toEqual([{ messageId: message.id, emoji, added: true }]);
       gate.selected(hit, scenario.requests.reactions.length);
-      await expect(more).toBeFocused();
-      await gate.closed();
-      await page.keyboard.press("Escape");
+      // A reação confirmada encerra picker e menu (CQR R4 da #1238).
       await expect(menu(page)).toHaveCount(0);
+      await expect(actions).toBeFocused();
+      await gate.closed();
 
       expect((await gate.verdict()).failures).toEqual([]);
     });
@@ -421,23 +472,8 @@ test.describe("controles negativos do gate do ResizeObserver", () => {
     const { gate, picker } = await openAndSettle(page, testInfo);
     expect(await gate.settle(), "o picker não parou por 20 quadros").toBe(true);
     await closeAll(page, gate, picker);
-    // Uma caixa que muda de tamanho uma vez dentro do próprio callback: um
-    // aviso só, e o observer se desliga na entrega seguinte.
-    await page.evaluate(() => {
-      const box = document.createElement("div");
-      box.style.cssText = "position:fixed;left:0;top:0;width:10px;height:10px;pointer-events:none";
-      document.body.append(box);
-      let deliveries = 0;
-      const observer = new ResizeObserver(() => {
-        if (++deliveries === 1) {
-          box.style.height = "20px";
-          return;
-        }
-        observer.disconnect();
-        box.remove();
-      });
-      observer.observe(box);
-    });
+    // Um aviso só, e o observer se desliga na entrega seguinte.
+    expect(await provokeForeignNotice(page), "a entrega adiada não chegou").toBe(2);
     await expect
       .poll(async () => (await gate.log())?.native.map((event) => event.message))
       .toContain(RESIZE_OBSERVER_LOOP);
@@ -454,21 +490,7 @@ test.describe("controles negativos do gate do ResizeObserver", () => {
     // menu. Uma caixa alheia muda de tamanho uma vez no próprio callback.
     await expect(picker.locator(".chat-emoji-picker__emoji").first()).toBeVisible();
     await finishAnimations(picker);
-    await page.evaluate(() => {
-      const box = document.createElement("div");
-      box.style.cssText = "position:fixed;left:0;top:0;width:10px;height:10px;pointer-events:none";
-      document.body.append(box);
-      let deliveries = 0;
-      const observer = new ResizeObserver(() => {
-        if (++deliveries === 1) {
-          box.style.height = "20px";
-          return;
-        }
-        observer.disconnect();
-        box.remove();
-      });
-      observer.observe(box);
-    });
+    expect(await provokeForeignNotice(page), "a entrega adiada não chegou").toBe(2);
     await expect
       .poll(async () => (await gate.log())?.native.map((event) => event.message))
       .toContain(RESIZE_OBSERVER_LOOP);
