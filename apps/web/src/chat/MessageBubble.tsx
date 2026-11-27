@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   FocusEvent as ReactFocusEvent,
+  KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
+  RefObject,
 } from "react";
 
 import type { CallParticipantProfile } from "./chatApi";
@@ -22,7 +24,9 @@ import { presenceLabel, usePresence, type PresenceState } from "./presence";
 import { UserAvatar } from "./UserAvatar";
 import type { MentionInteraction } from "./RichTextRenderer";
 import { useMessageEditing } from "./useMessageEditing";
-import { useMessageTouchGestures } from "./useMessageTouchGestures";
+import { CONTROL_SELECTOR, useMessageTouchGestures } from "./useMessageTouchGestures";
+import { reactionMenuId } from "./message-area/timeline/useReactionMenu";
+import { anchorOutOfSight, selectionHeaderClass } from "./message-area/timeline/useSelectionMode";
 
 export interface MessageBubbleProps {
   message: Message;
@@ -69,6 +73,13 @@ export interface MessageBubbleProps {
   reactionMenuTouch?: boolean;
   /** Opens this message's menu from a long press (issue #1152). */
   onReactionMenuLongPress?: (messageId: string) => void;
+  /**
+   * Selected for its actions on touch (issue #1238): the header shows its
+   * actions and a way back, the bubble a ring.
+   */
+  selected?: boolean;
+  /** Selects this message — a tap, or keyboard focus, on touch (issue #1238). */
+  onMessageSelect?: (messageId: string) => void;
   /** A touch menu or picker is open somewhere: a swipe must not reply under it. */
   gesturesBlocked?: boolean;
   /** Closes what this message has open when it is removed or unmounted (issue #1152). */
@@ -224,11 +235,25 @@ function messageShellClassName(flags: {
   isMine: boolean;
   isGrouped: boolean;
   isHighlighted: boolean;
+  isSelected: boolean;
 }): string {
   const mine = flags.isMine ? " chat-msg-area__msg--mine" : "";
   const grouped = flags.isGrouped ? " chat-msg-area__msg--grouped" : "";
   const highlighted = flags.isHighlighted ? " chat-msg-area__msg--highlight" : "";
-  return `chat-msg-area__msg${mine}${grouped}${highlighted}`;
+  const selected = flags.isSelected ? " chat-msg-area__msg--selected" : "";
+  return `chat-msg-area__msg${mine}${grouped}${highlighted}${selected}`;
+}
+
+/**
+ * Whether focus at `node` is still the message's: inside its row, or inside a
+ * surface portalled out of it — the picker, its tone palette, and a touch menu
+ * without the top layer (issue #1238) — each marked with the message.
+ */
+function ownsFocus(row: HTMLElement, node: EventTarget | null, messageId: string): boolean {
+  if (!(node instanceof Element)) return false;
+  if (row.contains(node)) return true;
+  const surface = node.closest("[data-reaction-picker-for]");
+  return surface?.getAttribute("data-reaction-picker-for") === messageId;
 }
 
 /**
@@ -252,6 +277,7 @@ const touchEchoMs = 800;
 function useToolbarReveal(
   messageId: string,
   onVisibleChange: (messageId: string, visible: boolean) => void,
+  touchOpen: boolean,
 ) {
   const lastTouchRef = useRef(Number.NEGATIVE_INFINITY);
   const markTouch = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
@@ -265,36 +291,40 @@ function useToolbarReveal(
     [messageId, onVisibleChange],
   );
   // Focus moving inside the message — into its menu, or handed back to the row
-  // or its actions button when Escape closes that menu — is not the reader
-  // arriving: revealing on it would reopen what they just closed.
+  // when Escape closes that menu — is not the reader arriving: revealing on it
+  // would reopen what they just closed.
   const showOnFocus = useCallback(
     (event: ReactFocusEvent<HTMLDivElement>) => {
-      const from = event.relatedTarget;
-      if (from instanceof Node && event.currentTarget.contains(from)) return;
-      show(event);
+      if (!ownsFocus(event.currentTarget, event.relatedTarget, messageId)) show(event);
     },
-    [show],
+    [messageId, show],
   );
+  // Nor does a mouse leaving the row end a menu opened by touch (CQR R10 F-1 of
+  // issue #1238): a finger hovers nothing, and the mouse WebKit synthesises
+  // after a rotation leaves a row that moved — dropping the touch menu, picker
+  // and focus with it. That menu ends on its own terms, as another message's
+  // touch menu already did (useReactionMenu).
   const hideOnLeave = useCallback(
     (event: ReactMouseEvent<HTMLDivElement>) => {
+      if (touchOpen) return;
       const nextTarget = event.relatedTarget;
       if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
         onVisibleChange(messageId, false);
       }
     },
-    [messageId, onVisibleChange],
+    [messageId, onVisibleChange, touchOpen],
   );
-  // The message's picker is portalled out of its DOM, and its tone palette out
-  // of the picker's; both are marked with the message. Focus going into them —
-  // the search field taking focus once the catalog loads, the palette its tone
-  // — stays with the message: hiding on it closed a touch-opened menu, picker
-  // and all.
+  // Focus going into the message's portalled surfaces — the search field
+  // taking focus once the catalog loads, the palette its tone — stays with the
+  // message: hiding on it closed a touch-opened menu, picker and all. So does
+  // focus a touch drops to nowhere (CQR R4 of issue #1238): WebKit does not
+  // focus a tapped button, so a tap on the menu's own buttons blurred to the
+  // body and dropped the touch menu before its click arrived.
   const hideOnBlur = useCallback(
     (event: ReactFocusEvent<HTMLDivElement>) => {
-      const next = event.relatedTarget;
-      if (event.currentTarget.contains(next)) return;
-      const picker = next instanceof Element ? next.closest("[data-reaction-picker-for]") : null;
-      if (picker?.getAttribute("data-reaction-picker-for") === messageId) return;
+      if (ownsFocus(event.currentTarget, event.relatedTarget, messageId)) return;
+      const tapEcho = event.timeStamp - lastTouchRef.current < touchEchoMs;
+      if (event.relatedTarget === null && tapEcho) return;
       onVisibleChange(messageId, false);
     },
     [messageId, onVisibleChange],
@@ -333,9 +363,146 @@ function useMessageGestures(props: MessageBubbleProps) {
   });
 }
 
+/** Where there is no hover to reveal a message's actions (see its CSS). */
+const touchQuery = "(hover: none), (pointer: coarse)";
+
+/**
+ * Watches a selected row and calls `onOut` once it is out of the timeline's
+ * view (CQR R3/R4 of issue #1238). A reading out of view ends it, the first one
+ * included — focus is no proof of visibility: a row focused with
+ * `preventScroll`, or handed focus as its menu closes, may be anywhere.
+ *
+ * The one reading it does not take at its word is the first one after the
+ * keyboard arrived at the row (`keyboardEntry`): WebKit scrolls a focused
+ * element in after the focus event. That reading is reconciled instead, once
+ * the browser has had its frame to scroll — measured against the list's band
+ * and the visual viewport — and ends the selection if the row is still out.
+ * A later reading in view settles it as well.
+ *
+ * The list's observer sees the list, not what the reader sees of it (CQR R5):
+ * pinch zoom, the on-screen keyboard and rotation move or resize the visual
+ * viewport and leave the list's layout alone. So a reading in the list counts
+ * only if the row is in the visual viewport too, and each of those changes is
+ * reconciled the same way — one pending check at a time, cancelled with the
+ * watch. Returns the cleanup.
+ */
+function watchSelectedRow(
+  row: HTMLElement,
+  root: Element,
+  keyboardEntry: boolean,
+  onOut: () => void,
+): () => void {
+  let pendingEntry = keyboardEntry;
+  let frame = 0;
+  const reconcile = () => {
+    cancelAnimationFrame(frame);
+    frame = requestAnimationFrame(() => {
+      frame = requestAnimationFrame(() => {
+        if (anchorOutOfSight(row)) onOut();
+      });
+    });
+  };
+  const observer = new IntersectionObserver(
+    ([entry]) => {
+      const entering = pendingEntry;
+      pendingEntry = false;
+      if (entry.isIntersecting && !anchorOutOfSight(row)) return;
+      if (entering) reconcile();
+      else onOut();
+    },
+    { root },
+  );
+  observer.observe(row);
+  const view = window.visualViewport;
+  view?.addEventListener("resize", reconcile);
+  view?.addEventListener("scroll", reconcile);
+  window.addEventListener("resize", reconcile);
+  return () => {
+    observer.disconnect();
+    cancelAnimationFrame(frame);
+    view?.removeEventListener("resize", reconcile);
+    view?.removeEventListener("scroll", reconcile);
+    window.removeEventListener("resize", reconcile);
+  };
+}
+
+/**
+ * Ends a selection whose row went out of sight (CQR R5 of issue #1238). Focus
+ * left on that row, on the header's selection controls — which go with the
+ * selection — or on nothing, its menu having closed under it, goes to the
+ * conversation's list, the place #675 gives focus that lost its row. Focus the
+ * reader put anywhere else stays there.
+ */
+function endUnseenSelection(row: HTMLElement, list: Element, release: () => void) {
+  const active = document.activeElement;
+  const adrift =
+    !active ||
+    active === document.body ||
+    row.contains(active) ||
+    !!active.closest(`.${selectionHeaderClass}`);
+  if (adrift && list instanceof HTMLElement) list.focus({ preventScroll: true });
+  release();
+}
+
+/**
+ * How a message becomes, and stops being, the selected one on touch (CQR R3 of
+ * issue #1238). A tap on it — not on a link, a mention, an attachment or any
+ * other control inside it, whose tap stays theirs — or keyboard focus arriving
+ * at it selects it; a programmatic focus (a jump to the message, a menu handing
+ * focus back) does not. Enter on the selected row opens its menu, the
+ * keyboard's way to what the header's actions button opens.
+ *
+ * Selected with nothing open, it watches whether it is still in the timeline's
+ * view — one observer, for the selected message only — and ends the selection
+ * once it has scrolled out: the header would otherwise act on a message the
+ * reader no longer sees. An open menu or picker has its own verdict (#839).
+ */
+function useMessageSelection(props: MessageBubbleProps, rowRef: RefObject<HTMLDivElement | null>) {
+  const { message, selected = false, onMessageSelect, onReactionMenuRelease } = props;
+  const surfaceOpen = !!props.reactionMenuTouch || props.pickerOpen;
+  // Set by the keyboard arriving at the row, read once by the next watch.
+  const keyboardEntryRef = useRef(false);
+  useEffect(() => {
+    const row = rowRef.current;
+    const root = row?.closest(".chat-msg-area__list");
+    if (!selected || surfaceOpen || !row || !root || !onReactionMenuRelease) return;
+    if (typeof IntersectionObserver === "undefined") return;
+    const entering = keyboardEntryRef.current;
+    keyboardEntryRef.current = false;
+    return watchSelectedRow(row, root, entering, () =>
+      endUnseenSelection(row, root, () => onReactionMenuRelease(message.id)),
+    );
+  }, [message.id, onReactionMenuRelease, rowRef, selected, surfaceOpen]);
+
+  const selectable = !!onMessageSelect && !message.isRemoved;
+  const select = () => {
+    if (!selectable || !window.matchMedia?.(touchQuery).matches) return false;
+    onMessageSelect(message.id);
+    return true;
+  };
+  return {
+    onClick: (event: ReactMouseEvent<HTMLDivElement>) => {
+      if (!(event.target as Element).closest(CONTROL_SELECTOR)) select();
+    },
+    onFocus: (event: ReactFocusEvent<HTMLDivElement>) => {
+      const row = event.currentTarget;
+      const arriving = !ownsFocus(row, event.relatedTarget, message.id);
+      if (event.target !== row || !arriving || !row.matches(":focus-visible")) return;
+      // Only a selection this focus starts gets a new watch to tell it about.
+      if (!selected && select()) keyboardEntryRef.current = true;
+    },
+    onKeyDown: (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (event.key !== "Enter" || event.target !== event.currentTarget || !selected) return;
+      event.preventDefault();
+      props.onReactionMenuLongPress?.(message.id);
+    },
+  };
+}
+
 /**
  * A message that is removed, or whose row is unmounted or recycled for another
- * message, takes the touch menu or picker it owns with it (issue #1152):
+ * message, takes the touch menu, picker or selection it owns with it (issues
+ * #1152, #1238):
  * otherwise the shared state still names it, every swipe stays blocked behind
  * a menu nobody can see, and the menu reappears when the message comes back.
  * The release names this message, so it never closes another one's.
@@ -347,7 +514,7 @@ function useReleaseSurfacesOnExit(props: MessageBubbleProps) {
   // leaving, and must not take the rest of its state with it.
   const ownsRef = useRef(false);
   useEffect(() => {
-    ownsRef.current = !!props.reactionMenuTouch || props.pickerOpen;
+    ownsRef.current = !!props.reactionMenuTouch || props.pickerOpen || !!props.selected;
   });
   useEffect(() => {
     if (!release) return;
@@ -356,44 +523,6 @@ function useReleaseSurfacesOnExit(props: MessageBubbleProps) {
       if (ownsRef.current) release(message.id);
     };
   }, [message.id, message.isRemoved, release]);
-}
-
-/**
- * The way to a message's actions that needs no long press (issue #1152): a
- * button a screen reader announces, a keyboard reaches and a finger taps,
- * opening the same menu the long press opens — the same controller, the same
- * permissions. Shown where there is no hover (see its CSS); the desktop keeps
- * its hover and focus reveal and never draws it.
- */
-function MessageActionsButton({ props, menuId }: { props: MessageBubbleProps; menuId: string }) {
-  const { message, onReactionMenuLongPress } = props;
-  if (!onReactionMenuLongPress || message.isRemoved) return null;
-  // The menu this button opens is the touch-opened one. A hover menu that
-  // keyboard focus revealed on the way here is not it: pressing then opens the
-  // touch menu, focus inside, instead of closing what the reader never chose.
-  const open = !!props.reactionMenuTouch && (props.reactionMenuVisible || props.pickerOpen);
-  // WebKit does not focus a pressed button — a tap focuses the row around it —
-  // so the menu would take the row for its opener and Escape would land there.
-  const toggle = (event: ReactMouseEvent<HTMLButtonElement>) => {
-    event.currentTarget.focus({ preventScroll: true });
-    if (!open) return onReactionMenuLongPress(message.id);
-    props.onPickerOpenChange(message.id, false);
-    props.onReactionMenuVisibleChange(message.id, false);
-  };
-  return (
-    <button
-      type="button"
-      className="chat-msg-area__msg-actions"
-      aria-label="Ações da mensagem"
-      aria-expanded={open}
-      aria-controls={open ? menuId : undefined}
-      onClick={toggle}
-    >
-      <span className="material-symbols-outlined" aria-hidden="true">
-        more_vert
-      </span>
-    </button>
-  );
 }
 
 /**
@@ -512,20 +641,40 @@ export default function MessageBubble(props: MessageBubbleProps) {
   // Scoped to the conversation being read: the sender wrote here, so this
   // conversation's roster is the one that would have named them.
   const senderPresence = usePresence(message.senderId, props.presenceTarget);
-  const reveal = useToolbarReveal(message.id, props.onReactionMenuVisibleChange);
+  const reveal = useToolbarReveal(
+    message.id,
+    props.onReactionMenuVisibleChange,
+    !!props.reactionMenuTouch,
+  );
   const gestures = useMessageGestures(props);
   useReleaseSurfacesOnExit(props);
-  const menuId = useId();
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  const selection = useMessageSelection(props, rowRef);
+  const menuId = reactionMenuId(message.id);
 
   return (
     <div
-      ref={(el) => props.setMessageRef?.(message.id, el)}
-      className={messageShellClassName({ isMine, isGrouped, isHighlighted })}
+      ref={(el) => {
+        rowRef.current = el;
+        props.setMessageRef?.(message.id, el);
+      }}
+      className={messageShellClassName({
+        isMine,
+        isGrouped,
+        isHighlighted,
+        isSelected: !!props.selected,
+      })}
       data-testid="chat-msg-bubble"
       data-message-id={message.id}
       tabIndex={0}
       {...reveal}
       {...gestures}
+      onFocus={(event) => {
+        reveal.onFocus(event);
+        selection.onFocus(event);
+      }}
+      onClick={selection.onClick}
+      onKeyDown={selection.onKeyDown}
     >
       {!isMine && (
         <MessageAvatar
@@ -535,7 +684,6 @@ export default function MessageBubble(props: MessageBubbleProps) {
         />
       )}
       <MessageBubbleBody props={props} senderPresence={senderPresence} menuId={menuId} />
-      <MessageActionsButton props={props} menuId={menuId} />
     </div>
   );
 }

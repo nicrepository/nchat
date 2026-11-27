@@ -11,18 +11,27 @@
  * the reader's cursor.
  */
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import { skinToneLabels } from "./emojiCategories";
 import { withSkinTone, type EmojiEntry } from "./emojiCatalog";
-import type { VisibleBounds } from "./useAnchoredPicker";
+import { anchorIsVisible, pickerPlacedEvent, type VisibleBounds } from "./useAnchoredPicker";
 
 export interface EmojiTonePaletteProps {
   entry: EmojiEntry;
-  /** The emoji cell this palette belongs to, in viewport coordinates. */
-  anchor: DOMRect;
+  /**
+   * The emoji cell this palette belongs to, measured at every placement (CQR R9
+   * of issue #1238): a box taken when the palette opened stayed there while a
+   * resize moved the picker, and the touch menu covered every tone.
+   */
+  cell: HTMLElement;
+  /**
+   * The cell is gone — removed, or scrolled out of the picker's results — so
+   * the palette has nothing to hang off and closes.
+   */
+  onLost: () => void;
   /** The reader's remembered tone, marked as current. */
   tone: number;
   onSelect: (emoji: string, tone: number) => void;
@@ -68,6 +77,18 @@ function placePalette(element: HTMLElement, anchor: DOMRect, bounds: VisibleBoun
   element.style.visibility = "visible";
 }
 
+/**
+ * Whether a cell is still one the reader can see: connected, and at least
+ * partly inside the picker's scrolling results. Anywhere else a palette over it
+ * would point at nothing. Results not laid out yet (no height) are nothing to
+ * judge against.
+ */
+function cellInSight(cell: HTMLElement, box: DOMRect): boolean {
+  if (!cell.isConnected) return false;
+  const results = cell.closest(".chat-emoji-picker__sections")?.getBoundingClientRect();
+  return !results?.height || anchorIsVisible(box, results);
+}
+
 const toneSteps: Record<string, number> = {
   ArrowRight: 1,
   ArrowDown: 1,
@@ -89,7 +110,8 @@ function nextTone(key: string, tone: number): number | null {
 
 export default function EmojiTonePalette({
   entry,
-  anchor,
+  cell,
+  onLost,
   tone,
   onSelect,
   onDismiss,
@@ -99,9 +121,22 @@ export default function EmojiTonePalette({
   const paletteRef = useRef<HTMLDivElement>(null);
   const [active, setActive] = useState(tone);
 
-  useLayoutEffect(() => {
-    if (paletteRef.current) placePalette(paletteRef.current, anchor, bounds());
-  }, [anchor, bounds]);
+  // Against where the cell is now, whenever the picker holding it is placed.
+  const place = useCallback(() => {
+    if (!paletteRef.current) return;
+    const box = cell.getBoundingClientRect();
+    if (!cellInSight(cell, box)) return onLost();
+    placePalette(paletteRef.current, box, bounds());
+  }, [bounds, cell, onLost]);
+
+  // And on every render: a new search re-renders the picker and may take the
+  // cell with its results without changing the picker's size.
+  useLayoutEffect(() => place());
+
+  useEffect(() => {
+    document.addEventListener(pickerPlacedEvent, place);
+    return () => document.removeEventListener(pickerPlacedEvent, place);
+  }, [place]);
 
   // Opening moves focus onto the tone the reader last chose, so the palette is
   // usable from the keyboard the instant it appears.

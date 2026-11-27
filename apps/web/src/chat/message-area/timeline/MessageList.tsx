@@ -30,7 +30,7 @@ import MessageTimelineItem, {
   type TimelineRowContext,
 } from "./MessageTimelineItem";
 import ScrollToBottomButton from "./ScrollToBottomButton";
-import { useReactionMenu } from "./useReactionMenu";
+import type { ReactionMenuState } from "./useReactionMenu";
 
 export interface MessageListProps {
   messages: Message[];
@@ -47,6 +47,12 @@ export interface MessageListProps {
    * both halves, so it joins them rather than the page above passing one down.
    */
   actions: ConversationMessageActions;
+  /**
+   * The one message with a menu, a picker or the touch selection open. Held
+   * by the conversation (issue #1238): the selection's controls are the
+   * header's, which is not in this list.
+   */
+  reactionMenu: ReactionMenuState;
   onLoadMore: () => void;
   editDisabledIds: Set<string>;
   mentionTarget?: MentionTarget;
@@ -107,6 +113,7 @@ export default function MessageList(props: MessageListProps) {
     focusRequest,
     onCaptureAnchor,
     onReadProgress,
+    reactionMenu,
   } = props;
 
   const {
@@ -143,7 +150,6 @@ export default function MessageList(props: MessageListProps) {
     onReadProgress,
     serverReadThrough: props.serverReadThrough,
   });
-  const reactionMenu = useReactionMenu();
   const messagesById = useMemo(
     () => new Map(messages.map((message) => [message.id, message])),
     [messages],

@@ -387,6 +387,10 @@ jobs:
     name: E2E / Web
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -404,6 +408,8 @@ jobs:
       - name: Install Playwright Chromium
         run: pnpm --filter @nchat/web exec playwright install --with-deps chromium
       - name: Test
+        env:
+          NCHAT_E2E_SHARD: ${{ matrix.shard }}
         run: pnpm test:e2e:web
       # Only on failure: the HTML report and the traces Playwright writes on a
       # retry are a diagnosis of a red run, and worth nothing for a green one.
@@ -411,7 +417,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: playwright-report-web
+          name: playwright-report-web-${{ matrix.shard }}
           path: |
             apps/web/playwright-report
             apps/web/test-results

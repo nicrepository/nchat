@@ -9,7 +9,7 @@
  * to a header is a change to this file alone.
  */
 
-import { forwardRef, type RefObject } from "react";
+import { forwardRef, useId, type RefObject } from "react";
 
 import { useMeetingScheduling } from "../../meetings/meetingContext";
 
@@ -26,6 +26,7 @@ import type { ConversationDetailsPanelState } from "../useConversationDetailsPan
 import ChannelIcon from "../ChannelIcon";
 import GroupAvatar from "../GroupAvatar";
 import { channelAccessibleName } from "../channelIdentity";
+import { selectionHeaderClass, type SelectionHeaderState } from "./timeline/useSelectionMode";
 
 interface DetailsToggleProps {
   open: boolean;
@@ -341,6 +342,55 @@ export function HeaderDM({
   );
 }
 
+/**
+ * The header while a message is selected on touch (CQR R3 of issue #1238): a
+ * contextual mode, in place of the conversation's controls rather than over
+ * them, so nothing stays drawn — and seemingly operable — under it. A labelled
+ * group with the way back, which ends the selection and restores the controls,
+ * and the selected message's actions, which open the very menu its long press
+ * opens. The same strip and test id, so the layout below never moves.
+ */
+export function SelectionHeader({ selection }: { selection: SelectionHeaderState }) {
+  const labelId = useId();
+  return (
+    <header
+      className={`chat-msg-area__header ${selectionHeaderClass}`}
+      data-testid="chat-msg-header"
+    >
+      <div className="chat-msg-area__selection" role="group" aria-labelledby={labelId}>
+        <button
+          type="button"
+          className="chat-msg-area__header-btn"
+          aria-label="Cancelar seleção"
+          title="Cancelar seleção"
+          onClick={selection.onCancel}
+          data-testid="chat-selection-cancel"
+        >
+          <span className="material-symbols-outlined" aria-hidden="true">
+            close
+          </span>
+        </button>
+        <span id={labelId} className="chat-msg-area__header-title">
+          Mensagem selecionada
+        </span>
+        <button
+          type="button"
+          className="chat-msg-area__header-btn"
+          aria-label="Ações da mensagem"
+          aria-expanded={selection.menuOpen}
+          aria-controls={selection.menuOpen ? selection.menuId : undefined}
+          onClick={(event) => selection.onToggleMenu(event.currentTarget)}
+          data-testid="chat-selection-actions"
+        >
+          <span className="material-symbols-outlined" aria-hidden="true">
+            more_vert
+          </span>
+        </button>
+      </div>
+    </header>
+  );
+}
+
 interface ConversationHeaderProps {
   targetId?: string;
   kind: "channel" | "dm";
@@ -358,6 +408,8 @@ interface ConversationHeaderProps {
   /** Issue #1124: absent, the header offers no Back. */
   onBack?: () => void;
   backRef?: RefObject<HTMLButtonElement | null>;
+  /** Issue #1238: a message is selected on touch; the header is in its mode. */
+  selection?: SelectionHeaderState;
 }
 
 /** The channel or DM header, and the details control both of them offer. */
@@ -376,8 +428,10 @@ export default function ConversationHeader({
   detailsToggleRef,
   onBack,
   backRef,
+  selection,
 }: ConversationHeaderProps) {
   const openScheduling = useMeetingScheduling();
+  if (selection) return <SelectionHeader selection={selection} />;
   const scheduleAction =
     openScheduling && targetId ? (
       <button

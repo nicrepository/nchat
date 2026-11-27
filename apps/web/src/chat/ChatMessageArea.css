@@ -1346,39 +1346,69 @@
    (issue #1152): it keeps only the button the picker belongs to, which is
    where focus goes back. The placement sets this while the picker is open and
    the toolbar removes it when the picker closes. */
-.chat-msg-area__reaction-menu--cramped > button:not([aria-haspopup="dialog"]) {
+.chat-msg-area__reaction-menu--cramped > :not([aria-haspopup="dialog"]) {
   display: none;
 }
 
-/* The message's actions without a long press (issue #1152), where there is
-   no hover to reveal them: a 44px target beside the bubble, never over it. A
-   mouse and a desktop keyboard keep the hover/focus reveal and never see it. */
-.chat-msg-area__msg-actions {
-  display: none;
+/* A touch menu's other actions, opened by "Mais ações" (issue #1238): beside
+   the reactions while the menu fits beside its bubble, a row of their own in
+   the sheet. */
+.chat-msg-area__reaction-menu-actions {
+  display: flex;
+  gap: inherit;
 }
 
-@media (hover: none), (pointer: coarse) {
-  .chat-msg-area__msg-actions {
-    display: inline-flex;
-    flex: none;
-    align-self: center;
-    align-items: center;
-    justify-content: center;
-    width: 44px;
-    height: 44px;
-    padding: 0;
-    border: 0;
-    border-radius: 50%;
-    background: transparent;
-    color: var(--color-muted);
-    cursor: pointer;
-    /* Its own pressed state below; the browser's square flash is not round. */
-    -webkit-tap-highlight-color: transparent;
-  }
+.chat-msg-area__reaction-menu--sheet > .chat-msg-area__reaction-menu-actions {
+  flex: 1 0 100%;
+  flex-wrap: wrap;
+  justify-content: center;
+}
 
-  .chat-msg-area__msg-actions:focus-visible,
-  .chat-msg-area__msg-actions[aria-expanded="true"] {
-    background: var(--color-primary-tint);
+/* The selected message on touch (CQR R3 of issue #1238). Its actions and the
+   way back are the header's, in a contextual mode that replaces the header's
+   controls (see ConversationHeader); the message itself only shows which one
+   it is — a ring, which takes no room, so the bubble keeps its box selected or
+   not and nothing beside it is reserved. Only touch ever selects. */
+.chat-msg-area__msg--selected .chat-msg-area__msg-bubble {
+  box-shadow: 0 0 0 2px var(--color-primary);
+}
+
+/* Its controls are the only way to the selected message's actions: on a
+   screen as low as 320x210 the list is a strip, and the "Ir para o final"
+   button pinned to its bottom rises over the header — under it, not over it. */
+.chat-msg-area__header--selection {
+  position: relative;
+  z-index: 1;
+}
+
+.chat-msg-area__selection {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.chat-msg-area__selection .chat-msg-area__header-title {
+  flex: 1 1 auto;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+/* Touch targets: the mode exists only where a finger is the pointer. */
+.chat-msg-area__selection .chat-msg-area__header-btn {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+}
+
+/* Above the drawer band the header holds 34px buttons and no 44px Back, and
+   the mode's targets would grow it by a pixel: the strip, and the timeline
+   under it, must not move when a message is selected. */
+@media (min-width: 1024px) {
+  .chat-msg-area__selection .chat-msg-area__header-btn {
+    margin-block: -1px;
   }
 }
 
