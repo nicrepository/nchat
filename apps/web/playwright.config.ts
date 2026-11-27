@@ -1,9 +1,11 @@
 import { defineConfig, devices } from "@playwright/test";
 
 const baseURL = process.env.E2E_BASE_URL ?? "http://localhost:5173";
+const shardIndex = process.env.NCHAT_E2E_SHARD;
 
 export default defineConfig({
   testDir: "./e2e",
+  shard: shardIndex ? { current: Number(shardIndex), total: 3 } : undefined,
   // The strict ResizeObserver controls run only with their dedicated configuration.
   testIgnore: "**/resize-observer-gate.spec.ts",
   fullyParallel: true,
